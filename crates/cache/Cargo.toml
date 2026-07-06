@@ -1,0 +1,16 @@
+[package]
+name = "cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "KV cache layouts (flat only in Phase 2; paged + radix in Phases 6 + 12)."
+publish = false
+
+[dependencies]
+taxis = { workspace = true }
+half = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

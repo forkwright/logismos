@@ -1,0 +1,19 @@
+[package]
+name = "hipcore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "HIP FFI + device / stream / event / memory primitives. Foundation of the logismos platform."
+publish = false
+links = "amdhip64"
+
+[dependencies]
+half.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true
+
+[lints]
+workspace = true

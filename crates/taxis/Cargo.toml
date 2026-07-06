@@ -1,0 +1,17 @@
+[package]
+name = "taxis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Typed tensors: shape, stride, dtype, device placement. Greek τάξις, arrangement."
+publish = false
+
+[dependencies]
+half.workspace = true
+hipcore.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

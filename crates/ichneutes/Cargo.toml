@@ -1,0 +1,11 @@
+[package]
+name = "ichneutes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Phase 0 scaffold - not implemented. Intended for classification, NER, and structured extraction."
+publish = false
+
+[lints]
+workspace = true

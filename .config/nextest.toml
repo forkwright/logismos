@@ -1,0 +1,13 @@
+# cargo-nextest configuration
+# https://nexte.st/book/configuration
+
+[profile.default]
+# Fail fast on the first test failure — GPU kernels are sequential by necessity
+# during HIP device init.
+fail-fast = false
+
+# WHY: HIP device teardown can be slow; 60s is generous for CPU-only reference tests.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.ci]
+fail-fast = true

@@ -1,0 +1,217 @@
+//! HIP streams and events.
+
+use std::io::{self, Write};
+use std::ptr;
+
+use crate::device::Device;
+use crate::error::{Result, check, hipError_t_code};
+use crate::ffi;
+
+/// Handle to a HIP stream.
+///
+/// Streams are created non-blocking with `hipStreamNonBlocking`; the
+/// default (NULL) stream serialises against every other stream and is
+/// exposed through [`Stream::null`] only for ergonomic fallback code.
+pub struct Stream {
+    handle: ffi::hipStream_t,
+    device: Device,
+    owns_handle: bool,
+}
+
+// SAFETY: `hipStream_t` is an opaque pointer; the HIP runtime
+// supports submitting work from any thread as long as the device is
+// current. `Send` is sufficient; we deliberately do not implement
+// `Sync` (concurrent use from two threads is undefined per HIP docs).
+unsafe impl Send for Stream {}
+
+impl Stream {
+    /// Create a new non-blocking stream on `device`.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Runtime`] on HIP failure.
+    pub fn new(device: &Device) -> Result<Self> {
+        device.make_current()?;
+        let mut handle: ffi::hipStream_t = ptr::null_mut();
+        // SAFETY: FFI call; `&mut handle` valid.
+        check(
+            unsafe { ffi::hipStreamCreateWithFlags(&mut handle, ffi::hipStreamNonBlocking) },
+            "hipStreamCreateWithFlags",
+        )?;
+        Ok(Self {
+            handle,
+            device: device.clone(),
+            owns_handle: true,
+        })
+    }
+
+    /// The NULL (default) stream on `device`. Inexpensive to create;
+    /// does not own a handle (no destroy on drop).
+    #[must_use]
+    pub fn null(device: &Device) -> Self {
+        Self {
+            handle: ptr::null_mut(),
+            device: device.clone(),
+            owns_handle: false,
+        }
+    }
+
+    /// Raw stream handle for passing to FFI.
+    #[must_use]
+    pub fn raw(&self) -> ffi::hipStream_t {
+        self.handle
+    }
+
+    /// Device this stream belongs to.
+    #[must_use]
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Block the calling thread until all work on this stream completes.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Runtime`] on HIP failure.
+    pub fn synchronize(&self) -> Result<()> {
+        self.device.make_current()?;
+        // SAFETY: FFI call; handle is valid (null is accepted by HIP
+        // to mean the default stream).
+        check(
+            unsafe { ffi::hipStreamSynchronize(self.handle) },
+            "hipStreamSynchronize",
+        )
+    }
+
+    /// Queue `event` on this stream.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Runtime`] on HIP failure.
+    pub fn record(&self, event: &Event) -> Result<()> {
+        self.device.make_current()?;
+        // SAFETY: FFI call; handles validated at construction.
+        check(
+            unsafe { ffi::hipEventRecord(event.handle, self.handle) },
+            "hipEventRecord",
+        )
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        if self.owns_handle && !self.handle.is_null() {
+            if let Err(error) = self.device.make_current() {
+                if writeln!(
+                    io::stderr().lock(),
+                    "hipcore: make_current before hipStreamDestroy failed: {error}"
+                )
+                .is_err()
+                {
+                    // Drop cannot surface secondary stderr failures.
+                }
+            }
+            // SAFETY: handle owned by this wrapper and not yet freed.
+            // Errors during teardown are logged but cannot be returned from Drop.
+            let status = unsafe { ffi::hipStreamDestroy(self.handle) };
+            if status != ffi::hipError_t::hipSuccess {
+                if writeln!(
+                    io::stderr().lock(),
+                    "hipcore: hipStreamDestroy failed (code {}) — leaking stream handle",
+                    hipError_t_code(status)
+                )
+                .is_err()
+                {
+                    // Drop cannot surface secondary stderr failures.
+                }
+            }
+        }
+    }
+}
+
+/// Handle to a HIP event, used for intra-stream timing and cross-stream
+/// ordering.
+pub struct Event {
+    handle: ffi::hipEvent_t,
+    owns_handle: bool,
+}
+
+// SAFETY: `hipEvent_t` is an opaque pointer; HIP permits cross-thread
+// recording / synchronisation once the device is current.
+unsafe impl Send for Event {}
+
+impl Event {
+    /// Create a default event (timing enabled).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Runtime`] on HIP failure.
+    pub fn new(device: &Device) -> Result<Self> {
+        device.make_current()?;
+        let mut handle: ffi::hipEvent_t = ptr::null_mut();
+        // SAFETY: FFI call; `&mut handle` valid.
+        check(
+            unsafe { ffi::hipEventCreate(&mut handle) },
+            "hipEventCreate",
+        )?;
+        Ok(Self {
+            handle,
+            owns_handle: true,
+        })
+    }
+
+    /// Block until this event has fired.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Runtime`] on HIP failure.
+    pub fn synchronize(&self) -> Result<()> {
+        // SAFETY: FFI call; handle owned.
+        check(
+            unsafe { ffi::hipEventSynchronize(self.handle) },
+            "hipEventSynchronize",
+        )
+    }
+
+    /// Elapsed time in milliseconds between two recorded events.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Runtime`] on HIP failure (typical cause: the
+    /// events were not both recorded on the same stream).
+    pub fn elapsed_ms(start: &Event, end: &Event) -> Result<f32> {
+        let mut ms: f32 = 0.0;
+        // SAFETY: FFI call; handles owned, output pointer valid.
+        check(
+            unsafe { ffi::hipEventElapsedTime(&mut ms, start.handle, end.handle) },
+            "hipEventElapsedTime",
+        )?;
+        Ok(ms)
+    }
+
+    /// Raw handle for FFI passthrough.
+    #[must_use]
+    pub fn raw(&self) -> ffi::hipEvent_t {
+        self.handle
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        if self.owns_handle && !self.handle.is_null() {
+            // SAFETY: handle owned and not yet destroyed.
+            let status = unsafe { ffi::hipEventDestroy(self.handle) };
+            if status != ffi::hipError_t::hipSuccess {
+                if writeln!(
+                    io::stderr().lock(),
+                    "hipcore: hipEventDestroy failed (code {}) — leaking event handle",
+                    hipError_t_code(status)
+                )
+                .is_err()
+                {
+                    // Drop cannot surface secondary stderr failures.
+                }
+            }
+        }
+    }
+}

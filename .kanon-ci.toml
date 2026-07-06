@@ -1,0 +1,45 @@
+# Forge CI pipeline for forkwright/logismos.
+#
+# archetype: B
+# forge-only: true until menos returns with ROCm 6.4 available
+#
+# Mirrors harmonia's / aletheia's .kanon-ci.toml with logismos-specific
+# adjustments.
+#
+# Per-stage build + test concurrency pinned to 8. Without this cap cargo
+# defaults to num_cpus (64 on this Threadripper) and parallel rustc +
+# nextest processes peak well over 100GB RSS, enough to OOM menos when
+# any other fleet work is running. 8 is the budget that keeps a single
+# CI run under ~25GB peak so serial drains don't OOM with the dispatch
+# fleet resident.
+#
+# Keep in sync with:
+# - crates/archeion/src/ci_config.rs::default_rust_gate (upstream default)
+#
+# NOTE: the `kanon lint` stage is intentionally omitted while the
+# logismos lint baseline remains nonzero, because enforcing it in CI
+# would reject every PR until dedicated cleanup slices reduce the
+# baseline to zero (harmonia at zero is why its gate passes). Re-add
+# the stage (matching harmonia's) once the baseline is clean.
+
+[pipeline]
+stages = ["cargo fmt", "cargo check", "cargo clippy", "cargo nextest"]
+
+[stages."cargo fmt"]
+cmd = "cargo fmt --all -- --check"
+timeout_secs = 300
+
+[stages."cargo check"]
+cmd = "cargo check --workspace --all-targets --jobs 8"
+timeout_secs = 1800
+
+[stages."cargo clippy"]
+cmd = "cargo clippy --workspace --all-targets --jobs 8 -- -D warnings"
+timeout_secs = 1800
+
+[stages."cargo nextest"]
+cmd = "cargo nextest run --workspace --build-jobs 8 --test-threads 8 --no-fail-fast"
+timeout_secs = 2400
+
+# License metadata lives in `.kanon-license-fingerprint.toml`, the canonical
+# v2 surface consumed by `MANIFEST/license-spdx-match`.

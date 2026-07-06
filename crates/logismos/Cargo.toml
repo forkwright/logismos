@@ -1,0 +1,40 @@
+[package]
+name = "logismos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Top-level facade crate: ergonomic re-exports over the logismos workspace. No logic."
+publish = false
+
+[features]
+# Gate the manual debug-diagnostic test (`tests/phase_3_debug.rs`) on
+# an opt-in feature rather than `#[ignore]`. `#[ignore]` leaves the
+# test in nextest's discovered-but-skipped set, which the stoa CI
+# verifier counts differently between main and verifier runs and
+# flags as a test_count divergence (kanon forge issue #32). `#[cfg]`
+# removes the test from discovery entirely when the feature is off.
+# Run manually with `cargo test -p logismos --features debug-diagnostics --test phase_3_debug`.
+debug-diagnostics = []
+
+[dependencies]
+taxis = { workspace = true }
+loader = { workspace = true }
+tokenize = { workspace = true }
+cache = { workspace = true }
+decode = { workspace = true }
+logismos_core = { path = "../core", package = "core" }
+transformers = { path = "../transformers" }
+encoders = { path = "../encoders" }
+embed = { path = "../embed" }
+
+[dev-dependencies]
+# The Phase-2 integration test writes a synthetic safetensors fixture
+# when Stella isn't on disk, so it needs the upstream writer.
+safetensors = { workspace = true }
+kernels = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "embed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sentence-transformer heads and Matryoshka projection; concrete embedding models."
+publish = false
+
+[[bench]]
+name = "stella_throughput"
+path = "benches/stella_throughput.rs"
+harness = false
+
+[dependencies]
+logismos-core = { path = "../core", package = "core" }
+encoders = { path = "../encoders" }
+kernels = { workspace = true }
+loader = { workspace = true }
+rayon = { workspace = true }
+taxis = { workspace = true }
+tokenize = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

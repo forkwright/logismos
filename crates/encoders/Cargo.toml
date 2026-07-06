@@ -1,0 +1,18 @@
+[package]
+name = "encoders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Encoder-only model family: Stella (Qwen2-encoder mode), BERT, ModernBERT, GTE."
+publish = false
+
+[dependencies]
+kernels = { workspace = true }
+loader = { workspace = true }
+taxis = { workspace = true }
+transformers = { path = "../transformers" }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

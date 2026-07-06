@@ -1,0 +1,11 @@
+{
+  "generated_at": 1776560501,
+  "model_path": "/models/stella-1.5b-v5",
+  "torch": "2.9.1+rocm6.4",
+  "transformers": "5.5.3",
+  "tokenizers": "0.22.2",
+  "safetensors": "0.7.0",
+  "num_sentences": 15,
+  "dim": 1024,
+  "inputs_sha256": "c0c0d511f9247f1495068c17bf15b159bec2d86abb63b341ae190d01178f185e"
+}

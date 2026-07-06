@@ -1,0 +1,18 @@
+[package]
+name = "core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Public trait surface: EmbeddingModel, Reranker, DecoderModel, SpeechRecognizer, etc."
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+thiserror = { workspace = true }
+
+
+[lints]
+workspace = true

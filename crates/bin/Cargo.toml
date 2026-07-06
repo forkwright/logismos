@@ -1,0 +1,15 @@
+[package]
+name = "bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "logismos CLI entrypoint. Phase 0 scaffold; replaced in Phase 7 with full model-serving binary."
+publish = false
+
+[[bin]]
+name = "logismos"
+path = "src/main.rs"
+
+[lints]
+workspace = true

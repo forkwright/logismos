@@ -1,0 +1,18 @@
+[package]
+name = "loader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Weight loaders: safetensors (upstream) + own GGUF reader; weight-name mapping."
+publish = false
+
+[dependencies]
+taxis = { workspace = true }
+half = { workspace = true }
+thiserror = { workspace = true }
+safetensors = { workspace = true }
+memmap2 = { workspace = true }
+
+[lints]
+workspace = true

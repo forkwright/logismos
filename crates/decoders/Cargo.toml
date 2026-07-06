@@ -1,0 +1,11 @@
+[package]
+name = "decoders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Phase 0 scaffold - not implemented. Intended for decoder-only model families such as Qwen and Llama."
+publish = false
+
+[lints]
+workspace = true

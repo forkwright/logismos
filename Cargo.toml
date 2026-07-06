@@ -1,0 +1,78 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+license = "LicenseRef-PolyForm-Shield-1.0.0"
+publish = false
+repository = "local-only"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+multiple_crate_versions = "allow"
+
+[workspace.dependencies]
+# Tier-1 foundation deps (Phase 1).
+half = "2.4"
+smallvec = { version = "1.13", features = ["union"] }
+thiserror = "2"
+snafu = "0.8"
+bindgen = "0.71"
+num-traits = "0.2"
+
+# Tier-2 infrastructure deps (Phase 2).
+# safetensors: upstream reader for the HF safetensors format
+# (approved in the Phase-0 dossier as a sovereignty cut; the format
+# itself is our API, no reason to reinvent header parsing).
+safetensors = "0.7"
+# tokenizers: HF tokenizer.json runtime. Approved as a sovereignty
+# cut in Phase-0 dossier 02 §tokenize. `default-features = false` strips
+# the HTTP hub client, progressbar, and C++ esaxx dep; we keep only the
+# onig regex engine (required by BPE pre-tokenizers).
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+# memmap2: read-only mmap for bulk-tensor files. No alternatives in the
+# Rust ecosystem; used only inside loader's safetensors path.
+memmap2 = "0.9"
+# rayon: work-stealing thread pool for CPU parallel matmul (Phase 3
+# throughput floor). Single dep, no feature knobs needed.
+rayon = "1.10"
+# matrixmultiply: pure-Rust autovectorised GEMM (sgemm/dgemm). Used only
+# by the Phase-3 CPU reference path; the GPU path in Phase 6 supersedes
+# it. `threading` enables internal multi-thread tiling via std::thread.
+matrixmultiply = "0.3"
+
+# Test-only tier-1 deps.
+approx = "0.5"
+rand = { version = "0.8", features = ["small_rng"] }
+
+# Serialization (used by rerank config, brought in by tokenizers/safetensors
+# transitively; made explicit for workspace members).
+serde = "1.0"
+serde_json = "1.0"
+
+# Internal crate cross-refs.
+hipcore = { path = "crates/hipcore" }
+taxis = { path = "crates/taxis" }
+kernels = { path = "crates/kernels" }
+praxis = { path = "crates/praxis" }
+loader = { path = "crates/loader" }
+tokenize = { path = "crates/tokenize" }
+cache = { path = "crates/cache" }
+decode = { path = "crates/decode" }
+core = { path = "crates/core" }
+transformers = { path = "crates/transformers" }
+encoders = { path = "crates/encoders" }
+embed = { path = "crates/embed" }

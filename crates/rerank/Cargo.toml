@@ -1,0 +1,21 @@
+[package]
+name = "rerank"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cross-encoder reranker contract and preflight surface. Phase 5 Option A."
+publish = false
+
+[dependencies]
+encoders = { workspace = true }
+kernels = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+snafu = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+transformers = { workspace = true }
+
+[lints]
+workspace = true

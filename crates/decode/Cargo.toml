@@ -1,0 +1,16 @@
+[package]
+name = "decode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Logit processors + samplers (Phase 2: greedy, top-k, top-p, min-p, temperature, repetition penalty)."
+publish = false
+
+[dependencies]
+taxis = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+
+[lints]
+workspace = true

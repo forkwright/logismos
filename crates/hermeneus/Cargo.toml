@@ -1,0 +1,11 @@
+[package]
+name = "hermeneus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Phase 0 scaffold - not implemented. Intended for OpenAI-compatible HTTP and MCP protocol surfaces."
+publish = false
+
+[lints]
+workspace = true

@@ -1,0 +1,35 @@
+# Rust build
+/target/
+**/*.rs.bk
+
+# Cargo
+Cargo.lock
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# HIP / ROCm build artefacts
+*.hsaco
+*.co
+*.bc
+*.o
+*.a
+*.so
+*.so.*
+
+# Benchmark + profile output
+/benchmarks/
+/profiles/
+*.nvprof
+*.csv.gz
+flamegraph.svg
+perf.data*
+
+# Local scratch
+scratch/
+.claude/

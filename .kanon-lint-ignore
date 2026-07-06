@@ -1,0 +1,76 @@
+# Rules to skip for specific paths
+# Format: RULE/name:path/glob # reason
+# Every entry requires justification.
+
+# =============================================================================
+# TESTING false positives
+# =============================================================================
+
+# WHY: parity_check() panics on tolerance failure — it IS the assertion;
+# basanos does not recognize custom assertion functions as "verification signals".
+TESTING/tautological-test:crates/kernels/tests/matmul_parity.rs
+
+# WHY: phase_3_debug returns Result<(), TestError> — the ? operator is the
+# verification signal; basanos does not recognize Result propagation as assertion.
+TESTING/tautological-test:crates/logismos/tests/phase_3_debug.rs
+
+# WHY: phase_3_fixture_check returns Result<(), TestError> — same as above.
+TESTING/tautological-test:crates/logismos/tests/phase_3_fixture_check.rs
+
+# =============================================================================
+# OPERATIONS — Info-severity rules not applicable to this repo class
+# =============================================================================
+
+# WHY: logismos is a library/inference-runtime crate, not a long-running
+# service. RUNBOOK.md is appropriate for services; each crate here has a PLAN.md
+# in kanon/projects/logismos/phases/ which serves this purpose.
+OPERATIONS/no-runbook:crates/**
+
+# WHY: Same as above — health endpoints apply to HTTP services, not library crates.
+OPERATIONS/no-health-endpoint:crates/**
+
+# =============================================================================
+# TESTING — Info-severity rules — deferred, not inapplicable
+# =============================================================================
+
+# WHY: Benchmarks require the W7900 hardware to be meaningful. Deferred to
+# Phase 7 when the HIP kernel suite is complete.
+TESTING/no-benchmarks:Cargo.toml
+
+# WHY: Fuzz targets require the decode/parser surface to stabilize.
+# Deferred to Phase 4+.
+TESTING/no-fuzz:Cargo.toml
+
+# =============================================================================
+# ORCHESTRATION — main worktree commit rule
+# =============================================================================
+
+# WHY: Commit ac7e8d2 was authored in the main worktree during menos-down
+# recovery window (verda is the compute host; dispatch infrastructure is
+# degraded). One-time exception — future work uses worktrees.
+ORCHESTRATION/main-worktree-commit-prohibited:Cargo.toml
+
+# =============================================================================
+# TESTING — false positive on cross-variant assert_ne!
+# =============================================================================
+
+# WHY: assert_ne!(Prompt::S2sQuery, Prompt::S2pQuery) compares two DIFFERENT
+# enum variants; basanos incorrectly flags this as 'identical expressions'.
+TESTING/tautological-test:crates/core/src/lib.rs
+
+# =============================================================================
+# ARCHITECTURE — glossary location
+# =============================================================================
+
+# WHY: Glossary lives at _llm/glossary.md per the llms.txt corpus standard.
+# The root-level glossary.md location expected by this rule is not the
+# canonical location for this repo (AI-corpus files go under _llm/).
+ARCHITECTURE/no-glossary:Cargo.toml
+
+# =============================================================================
+# TOPOLOGY — shallow-struct for config structs (pre-existing design)
+# =============================================================================
+
+# WHY: EncodeOpts is intentionally a plain config struct; users build it with
+# struct literal syntax. A smart constructor would add no value here.
+TOPOLOGY/shallow-struct:crates/core/src/lib.rs

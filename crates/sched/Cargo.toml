@@ -1,0 +1,11 @@
+[package]
+name = "sched"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Phase 0 scaffold - not implemented. Intended for batching, admission control, preemption, and priority queueing."
+publish = false
+
+[lints]
+workspace = true

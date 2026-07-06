@@ -1,0 +1,43 @@
+# llms.txt - Logismos AI navigation index
+
+> Sovereign GPU inference runtime for AMD W7900 (gfx1100). ~27 peer crates.
+> Rust + HIP + hipBLASLt. Private repo.
+
+## LLM corpus
+
+Structured reference data for AI agents is in `_llm/`:
+
+- [_llm/glossary.md](_llm/glossary.md): Domain term definitions (GDN, WMMA, wave32, TurboQuant, ModernBERT, ...)
+
+## Core docs
+
+- [CLAUDE.md](CLAUDE.md): Operating instructions, boundaries, standards
+- [AGENTS.md](AGENTS.md): Cross-tool bootstrap guide
+- [README.md](README.md): Project overview and layout
+- [ARCHITECTURE.md](ARCHITECTURE.md): Crate topology and dependency model
+- [CHANGELOG.md](CHANGELOG.md): Release history
+
+## Planning (in kanon)
+
+- `~/dev/kanon/projects/logismos/vision.md` - what this is and what it is not
+- `~/dev/kanon/projects/logismos/ROADMAP.md` - phased plan
+- `~/dev/kanon/projects/logismos/STATE.md` - current state
+- `~/dev/kanon/projects/logismos/phases/` - per-phase PLAN.md files
+
+## Key crates
+
+- `crates/core/` - stable public traits (`EmbeddingModel`, `Reranker`)
+- `crates/hipcore/` - HIP FFI surface, device/stream/memory
+- `crates/kernels/` - HIP + CPU reference kernels
+- `crates/transformers/` - transformer building blocks (attention, norms)
+- `crates/encoders/` - encoder model impls (Stella, ModernBERT)
+- `crates/embed/` - embedding pipeline
+- `crates/rerank/` - cross-encoder reranker (GteReranker, ModernBERT CPU)
+- `crates/quant/` - quantization schemes (TurboQuant 3-bit)
+- `crates/loader/` - safetensors + GGUF v3 reader
+- `crates/tokenize/` - tokenizer facade
+- `crates/logismos/` - top-level integration facade
+
+## Research
+
+- `research/` - preflight docs for hardware-gated features

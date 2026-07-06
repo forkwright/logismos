@@ -1,0 +1,15 @@
+The quick brown fox jumps over the lazy dog.
+Hello world, this is a simple test sentence.
+Semantic similarity benchmarks measure how close two embeddings are in vector space.
+Rust is a systems programming language focused on safety and performance.
+The W7900 GPU has 48 gigabytes of video RAM and a gfx1100 ISA.
+Retrieval-augmented generation combines dense retrieval with language model decoding.
+Matryoshka Representation Learning produces nested embeddings at multiple dimensionalities.
+Stella 1.5B is an embedding model derived from the Qwen2 decoder architecture.
+Tokenization with byte-pair encoding handles out-of-vocabulary words by splitting into subwords.
+Mean-pooling over the transformer's final hidden states gives a fixed-size sentence vector.
+L2 normalisation projects vectors onto the unit hypersphere so cosine equals dot product.
+Sovereign infrastructure means owning the compute stack from HIP kernels up to the service surface.
+The AMD Radeon Pro W7900 is a workstation graphics card based on the RDNA 3 architecture.
+Embeddings power semantic search, clustering, classification, and retrieval pipelines.
+Attention mechanisms compute pairwise token interactions weighted by a learned scoring function.

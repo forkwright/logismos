@@ -1,0 +1,12 @@
+{
+  "implementation": "transformers-cpu-fp32",
+  "host": "menos",
+  "n_sentences": 15,
+  "total_sec": 17.24022260925267,
+  "mean_latency_ms": 1149.3481739501779,
+  "throughput_sent_per_sec": 0.8700583710531462,
+  "dim": 1024,
+  "torch": "2.9.1+rocm6.4",
+  "transformers": "5.5.3",
+  "note": "CPU stand-in for the candle-CPU baseline. 10x floor = 10 * throughput."
+}
