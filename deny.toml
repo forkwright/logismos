@@ -37,3 +37,10 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "allow"
 wildcards = "deny"
+# WHY: every internal crates/* member is publish = false at workspace.package
+# scope (never shipped to crates.io), so intra-workspace path deps without an
+# explicit version requirement are the correct form, not an oversight — cargo-deny
+# otherwise treats a versionless path dep as an implicit wildcard and denies it
+# (11 workspace members flagged as of 2026-07-16). allow-wildcard-paths exempts
+# path deps specifically while still denying a genuine `foo = "*"` registry dep.
+allow-wildcard-paths = true

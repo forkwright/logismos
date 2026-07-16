@@ -1,0 +1,13 @@
+# cargo-audit configuration (separate tool/config from cargo-deny's deny.toml —
+# cargo-audit does not read deny.toml). See standards/CI.md § Vulnerability scanning.
+# https://github.com/rustsec/rustsec/tree/main/cargo-audit#configuration
+
+[advisories]
+ignore = [
+    # RUSTSEC-2024-0436: paste unmaintained (dtolnay archived). Transitive via
+    # tokenizers 0.22 → spm_precompiled → paste. No safe upgrade until
+    # tokenizers replaces spm_precompiled. Mirrors the deny.toml
+    # advisories.ignore entry — cargo-deny and cargo-audit are separate tools
+    # with separate config, both need the same ignore to actually pass CI.
+    "RUSTSEC-2024-0436",
+]
