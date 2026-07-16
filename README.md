@@ -41,3 +41,28 @@ Repo-local:
 ## License
 
 PolyForm Shield 1.0.0 with AI-training prohibition. See [LICENSE](LICENSE).
+
+<!-- kanon:auto-start -->
+## Repository Metadata
+
+- Registry name: `logismos`
+- Description: Kanon-managed forkwright repository `logismos`.
+- Forge repo: `forkwright/logismos`
+- Kanon prefix: `lo`
+- Config source: `workflow/kanon.toml [projects.logismos]`
+- Planning state: `projects/logismos/STATE.md`
+- Last state update: `not recorded`
+
+Run `kanon docs sync --check --repo logismos` to verify this generated
+section and `kanon docs sync --apply --repo logismos` to refresh it.
+
+## Blast zone
+
+- Paths explicitly named by the rendered prompt, role, or template input.
+
+## Acceptance verifier
+
+```bash
+kanon gate
+```
+<!-- kanon:auto-end -->

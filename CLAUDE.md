@@ -109,3 +109,27 @@ Operating principle, memory system, and global constraints come from
 - A passing `cargo check` is not evidence of correctness. Every
  kernel carries a CPU reference test at 1e-3 tolerance.
 - Never push this repo to any remote (per Boundaries above).
+
+<!-- kanon:auto-start -->
+## Generated kanon context
+
+- Registry name: `logismos`
+- Forge repo: `forkwright/logismos`
+- Kanon prefix: `lo`
+- Config source: `workflow/kanon.toml [projects.logismos]`
+- Standards source: `crates/basanos/standards/STANDARDS.md`
+- MCP routing catalog: `workflow/AGENTS-mcp-tools.md`
+
+Run `kanon docs sync --check --repo logismos` to verify this generated
+section and `kanon docs sync --apply --repo logismos` to refresh it.
+
+## Blast zone
+
+- Paths explicitly named by the rendered prompt, role, or template input.
+
+## Acceptance verifier
+
+```bash
+kanon gate
+```
+<!-- kanon:auto-end -->
