@@ -145,7 +145,10 @@ mod tests {
             is_varlen: false,
         };
         let result = chunk_gated_delta_rule_fwd(&[], &[], &[], &[], &config);
-        assert!(matches!(result, Err(Error::UnsupportedHeadDim { got: 256 })));
+        assert!(matches!(
+            result,
+            Err(Error::UnsupportedHeadDim { got: 256 })
+        ));
     }
 
     /// Verify that 64 and 128 are accepted, then still return NotImplemented.

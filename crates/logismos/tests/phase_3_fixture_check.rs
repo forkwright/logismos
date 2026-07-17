@@ -1,10 +1,3 @@
-#![expect(
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::cast_lossless,
-    clippy::cast_precision_loss,
-    reason = "integration-test error surface and fixture numeric casts are test-local"
-)]
 //! Deterministic Phase 3 fixture validation.
 //!
 //! Verifies that the committed golden artefacts in `phases/03-stella/golden/`
@@ -43,6 +36,11 @@ fn workspace_root() -> PathBuf {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear top-to-bottom fixture validation; splitting it obscures the \
+              existence -> inputs -> tokens -> embeddings -> provenance -> baseline sequence"
+)]
 fn phase_3_fixture_check() -> Result<(), TestError> {
     let ws = workspace_root();
     let golden = ws.join(GOLDEN_DIR);
@@ -122,7 +120,7 @@ fn phase_3_fixture_check() -> Result<(), TestError> {
     let provenance: Value = serde_json::from_str(&prov_text)
         .map_err(|e| TestError::Msg(format!("PROVENANCE.json: invalid JSON: {e}")))?;
     let prov_sentences = json_u64(&provenance, "num_sentences", "PROVENANCE.json")?;
-    if prov_sentences as usize != sentences.len() {
+    if prov_sentences != sentences.len() as u64 {
         return Err(TestError::Msg(format!(
             "PROVENANCE.json num_sentences={} but inputs.txt has {}",
             prov_sentences,
@@ -132,8 +130,7 @@ fn phase_3_fixture_check() -> Result<(), TestError> {
     let prov_dim = json_u64(&provenance, "dim", "PROVENANCE.json")?;
     if prov_dim != 1024 {
         return Err(TestError::Msg(format!(
-            "PROVENANCE.json dim={} expected 1024",
-            prov_dim
+            "PROVENANCE.json dim={prov_dim} expected 1024"
         )));
     }
 

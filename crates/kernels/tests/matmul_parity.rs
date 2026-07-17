@@ -4,16 +4,9 @@
 
 #![expect(
     clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::cast_lossless,
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
     clippy::many_single_char_names,
-    clippy::similar_names,
-    clippy::cast_ptr_alignment,
     reason = "GPU parity tests use compact math notation, host/device casts, and assertion-first failure paths"
 )]
 
