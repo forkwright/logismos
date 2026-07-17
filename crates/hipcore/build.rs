@@ -53,6 +53,18 @@ fn main() -> Result<(), String> {
         .rustified_enum("hipError_t")
         .rustified_enum("hipMemcpyKind")
         .rustified_enum("hipDeviceAttribute_t")
+        // hip_runtime_api.h macro-renames a handful of symbols to an ABI-revision
+        // suffix (`#define hipDeviceProp_t hipDeviceProp_tR0600`, same for
+        // hipGetDeviceProperties) before bindgen ever sees the unversioned name —
+        // the preprocessor rewrites the typedef and every reference to it in the
+        // header itself. C callers get the versioned symbol transparently by
+        // re-including the header; bindgen has no equivalent, so the generated
+        // bindings only expose the suffixed names. Alias them back so hipcore's
+        // Rust call sites can use the stable, version-agnostic name like a C
+        // caller would. Bump the suffix here if a future ROCm header revision
+        // renames it again.
+        .raw_line("pub type hipDeviceProp_t = hipDeviceProp_tR0600;")
+        .raw_line("pub use hipGetDevicePropertiesR0600 as hipGetDeviceProperties;")
         .generate()
         .map_err(|e| format!("bindgen failed on HIP runtime header: {e}"))?;
 
