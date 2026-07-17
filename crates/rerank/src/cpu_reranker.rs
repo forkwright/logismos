@@ -258,7 +258,10 @@ pub(crate) fn encoder_config_from(cfg: &ModernBertConfig) -> ModernBertEncoderCo
         global_rope_theta: cfg.global_rope_theta,
         // WHY: layer_norm_eps is f64 in config (JSON source); f32 precision is
         // sufficient for layer normalization epsilon (typical value 1e-12).
-        #[expect(clippy::cast_possible_truncation, reason = "eps precision loss from f64->f32 is acceptable")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "eps precision loss from f64->f32 is acceptable"
+        )]
         layer_norm_eps: cfg.layer_norm_eps as f32,
         attention_bias: cfg.attention_bias,
         mlp_bias: cfg.mlp_bias,
@@ -310,6 +313,12 @@ pub(crate) fn zeroed_weights(cfg: &ModernBertEncoderConfig) -> ModernBertWeights
 #[expect(
     clippy::unwrap_used,
     reason = "tests intentionally unwrap successful fixture calls to keep failure locations precise"
+)]
+#[expect(
+    clippy::float_cmp,
+    clippy::cast_possible_truncation,
+    reason = "encoder_config_from does a plain f64->f32 pass-through with no arithmetic, so exact \
+              equality against the same cast is the correct check, not an accumulation-error case"
 )]
 mod tests {
     use super::*;
@@ -364,7 +373,7 @@ mod tests {
             sparse_pred_ignore_index: -100,
             sparse_prediction: false,
             torch_dtype: "float32".into(),
-            transformers_version: "".into(),
+            transformers_version: String::new(),
         }
     }
 

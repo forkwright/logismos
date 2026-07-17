@@ -44,7 +44,10 @@ pub fn layer_norm_f32(
             continue;
         };
         // WHY: n is bounded by hidden_size (max 4096); precision loss at 2^24 is unreachable.
-        #[expect(clippy::cast_precision_loss, reason = "n < 2^24 for any realistic hidden_size")]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "n < 2^24 for any realistic hidden_size"
+        )]
         let n_f32 = n as f32;
         let mean: f32 = row.iter().sum::<f32>() / n_f32;
         let var: f32 = row.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n_f32;
@@ -78,12 +81,16 @@ pub fn layer_norm_f32(
 pub fn gelu(x: &[f32]) -> Vec<f32> {
     x.iter()
         .map(|&v| {
-            let t = 1.0_f32 / (1.0 + 0.327_591_1 * v.abs());
+            // GELU(v) = v * Phi(v) = v * 0.5 * (1 + erf(v / sqrt(2))). The A&S
+            // 7.1.26 approximation below computes erf(z) for a given z >= 0; it
+            // must be fed z = |v| / sqrt(2), not |v| directly.
+            let z = v.abs() * std::f32::consts::FRAC_1_SQRT_2;
+            let t = 1.0_f32 / (1.0 + 0.327_591_1 * z);
             let poly = t
-                * (0.254_829_592
-                    + t * (-0.284_496_736
-                        + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
-            let erf_abs = 1.0 - poly * (-(v * v)).exp();
+                * (0.254_829_6
+                    + t * (-0.284_496_72
+                        + t * (1.421_413_8 + t * (-1.453_152_1 + t * 1.061_405_4))));
+            let erf_abs = 1.0 - poly * (-(z * z)).exp();
             let erf_v = if v >= 0.0 { erf_abs } else { -erf_abs };
             0.5 * v * (1.0 + erf_v)
         })
@@ -381,7 +388,10 @@ impl ModernBertAttention {
         }
         // Compute attention scores [n_h, seq, seq]
         // WHY: d is head_dim (64 or 128); precision loss at 2^24 is unreachable.
-        #[expect(clippy::cast_precision_loss, reason = "head_dim <= 128, well within f32 exact range")]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "head_dim <= 128, well within f32 exact range"
+        )]
         let scale = (d as f32).sqrt().recip();
         let mut scores = vec![0.0f32; n_h * seq * seq];
         for h_idx in 0..n_h {
@@ -453,7 +463,7 @@ fn apply_attention_mask(
             let window_ok = if is_global {
                 true
             } else {
-                let diff = if i >= j { i - j } else { j - i };
+                let diff = i.abs_diff(j);
                 diff <= local_window
             };
             if !padding_ok || !window_ok {

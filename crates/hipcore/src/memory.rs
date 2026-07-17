@@ -211,28 +211,26 @@ impl<T: BytePod> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         // SAFETY: `ptr` was returned by `hipMalloc` and is owned here.
         // HIP accepts free from any thread after setting the device.
-        if let Err(error) = self.device.make_current() {
-            if writeln!(
+        if let Err(error) = self.device.make_current()
+            && writeln!(
                 io::stderr().lock(),
                 "hipcore: make_current before hipFree failed: {error}"
             )
             .is_err()
-            {
-                // Drop cannot surface secondary stderr failures.
-            }
+        {
+            // Drop cannot surface secondary stderr failures.
         }
         // SAFETY: same.
         let status = unsafe { ffi::hipFree(self.ptr.as_ptr().cast::<c_void>()) };
-        if status != ffi::hipError_t::hipSuccess {
-            if writeln!(
+        if status != ffi::hipError_t::hipSuccess
+            && writeln!(
                 io::stderr().lock(),
                 "hipcore: hipFree failed (code {}) — leaking buffer",
                 hipError_t_code(status)
             )
             .is_err()
-            {
-                // Drop cannot surface secondary stderr failures.
-            }
+        {
+            // Drop cannot surface secondary stderr failures.
         }
     }
 }

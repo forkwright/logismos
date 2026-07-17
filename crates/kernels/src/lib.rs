@@ -51,6 +51,4 @@ pub mod rope;
 pub mod softmax;
 
 pub use crate::error::{Error, Result};
-pub use crate::gdn::{
-    chunk_gated_delta_rule_fwd, fused_recurrent_gated_delta_rule_fwd, GdnConfig,
-};
+pub use crate::gdn::{GdnConfig, chunk_gated_delta_rule_fwd, fused_recurrent_gated_delta_rule_fwd};

@@ -175,7 +175,7 @@ impl DeviceProps {
         let pci_domain = device_prop_u32("pciDomainID", raw.pciDomainID)?;
         let pci_bus = device_prop_u32("pciBusID", raw.pciBusID)?;
         let pci_device = device_prop_u32("pciDeviceID", raw.pciDeviceID)?;
-        let pci = format!("{:04x}:{:02x}:{:02x}.0", pci_domain, pci_bus, pci_device);
+        let pci = format!("{pci_domain:04x}:{pci_bus:02x}:{pci_device:02x}.0");
         Ok(Self {
             isa,
             name,

@@ -596,6 +596,14 @@ const CRATE_NAME: &str = "quant";
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        reason = "test fixtures use small deterministic index->f32 conversions \
+                  (indices < 128, well within f32's exact range) and expect() \
+                  as the assertion mechanism"
+    )]
+
     use core::mem::{align_of, size_of};
 
     use super::*;

@@ -2,17 +2,8 @@
 
 #![expect(
     clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::cast_lossless,
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::many_single_char_names,
-    clippy::similar_names,
-    clippy::cast_ptr_alignment,
-    clippy::manual_is_multiple_of,
     reason = "GPU parity tests use compact math notation, host/device casts, and assertion-first failure paths"
 )]
 
@@ -62,7 +53,7 @@ fn f16_bytes(v: &[f16]) -> &[u8] {
 }
 
 fn bytes_to_f16(v: &[u8]) -> Vec<f16> {
-    assert!(v.len() % 2 == 0);
+    assert_eq!(v.len() % 2, 0);
     let len = v.len() / 2;
     // SAFETY: f16 is bit-pattern-total.
     let slice = unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<f16>(), len) };

@@ -101,29 +101,27 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         if self.owns_handle && !self.handle.is_null() {
-            if let Err(error) = self.device.make_current() {
-                if writeln!(
+            if let Err(error) = self.device.make_current()
+                && writeln!(
                     io::stderr().lock(),
                     "hipcore: make_current before hipStreamDestroy failed: {error}"
                 )
                 .is_err()
-                {
-                    // Drop cannot surface secondary stderr failures.
-                }
+            {
+                // Drop cannot surface secondary stderr failures.
             }
             // SAFETY: handle owned by this wrapper and not yet freed.
             // Errors during teardown are logged but cannot be returned from Drop.
             let status = unsafe { ffi::hipStreamDestroy(self.handle) };
-            if status != ffi::hipError_t::hipSuccess {
-                if writeln!(
+            if status != ffi::hipError_t::hipSuccess
+                && writeln!(
                     io::stderr().lock(),
                     "hipcore: hipStreamDestroy failed (code {}) — leaking stream handle",
                     hipError_t_code(status)
                 )
                 .is_err()
-                {
-                    // Drop cannot surface secondary stderr failures.
-                }
+            {
+                // Drop cannot surface secondary stderr failures.
             }
         }
     }
@@ -201,16 +199,15 @@ impl Drop for Event {
         if self.owns_handle && !self.handle.is_null() {
             // SAFETY: handle owned and not yet destroyed.
             let status = unsafe { ffi::hipEventDestroy(self.handle) };
-            if status != ffi::hipError_t::hipSuccess {
-                if writeln!(
+            if status != ffi::hipError_t::hipSuccess
+                && writeln!(
                     io::stderr().lock(),
                     "hipcore: hipEventDestroy failed (code {}) — leaking event handle",
                     hipError_t_code(status)
                 )
                 .is_err()
-                {
-                    // Drop cannot surface secondary stderr failures.
-                }
+            {
+                // Drop cannot surface secondary stderr failures.
             }
         }
     }

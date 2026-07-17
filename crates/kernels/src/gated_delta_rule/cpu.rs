@@ -17,7 +17,7 @@
 ///
 /// Debug-mode: `x.len()` not a multiple of `k`.
 pub fn l2_norm_in_place(x: &mut [f32], k: usize) {
-    debug_assert!(k > 0 && x.len() % k == 0);
+    debug_assert!(k > 0 && x.len().is_multiple_of(k));
     let rows = x.len() / k;
     for r in 0..rows {
         let start = r * k;
@@ -126,7 +126,7 @@ pub fn gated_delta_rule_recurrent_fwd(
 
         // 1. Decay: h *= exp(g_t)
         let decay = g_t.exp();
-        for hv in h.iter_mut() {
+        for hv in &mut h {
             *hv *= decay;
         }
 
@@ -134,6 +134,14 @@ pub fn gated_delta_rule_recurrent_fwd(
         //    h is [K, V] so h^T is [V, K]; h^T @ k = sum_k h[k,v] * k[k]
         let mut h_t_k = vec![0.0f32; v_dim];
         for ki in 0..k_dim {
+            // vi also drives h's flat offset (ki * v_dim + vi), not just h_t_k's —
+            // can't collapse to a single iterator without losing the get().unwrap_or(0.0)
+            // out-of-bounds fallback that guards release builds against malformed shapes.
+            #[expect(
+                clippy::needless_range_loop,
+                reason = "vi indexes both h_t_k[vi] and h[ki * v_dim + vi]; a slice zip would \
+                          drop the get().unwrap_or(0.0) bounds fallback"
+            )]
             for vi in 0..v_dim {
                 h_t_k[vi] += h.get(ki * v_dim + vi).copied().unwrap_or(0.0)
                     * k_t.get(ki).copied().unwrap_or(0.0);
@@ -160,6 +168,13 @@ pub fn gated_delta_rule_recurrent_fwd(
         let o_t = o
             .get_mut(t_idx * v_dim..(t_idx + 1) * v_dim)
             .unwrap_or_default();
+        // vi also drives h's flat offset (ki * v_dim + vi) in the inner loop, not
+        // just o_t[vi] — same fallback-preserving rationale as the h_t_k loop above.
+        #[expect(
+            clippy::needless_range_loop,
+            reason = "vi indexes both o_t[vi] and h[ki * v_dim + vi]; a slice zip would \
+                      drop the get().unwrap_or(0.0) bounds fallback"
+        )]
         for vi in 0..v_dim {
             let mut acc = 0.0f32;
             for ki in 0..k_dim {

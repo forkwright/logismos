@@ -4,6 +4,11 @@
     clippy::too_many_arguments,
     reason = "benchmark shape and launch parameters are clearest as explicit arguments"
 )]
+#![expect(
+    clippy::similar_names,
+    reason = "m_i32/n_i32/k_i32 (launch args) and m_f64/n_f64/k_f64 (flop-count math) are \
+              intentionally parallel per-dimension type conversions, not a naming accident"
+)]
 //!
 //! Sweeps two shapes on the W7900: a small "sanity" shape (256³) to
 //! confirm the pipeline, and 4096³ for the headline number. Both use

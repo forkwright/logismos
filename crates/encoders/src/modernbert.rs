@@ -148,6 +148,10 @@ impl ModernBertWeights {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-layer safetensors shape/bias-presence parameters are clearest as explicit arguments"
+)]
 fn load_layer(
     reader: &Reader,
     i: usize,
@@ -262,7 +266,7 @@ impl ModernBertEncoder {
     pub fn new(cfg: ModernBertEncoderConfig, weights: ModernBertWeights) -> Result<Self> {
         let h = cfg.hidden_size;
         let n_heads = cfg.num_attention_heads;
-        if n_heads == 0 || h % n_heads != 0 {
+        if n_heads == 0 || !h.is_multiple_of(n_heads) {
             return Err(Error::Shape(format!(
                 "hidden_size {h} not divisible by num_attention_heads {n_heads}"
             )));
@@ -378,7 +382,7 @@ impl ModernBertEncoder {
             let attn_out = self.attn_blocks[i]
                 .forward(&normed_attn, rope, &positions, mask)
                 .map_err(|e| Error::Shape(e.to_string()))?;
-            for (xv, av) in x.iter_mut().zip(attn_out.iter()) {
+            for (xv, av) in hidden.iter_mut().zip(attn_out.iter()) {
                 *xv += av;
             }
 
@@ -394,7 +398,7 @@ impl ModernBertEncoder {
             let mlp_out = self.mlp_blocks[i]
                 .forward(&normed_mlp)
                 .map_err(|e| Error::Shape(e.to_string()))?;
-            for (xv, mv) in x.iter_mut().zip(mlp_out.iter()) {
+            for (xv, mv) in hidden.iter_mut().zip(mlp_out.iter()) {
                 *xv += mv;
             }
         }
@@ -409,7 +413,7 @@ impl ModernBertEncoder {
             norm_eps,
         );
 
-        Ok(x)
+        Ok(hidden)
     }
 
     /// Run the encoder and mean-pool over valid (unmasked) tokens.

@@ -2,11 +2,7 @@
 
 #![expect(
     clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
     clippy::cast_precision_loss,
-    clippy::cast_lossless,
-    clippy::needless_pass_by_value,
     reason = "HIP smoke tests use direct assertions and casts against device properties"
 )]
 

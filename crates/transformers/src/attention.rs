@@ -369,6 +369,11 @@ fn checked_slice_mut<'a>(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::expect_used,
+        reason = "test assertions use expect()/expect_err() directly"
+    )]
+
     use super::*;
 
     #[test]
