@@ -163,11 +163,21 @@ fn load_layer(
 ) -> Result<ModernBertLayerWeights> {
     let p = format!("model.layers.{i}");
 
-    let attn_norm_weight = read_f32(reader, &format!("{p}.attn_norm.weight"), &[h])?;
-    let attn_norm_bias = if norm_bias {
-        read_f32(reader, &format!("{p}.attn_norm.bias"), &[h])?
+    // WHY: ModernBERT defines layer 0's pre-attention norm as Identity — the
+    // checkpoint carries no `model.layers.0.attn_norm.weight` tensor, so
+    // reading it here fails every real checkpoint. Empty vector is this
+    // crate's "absent" sentinel (mirrors the norm_bias convention below);
+    // forward() checks for it and skips the layer_norm_f32 call for layer 0.
+    let (attn_norm_weight, attn_norm_bias) = if i == 0 {
+        (Vec::new(), Vec::new())
     } else {
-        Vec::new()
+        let weight = read_f32(reader, &format!("{p}.attn_norm.weight"), &[h])?;
+        let bias = if norm_bias {
+            read_f32(reader, &format!("{p}.attn_norm.bias"), &[h])?
+        } else {
+            Vec::new()
+        };
+        (weight, bias)
     };
 
     let wqkv = read_f32(reader, &format!("{p}.attn.Wqkv.weight"), &[3 * h, h])?;
@@ -241,6 +251,15 @@ fn read_f32(reader: &Reader, name: &str, expected_shape: &[usize]) -> Result<Vec
     Ok(out)
 }
 
+// WHY: single source of truth for the local/global attention schedule.
+// ModernBERT selects global attention every Nth layer starting at layer 0
+// (`layer_id % N == 0`), not `(layer_id + 1) % N == 0` — the two prior
+// call sites in `new()` and `forward()` computed this independently and had
+// drifted from the reference schedule.
+fn is_global_layer(i: usize, global_attn_every_n_layers: usize) -> bool {
+    i % global_attn_every_n_layers == 0
+}
+
 /// CPU ModernBERT encoder.
 ///
 /// Owns the weights and configuration. `forward()` runs the full encoder
@@ -283,7 +302,7 @@ impl ModernBertEncoder {
         let mut mlp_blocks = Vec::with_capacity(cfg.num_hidden_layers);
 
         for (i, lw) in weights.layers.iter().enumerate() {
-            let is_global = (i + 1) % global_every == 0;
+            let is_global = is_global_layer(i, global_every);
             let acfg = ModernBertAttentionConfig {
                 hidden: h,
                 n_heads,
@@ -364,16 +383,24 @@ impl ModernBertEncoder {
 
         // Transformer layers
         for i in 0..n_layers {
-            // Pre-attention norm + attention + residual
-            let normed_attn = layer_norm_f32(
-                &hidden,
-                &self.weights.layers[i].attn_norm_weight,
-                &self.weights.layers[i].attn_norm_bias,
-                seq,
-                h,
-                norm_eps,
-            );
-            let is_global = (i + 1) % global_every == 0;
+            // Pre-attention norm + attention + residual.
+            // WARNING: an empty attn_norm_weight is layer 0's Identity-norm
+            // sentinel (see load_layer) — layer_norm_f32 requires
+            // weight.len() == h, so it must not be called in that case.
+            let attn_norm_weight = &self.weights.layers[i].attn_norm_weight;
+            let normed_attn = if attn_norm_weight.is_empty() {
+                hidden.clone()
+            } else {
+                layer_norm_f32(
+                    &hidden,
+                    attn_norm_weight,
+                    &self.weights.layers[i].attn_norm_bias,
+                    seq,
+                    h,
+                    norm_eps,
+                )
+            };
+            let is_global = is_global_layer(i, global_every);
             let rope = if is_global {
                 &self.rope[1]
             } else {
@@ -545,6 +572,43 @@ mod tests {
     fn encoder_output_is_finite() {
         let cfg = tiny_cfg();
         let weights = zero_weights(&cfg);
+        let encoder = ModernBertEncoder::new(cfg, weights).unwrap();
+        let ids = vec![1u32, 5, 2];
+        let mask = vec![1u8; 3];
+        let out = encoder.forward(&ids, &mask).unwrap();
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "all output values must be finite"
+        );
+    }
+
+    #[test]
+    fn is_global_layer_selects_zero_indexed_schedule() {
+        // global_attn_every_n_layers = 3: the reference schedule selects
+        // layers 0, 3, 6 (layer_id % N == 0). The prior (i + 1) % N == 0
+        // formula selected 2, 5, 8 instead.
+        let global_every = 3;
+        let expected_global = [0usize, 3, 6];
+        for i in 0..9 {
+            assert_eq!(
+                is_global_layer(i, global_every),
+                expected_global.contains(&i),
+                "layer {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn encoder_forward_treats_layer_zero_attn_norm_as_identity() {
+        // Layer 0's pre-attention norm is Identity in the reference
+        // architecture; an empty weight vector is this crate's sentinel for
+        // that (see load_layer). Regressing to an unconditional
+        // layer_norm_f32 call here would panic on its weight.len() == h
+        // debug assertion instead of running layer 0 as a no-op norm.
+        let cfg = tiny_cfg();
+        let mut weights = zero_weights(&cfg);
+        weights.layers[0].attn_norm_weight = Vec::new();
+        weights.layers[0].attn_norm_bias = Vec::new();
         let encoder = ModernBertEncoder::new(cfg, weights).unwrap();
         let ids = vec![1u32, 5, 2];
         let mask = vec![1u8; 3];
