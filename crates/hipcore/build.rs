@@ -113,11 +113,11 @@ fn locate_hip_lib() -> Result<PathBuf, String> {
             // /usr/lib. Searching only lib and lib64 reports the runtime as missing on every
             // Debian-family box while it is installed and loadable, which reads as "install
             // ROCm" to someone who already has.
-            vec![
-                base.join("lib"),
-                base.join("lib64"),
-                base.join("lib").join(&multiarch),
-            ]
+            let mut dirs = vec![base.join("lib"), base.join("lib64")];
+            if let Some(m) = multiarch.as_ref() {
+                dirs.push(base.join("lib").join(m));
+            }
+            dirs
         })
         .chain([PathBuf::from("/usr/lib64"), PathBuf::from("/usr/lib")])
         .collect();
@@ -192,14 +192,18 @@ fn has_hip_runtime(dir: &Path) -> bool {
 /// WHY derived from TARGET rather than hardcoded: cargo's triple carries a vendor field
 /// (`x86_64-unknown-linux-gnu`) that the multiarch path omits, and hardcoding one arch would
 /// silently reintroduce this bug on aarch64.
-fn multiarch_dir_name() -> String {
-    let target = env::var("TARGET").unwrap_or_default();
+///
+/// `None` when cargo did not set TARGET. Defaulting to an empty string instead would append a
+/// bare `lib` candidate and search the wrong directory silently — the same shape of failure this
+/// function exists to remove.
+fn multiarch_dir_name() -> Option<String> {
+    let target = env::var("TARGET").ok()?;
     let parts: Vec<&str> = target.split('-').collect();
-    if parts.len() >= 4 {
+    Some(if parts.len() >= 4 {
         format!("{}-{}-{}", parts[0], parts[2], parts[3])
     } else {
         target
-    }
+    })
 }
 
 fn hip_base_candidates() -> Vec<PathBuf> {
