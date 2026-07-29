@@ -40,7 +40,20 @@ fn main() -> Result<(), String> {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap_or_else(|_| "target".into()));
     let out_path = out_dir.join("hip_bindings.rs");
 
-    let bindings = bindgen::Builder::default()
+    // WHY the suffix is detected rather than written down: hip_runtime_api.h macro-renames a few
+    // symbols to an ABI-revision suffix (`#define hipDeviceProp_t hipDeviceProp_tR0600`) before
+    // bindgen ever sees the unversioned name, so the generated bindings expose only the suffixed
+    // ones and an alias is needed to restore the stable name a C caller gets for free.
+    //
+    // Hardcoding `R0600` pinned this crate to ROCm 6.0 in a way that failed misleadingly: on ROCm
+    // 5.7 the macro does not exist, the build script still succeeded, and the crate then failed to
+    // compile with unresolved-import errors that read as a code defect rather than a too-old SDK.
+    // Reading the revision out of the installed header instead means the crate tracks whatever
+    // ROCm is present — including revisions that do not exist yet — and needs no edit when AMD
+    // bumps it again.
+    let abi_aliases = detect_abi_aliases(&hip_include);
+
+    let mut builder = bindgen::Builder::default()
         .header(wrapper.to_string_lossy())
         .clang_arg("-D__HIP_PLATFORM_AMD__=1")
         .clang_arg(format!("-I{}", hip_include.display()))
@@ -54,19 +67,13 @@ fn main() -> Result<(), String> {
         .allowlist_var("hip.*|HIP.*")
         .rustified_enum("hipError_t")
         .rustified_enum("hipMemcpyKind")
-        .rustified_enum("hipDeviceAttribute_t")
-        // hip_runtime_api.h macro-renames a handful of symbols to an ABI-revision
-        // suffix (`#define hipDeviceProp_t hipDeviceProp_tR0600`, same for
-        // hipGetDeviceProperties) before bindgen ever sees the unversioned name —
-        // the preprocessor rewrites the typedef and every reference to it in the
-        // header itself. C callers get the versioned symbol transparently by
-        // re-including the header; bindgen has no equivalent, so the generated
-        // bindings only expose the suffixed names. Alias them back so hipcore's
-        // Rust call sites can use the stable, version-agnostic name like a C
-        // caller would. Bump the suffix here if a future ROCm header revision
-        // renames it again.
-        .raw_line("pub type hipDeviceProp_t = hipDeviceProp_tR0600;")
-        .raw_line("pub use hipGetDevicePropertiesR0600 as hipGetDeviceProperties;")
+        .rustified_enum("hipDeviceAttribute_t");
+
+    for line in &abi_aliases {
+        builder = builder.raw_line(line);
+    }
+
+    let bindings = builder
         .generate()
         .map_err(|e| format!("bindgen failed on HIP runtime header: {e}"))?;
 
@@ -124,6 +131,44 @@ fn locate_hip_lib() -> Result<PathBuf, String> {
         "hipcore: could not find libamdhip64.so. Searched: {candidates:?}. \
          Install ROCm runtime (Fedora: `hip-runtime-amd`)."
     ))
+}
+
+/// Aliases restoring the unversioned HIP symbol names, derived from the installed header.
+///
+/// Returns an empty list when the header does not macro-rename them, which is the case before
+/// ROCm 6 — there the unversioned names are already what bindgen emits, and adding an alias to a
+/// symbol that does not exist is what broke the build on ROCm 5.7.
+fn detect_abi_aliases(include_dir: &Path) -> Vec<String> {
+    let header = include_dir.join("hip/hip_runtime_api.h");
+    let Ok(src) = fs::read_to_string(&header) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (macro_name, alias) in [
+        ("hipDeviceProp_t", "pub type hipDeviceProp_t = {};"),
+        (
+            "hipGetDeviceProperties",
+            "pub use {} as hipGetDeviceProperties;",
+        ),
+    ] {
+        if let Some(target) = renamed_target(&src, macro_name) {
+            out.push(alias.replace("{}", &target));
+        }
+    }
+    out
+}
+
+/// The right-hand side of `#define <name> <name>R<digits>`, if the header defines one.
+fn renamed_target(src: &str, name: &str) -> Option<String> {
+    let needle = format!("#define {name} ");
+    src.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix(&needle)?;
+        let target = rest.split_whitespace().next()?;
+        // Only accept the ABI-revision form, so an unrelated #define cannot inject a name.
+        let suffix = target.strip_prefix(name)?.strip_prefix('R')?;
+        (!suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+            .then(|| target.to_string())
+    })
 }
 
 /// WHY a prefix scan instead of exact filenames: distributions ship the runtime under a
