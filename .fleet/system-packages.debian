@@ -4,13 +4,18 @@
 # The fleet build-box installer reads this file from every cloned repo and installs the union.
 # It lives here rather than in the installer because it is a fact about this repo: when a
 # dependency changes, the repo that changed it is the one that knows.
-#
-# WHY a GPU box is not required: hipcore links the HIP runtime, and praxis, taxis and kernels
-# depend on hipcore unconditionally, so the whole workspace fails to build without it. Compiling
-# against HIP needs the headers and the shared object; only RUNNING GPU code needs the hardware.
-libamdhip64-dev
-libamdhip64-5
 
 # bindgen runs clang over the HIP header and needs clang's own builtin headers (stddef.h).
 clang
 libclang-dev
+
+# WARNING: these are NOT sufficient on their own. Ubuntu 24.04 ships ROCm 5.7, and
+# crates/hipcore/build.rs aliases the ROCm 6 ABI symbols (hipDeviceProp_tR0600,
+# hipGetDevicePropertiesR0600) which do not exist in 5.7 — the build script succeeds and the
+# crate then fails to compile with unresolved-import errors that look like a code defect.
+# A full workspace build needs ROCm 6.x from AMD's own apt repository.
+#
+# Compiling needs the headers and shared object only; running GPU code needs the hardware.
+# A box with no AMD GPU can still gate this repo once ROCm 6 is installed.
+libamdhip64-dev
+libamdhip64-5
