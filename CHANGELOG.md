@@ -24,6 +24,13 @@ All notable changes to logismos are recorded here.
 - Kernel result defaults: explicit handling in cfg-gated branches
 - Matmul CPU helper visibility: narrowed to `pub(crate)`
 
+## [1.0.1](https://github.com/forkwright/logismos/compare/v1.0.0...v1.0.1) (2026-07-30)
+
+
+### Bug Fixes
+
+* **hipcore:** build on Debian-family distros and any installed ROCm revision ([#15](https://github.com/forkwright/logismos/issues/15)) ([070ca43](https://github.com/forkwright/logismos/commit/070ca4311bad86c5e3f7d7821306b6c113e920d3))
+
 ## 1.0.0 (2026-07-22)
 
 
