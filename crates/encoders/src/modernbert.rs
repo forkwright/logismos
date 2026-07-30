@@ -257,7 +257,7 @@ fn read_f32(reader: &Reader, name: &str, expected_shape: &[usize]) -> Result<Vec
 // call sites in `new()` and `forward()` computed this independently and had
 // drifted from the reference schedule.
 fn is_global_layer(i: usize, global_attn_every_n_layers: usize) -> bool {
-    i % global_attn_every_n_layers == 0
+    i.is_multiple_of(global_attn_every_n_layers)
 }
 
 /// CPU ModernBERT encoder.
