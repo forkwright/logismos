@@ -24,6 +24,18 @@ All notable changes to logismos are recorded here.
 - Kernel result defaults: explicit handling in cfg-gated branches
 - Matmul CPU helper visibility: narrowed to `pub(crate)`
 
+## 1.0.0 (2026-07-22)
+
+
+### Bug Fixes
+
+* **ci:** security workflow — audit-ignore parity + workspace wildcard-path allowance ([#1](https://github.com/forkwright/logismos/issues/1)) ([00c05e4](https://github.com/forkwright/logismos/commit/00c05e42e1b1fe6c67dc8e7a0c3012e2e3c4de3c))
+
+
+### Documentation
+
+* **repo:** sync kanon-generated context blocks into CLAUDE.md + README.md ([#2](https://github.com/forkwright/logismos/issues/2)) ([#2](https://github.com/forkwright/logismos/issues/2)) ([94e4e97](https://github.com/forkwright/logismos/commit/94e4e97dce6eee8f29098e792b2790b709778b0b))
+
 ## 0.0.0
 
 Initial workspace bootstrap. Phase 0: crate scaffolding, forge CI baseline, license configuration.
