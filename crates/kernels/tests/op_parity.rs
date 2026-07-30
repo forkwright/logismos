@@ -54,10 +54,18 @@ fn f16_bytes(v: &[f16]) -> &[u8] {
 
 fn bytes_to_f16(v: &[u8]) -> Vec<f16> {
     assert_eq!(v.len() % 2, 0);
-    let len = v.len() / 2;
-    // SAFETY: f16 is bit-pattern-total.
-    let slice = unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<f16>(), len) };
-    slice.to_vec()
+    // WHY not a `*const f16` reinterpret: `from_raw_parts` requires the pointer
+    // to be aligned for `f16`, and a `&[u8]` guarantees only 1-byte alignment.
+    // The old SAFETY comment established bit-pattern totality but never that
+    // precondition. Chunking is alignment-independent and `from_ne_bytes` keeps
+    // the native byte order the reinterpret read.
+    v.chunks_exact(2)
+        .map(|pair| {
+            let mut bytes = [0u8; 2];
+            bytes.copy_from_slice(pair);
+            f16::from_ne_bytes(bytes)
+        })
+        .collect()
 }
 
 #[test]
