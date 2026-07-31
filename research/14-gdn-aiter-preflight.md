@@ -65,7 +65,7 @@ What it does:
 - Gate decay: `b_h *= exp(g)` with per-head `A_log` + `dt_bias` fusion when
   `USE_GATE_IN_KERNEL` (lines 93-100). This is the exact math from the
   canonical Phase 6a plan at
-  `/home/ck/dev/logismos/phases/06a-gdn-hybrid/PLAN.md` section 6.2 step 3.
+  `phases/06a-gdn-hybrid/PLAN.md` section 6.2 step 3.
 - Per-v-head `gk`/`gv` apply elementwise exponent to state (lines 102-111).
 - Delta update (lines 113-120):
   ```
@@ -328,7 +328,7 @@ Every stage must have a pure-Rust (or pure-NumPy golden-generating) fp32
 reference. The CPU reference is the parity anchor. HIP is the test subject.
 
 **Algorithm source:** Implement against the canonical Phase 6a plan at
-`/home/ck/dev/logismos/phases/06a-gdn-hybrid/PLAN.md` sections 6.2 and 6.3,
+`phases/06a-gdn-hybrid/PLAN.md` sections 6.2 and 6.3,
 not against Triton source. Triton is the cross-check. The plan math is the
 spec.
 
