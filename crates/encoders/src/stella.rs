@@ -162,6 +162,39 @@ pub struct StellaLayer {
     pub mlp: SwiGluMlp,
 }
 
+impl StellaLayer {
+    /// Run this layer over `x` (`[seq, hidden]`): pre-attention RMSNorm →
+    /// attention → residual, then pre-MLP RMSNorm → MLP → residual.
+    /// Updates `x` in place.
+    ///
+    /// # Errors
+    ///
+    /// Propagates attention / MLP shape errors.
+    fn forward(
+        &self,
+        x: &mut [f32],
+        mask: &[u8],
+        rope: &RopeTable,
+        seq: usize,
+        hidden: usize,
+        rms_eps: f32,
+    ) -> Result<()> {
+        let norm = rms_norm_f32(x, &self.norm1, seq, hidden, rms_eps)?;
+        let attn_out = self.attn.forward(&norm, mask, rope)?;
+        for (xi, ai) in x.iter_mut().zip(attn_out.iter()) {
+            *xi += ai;
+        }
+
+        let norm = rms_norm_f32(x, &self.norm2, seq, hidden, rms_eps)?;
+        let mlp_out = self.mlp.forward(&norm)?;
+        for (xi, mi) in x.iter_mut().zip(mlp_out.iter()) {
+            *xi += mi;
+        }
+
+        Ok(())
+    }
+}
+
 /// Stella encoder — embedding lookup → 28 layers → final norm.
 #[derive(Debug, Clone)]
 pub struct StellaEncoder {
@@ -257,22 +290,7 @@ impl StellaEncoder {
 
         // 2. 28 transformer layers.
         for layer in &self.layers {
-            // Pre-attention RMSNorm.
-            let norm = rms_norm_f32(&x, &layer.norm1, seq, self.cfg.hidden, self.cfg.rms_eps)?;
-            // Attention.
-            let attn_out = layer.attn.forward(&norm, mask, &self.rope)?;
-            // Residual.
-            for (xi, ai) in x.iter_mut().zip(attn_out.iter()) {
-                *xi += ai;
-            }
-            // Pre-MLP RMSNorm.
-            let norm = rms_norm_f32(&x, &layer.norm2, seq, self.cfg.hidden, self.cfg.rms_eps)?;
-            // MLP.
-            let mlp_out = layer.mlp.forward(&norm)?;
-            // Residual.
-            for (xi, mi) in x.iter_mut().zip(mlp_out.iter()) {
-                *xi += mi;
-            }
+            layer.forward(&mut x, mask, &self.rope, seq, self.cfg.hidden, self.cfg.rms_eps)?;
         }
 
         // 3. Final RMSNorm.
