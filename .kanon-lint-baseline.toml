@@ -4,72 +4,6 @@ remove_after = "2026-08-14"
 reason = "forkwright/logismos#3 -- pre-existing kanon-lint debt, unrelated to any single PR, uncovered when ROCm compile-only headers unblocked cargo check/clippy/nextest workspace-wide for the first time; matches .kanon-ci.toml's documented deferral of the lint stage pending a dedicated cleanup slice"
 
 [[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/encoders/src/modernbert.rs"
-line = 370
-hash = "ca156b7c9f7acc906ba7f2f1b7a71b810c166269a71d34ddf25fa4dcddcd85fe"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/encoders/src/modernbert.rs"
-line = 371
-hash = "b760230bbe2b94a58db60caf241f9f4c3f8527c843fd5ae3bf2dc32aa403188f"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/encoders/src/modernbert.rs"
-line = 378
-hash = "d2865c6361776672e0f222b8ecaa4b6bf908fedb22c38c4ab6c38e80e718d79c"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/encoders/src/modernbert.rs"
-line = 380
-hash = "caa133975ce962caabc44ebf76a375fd681672e45ca50ef7e31096f70215277b"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/encoders/src/modernbert.rs"
-line = 382
-hash = "85d4532638750d2edf4cf60875c3f346fbe6971251e6763f1d491db09a9318f0"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/encoders/src/modernbert.rs"
-line = 392
-hash = "574907ef14ca9756c02462f99081aa22b684d17ee48ca2945ffe260bb9be20a2"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/encoders/src/modernbert.rs"
-line = 393
-hash = "ca30cc70d87a4c1dbc2bfe1043344665e5857c29e78cb3f6b07d6cb2abdbcdb5"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/encoders/src/modernbert.rs"
-line = 398
-hash = "7cd6c50bfa3ac21476084ad997de534d259db5a7ffceb6daa65a88b7145ef682"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/kernels/src/gated_delta_rule/cpu.rs"
-line = 146
-hash = "832f599d9c262af0b03ac64b369d5be26180c327b20d19a85e24af7782b170b7"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/kernels/src/gated_delta_rule/cpu.rs"
-line = 154
-hash = "7e2e4667d4926e68b166e29a030639ac131f8fa67bfbcfc654e43e73f73fd5b1"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/kernels/src/gated_delta_rule/cpu.rs"
-line = 185
-hash = "6ef711bc93c6117e70f8c357fad60dc5fb11ed48bc13d3dcaed2b141c7598570"
-
-[[baseline.entry]]
 rule = "WORKFLOW/unwired-dead-code-untracked"
 file = "crates/kernels/src/matmul/cpu.rs"
 line = 35
@@ -104,120 +38,6 @@ rule = "WORKFLOW/unwired-feature-ungated"
 file = "crates/logismos/Cargo.toml"
 line = 18
 hash = "35673fd05f9e7274680611d3a7fbb916e8e25824e70f22e3e2b735c43ff1f9e8"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/quant/src/lib.rs"
-line = 93
-hash = "c576f91255aa2119233086cc79a4836774c91a3c66e687e6bd4889f2cf6b7259"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/quant/src/lib.rs"
-line = 95
-hash = "2f0375b5c5acd21e83148db9ba165e5b275f31aeb26c483fa200fc7caa8ae366"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/quant/src/lib.rs"
-line = 117
-hash = "eaaeb89ae65f4b5c48460d12d844510ecf5b4e0628d57829d81b87e4f07f1124"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/quant/src/lib.rs"
-line = 461
-hash = "b1c4f3a6ce4f42ec1324064ae72ef75f09b76163e8e761e46c6855ab8f13d360"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/quant/src/lib.rs"
-line = 475
-hash = "afeaa2a57a7bff55bc6b920049a6e44c377b5e24d4a0502fdee06431c67d64ac"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/quant/src/lib.rs"
-line = 516
-hash = "bcab4f303bcb38cee20a5d044c8a52427bd0f94327c62e98fb1315d9ca0783b8"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/quant/src/lib.rs"
-line = 522
-hash = "b516f09d9368bef9cfe15944cf2c38e75643657c0a8220af5c0685ad88204f2a"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/transformers/src/modernbert.rs"
-line = 398
-hash = "22ee651a56e475659fc431d7f403fa11fa75b2aed944d0eae78063828f5cb89a"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/transformers/src/modernbert.rs"
-line = 399
-hash = "2b5d82a882b46b74b87b9bcef2c803b242b97f46c5916e57c73903147f8d9219"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/transformers/src/modernbert.rs"
-line = 402
-hash = "bba0408adc7ec7b1c1d2e9519b1e4980cabbb8b666e055d79d80f05e441a12d7"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/transformers/src/modernbert.rs"
-line = 409
-hash = "bc80b5d056186545157a09dca24b09e447aef6ac2e6eb902a0d8f746c3179cca"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/transformers/src/modernbert.rs"
-line = 414
-hash = "bc80b5d056186545157a09dca24b09e447aef6ac2e6eb902a0d8f746c3179cca"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/transformers/src/modernbert.rs"
-line = 421
-hash = "c07a0acd5695db71c2f7982966554af0d3759e66fecc7e76e828bfa1f4670b91"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/transformers/src/modernbert.rs"
-line = 422
-hash = "c6501a0affea51199015b1c42f75d88a5cccb44786f1493bd1aa531ceaf56a2e"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/transformers/src/modernbert.rs"
-line = 424
-hash = "f7777a05640301da02bf61f7d5e734aa31326ec5df9c70e4ec6a52b00a9be7dd"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/transformers/src/modernbert.rs"
-line = 485
-hash = "98d5417aca4b16ab474093c18cf81bd8af2f16f48ce38412fd03fc12e192b258"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/transformers/src/modernbert.rs"
-line = 486
-hash = "c182a72bad1703233e5292a5f14fe9671a63971134376307e5eef98fa8246778"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/transformers/src/modernbert.rs"
-line = 498
-hash = "68ad84238f4d5d76c88ac08e0e37a5a1ed98328a8d534024ac78ff978a95f01b"
-
-[[baseline.entry]]
-rule = "RUST/indexing-slicing"
-file = "crates/transformers/src/modernbert.rs"
-line = 499
-hash = "5aaf0cc2dc4f92f24c4c0e9b3185f27c58de7cd7dbe208da2e94809effda7e4e"
 
 [[baseline.entry]]
 rule = "CI/release-yml-missing-attestation"
@@ -304,12 +124,6 @@ line = 1
 hash = "d9c1f8fcef125d53f4157d9d7fc3e67171ff1fc07640079f7f1bb2067318f027"
 
 [[baseline.entry]]
-rule = "RUST/as-cast"
-file = "crates/quant/src/lib.rs"
-line = 516
-hash = "bcab4f303bcb38cee20a5d044c8a52427bd0f94327c62e98fb1315d9ca0783b8"
-
-[[baseline.entry]]
 rule = "TOPOLOGY/shallow-struct"
 file = "crates/rerank/src/batch.rs"
 line = 15
@@ -356,4 +170,3 @@ rule = "TOPOLOGY/shallow-struct"
 file = "crates/transformers/src/modernbert.rs"
 line = 260
 hash = "ee40fa87e7d547b0997f72f039838d63d47f0e8bd9a0b6e60cb66f40b97ff724"
-

@@ -394,34 +394,34 @@ impl ModernBertAttention {
         )]
         let scale = (d as f32).sqrt().recip();
         let mut scores = vec![0.0f32; n_h * seq * seq];
-        for h_idx in 0..n_h {
-            let q_head = &q_rope[h_idx * seq * d..(h_idx + 1) * seq * d];
-            let k_head = &k_rope[h_idx * seq * d..(h_idx + 1) * seq * d];
+        for ((q_head, k_head), dst) in q_rope
+            .chunks_exact(seq * d)
+            .zip(k_rope.chunks_exact(seq * d))
+            .zip(scores.chunks_exact_mut(seq * seq))
+        {
             // [seq, seq] = [seq, d] @ [d, seq]
             let sc = cpu_f32::linear_t(q_head, k_head, None, seq, seq, d);
-            let dst = &mut scores[h_idx * seq * seq..(h_idx + 1) * seq * seq];
             for (s, v) in dst.iter_mut().zip(sc.iter()) {
                 *s = v * scale;
             }
         }
         // Apply attention mask (padding and optionally local window)
-        for h_idx in 0..n_h {
-            let head = &mut scores[h_idx * seq * seq..(h_idx + 1) * seq * seq];
+        for head in scores.chunks_exact_mut(seq * seq) {
             apply_attention_mask(head, mask, seq, self.cfg.local_window, self.cfg.is_global);
         }
         // Softmax per row per head
-        for h_idx in 0..n_h {
-            let head = &mut scores[h_idx * seq * seq..(h_idx + 1) * seq * seq];
+        for head in scores.chunks_exact_mut(seq * seq) {
             let sm = cpu_f32::softmax_last_dim(head, seq, seq);
             head.copy_from_slice(&sm);
         }
         // Attention output: [n_h, seq, d] = softmax @ V
         let mut attn = vec![0.0f32; n_h * seq * d];
-        for h_idx in 0..n_h {
-            let sh = &scores[h_idx * seq * seq..(h_idx + 1) * seq * seq];
-            let vh = &v_hsd[h_idx * seq * d..(h_idx + 1) * seq * d];
+        for ((sh, vh), dst) in scores
+            .chunks_exact(seq * seq)
+            .zip(v_hsd.chunks_exact(seq * d))
+            .zip(attn.chunks_exact_mut(seq * d))
+        {
             let ah = cpu_f32::linear(sh, vh, None, seq, d, seq);
-            let dst = &mut attn[h_idx * seq * d..(h_idx + 1) * seq * d];
             dst.copy_from_slice(&ah);
         }
         // Merge heads: [n_h, seq, d] -> [seq, hidden]
@@ -482,9 +482,14 @@ fn transpose_seq_heads(x: &[f32], seq: usize, heads: usize, d: usize) -> Vec<f32
     let mut out = vec![0.0f32; seq * heads * d];
     for s in 0..seq {
         for h in 0..heads {
-            let src = &x[(s * heads + h) * d..(s * heads + h + 1) * d];
-            let dst = &mut out[(h * seq + s) * d..(h * seq + s + 1) * d];
-            dst.copy_from_slice(src);
+            let src_start = (s * heads + h) * d;
+            let dst_start = (h * seq + s) * d;
+            if let (Some(src), Some(dst)) = (
+                x.get(src_start..src_start + d),
+                out.get_mut(dst_start..dst_start + d),
+            ) {
+                dst.copy_from_slice(src);
+            }
         }
     }
     out
@@ -495,9 +500,14 @@ fn merge_heads(attn: &[f32], heads: usize, seq: usize, d: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; seq * heads * d];
     for h in 0..heads {
         for s in 0..seq {
-            let src = &attn[(h * seq + s) * d..(h * seq + s + 1) * d];
-            let dst = &mut out[(s * heads + h) * d..(s * heads + h + 1) * d];
-            dst.copy_from_slice(src);
+            let src_start = (h * seq + s) * d;
+            let dst_start = (s * heads + h) * d;
+            if let (Some(src), Some(dst)) = (
+                attn.get(src_start..src_start + d),
+                out.get_mut(dst_start..dst_start + d),
+            ) {
+                dst.copy_from_slice(src);
+            }
         }
     }
     out

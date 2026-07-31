@@ -274,6 +274,14 @@ impl ModernBertEncoder {
         let head_dim = h / n_heads;
         let global_every = cfg.global_attn_every_n_layers;
 
+        if weights.layers.len() != cfg.num_hidden_layers {
+            return Err(Error::Shape(format!(
+                "weights.layers.len()={} != num_hidden_layers={}",
+                weights.layers.len(),
+                cfg.num_hidden_layers
+            )));
+        }
+
         let rope_local =
             RopeTable::new(cfg.max_position_embeddings, head_dim, cfg.local_rope_theta);
         let rope_global =
@@ -343,7 +351,6 @@ impl ModernBertEncoder {
             )));
         }
         let h = self.cfg.hidden_size;
-        let n_layers = self.cfg.num_hidden_layers;
         let global_every = self.cfg.global_attn_every_n_layers;
         let norm_eps = self.cfg.layer_norm_eps;
         let positions: Vec<usize> = (0..seq).collect();
@@ -363,23 +370,27 @@ impl ModernBertEncoder {
         );
 
         // Transformer layers
-        for i in 0..n_layers {
+        let [rope_local, rope_global] = &self.rope;
+        for (i, ((lw, attn_block), mlp_block)) in self
+            .weights
+            .layers
+            .iter()
+            .zip(self.attn_blocks.iter())
+            .zip(self.mlp_blocks.iter())
+            .enumerate()
+        {
             // Pre-attention norm + attention + residual
             let normed_attn = layer_norm_f32(
                 &hidden,
-                &self.weights.layers[i].attn_norm_weight,
-                &self.weights.layers[i].attn_norm_bias,
+                &lw.attn_norm_weight,
+                &lw.attn_norm_bias,
                 seq,
                 h,
                 norm_eps,
             );
             let is_global = (i + 1) % global_every == 0;
-            let rope = if is_global {
-                &self.rope[1]
-            } else {
-                &self.rope[0]
-            };
-            let attn_out = self.attn_blocks[i]
+            let rope = if is_global { rope_global } else { rope_local };
+            let attn_out = attn_block
                 .forward(&normed_attn, rope, &positions, mask)
                 .map_err(|e| Error::Shape(e.to_string()))?;
             for (xv, av) in hidden.iter_mut().zip(attn_out.iter()) {
@@ -389,13 +400,13 @@ impl ModernBertEncoder {
             // Pre-MLP norm + MLP + residual
             let normed_mlp = layer_norm_f32(
                 &hidden,
-                &self.weights.layers[i].mlp_norm_weight,
-                &self.weights.layers[i].mlp_norm_bias,
+                &lw.mlp_norm_weight,
+                &lw.mlp_norm_bias,
                 seq,
                 h,
                 norm_eps,
             );
-            let mlp_out = self.mlp_blocks[i]
+            let mlp_out = mlp_block
                 .forward(&normed_mlp)
                 .map_err(|e| Error::Shape(e.to_string()))?;
             for (xv, mv) in hidden.iter_mut().zip(mlp_out.iter()) {
