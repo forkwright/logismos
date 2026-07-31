@@ -88,12 +88,13 @@ pub fn fwht_128(data: &mut [f32; 128]) {
     let n = data.len();
     let mut h = 1usize;
     while h < n {
-        for i in (0..n).step_by(h * 2) {
-            for j in i..i + h {
-                let a = data[j];
-                let b = data[j + h];
-                data[j] = a + b;
-                data[j + h] = a - b;
+        for chunk in data.chunks_exact_mut(h * 2) {
+            let (lo, hi) = chunk.split_at_mut(h);
+            for (a, b) in lo.iter_mut().zip(hi.iter_mut()) {
+                let x = *a;
+                let y = *b;
+                *a = x + y;
+                *b = x - y;
             }
         }
         h *= 2;
@@ -113,16 +114,12 @@ pub fn fwht_128(data: &mut [f32; 128]) {
     reason = "codebook has at most 16 entries, index always fits in u8"
 )]
 fn nearest_centroid(value: f32, codebook: &[f32]) -> u8 {
-    let mut best_idx = 0usize;
-    let mut best_dist = (value - codebook[0]).abs();
-    for (i, &c) in codebook.iter().enumerate().skip(1) {
-        let dist = (value - c).abs();
-        if dist < best_dist {
-            best_dist = dist;
-            best_idx = i;
-        }
-    }
-    best_idx as u8
+    codebook
+        .iter()
+        .map(|&c| (value - c).abs())
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map_or(0, |(i, _)| i as u8)
 }
 
 /// Crate-local result alias.
@@ -457,8 +454,8 @@ pub fn encode_turbo3_0_head(values: &[f32]) -> Result<[Turbo3Block; TURBOQUANT_B
 
     let mut transformed = [0.0f32; TURBOQUANT_HEAD_DIM];
     if norm > 1e-12 {
-        for (i, &v) in values.iter().enumerate() {
-            transformed[i] = v / norm;
+        for (t, &v) in transformed.iter_mut().zip(values.iter()) {
+            *t = v / norm;
         }
     }
 
@@ -472,7 +469,10 @@ pub fn encode_turbo3_0_head(values: &[f32]) -> Result<[Turbo3Block; TURBOQUANT_B
         let mut indices = [0u8; TURBOQUANT_VALUES_PER_BLOCK];
         for (i, index) in indices.iter_mut().enumerate() {
             let idx = bi * TURBOQUANT_VALUES_PER_BLOCK + i;
-            *index = nearest_centroid(transformed[idx], &TURBO3_CODEBOOK);
+            *index = nearest_centroid(
+                transformed.get(idx).copied().unwrap_or(0.0),
+                &TURBO3_CODEBOOK,
+            );
         }
         let packed = pack_turbo3_indices(&indices)?;
         *block = Turbo3Block::new(norm_bytes, packed);
@@ -511,15 +511,27 @@ pub fn decode_turbo3_0_head(blocks: &[Turbo3Block]) -> Result<[f32; TURBOQUANT_H
     let mut transformed = [0.0f32; TURBOQUANT_HEAD_DIM];
     for (bi, block) in blocks.iter().enumerate() {
         let indices = unpack_turbo3_indices(&block.packed_indices());
-        for i in 0..TURBOQUANT_VALUES_PER_BLOCK {
+        for (i, &index) in indices.iter().enumerate() {
             let idx = bi * TURBOQUANT_VALUES_PER_BLOCK + i;
-            transformed[idx] = TURBO3_CODEBOOK[indices[i] as usize];
+            if let Some(slot) = transformed.get_mut(idx) {
+                *slot = TURBO3_CODEBOOK
+                    .get(usize::from(index))
+                    .copied()
+                    .unwrap_or(0.0);
+            }
         }
     }
 
     fwht_128(&mut transformed);
 
-    let norm_bits = u16::from_le_bytes(blocks[0].norm_f16_le());
+    let Some(first_block) = blocks.first().copied() else {
+        return Err(Error::InvalidBlockCount {
+            scheme: TurboQuantScheme::Turbo3_0,
+            got: blocks.len(),
+            expected: TURBOQUANT_BLOCKS_PER_HEAD,
+        });
+    };
+    let norm_bits = u16::from_le_bytes(first_block.norm_f16_le());
     let norm = f16::from_bits(norm_bits).to_f32();
 
     for v in &mut transformed {
