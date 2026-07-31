@@ -76,12 +76,6 @@ line = 71
 hash = "82b5c239bd818d672958d0486cf62d1c43dfe6c38201ac4eba7136ea1f110414"
 
 [[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/encoders/src/stella.rs"
-line = 154
-hash = "ac33188a6d6d289999fbe7a3b351a58ca1e19b3d6482ebc5168ad636836629ad"
-
-[[baseline.entry]]
 rule = "RUST/primitive-for-domain-id"
 file = "crates/hipcore/src/device.rs"
 line = 38
