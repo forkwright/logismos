@@ -13,7 +13,13 @@ use hipcore::Stream;
 
 use crate::error::{Error, Result};
 
-#[cfg_attr(logismos_no_gpu_kernels, allow(dead_code))]
+#[cfg_attr(
+    logismos_no_gpu_kernels,
+    allow(
+        dead_code,
+        reason = "schema-contract: HIP kernel ABI declarations, linked only when GPU kernels are compiled"
+    )
+)]
 unsafe extern "C" {
     fn logismos_launch_softmax_fp16(
         x_fp16: *const c_void,

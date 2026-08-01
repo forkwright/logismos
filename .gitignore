@@ -33,3 +33,6 @@ perf.data*
 # Local scratch
 scratch/
 .claude/
+
+# kanon lint engine substrate (local index cache, never committed)
+.kanon/substrate/

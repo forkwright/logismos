@@ -64,4 +64,4 @@ Universal engineering policy lives in kanon at `~/dev/kanon/crates/basanos/stand
 
 ## Gate trailer
 
-`kanon gate --stamp` is the gate. Prefix every commit body with `Gate-Passed: kanon 0.1.0` once the stamp succeeds. Kanon's gate is the trailer authority until logismos has its own dispatched CI.
+Run `kanon gate --stamp` before pushing, then prefix every commit body with `Gate-Passed: kanon 0.1.0` once the stamp succeeds. Kanon holds trailer authority until logismos has its own dispatched CI.

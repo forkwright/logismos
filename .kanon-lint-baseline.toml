@@ -4,36 +4,6 @@ remove_after = "2026-08-14"
 reason = "forkwright/logismos#3 -- pre-existing kanon-lint debt, unrelated to any single PR, uncovered when ROCm compile-only headers unblocked cargo check/clippy/nextest workspace-wide for the first time; matches .kanon-ci.toml's documented deferral of the lint stage pending a dedicated cleanup slice"
 
 [[baseline.entry]]
-rule = "WORKFLOW/unwired-dead-code-untracked"
-file = "crates/kernels/src/matmul/cpu.rs"
-line = 35
-hash = "db1a167bcc5344095adb8690fc79aa1d2211147285838af8323b5a339a1503cf"
-
-[[baseline.entry]]
-rule = "WORKFLOW/unwired-dead-code-untracked"
-file = "crates/kernels/src/matmul/mod.rs"
-line = 15
-hash = "08b1797f4ed68a9b2e8701a81b9596c72315786674561506d4d169548efd93ef"
-
-[[baseline.entry]]
-rule = "WORKFLOW/unwired-dead-code-untracked"
-file = "crates/kernels/src/rms_norm/mod.rs"
-line = 21
-hash = "08b1797f4ed68a9b2e8701a81b9596c72315786674561506d4d169548efd93ef"
-
-[[baseline.entry]]
-rule = "WORKFLOW/unwired-dead-code-untracked"
-file = "crates/kernels/src/rope/mod.rs"
-line = 23
-hash = "08b1797f4ed68a9b2e8701a81b9596c72315786674561506d4d169548efd93ef"
-
-[[baseline.entry]]
-rule = "WORKFLOW/unwired-dead-code-untracked"
-file = "crates/kernels/src/softmax/mod.rs"
-line = 16
-hash = "08b1797f4ed68a9b2e8701a81b9596c72315786674561506d4d169548efd93ef"
-
-[[baseline.entry]]
 rule = "WORKFLOW/unwired-feature-ungated"
 file = "crates/logismos/Cargo.toml"
 line = 18
@@ -44,18 +14,6 @@ rule = "CI/release-yml-missing-attestation"
 file = ".github/workflows/release-please.yml"
 line = 1
 hash = "b525087c2878d94b7bcb773fc6795d4e90b36c64bb32ad2ec421a37935890fb1"
-
-[[baseline.entry]]
-rule = "WRITING/definitional-opening"
-file = "AGENTS.md"
-line = 67
-hash = "9738a9da5cb14b127ed5e1868687d0a9cef5d2859ae9a6126c205fd524f1cd73"
-
-[[baseline.entry]]
-rule = "WRITING/em-dash"
-file = "README.md"
-line = 8
-hash = "c226187ccd062bf575e850c4f1e1207d4c0ebd5b55509a370e3f765d01a8736e"
 
 [[baseline.entry]]
 rule = "TOPOLOGY/shallow-struct"
@@ -86,18 +44,6 @@ rule = "TOPOLOGY/shallow-struct"
 file = "crates/hipcore/src/device.rs"
 line = 43
 hash = "d0730120321c69eadd20a0213563abc8d784ef0377191fa20bd9be8b9bfb9ac5"
-
-[[baseline.entry]]
-rule = "RUST/no-direct-process-command"
-file = "crates/kernels/build.rs"
-line = 22
-hash = "c91984099e3ebbbcff1edb15d17fd61508db453c2c4a5398fb0fe8106165a4e9"
-
-[[baseline.entry]]
-rule = "RUST/no-direct-process-command"
-file = "crates/kernels/build.rs"
-line = 69
-hash = "cfba152ceae188ab9b652583ada8969e461395c035979b0f14358818da82e4db"
 
 [[baseline.entry]]
 rule = "TOPOLOGY/shallow-struct"
