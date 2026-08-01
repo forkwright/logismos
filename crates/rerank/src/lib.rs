@@ -27,13 +27,15 @@ pub mod batch;
 pub mod config;
 pub mod cpu_reranker;
 pub mod error;
+pub mod gte;
 pub mod reranker;
 
 pub use crate::batch::{Predictions, RerankBatch, RerankItem, RerankScores};
 pub use crate::config::{ModernBertConfig, ModernBertPreflight};
 pub use crate::cpu_reranker::{ClassifierHead, ModernBertCpuReranker};
 pub use crate::error::{Error, Result};
-pub use crate::reranker::{GteReranker, Reranker};
+pub use crate::gte::GteReranker;
+pub use crate::reranker::Reranker;
 
 #[cfg(test)]
 const CRATE_NAME: &str = "rerank";

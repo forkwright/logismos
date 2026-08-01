@@ -9,6 +9,33 @@ use crate::ffi;
 /// Device ordinal. Stable across runs; `0` is the first reported device.
 pub(crate) type DeviceOrdinal = c_int;
 
+/// PCI bus identifier in `domain:bus:device.function` form, e.g. `0000:03:00.0`.
+///
+/// Correlates a HIP device with `rocm-smi` output. Opaque: the runtime reports
+/// the three numeric components separately and this type is the assembled form.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PciBusId(String);
+
+impl PciBusId {
+    /// Wraps an already-formatted `domain:bus:device.function` string.
+    #[must_use]
+    pub const fn new(id: String) -> Self {
+        Self(id)
+    }
+
+    /// Borrows the identifier as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PciBusId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Static properties of a HIP device (a subset of the full
 /// `hipDeviceProp_t`).
 #[derive(Clone, Debug)]
@@ -35,7 +62,7 @@ pub struct DeviceProps {
     /// Maximum core clock reported by the runtime, in kHz.
     pub clock_rate_khz: u32,
     /// PCI bus identifier (for correlation with `rocm-smi`).
-    pub pci_bus_id: String,
+    pub pci_bus_id: PciBusId,
 }
 
 /// Free / total VRAM snapshot.
@@ -185,7 +212,7 @@ impl DeviceProps {
             max_threads_per_block: device_prop_u32("maxThreadsPerBlock", raw.maxThreadsPerBlock)?,
             max_shared_mem_per_block: device_prop_u32("sharedMemPerBlock", raw.sharedMemPerBlock)?,
             clock_rate_khz: device_prop_u32("clockRate", raw.clockRate)?,
-            pci_bus_id: pci,
+            pci_bus_id: PciBusId::new(pci),
         })
     }
 }

@@ -115,3 +115,19 @@ TOPOLOGY/shallow-struct:crates/rerank/src/config.rs
 # checkpoints. The struct already carries an `#[expect(clippy::struct_excessive_bools)]`
 # with the same justification.
 RUST/struct-too-many-fields:crates/rerank/src/config.rs
+
+# =============================================================================
+# CI — attestation has no subject in this repo
+# =============================================================================
+
+# WARNING: revisit this the moment a publish or upload step is added. The
+# exemption rests entirely on there being no artifact, not on attestation being
+# unwanted.
+#
+# WHY: SLSA provenance and SBOM attestation attest a built artifact. This repo
+# has three workflows — gate-attestation, release-please, security — and none
+# builds, uploads, or publishes one: no `cargo publish`, no `upload-artifact`,
+# no `gh release`. release-please.yml only runs the release-please action to
+# open and maintain the release PR. Adding attest-build-provenance and
+# attest-sbom here would emit attestations over nothing.
+CI/release-yml-missing-attestation:.github/workflows/release-please.yml
