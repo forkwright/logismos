@@ -4,34 +4,10 @@ remove_after = "2026-08-14"
 reason = "forkwright/logismos#3 -- pre-existing kanon-lint debt, unrelated to any single PR, uncovered when ROCm compile-only headers unblocked cargo check/clippy/nextest workspace-wide for the first time; matches .kanon-ci.toml's documented deferral of the lint stage pending a dedicated cleanup slice"
 
 [[baseline.entry]]
-rule = "WORKFLOW/unwired-feature-ungated"
-file = "crates/logismos/Cargo.toml"
-line = 18
-hash = "35673fd05f9e7274680611d3a7fbb916e8e25824e70f22e3e2b735c43ff1f9e8"
-
-[[baseline.entry]]
 rule = "CI/release-yml-missing-attestation"
 file = ".github/workflows/release-please.yml"
 line = 1
 hash = "b525087c2878d94b7bcb773fc6795d4e90b36c64bb32ad2ec421a37935890fb1"
-
-[[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/decode/src/chain.rs"
-line = 25
-hash = "c44a4db8b96d5d4988b2aa9a54ae67e863c41afd52f5efa4a2071feaff6390ee"
-
-[[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/encoders/src/modernbert.rs"
-line = 61
-hash = "b5266233e9e574dc1ee4d5536c314b2537151aaebd3f29da8ecf0bf99f40bb9e"
-
-[[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/encoders/src/stella.rs"
-line = 71
-hash = "82b5c239bd818d672958d0486cf62d1c43dfe6c38201ac4eba7136ea1f110414"
 
 [[baseline.entry]]
 rule = "RUST/primitive-for-domain-id"
@@ -40,46 +16,10 @@ line = 38
 hash = "80a3dec8477f031fb39841d6e33c997806a440230bbcdee2581e491518f1d90a"
 
 [[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/hipcore/src/device.rs"
-line = 43
-hash = "d0730120321c69eadd20a0213563abc8d784ef0377191fa20bd9be8b9bfb9ac5"
-
-[[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/loader/src/gguf.rs"
-line = 171
-hash = "f3d2fef8af5ea33dee4ea1cb6ae9356f9cc292665a40826eee67a33097808b01"
-
-[[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/loader/src/mapping.rs"
-line = 18
-hash = "361987ba5b03e84923cab3e3457dee12153096bee53eccfdc0300f9d7b29abd3"
-
-[[baseline.entry]]
 rule = "RUST/file-too-long"
 file = "crates/quant/src/lib.rs"
 line = 1
 hash = "d9c1f8fcef125d53f4157d9d7fc3e67171ff1fc07640079f7f1bb2067318f027"
-
-[[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/rerank/src/batch.rs"
-line = 15
-hash = "083bc3bc3f5252e2735c4a6ba5505f25ed339cb7122464c8b654db269e989a14"
-
-[[baseline.entry]]
-rule = "RUST/struct-too-many-fields"
-file = "crates/rerank/src/config.rs"
-line = 25
-hash = "f56caafb249e157a6a6a86e06404f005fc9dbc08cc3636411af02e92d828129d"
-
-[[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/rerank/src/config.rs"
-line = 342
-hash = "20d43e905f5e3decc2e34aa6467e2b0e34d11be95d733c80331034be08df7d17"
 
 [[baseline.entry]]
 rule = "ARCHITECTURE/trait-impl-colocation"
@@ -87,26 +27,3 @@ file = "crates/rerank/src/reranker.rs"
 line = 72
 hash = "61bbd42cb9a8e21651c46e6e3bae1d86585cf0ab0b3f521727074cd7444c3795"
 
-[[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/transformers/src/attention.rs"
-line = 46
-hash = "9b4117b6e54f5112b89c8ba4bb8c68976e1f68ce1b99ffff9b735861d23603bc"
-
-[[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/transformers/src/mlp.rs"
-line = 13
-hash = "f49127a78144dcda78241e564e88cde7b1a65fa26ed5d64b44886089a5c11602"
-
-[[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/transformers/src/modernbert.rs"
-line = 110
-hash = "f757698964ad59089d0a5fc03a3f7b4fe26d3710d539645c925f60627c8ce0d2"
-
-[[baseline.entry]]
-rule = "TOPOLOGY/shallow-struct"
-file = "crates/transformers/src/modernbert.rs"
-line = 260
-hash = "ee40fa87e7d547b0997f72f039838d63d47f0e8bd9a0b6e60cb66f40b97ff724"

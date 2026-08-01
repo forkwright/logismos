@@ -74,3 +74,44 @@ ARCHITECTURE/no-glossary:Cargo.toml
 # WHY: EncodeOpts is intentionally a plain config struct; users build it with
 # struct literal syntax. A smart constructor would add no value here.
 TOPOLOGY/shallow-struct:crates/core/src/lib.rs
+
+# =============================================================================
+# TOPOLOGY — shallow-struct on data records owned by a sibling in the same file
+# =============================================================================
+
+# WHY: the rule reports "no in-file behavior" by looking for an inherent impl on
+# the record itself. Each struct below is a plain data record whose behavior lives
+# on the owning type declared in the same file — SwiGluMlp, QwenAttention,
+# ModernBertLayer, StellaLayer, NameMap, Reader, RerankBatch, DecodeChain, Device.
+# Splitting the record from its owner to satisfy the rule would move the fields
+# away from the code that validates them.
+#
+# WHY: the weight structs additionally mirror a published checkpoint tensor layout
+# (HF `[out, in]`), so their field set is upstream's, not a design choice of ours.
+TOPOLOGY/shallow-struct:crates/transformers/src/mlp.rs
+TOPOLOGY/shallow-struct:crates/transformers/src/attention.rs
+TOPOLOGY/shallow-struct:crates/transformers/src/modernbert.rs
+TOPOLOGY/shallow-struct:crates/encoders/src/modernbert.rs
+TOPOLOGY/shallow-struct:crates/encoders/src/stella.rs
+TOPOLOGY/shallow-struct:crates/loader/src/gguf.rs
+TOPOLOGY/shallow-struct:crates/loader/src/mapping.rs
+TOPOLOGY/shallow-struct:crates/rerank/src/batch.rs
+TOPOLOGY/shallow-struct:crates/decode/src/chain.rs
+TOPOLOGY/shallow-struct:crates/hipcore/src/device.rs
+
+# WHY: ModernBertPreflight is the counter-example that shows the rule misfiring —
+# it is already produced by a smart constructor (`ModernBertConfig::preflight()`)
+# and is `#[non_exhaustive]`, which is precisely the remedy the rule proposes, and
+# the rule still fires on it.
+TOPOLOGY/shallow-struct:crates/rerank/src/config.rs
+
+# =============================================================================
+# RUST — field count fixed by an upstream schema
+# =============================================================================
+
+# WHY: ModernBertConfig is a serde DTO carrying `deny_unknown_fields`, deserialized
+# from the published `Alibaba-NLP/gte-reranker-modernbert-base` config.json. Its 47
+# fields are upstream's schema; dropping any of them makes the loader reject real
+# checkpoints. The struct already carries an `#[expect(clippy::struct_excessive_bools)]`
+# with the same justification.
+RUST/struct-too-many-fields:crates/rerank/src/config.rs
