@@ -24,6 +24,16 @@ All notable changes to logismos are recorded here.
 - Kernel result defaults: explicit handling in cfg-gated branches
 - Matmul CPU helper visibility: narrowed to `pub(crate)`
 
+## [1.0.2](https://github.com/forkwright/logismos/compare/v1.0.1...v1.0.2) (2026-08-03)
+
+
+### Bug Fixes
+
+* **encoders:** correct ModernBERT global-attention schedule and layer-0 identity norm ([#22](https://github.com/forkwright/logismos/issues/22)) ([8347721](https://github.com/forkwright/logismos/commit/83477217d08736e3746f648463af6f87271867d3))
+* **encoders:** give StellaLayer its own forward instead of inlining it in the encoder ([#19](https://github.com/forkwright/logismos/issues/19)) ([12bfd17](https://github.com/forkwright/logismos/commit/12bfd178ecb34a4c54c45d6a469d6a380c5a410d)), closes [#3](https://github.com/forkwright/logismos/issues/3)
+* **gate-attestation:** bind Gate-Passed check to PR tip commit ([#23](https://github.com/forkwright/logismos/issues/23)) ([293392c](https://github.com/forkwright/logismos/commit/293392ccaefbad9f4cd3abd2b7297edb2fbbca2e)), closes [#2399](https://github.com/forkwright/logismos/issues/2399)
+* remove indexing panics across kernels, quant, encoders and transformers ([#17](https://github.com/forkwright/logismos/issues/17)) ([5ed3886](https://github.com/forkwright/logismos/commit/5ed388699f0f8f6e5aca099888ed81894e9a9fa0)), closes [#3](https://github.com/forkwright/logismos/issues/3)
+
 ## [1.0.1](https://github.com/forkwright/logismos/compare/v1.0.0...v1.0.1) (2026-07-30)
 
 
