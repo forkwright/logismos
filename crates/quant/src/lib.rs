@@ -17,9 +17,13 @@
 //! research stream 4 before Phase 6.
 #![deny(missing_docs)]
 
-use core::fmt;
-
 use half::f16;
+
+pub mod error;
+pub mod scheme;
+
+pub use crate::error::{Error, Result};
+pub use crate::scheme::TurboQuantScheme;
 
 /// Number of scalar values represented by one `TurboQuant` block.
 pub const TURBOQUANT_VALUES_PER_BLOCK: usize = 32;
@@ -51,12 +55,12 @@ pub const TURBO4_0_BLOCK_BYTES: usize = TURBOQUANT_NORM_BYTES + TURBO4_0_PACKED_
 /// Stored bytes for one 128-value head chunk encoded as `turbo4_0`.
 pub const TURBO4_0_BYTES_PER_HEAD: usize = TURBO4_0_BLOCK_BYTES * TURBOQUANT_BLOCKS_PER_HEAD;
 
-const TURBO3_0_BITS_PER_INDEX: usize = 3;
+pub(crate) const TURBO3_0_BITS_PER_INDEX: usize = 3;
 const TURBO3_0_INDEX_MASK: u8 = 0x07;
-const TURBO3_0_MAX_INDEX: u8 = 7;
-const TURBO4_0_BITS_PER_INDEX: usize = 4;
+pub(crate) const TURBO3_0_MAX_INDEX: u8 = 7;
+pub(crate) const TURBO4_0_BITS_PER_INDEX: usize = 4;
 const TURBO4_0_INDEX_MASK: u8 = 0x0f;
-const TURBO4_0_MAX_INDEX: u8 = 15;
+pub(crate) const TURBO4_0_MAX_INDEX: u8 = 15;
 const ENCODE_REASON: &str = "FWHT Lloyd-Max encode parity is not implemented";
 const DECODE_REASON: &str = "FWHT Lloyd-Max decode parity is not implemented";
 
@@ -121,139 +125,6 @@ fn nearest_centroid(value: f32, codebook: &[f32]) -> u8 {
         .min_by(|(_, a), (_, b)| a.total_cmp(b))
         .map_or(0, |(i, _)| i as u8)
 }
-
-/// Crate-local result alias.
-pub type Result<T> = core::result::Result<T, Error>;
-
-/// Supported `TurboQuant` block schemes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum TurboQuantScheme {
-    /// 3-bit index payload with a 2-byte fp16 norm.
-    Turbo3_0,
-    /// 4-bit index payload with a 2-byte fp16 norm.
-    Turbo4_0,
-}
-
-impl TurboQuantScheme {
-    /// Returns the number of payload bits per quantized index.
-    #[must_use]
-    pub const fn bits_per_index(self) -> usize {
-        match self {
-            Self::Turbo3_0 => TURBO3_0_BITS_PER_INDEX,
-            Self::Turbo4_0 => TURBO4_0_BITS_PER_INDEX,
-        }
-    }
-
-    /// Returns the packed payload bytes per 32-value block.
-    #[must_use]
-    pub const fn packed_bytes_per_block(self) -> usize {
-        match self {
-            Self::Turbo3_0 => TURBO3_0_PACKED_BYTES_PER_BLOCK,
-            Self::Turbo4_0 => TURBO4_0_PACKED_BYTES_PER_BLOCK,
-        }
-    }
-
-    /// Returns the total bytes per 32-value block, including the norm.
-    #[must_use]
-    pub const fn block_bytes(self) -> usize {
-        match self {
-            Self::Turbo3_0 => TURBO3_0_BLOCK_BYTES,
-            Self::Turbo4_0 => TURBO4_0_BLOCK_BYTES,
-        }
-    }
-
-    const fn max_index(self) -> u8 {
-        match self {
-            Self::Turbo3_0 => TURBO3_0_MAX_INDEX,
-            Self::Turbo4_0 => TURBO4_0_MAX_INDEX,
-        }
-    }
-}
-
-impl fmt::Display for TurboQuantScheme {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Turbo3_0 => f.write_str("turbo3_0"),
-            Self::Turbo4_0 => f.write_str("turbo4_0"),
-        }
-    }
-}
-
-/// Errors surfaced by `quant` preflight utilities.
-#[derive(Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum Error {
-    /// Caller supplied a quantized index outside the scheme's codebook range.
-    IndexOutOfRange {
-        /// Quantization scheme being packed.
-        scheme: TurboQuantScheme,
-        /// Index position in the 32-value block.
-        position: usize,
-        /// Supplied index value.
-        value: u8,
-        /// Maximum allowed index for the scheme.
-        max: u8,
-    },
-
-    /// Caller supplied a value count that is not one 128-value head chunk.
-    InvalidHeadDim {
-        /// Supplied scalar count.
-        got: usize,
-        /// Required scalar count.
-        expected: usize,
-    },
-
-    /// Caller supplied a block count that is not one 128-value head chunk.
-    InvalidBlockCount {
-        /// Quantization scheme being decoded.
-        scheme: TurboQuantScheme,
-        /// Supplied block count.
-        got: usize,
-        /// Required block count.
-        expected: usize,
-    },
-
-    /// The requested FWHT encode/decode path has not landed yet.
-    Unsupported {
-        /// Operation name.
-        operation: &'static str,
-        /// Reason the operation is not available.
-        reason: &'static str,
-    },
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::IndexOutOfRange {
-                scheme,
-                position,
-                value,
-                max,
-            } => write!(
-                f,
-                "{scheme}: index at position {position} has value {value}, max {max}"
-            ),
-            Self::InvalidHeadDim { got, expected } => {
-                write!(f, "turboquant: head_dim must be {expected}, got {got}")
-            }
-            Self::InvalidBlockCount {
-                scheme,
-                got,
-                expected,
-            } => write!(
-                f,
-                "{scheme}: block count must be {expected} per head, got {got}"
-            ),
-            Self::Unsupported { operation, reason } => {
-                write!(f, "{operation} unsupported: {reason}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 /// Rust representation of the upstream `block_turbo3_0` binary layout.
 #[repr(C)]

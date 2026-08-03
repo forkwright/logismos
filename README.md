@@ -5,7 +5,7 @@
 GPU inference stack for transformer embedding models, built ground-up on
 HIP + hipBLASLt, targeting AMD gfx1100 (W7900).
 
-**Status:** Phases 0-3 complete — Stella 1.5B v5 runs end-to-end on CPU with golden-fixture parity. Phase 4 (GPU cutover) is blocked on hardware availability: the AMD W7900 host is down for recovery, so GPU paths are unverified until it returns.
+**Status:** Phases 0-3 complete - Stella 1.5B v5 runs end-to-end on CPU with golden-fixture parity. Phase 4 (GPU cutover) is blocked on hardware availability: the AMD W7900 host is down for recovery, so GPU paths are unverified until it returns.
 
 ## Why
 

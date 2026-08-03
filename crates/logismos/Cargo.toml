@@ -15,6 +15,10 @@ publish = false
 # flags as a test_count divergence (kanon forge issue #32). `#[cfg]`
 # removes the test from discovery entirely when the feature is off.
 # Run manually with `cargo test -p logismos --features debug-diagnostics --test phase_3_debug`.
+# NOTE: the cfg gate is `#![cfg(feature = "debug-diagnostics")]` at
+# tests/phase_3_debug.rs:11. It gates a test target, not library source, and the
+# ungated-feature check scans only <crate>/src, so it cannot see the gate.
+# NOTE: test-fixture — gates a test target only; no library code is affected.
 debug-diagnostics = []
 
 [dependencies]

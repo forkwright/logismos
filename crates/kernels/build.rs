@@ -19,6 +19,7 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+// kanon:ignore RUST/no-direct-process-command -- a build script runs before the workspace is built, so no project process wrapper is linkable here
 use std::process::Command;
 
 fn main() -> Result<(), String> {
@@ -66,6 +67,7 @@ fn main() -> Result<(), String> {
             "{}.o",
             src.file_name().and_then(|s| s.to_str()).unwrap_or("anon")
         ));
+        // kanon:ignore RUST/no-direct-process-command -- invoking hipcc is the build script's purpose
         let status = match Command::new(&hipcc)
             .args([
                 "--offload-arch=gfx1100",

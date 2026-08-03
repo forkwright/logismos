@@ -32,7 +32,10 @@ pub fn matmul_fp16_ref(a: &[f16], b: &[f16], m: usize, n: usize, k: usize) -> Ve
 /// Reference matmul keeping fp32 output (for tight comparisons
 /// where converting to fp16 would lose information we want to see).
 #[must_use]
-#[expect(dead_code, reason = "used only in GPU-enabled test paths")]
+#[expect(
+    dead_code,
+    reason = "test-fixture: reference implementation used only by GPU-enabled parity tests"
+)]
 pub(crate) fn matmul_fp16_to_f32_ref(
     a: &[f16],
     b: &[f16],
