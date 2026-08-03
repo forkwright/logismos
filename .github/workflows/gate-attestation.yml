@@ -28,26 +28,21 @@ jobs:
 
       - name: Verify Gate-Passed trailer
         if: ${{ github.actor != 'dependabot[bot]' && github.actor != 'release-please[bot]' && github.actor != 'github-actions[bot]' }}
+        # WHY (kanon#2399): bind to the PR TIP, not "any commit in the range". The
+        # range form passed when any ancestor carried a trailer, so an unstamped tip
+        # could ride an earlier commit's attestation and the tree that actually
+        # merges was never gated. This matches the canonical
+        # forkwright/.github gate-attestation.yml and hybrid-gate.yml.
+        env:
+          # WHY: head.sha is server-populated and content-addressed, so it reaches
+          # the script through the environment rather than shell interpolation.
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          commits=$(git log --format="%H" "origin/${{ github.base_ref }}..HEAD")
-          if [ -z "$commits" ]; then
-            echo "ERROR: No commits found in PR"
-            exit 1
-          fi
-
-          found=false
-          for sha in $commits; do
-            body=$(git log -1 --format="%b" "$sha")
-            if echo "$body" | grep -q "^Gate-Passed:"; then
-              version=$(echo "$body" | grep "^Gate-Passed:" | head -1)
-              echo "Found gate attestation: $version"
-              found=true
-              break
-            fi
-          done
-
-          if [ "$found" = false ]; then
-            echo "ERROR: No Gate-Passed trailer found in any PR commit."
+          body=$(git log -1 --format="%b" "$PR_HEAD_SHA")
+          if echo "$body" | grep -q "^Gate-Passed:"; then
+            echo "Found gate attestation on PR tip: $(echo "$body" | grep '^Gate-Passed:' | head -1)"
+          else
+            echo "ERROR: PR tip carries no Gate-Passed trailer (ancestors' trailers do not count — kanon#2399)."
             echo "Run the local gate and commit with the trailer."
             exit 1
           fi
