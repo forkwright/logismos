@@ -58,10 +58,19 @@ fn run_gpu_matmul(
 
     let mut out_bytes = vec![0u8; m * n * 2];
     d_dev.copy_to_host(&mut out_bytes).expect("d2h");
-    // SAFETY: `f16` is `#[repr(transparent)] struct f16(u16)`; every
-    // 2-byte pattern is a valid inhabitant.
-    let out = unsafe { std::slice::from_raw_parts(out_bytes.as_ptr().cast::<f16>(), m * n) };
-    out.to_vec()
+    // WHY not a `*const f16` reinterpret: `from_raw_parts` requires the pointer
+    // to be aligned for `f16`, and a `Vec<u8>` guarantees only 1-byte alignment.
+    // The old SAFETY comment established bit-pattern totality but never that
+    // precondition. Chunking is alignment-independent and `from_ne_bytes` keeps
+    // the native byte order the reinterpret read.
+    out_bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let mut bytes = [0u8; 2];
+            bytes.copy_from_slice(pair);
+            f16::from_ne_bytes(bytes)
+        })
+        .collect()
 }
 
 fn random_f16_matrix(rows: usize, cols: usize, seed: u64) -> Vec<f16> {
