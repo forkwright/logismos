@@ -1,48 +1,95 @@
+# WHY(kanon#2522): replaces logismos's standalone trailer-attestation
+# workflow — which waived the Gate-Passed check by `github.actor`, the actor
+# who caused the CURRENT run rather than the PR's actual author, so a
+# maintainer's "Re-run failed jobs" click flipped the waiver on and
+# re-armed a bot PR's already-passed check — with the kanon-designed hybrid
+# gate. An untrailered PR now falls through to full-gate-build and actually
+# COMPILES; no actor-name or branch-name spoofable waiver exists at all
+# (closes the class an unmerged branch in this repo proposed reopening by
+# OR-ing in `startsWith(github.head_ref, 'release-please')`, which any
+# contributor could trigger by naming their own branch `release-please-*`).
+#
+# WHY hosted in forkwright/.github, not forkwright/kanon: GitHub cannot
+# resolve a workflow_call reference into a private repo owned by a personal
+# account for other-repo callers — this is the same structural limit every
+# other adoption (koinon, heurema, sphragis) hit.
+#
+# WHY these with: values (cite): .kanon-ci.toml (forge pipeline: fmt, check,
+# clippy, nextest — no doctest stage, no kanon-lint stage; `--jobs 8` /
+# `--build-jobs 8` / `--test-threads 8` dropped below because that ceiling
+# exists only to protect menos from concurrent-build OOM per that file's
+# own WHY comment, not applicable to a GH-hosted runner; `--no-fail-fast`
+# on nextest is a behavioral choice, not a concurrency cap, so it is kept).
+#
+# WHY rust_toolchain left empty: rust-toolchain.toml pins channel 1.90 —
+# auto-detect applies (fleet convention).
+#
+# WHY needs_fleet_repo_token false: no `git = "https://github.com/forkwright/..."`
+# dependency anywhere in the workspace (grepped directly).
+#
+# WHY system_packages carries libamdhip64-dev (forkwright/logismos#14):
+# `crates/hipcore/build.rs` has no ROCm-absent fallback (project rule 7,
+# by design) and is an unconditional workspace member, so `cargo check
+# --workspace` cannot complete without `hip/hip_runtime_api.h` and
+# `libamdhip64.so` present. Three prior sessions concluded this was
+# unfixable on a GH-hosted runner ("no GH-hosted runner will ever have
+# ROCm") without checking Ubuntu's `universe` component. It does carry
+# what hipcore needs: `libamdhip64-dev` (Ubuntu noble/24.04, universe,
+# 5.7.1-3) ships `/usr/include/hip/{hip_runtime_api.h,driver_types.h}` —
+# the only two headers hipcore's wrapper includes — plus
+# `libamdhip64.so`/`.so.5`, and apt resolves its Depends
+# (libamdhip64-5, libhiprtc-builtins5, libhsa-runtime-dev,
+# libamd-comgr-dev) automatically. Verified via packages.ubuntu.com
+# filelist + Depends before wiring this in; the CI run this PR triggers
+# is the actual proof. hipcore genuinely links against real HIP now —
+# this is not a fallback or a widened exemption.
+#
+# NOTE(kernels crate / HIP, watch on the adoption PR): crates/kernels/build.rs
+# separately invokes `hipcc` (ROCm >= 6.4) to compile .hip kernel sources,
+# and falls back to a CPU-only, `logismos_no_gpu_kernels`-cfg'd build with a
+# `cargo:warning` when hipcc is absent from PATH — by design, so `cargo
+# check` runs on a machine without a full ROCm toolchain. `hipcc` is not
+# added to system_packages here — only hipcore's header/link requirement
+# (the one blocking every gate run) is in scope for this fix, so kernels
+# still takes its documented CPU-only fallback on GH-hosted ubuntu-latest.
+#
+# WHY doctest_cmd is empty: .kanon-ci.toml's pipeline has no doctest stage —
+# mirroring the local gate exactly, not inventing new coverage.
 name: Gate Attestation
 
 on:
   pull_request:
     branches: [main]
+  # WHY a push trigger and not just pull_request: a squash merge does not
+  # carry the source commits' trailers, so no commit on main has a
+  # Gate-Passed trailer — check-trailer finds none and routes to
+  # full-gate-build, which is the job that actually compiles the workspace.
+  # Without this nothing ever builds main, and the first PR to inherit a
+  # merged break is what discovers it (forkwright/theatron#235).
+  push:
+    branches: [main]
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# WHY no concurrency: block here: hybrid-gate.yml itself already declares
+# `concurrency: group: ${{ github.workflow }}-${{ github.ref }}` and its own
+# comment states callers must NOT also set a concurrency group with that
+# same key, or the shared group self-cancels. logismos's PRIOR file set this
+# exact key — dropped here, not carried forward, for that reason.
 
 jobs:
-  gate-attestation:
-    name: gate-attestation
-    runs-on: ubuntu-latest
-    steps:
-      - name: Pass trusted automation PRs
-        if: ${{ github.actor == 'dependabot[bot]' || github.actor == 'release-please[bot]' || github.actor == 'github-actions[bot]' }}
-        run: echo "Gate attestation waived for trusted automation actor."
-
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        if: ${{ github.actor != 'dependabot[bot]' && github.actor != 'release-please[bot]' && github.actor != 'github-actions[bot]' }}
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Verify Gate-Passed trailer
-        if: ${{ github.actor != 'dependabot[bot]' && github.actor != 'release-please[bot]' && github.actor != 'github-actions[bot]' }}
-        # WHY (kanon#2399): bind to the PR TIP, not "any commit in the range". The
-        # range form passed when any ancestor carried a trailer, so an unstamped tip
-        # could ride an earlier commit's attestation and the tree that actually
-        # merges was never gated. This matches the canonical
-        # forkwright/.github gate-attestation.yml and hybrid-gate.yml.
-        env:
-          # WHY: head.sha is server-populated and content-addressed, so it reaches
-          # the script through the environment rather than shell interpolation.
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          body=$(git log -1 --format="%b" "$PR_HEAD_SHA")
-          if echo "$body" | grep -q "^Gate-Passed:"; then
-            echo "Found gate attestation on PR tip: $(echo "$body" | grep '^Gate-Passed:' | head -1)"
-          else
-            echo "ERROR: PR tip carries no Gate-Passed trailer (ancestors' trailers do not count — kanon#2399)."
-            echo "Run the local gate and commit with the trailer."
-            exit 1
-          fi
+  gate:
+    uses: forkwright/.github/.github/workflows/hybrid-gate.yml@main
+    with:
+      fmt_cmd: "cargo fmt --all -- --check"
+      check_cmd: "cargo check --workspace --all-targets"
+      clippy_cmd: "cargo clippy --workspace --all-targets -- -D warnings"
+      nextest_cmd: "cargo nextest run --workspace --no-fail-fast"
+      doctest_cmd: ""
+      system_packages: "libamdhip64-dev"
+      needs_fleet_repo_token: false
+      rust_cache_key: "gate-attestation"
+      ai_attribution_check: true
+      docs_only_exemption: true
+    secrets: inherit
