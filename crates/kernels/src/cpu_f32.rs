@@ -257,10 +257,19 @@ pub fn softmax_last_dim(x: &[f32], rows: usize, n: usize) -> Vec<f32> {
 /// where `rows` is a whole multiple of `rows_mask` (mask broadcasts across the
 /// heads dimension). A zero in `mask` zeroes the corresponding `scores` entry
 /// by adding `-inf`.
+///
+/// No-op when `n == 0`, `rows == 0`, or `mask` is empty — there is no work to
+/// do and no scores to mask.
 pub fn mask_additive_in_place(scores: &mut [f32], mask: &[u8], rows: usize, n: usize) {
+    if n == 0 || rows == 0 || mask.is_empty() {
+        return;
+    }
     debug_assert_eq!(scores.len(), rows * n);
     let mask_rows = mask.len() / n;
     debug_assert_eq!(mask.len(), mask_rows * n);
+    if mask_rows == 0 {
+        return;
+    }
     debug_assert!(rows.is_multiple_of(mask_rows));
     let repeat = rows / mask_rows;
     for mr in 0..mask_rows {
@@ -507,6 +516,25 @@ mod tests {
         assert!(s[2].is_finite());
         assert!(s[4].is_infinite() && s[4].is_sign_negative());
         assert!(s[6..].iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn mask_additive_zero_n_does_not_panic() {
+        // n == 0: mask.len() / n would divide by zero pre-fix.
+        let mut s: Vec<f32> = vec![];
+        let mask: [u8; 0] = [];
+        mask_additive_in_place(&mut s, &mask, 4, 0);
+    }
+
+    #[test]
+    fn mask_additive_empty_mask_does_not_panic() {
+        // rows > 0 with an empty mask: mask_rows == 0, so rows / mask_rows
+        // would divide by zero pre-fix.
+        let mut s = vec![1.0_f32; 12]; // 4 rows, 3 cols
+        let mask: [u8; 0] = [];
+        mask_additive_in_place(&mut s, &mask, 4, 3);
+        // No-op: scores are untouched since there is no mask to apply.
+        assert!(s.iter().all(|&v| v == 1.0));
     }
 
     #[test]
