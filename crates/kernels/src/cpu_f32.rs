@@ -534,7 +534,12 @@ mod tests {
         let mask: [u8; 0] = [];
         mask_additive_in_place(&mut s, &mask, 4, 3);
         // No-op: scores are untouched since there is no mask to apply.
-        assert!(s.iter().all(|&v| v == 1.0));
+        // WHY bit-pattern and not `==`: "untouched" is a bytes question, not an
+        // approximate one. Comparing bits is stricter than `==` here — it also
+        // catches a write of `-0.0`, which compares equal to `0.0` — and it is
+        // what `clippy::float_cmp` is steering away from exact `==` toward.
+        let untouched = 1.0_f32.to_bits();
+        assert!(s.iter().all(|&v| v.to_bits() == untouched));
     }
 
     #[test]
