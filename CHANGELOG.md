@@ -24,6 +24,13 @@ All notable changes to logismos are recorded here.
 - Kernel result defaults: explicit handling in cfg-gated branches
 - Matmul CPU helper visibility: narrowed to `pub(crate)`
 
+## [1.0.3](https://github.com/forkwright/logismos/compare/v1.0.2...v1.0.3) (2026-08-04)
+
+
+### Bug Fixes
+
+* **kernels:** guard mask_additive_in_place against div-by-zero ([#62](https://github.com/forkwright/logismos/issues/62)) ([b9ff95d](https://github.com/forkwright/logismos/commit/b9ff95dc85187696c9969a401f3c876893e2b116))
+
 ## [1.0.2](https://github.com/forkwright/logismos/compare/v1.0.1...v1.0.2) (2026-08-03)
 
 
