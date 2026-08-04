@@ -24,18 +24,34 @@
 # WHY rust_toolchain left empty: rust-toolchain.toml pins channel 1.90 —
 # auto-detect applies (fleet convention).
 #
-# WHY system_packages empty and needs_fleet_repo_token false: no
-# `git = "https://github.com/forkwright/..."` dependency anywhere in the
-# workspace (grepped directly); workspace deps are pure-Rust crates plus
-# safetensors/tokenizers/memmap2/rayon, none of which need apt packages.
+# WHY needs_fleet_repo_token false: no `git = "https://github.com/forkwright/..."`
+# dependency anywhere in the workspace (grepped directly).
+#
+# WHY system_packages carries libamdhip64-dev (forkwright/logismos#14):
+# `crates/hipcore/build.rs` has no ROCm-absent fallback (project rule 7,
+# by design) and is an unconditional workspace member, so `cargo check
+# --workspace` cannot complete without `hip/hip_runtime_api.h` and
+# `libamdhip64.so` present. Three prior sessions concluded this was
+# unfixable on a GH-hosted runner ("no GH-hosted runner will ever have
+# ROCm") without checking Ubuntu's `universe` component. It does carry
+# what hipcore needs: `libamdhip64-dev` (Ubuntu noble/24.04, universe,
+# 5.7.1-3) ships `/usr/include/hip/{hip_runtime_api.h,driver_types.h}` —
+# the only two headers hipcore's wrapper includes — plus
+# `libamdhip64.so`/`.so.5`, and apt resolves its Depends
+# (libamdhip64-5, libhiprtc-builtins5, libhsa-runtime-dev,
+# libamd-comgr-dev) automatically. Verified via packages.ubuntu.com
+# filelist + Depends before wiring this in; the CI run this PR triggers
+# is the actual proof. hipcore genuinely links against real HIP now —
+# this is not a fallback or a widened exemption.
 #
 # NOTE(kernels crate / HIP, watch on the adoption PR): crates/kernels/build.rs
-# invokes `hipcc` (ROCm >= 6.4) to compile GPU kernels but falls back to a
-# CPU-only, `logismos_no_gpu_kernels`-cfg'd build with a `cargo:warning` when
-# hipcc is absent from PATH — by design, so `cargo check` runs on a machine
-# without ROCm. GH-hosted ubuntu-latest has no ROCm, so full-gate-build
-# exercises that fallback path, not the GPU path the forge-only local gate
-# exercises day to day.
+# separately invokes `hipcc` (ROCm >= 6.4) to compile .hip kernel sources,
+# and falls back to a CPU-only, `logismos_no_gpu_kernels`-cfg'd build with a
+# `cargo:warning` when hipcc is absent from PATH — by design, so `cargo
+# check` runs on a machine without a full ROCm toolchain. `hipcc` is not
+# added to system_packages here — only hipcore's header/link requirement
+# (the one blocking every gate run) is in scope for this fix, so kernels
+# still takes its documented CPU-only fallback on GH-hosted ubuntu-latest.
 #
 # WHY doctest_cmd is empty: .kanon-ci.toml's pipeline has no doctest stage —
 # mirroring the local gate exactly, not inventing new coverage.
@@ -71,7 +87,7 @@ jobs:
       clippy_cmd: "cargo clippy --workspace --all-targets -- -D warnings"
       nextest_cmd: "cargo nextest run --workspace --no-fail-fast"
       doctest_cmd: ""
-      system_packages: ""
+      system_packages: "libamdhip64-dev"
       needs_fleet_repo_token: false
       rust_cache_key: "gate-attestation"
       ai_attribution_check: true
