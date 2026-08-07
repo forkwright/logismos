@@ -20,6 +20,27 @@ written from the device upward.
  `EmbeddingModel` contract mnemosyne consumes.
 - Out: training. Non-AMD GPUs. Runtime graph optimization. Multi-GPU.
 
+## Build configuration
+
+`crates/kernels/build.rs` compiles HIP kernel sources via `hipcc`. When
+`hipcc` is absent from `PATH` this falls back automatically to a
+CPU-only, `logismos_no_gpu_kernels`-cfg'd build (this is the normal
+path on a GH-hosted CI runner and any box without ROCm).
+
+On a box that *has* ROCm installed but where a HIP kernel compile needs
+to be skipped anyway — bisecting a `hipcc` regression, working around a
+broken local ROCm install, or a fast CPU-only iteration loop — set
+`LOGISMOS_SKIP_HIP_BUILD` to force the same CPU-only fallback the
+`hipcc`-absent path takes:
+
+```
+LOGISMOS_SKIP_HIP_BUILD=1 cargo build
+```
+
+Cost: the resulting build has no GPU kernels — `kernels` compiles
+against its CPU reference path only, and any HIP-backed op returns
+`Error::NoGpuBuild` at runtime instead of running on-device.
+
 ## Layout
 
 Planning canonical lives in kanon:
