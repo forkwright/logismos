@@ -425,3 +425,63 @@ fn extract_json_string_field(text: &str, key: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::expect_used, reason = "test assertions use expect() directly")]
+
+    use super::*;
+
+    #[test]
+    fn extract_json_string_field_happy_path_escapes() {
+        let text = r#"{"name": "line1\nline2\ttab\rcr\"quote\\backslash"}"#;
+        let got = extract_json_string_field(text, "name").expect("field present");
+        assert_eq!(got, "line1\nline2\ttab\rcr\"quote\\backslash");
+    }
+
+    #[test]
+    fn extract_json_string_field_unicode_escape_is_not_decoded() {
+        // WHY(forkwright/logismos#43): locks the current (non-decoding)
+        // behaviour as a stated contract rather than an unverified
+        // assumption. `\uXXXX` is walked as five literal characters
+        // ('u','0','0','e','9'), not decoded to the code point U+00E9.
+        let text = "{\"name\": \"caf\\u00e9\"}";
+        let got = extract_json_string_field(text, "name").expect("field present");
+        assert_eq!(got, "cafu00e9");
+    }
+
+    #[test]
+    fn extract_json_string_field_missing_key_returns_none() {
+        let text = r#"{"other": "value"}"#;
+        assert_eq!(extract_json_string_field(text, "name"), None);
+    }
+
+    #[test]
+    fn extract_json_string_field_unterminated_string_returns_none() {
+        let text = "{\"name\": \"no closing quote";
+        assert_eq!(extract_json_string_field(text, "name"), None);
+    }
+
+    #[test]
+    fn extract_json_string_field_duplicate_key_resolves_to_first_match() {
+        // Locks the documented "first match wins" behaviour: a later
+        // repeated key does not override an earlier one.
+        let text = r#"{"name": "first", "other": 1, "name": "second"}"#;
+        let got = extract_json_string_field(text, "name").expect("field present");
+        assert_eq!(got, "first");
+    }
+
+    #[test]
+    fn extract_json_string_field_key_text_in_a_value_matches_wrong_field() {
+        // Locks the documented "bare substring search" limitation: the
+        // needle is a plain `text.find`, with no check that the match is
+        // actually in key position. If the target key's quoted text
+        // happens to appear as *another* field's value earlier in the
+        // document, the parser walks forward from there — past that
+        // unrelated field's own colon and quoted value — and returns a
+        // different field's value instead of `None`.
+        let text = r#"{"note": "name", "real": "wrong_pick"}"#;
+        let got = extract_json_string_field(text, "name").expect("false match");
+        assert_eq!(got, "wrong_pick");
+    }
+}
