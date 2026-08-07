@@ -372,7 +372,7 @@ impl ModernBertAttention {
         let k_hsd = transpose_seq_heads(&k, seq, n_h, d);
         let v_hsd = transpose_seq_heads(&v, seq, n_h, d);
         // Gather RoPE for each position
-        let (cos_rows, sin_rows) = rope.gather(positions);
+        let (cos_rows, sin_rows) = rope.gather(positions)?;
         // Apply RoPE per head to Q and K
         let mut q_rope = q_hsd.clone();
         let mut k_rope = k_hsd.clone();

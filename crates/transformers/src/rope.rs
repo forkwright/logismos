@@ -13,6 +13,8 @@
 
 use kernels::cpu_f32::build_rope_table_f32;
 
+use crate::error::{Error, Result};
+
 /// Precomputed rotary-position-embedding table.
 #[derive(Debug, Clone)]
 pub struct RopeTable {
@@ -42,28 +44,74 @@ impl RopeTable {
 
     /// Gather per-row cos/sin for each position in `positions`. Returns
     /// `(cos_rows, sin_rows)` each of length `positions.len() * head_dim / 2`.
-    #[must_use]
-    pub(crate) fn gather(&self, positions: &[usize]) -> (Vec<f32>, Vec<f32>) {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Shape`] if any position in `positions` is `>= self.max_seq`,
+    /// or if the table itself is shorter than its declared `max_seq * head_dim
+    /// / 2` (malformed construction).
+    pub(crate) fn gather(&self, positions: &[usize]) -> Result<(Vec<f32>, Vec<f32>)> {
         let half = self.head_dim / 2;
         let mut cos_rows = Vec::with_capacity(positions.len() * half);
         let mut sin_rows = Vec::with_capacity(positions.len() * half);
         for &pos in positions {
-            debug_assert!(pos < self.max_seq);
+            if pos >= self.max_seq {
+                return Err(Error::Shape(format!(
+                    "RopeTable::gather: position {pos} >= max_seq {}",
+                    self.max_seq
+                )));
+            }
             let start = pos * half;
-            let end = (pos + 1) * half;
-            debug_assert!(end <= self.cos.len());
-            debug_assert!(end <= self.sin.len());
-            // SAFETY: `RopeTable::new` builds both tables as
-            // `max_seq * head_dim / 2`, and attention forward only gathers
-            // positions below `max_seq`. The debug assertions keep malformed
-            // table construction or caller bugs visible during development
-            // while keeping this per-token gather on the hot path branch-free.
-            let cos_row = unsafe { self.cos.get_unchecked(start..end) };
-            // SAFETY: same invariant as the cosine table above.
-            let sin_row = unsafe { self.sin.get_unchecked(start..end) };
+            let end = start + half;
+            let cos_row = self.cos.get(start..end).ok_or_else(|| {
+                Error::Shape(format!(
+                    "RopeTable::gather: cos range {start}..{end} exceeds table length {}",
+                    self.cos.len()
+                ))
+            })?;
+            let sin_row = self.sin.get(start..end).ok_or_else(|| {
+                Error::Shape(format!(
+                    "RopeTable::gather: sin range {start}..{end} exceeds table length {}",
+                    self.sin.len()
+                ))
+            })?;
             cos_rows.extend_from_slice(cos_row);
             sin_rows.extend_from_slice(sin_row);
         }
-        (cos_rows, sin_rows)
+        Ok((cos_rows, sin_rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::expect_used,
+        reason = "test assertions use expect()/expect_err() directly"
+    )]
+
+    use super::*;
+
+    #[test]
+    fn gather_in_range_matches_table_rows() {
+        let table = RopeTable::new(4, 4, 10_000.0);
+        let (cos_rows, sin_rows) = table.gather(&[0, 1, 2]).expect("in-range gather");
+        assert_eq!(cos_rows.len(), 3 * 2);
+        assert_eq!(sin_rows.len(), 3 * 2);
+        assert_eq!(cos_rows[0..2], table.cos[0..2]);
+        assert_eq!(sin_rows[2..4], table.sin[2..4]);
+    }
+
+    #[test]
+    fn gather_out_of_range_position_is_shape_error_not_ub() {
+        // WHY: this is the regression test for forkwright/logismos#28 —
+        // `gather` used to guard `pos < max_seq` with `debug_assert!` only
+        // and then read via `get_unchecked`, which is undefined behaviour
+        // in a release build on an out-of-range position. It must be a
+        // returned `Err` in every profile.
+        let table = RopeTable::new(4, 4, 10_000.0);
+        let err = table
+            .gather(&[0, 4])
+            .expect_err("position 4 >= max_seq 4 must error");
+        assert!(err.to_string().contains("position 4 >= max_seq 4"));
     }
 }
