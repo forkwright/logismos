@@ -58,8 +58,9 @@ pub struct EncodeOpts {
     /// Target output dimensionality. Must be in
     /// [`EmbeddingModel::supported_dims`].
     pub dim: Option<usize>,
-    /// Override the model's default max input length (tokens). Inputs
-    /// longer than this are truncated with a warning.
+    /// Override the model's default max input length (tokens). Input
+    /// that tokenises longer than this returns
+    /// [`EmbeddingError::InputTooLong`] rather than being truncated.
     pub max_tokens: Option<usize>,
     /// Prompt prefix to prepend to the input text.
     pub prompt: Option<Prompt>,
