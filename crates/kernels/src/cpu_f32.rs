@@ -444,6 +444,44 @@ mod tests {
     }
 
     #[test]
+    fn linear_matches_hand_computed() {
+        // WHY(forkwright/logismos#44): `linear` (A @ B + bias, row-major
+        // B) had no test at all, unlike its sibling `linear_t` — a
+        // stride mistake here would silently corrupt every `scores @ v`
+        // attention output with no panic, no assertion, no error signal.
+        // m>1, n>1, k>1 so a stride/transpose bug is observable.
+        let a = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // [2, 3]
+        let b = [1.0_f32, 0.0, 0.0, 1.0, 1.0, 1.0]; // [3, 2]
+        let bias = [100.0_f32, 200.0];
+        let y = linear(&a, &b, Some(&bias), 2, 2, 3);
+        let expected = [104.0_f32, 205.0, 110.0, 211.0];
+        for (got, want) in y.iter().zip(expected.iter()) {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "got {y:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linear_matches_linear_t_with_transposed_weight() {
+        // Cross-check: `linear_t(a, b_t, ...)` where `b_t` is `b`
+        // transposed must equal `linear(a, b, ...)` — the two functions
+        // encode the same product through different sgemm strides.
+        let a = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // [2, 3]
+        let b = [1.0_f32, 0.0, 0.0, 1.0, 1.0, 1.0]; // [3, 2]
+        let b_t = [1.0_f32, 0.0, 1.0, 0.0, 1.0, 1.0]; // [2, 3], b transposed
+        let via_linear = linear(&a, &b, None, 2, 2, 3);
+        let via_linear_t = linear_t(&a, &b_t, None, 2, 2, 3);
+        for (l, lt) in via_linear.iter().zip(via_linear_t.iter()) {
+            assert!(
+                (l - lt).abs() < 1e-5,
+                "linear={via_linear:?}, linear_t={via_linear_t:?}"
+            );
+        }
+    }
+
+    #[test]
     fn linear_t_matches_naive() {
         // x: [1, 3], w: [2, 3] → y: [1, 2]
         let x = [1.0_f32, 2.0, 3.0];
