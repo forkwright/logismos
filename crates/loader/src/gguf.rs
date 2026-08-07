@@ -222,20 +222,28 @@ impl Reader {
             _ => 32,
         };
 
-        let tensor_count_usize = usize::try_from(tensor_count).map_err(|_| Error::Gguf {
+        // WHY(forkwright/logismos#34): `tensor_count` is an untrusted u64
+        // straight off the wire. `usize::try_from` only rejects values
+        // that overflow `usize` (never, on a 64-bit target), so a file
+        // claiming e.g. 10^18 tensors would otherwise drive
+        // `Vec::with_capacity` to request an allocation the global
+        // allocator cannot satisfy — which aborts the process rather than
+        // returning an `Err`. No pre-allocation: `Vec::push` amortises
+        // its own growth, and `cur.read_string()`/`cur.read_u32()` below
+        // already bounds-check against the mmap, so a claimed count that
+        // outruns the real file fails fast with `Error::Gguf` instead.
+        usize::try_from(tensor_count).map_err(|_| Error::Gguf {
             offset: cur.pos,
             msg: format!("tensor count {tensor_count} exceeds usize::MAX"),
         })?;
-        let mut tensors = Vec::with_capacity(tensor_count_usize);
+        let mut tensors = Vec::new();
         let mut tensor_by_name = HashMap::new();
         for i in 0..tensor_count {
             let name = cur.read_string()?;
             let n_dims = cur.read_u32()?;
-            let n_dims_usize = usize::try_from(n_dims).map_err(|_| Error::Gguf {
-                offset: cur.pos,
-                msg: format!("tensor `{name}` n_dims {n_dims} exceeds usize::MAX"),
-            })?;
-            let mut dims = Vec::with_capacity(n_dims_usize);
+            // WHY(forkwright/logismos#34): same rationale as tensor_count
+            // above — no pre-allocation from an untrusted count.
+            let mut dims = Vec::new();
             for _ in 0..n_dims {
                 dims.push(cur.read_u64()?);
             }
@@ -319,7 +327,24 @@ impl Reader {
     /// Compute a tensor's `[start, end)` byte range inside the mmap'd file
     /// and convert both ends to `usize`.
     fn byte_range_for(&self, desc: &TensorDescriptor) -> Result<(usize, usize)> {
-        let elem_count_u64: u64 = desc.dims.iter().product();
+        // WHY(forkwright/logismos#36): `Iterator::product()` on `u64`
+        // uses ordinary wrapping multiplication in a release build — a
+        // GGUF-supplied `dims` whose product exceeds `u64::MAX` silently
+        // wraps, and can land on exactly `0`. A zero element count then
+        // produces a zero-byte `TensorView` that still reports the
+        // original (enormous) `dims` in its `shape`, passing every
+        // bounds check unchanged instead of failing loudly. `checked_mul`
+        // turns that silent wraparound into a returned `Err`.
+        let mut elem_count_u64: u64 = 1;
+        for &d in &desc.dims {
+            elem_count_u64 = elem_count_u64.checked_mul(d).ok_or_else(|| Error::Gguf {
+                offset: 0,
+                msg: format!(
+                    "tensor `{}` dims product overflows u64: {:?}",
+                    desc.name, desc.dims
+                ),
+            })?;
+        }
         let elem_count = usize::try_from(elem_count_u64).map_err(|_| Error::Gguf {
             offset: 0,
             msg: format!(
@@ -561,12 +586,27 @@ impl<'a> Cursor<'a> {
             8 => MetaValue::String(self.read_string()?),
             9 => {
                 let inner_type = self.read_u32()?;
+                // WHY(forkwright/logismos#35): the GGUF v3 spec forbids
+                // arrays-of-arrays. Without this check a crafted file
+                // chains `inner_type = 9` at every nesting level, and
+                // each recursive `read_meta_value_typed` call below adds
+                // an unbounded stack frame — a ~1MB file can encode
+                // ~65,000 levels, enough to overflow the thread stack
+                // (an unrecoverable process crash, not a catchable panic).
+                if inner_type == 9 {
+                    return Err(Error::Gguf {
+                        offset: self.pos,
+                        msg: "gguf spec forbids arrays-of-arrays (inner_type=9)".into(),
+                    });
+                }
                 let n = self.read_u64()?;
-                let n_usize = usize::try_from(n).map_err(|_| Error::Gguf {
-                    offset: self.pos,
-                    msg: format!("gguf array length {n} exceeds usize::MAX"),
-                })?;
-                let mut out = Vec::with_capacity(n_usize);
+                // WHY(forkwright/logismos#34): no pre-allocation from an
+                // untrusted length — see the tensor_count/n_dims WHY
+                // above in `Reader::open`. `Vec::push` amortises growth,
+                // and each element still costs a real bounds-checked
+                // read via `read_meta_value_typed`, so a claimed length
+                // that outruns the file fails fast with `Error::Gguf`.
+                let mut out = Vec::new();
                 for _ in 0..n {
                     out.push(self.read_meta_value_typed(inner_type)?);
                 }
@@ -656,6 +696,95 @@ mod tests {
         assert_eq!(tv.dtype, taxis::DType::F32);
         assert_eq!(tv.shape, vec![3]);
         assert_eq!(tv.bytes.len(), 12);
+        Ok(())
+    }
+
+    #[test]
+    fn array_metadata_type_parses_elements() -> Result<()> {
+        // WHY(forkwright/logismos#37): the array branch (type id 9) of
+        // `read_meta_value_typed` had no test coverage at all — this
+        // exercises length read, inner_type read, allocation, and the
+        // per-element recursive decode.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&4u32.to_le_bytes()); // inner_type = U32
+        buf.extend_from_slice(&3u64.to_le_bytes()); // n = 3 elements
+        for v in [10u32, 20, 30] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut cur = Cursor::new(&buf);
+        let value = cur.read_meta_value_typed(9)?;
+        let MetaValue::Array(items) = value else {
+            return Err(Error::Gguf {
+                offset: 0,
+                msg: "expected MetaValue::Array".into(),
+            });
+        };
+        assert_eq!(items.len(), 3);
+        assert!(matches!(items[0], MetaValue::U32(10)));
+        assert!(matches!(items[1], MetaValue::U32(20)));
+        assert!(matches!(items[2], MetaValue::U32(30)));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_array_inner_type_is_rejected() {
+        // WHY(forkwright/logismos#35): the GGUF v3 spec forbids
+        // arrays-of-arrays. Before the fix, `inner_type = 9` recursed
+        // unboundedly — a crafted file chaining this at every nesting
+        // level exhausts the thread stack (an unrecoverable SIGSEGV, not
+        // a catchable error). The very first nested level must instead
+        // return `Err`.
+        let inner_type_bytes = 9u32.to_le_bytes();
+        let mut cur = Cursor::new(&inner_type_bytes);
+        let result = cur.read_meta_value_typed(9);
+        assert!(matches!(result, Err(Error::Gguf { .. })));
+    }
+
+    #[test]
+    fn huge_tensor_count_returns_err_not_abort() -> Result<()> {
+        // WHY(forkwright/logismos#34): before the fix this pre-allocated
+        // `Vec::with_capacity(tensor_count_usize)` for an untrusted,
+        // attacker-controlled count straight off the wire — enough to
+        // abort the process through the allocator rather than returning
+        // a `Result::Err` a caller could handle. A file that claims an
+        // enormous tensor count but has no data behind it must fail fast
+        // with a returned error instead.
+        let dir = tempdir_for_test();
+        let path = dir.join("huge-tensor-count.gguf");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(GGUF_MAGIC);
+        buf.extend_from_slice(&GGUF_V3.to_le_bytes());
+        buf.extend_from_slice(&u64::MAX.to_le_bytes()); // tensor count
+        buf.extend_from_slice(&0u64.to_le_bytes()); // metadata count
+        std::fs::write(&path, buf)?;
+
+        let result = Reader::open(&path);
+        assert!(matches!(result, Err(Error::Gguf { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn dims_product_overflow_is_rejected_not_wrapped_to_zero() -> Result<()> {
+        // WHY(forkwright/logismos#36): `desc.dims.iter().product()` used
+        // ordinary wrapping multiplication in a release build. A dims
+        // vector whose product exceeds `u64::MAX` could silently wrap to
+        // `0`, producing a zero-byte `TensorView` that still reports the
+        // original (enormous) `dims` in its `shape` — passing every
+        // bounds check unchanged. The checked-multiply loop must instead
+        // return `Err`.
+        let dir = tempdir_for_test();
+        let path = dir.join("dims-overflow.gguf");
+        std::fs::write(&path, fixture_bytes())?;
+        let r = Reader::open(&path)?;
+
+        let desc = TensorDescriptor {
+            name: "overflow".to_string(),
+            dims: vec![u64::MAX, 2],
+            ggml_type: GgmlType::F32,
+            data_offset: 0,
+        };
+        let result = r.byte_range_for(&desc);
+        assert!(matches!(result, Err(Error::Gguf { .. })));
         Ok(())
     }
 
