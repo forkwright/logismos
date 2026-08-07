@@ -473,6 +473,50 @@ mod tests {
     }
 
     #[test]
+    fn rope_table_nonzero_position_matches_hand_computed_angles() {
+        // WHY(forkwright/logismos#45): the only prior test used seq=1, so
+        // every emitted angle was `0 * inv_freq = 0` and every (cos, sin)
+        // pair was trivially (1, 0) regardless of whether the inv_freq /
+        // powf math was even correct. This checks pos=1 against hand
+        // computed values at two different `i` (so `inv_freq`'s exponent
+        // is exercised at both 0 and non-zero) — a sign error in the
+        // `powf` exponent or an off-by-one in `inv_freq` fails this.
+        let head_dim = 4;
+        let half = head_dim / 2;
+        let theta = 10_000.0;
+        let (cos, sin) = build_rope_table_f32(2, head_dim, theta);
+
+        // pos=1, i=0: inv_freq = theta^0 = 1.0, angle = 1.0.
+        let expected_cos_i0 = 1.0_f64.cos();
+        let expected_sin_i0 = 1.0_f64.sin();
+        assert!(
+            (f64::from(cos[half]) - expected_cos_i0).abs() < 1e-5,
+            "cos[pos=1,i=0] = {}, expected {expected_cos_i0}",
+            cos[half]
+        );
+        assert!(
+            (f64::from(sin[half]) - expected_sin_i0).abs() < 1e-5,
+            "sin[pos=1,i=0] = {}, expected {expected_sin_i0}",
+            sin[half]
+        );
+
+        // pos=1, i=1: inv_freq = theta^(-2*1/4) = theta^-0.5 = 0.01,
+        // angle = 1.0 * 0.01 = 0.01.
+        let expected_cos_i1 = 0.01_f64.cos();
+        let expected_sin_i1 = 0.01_f64.sin();
+        assert!(
+            (f64::from(cos[half + 1]) - expected_cos_i1).abs() < 1e-5,
+            "cos[pos=1,i=1] = {}, expected {expected_cos_i1}",
+            cos[half + 1]
+        );
+        assert!(
+            (f64::from(sin[half + 1]) - expected_sin_i1).abs() < 1e-5,
+            "sin[pos=1,i=1] = {}, expected {expected_sin_i1}",
+            sin[half + 1]
+        );
+    }
+
+    #[test]
     fn rope_rotation_is_inverse_after_pi() {
         // After a full 2π rotation the vector returns; use theta=1 so angle
         // grows fast. Direct check: rotate forward, rotate backward → identity.
