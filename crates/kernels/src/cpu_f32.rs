@@ -235,6 +235,28 @@ pub fn softmax_last_dim(x: &[f32], rows: usize, n: usize) -> Vec<f32> {
                 m = v;
             }
         }
+        if m.is_infinite() && m.is_sign_negative() {
+            // WHY(forkwright/logismos#30): every entry in this row is
+            // -inf (a fully-masked attention row, routine for padded-batch
+            // inference). `(v - m).exp()` would evaluate
+            // `(NEG_INFINITY - NEG_INFINITY).exp()` = `NaN.exp()` = `NaN`
+            // for every entry, and that `NaN` propagates silently through
+            // every downstream kernel. There is no informative
+            // distribution to recover for a row with no unmasked tokens,
+            // so fall back to uniform — finite output beats a
+            // silently-propagating NaN.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "n is an attention sequence length, far below 2^24"
+            )]
+            let uniform = if n == 0 { 0.0 } else { 1.0 / n as f32 };
+            for j in 0..n {
+                if let Some(slot) = y.get_mut(row_start + j) {
+                    *slot = uniform;
+                }
+            }
+            continue;
+        }
         let mut denom = 0.0f32;
         for (j, &v) in row.iter().enumerate() {
             let e = (v - m).exp();
@@ -462,6 +484,46 @@ mod tests {
             let s: f32 = y[r * 3..(r + 1) * 3].iter().sum();
             assert!((s - 1.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn softmax_fully_masked_row_is_uniform_not_nan() {
+        // WHY(forkwright/logismos#30): a row that is entirely
+        // `f32::NEG_INFINITY` (a fully-masked attention row) used to
+        // produce `NaN` in every slot via `(NEG_INF - NEG_INF).exp()`.
+        // It must instead be a finite, uniform distribution.
+        let x = [f32::NEG_INFINITY; 4];
+        let y = softmax_last_dim(&x, 1, 4);
+        assert!(y.iter().all(|v| v.is_finite()), "row contains NaN: {y:?}");
+        let sum: f32 = y.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "row does not sum to 1: {sum}");
+        for v in &y {
+            assert!((v - 0.25).abs() < 1e-6, "row is not uniform: {y:?}");
+        }
+    }
+
+    #[test]
+    fn softmax_mixed_masked_and_unmasked_rows_both_finite() {
+        // A batch where one row is fully masked and the other is not —
+        // the fully-masked row must not poison the unmasked one, and both
+        // must come back finite.
+        let x = [
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            1.0,
+            2.0,
+        ];
+        let y = softmax_last_dim(&x, 2, 3);
+        assert!(
+            y.iter().all(|v| v.is_finite()),
+            "output contains NaN: {y:?}"
+        );
+        let row0_sum: f32 = y[0..3].iter().sum();
+        let row1_sum: f32 = y[3..6].iter().sum();
+        assert!((row0_sum - 1.0).abs() < 1e-6);
+        assert!((row1_sum - 1.0).abs() < 1e-6);
     }
 
     #[test]

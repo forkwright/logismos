@@ -432,4 +432,40 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    #[test]
+    fn forward_with_fully_masked_row_returns_finite_output_not_nan() {
+        // WHY(forkwright/logismos#41): a fully-masked attention row (every
+        // token in `mask` is 0) used to poison `scores` with `NaN` inside
+        // `softmax_last_dim` (forkwright/logismos#30), which then flowed
+        // unchecked through the `scores @ v` matmul, `merge_heads`, and the
+        // output projection — `forward()` returned `Ok(vec![NaN; hidden])`.
+        // The kernel-level fix substitutes a uniform distribution for a
+        // fully-masked row, so this must now come back finite.
+        let cfg = QwenAttentionConfig {
+            hidden: 4,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 2,
+        };
+        let weights = QwenAttentionWeights {
+            wq: vec![0.1; 16],
+            bq: vec![0.0; 4],
+            wk: vec![0.1; 8],
+            bk: vec![0.0; 2],
+            wv: vec![0.1; 8],
+            bv: vec![0.0; 2],
+            wo: vec![0.1; 16],
+        };
+        let attention = QwenAttention::new(cfg, weights).expect("attention");
+        let rope = RopeTable::new(1, 2, 1_000_000.0);
+
+        let out = attention
+            .forward(&[1.0, 2.0, 3.0, 4.0], &[0], &rope)
+            .expect("fully-masked forward should still succeed");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "forward output contains NaN/Inf for a fully-masked row: {out:?}"
+        );
+    }
 }
