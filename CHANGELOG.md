@@ -24,6 +24,21 @@ All notable changes to logismos are recorded here.
 - Kernel result defaults: explicit handling in cfg-gated branches
 - Matmul CPU helper visibility: narrowed to `pub(crate)`
 
+## [1.0.4](https://github.com/forkwright/logismos/compare/v1.0.3...v1.0.4) (2026-08-09)
+
+
+### Bug Fixes
+
+* **kernels:** guard softmax_last_dim against a fully-masked row's NaN ([#66](https://github.com/forkwright/logismos/issues/66)) ([e48f2ff](https://github.com/forkwright/logismos/commit/e48f2fff40fc6a486a2646c2dff344078da7722d)), closes [#30](https://github.com/forkwright/logismos/issues/30) [#41](https://github.com/forkwright/logismos/issues/41)
+* **kernels:** make embed_lookup's out-of-range contract explicit and uniform ([#73](https://github.com/forkwright/logismos/issues/73)) ([06fa164](https://github.com/forkwright/logismos/commit/06fa1646a4675ee6bff97ca0d7300bcfb29366d0)), closes [#55](https://github.com/forkwright/logismos/issues/55)
+* **loader:** reject unbounded GGUF allocations, array nesting, and dims overflow ([#67](https://github.com/forkwright/logismos/issues/67)) ([ee7fa09](https://github.com/forkwright/logismos/commit/ee7fa0994d1e3dd5fa4a39a0b6716d3b1943f46a)), closes [#34](https://github.com/forkwright/logismos/issues/34) [#35](https://github.com/forkwright/logismos/issues/35) [#36](https://github.com/forkwright/logismos/issues/36) [#37](https://github.com/forkwright/logismos/issues/37)
+* **transformers:** make attention slicing and rope gather bounds-checked ([#74](https://github.com/forkwright/logismos/issues/74)) ([fc1cb88](https://github.com/forkwright/logismos/commit/fc1cb882ebaba57ae2d490c74bbb45cb54ce3d26)), closes [#61](https://github.com/forkwright/logismos/issues/61) [#28](https://github.com/forkwright/logismos/issues/28)
+
+
+### Documentation
+
+* correct max_tokens contract and document LOGISMOS_SKIP_HIP_BUILD ([#72](https://github.com/forkwright/logismos/issues/72)) ([87080f3](https://github.com/forkwright/logismos/commit/87080f375fe0562e96ed6267efd6ab72b8928984)), closes [#50](https://github.com/forkwright/logismos/issues/50) [#48](https://github.com/forkwright/logismos/issues/48)
+
 ## [1.0.3](https://github.com/forkwright/logismos/compare/v1.0.2...v1.0.3) (2026-08-04)
 
 
