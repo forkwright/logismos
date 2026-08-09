@@ -37,6 +37,16 @@ fn usize_to_isize(value: usize) -> isize {
 /// - `weight`: `[vocab, hidden]`
 /// - `ids`: `[b * s]` flat
 /// - returns: `[b * s * hidden]`
+///
+/// Contract: an out-of-range `id` (`id >= vocab`, including an id that
+/// does not fit `usize` on this platform) is not an error — its output
+/// row is left zero-filled, uniformly across every build profile. This
+/// is intentional: a vocabulary mismatch between a tokenizer and a
+/// checkpoint is caller-detectable input validation, not a kernel-level
+/// failure, and none of this module's reference kernels return
+/// `Result`. A caller that must distinguish a genuine zero embedding
+/// from an out-of-range id has to validate `id < vocab` itself before
+/// calling.
 #[must_use]
 pub fn embed_lookup(weight: &[f32], hidden: usize, vocab: usize, ids: &[u32]) -> Vec<f32> {
     let mut out = vec![0.0f32; ids.len() * hidden];
@@ -44,7 +54,9 @@ pub fn embed_lookup(weight: &[f32], hidden: usize, vocab: usize, ids: &[u32]) ->
         let Ok(id) = usize::try_from(id) else {
             continue;
         };
-        debug_assert!(id < vocab);
+        if id >= vocab {
+            continue;
+        }
         let src_start = id * hidden;
         let src_end = (id + 1) * hidden;
         let dst_start = i * hidden;
@@ -452,6 +464,34 @@ pub fn build_rope_table_f32(seq: usize, head_dim: usize, theta: f64) -> (Vec<f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embed_lookup_in_range_copies_rows() {
+        let hidden = 2;
+        let vocab = 3;
+        let weight = [1.0_f32, 2.0, 10.0, 20.0, 100.0, 200.0]; // rows id0,id1,id2
+        let ids = [1u32, 0, 2];
+        let out = embed_lookup(&weight, hidden, vocab, &ids);
+        assert_eq!(out, vec![10.0, 20.0, 1.0, 2.0, 100.0, 200.0]);
+    }
+
+    #[test]
+    fn embed_lookup_out_of_range_id_yields_zeroed_row_uniformly() {
+        // WHY(forkwright/logismos#55): locks the stated contract — an
+        // out-of-range token id (e.g. from a tokenizer/checkpoint
+        // vocabulary mismatch) is not an error; its row is left
+        // zero-filled, the same way in every build profile. Before this
+        // fix the only guard was `debug_assert!(id < vocab)`, so a debug
+        // build panicked on exactly this input while a release build
+        // silently zero-filled — this test fails (panics) against that
+        // prior behaviour and passes against the explicit runtime check.
+        let hidden = 2;
+        let vocab = 2;
+        let weight = [1.0_f32, 2.0, 10.0, 20.0];
+        let ids = [0u32, 5u32]; // id=5 is out of range for vocab=2
+        let out = embed_lookup(&weight, hidden, vocab, &ids);
+        assert_eq!(out, vec![1.0, 2.0, 0.0, 0.0]);
+    }
 
     #[test]
     fn rms_norm_matches_manual() {
