@@ -82,7 +82,9 @@ L1-L4 gate. No haste to invent decoration.
  torch, burn, tract, ort, llama.cpp, vLLM). FFI to ROCm is the lowest
  acceptable layer.
 - **Do not** add backends speculatively.
-- **Do not** push this repo to any remote.
+- **Do not** push to a third-party upstream remote. `origin`
+ (`forkwright/logismos`, public) takes normal pushes, gated by
+ `gate-attestation`.
 - **Do not** start kernel work before the research dossier for that
  subsystem closes its decisions.
 
@@ -108,7 +110,6 @@ Operating principle, memory system, and global constraints come from
 - Agents must scope work to the active `~/dev/kanon/projects/logismos/phases/NN-*/PLAN.md`. No scope creep into future phases.
 - A passing `cargo check` is not evidence of correctness. Every
  kernel carries a CPU reference test at 1e-3 tolerance.
-- Never push this repo to any remote (per Boundaries above).
 
 <!-- kanon:auto-start -->
 ## Generated kanon context

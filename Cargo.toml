@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.90"
 license = "LicenseRef-PolyForm-Shield-1.0.0"
 publish = false
-repository = "local-only"
+repository = "https://github.com/forkwright/logismos"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
