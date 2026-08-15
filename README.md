@@ -41,6 +41,30 @@ Cost: the resulting build has no GPU kernels - `kernels` compiles
 against its CPU reference path only, and any HIP-backed op returns
 `Error::NoGpuBuild` at runtime instead of running on-device.
 
+`crates/hipcore/build.rs` is different: it resolves the HIP runtime
+header and links `amdhip64` unconditionally, with no `LOGISMOS_SKIP_HIP_BUILD`
+equivalent. `cargo check --workspace` therefore fails at `hipcore` on
+any box without ROCm headers installed — including a fresh developer
+machine. That failure is expected, not a defect
+(forkwright/logismos#14); do not look for a local workaround.
+
+It does not block CI or merging. `gate-attestation`
+(`.github/workflows/gate-attestation.yml`, via `forkwright/.github`'s
+`hybrid-gate.yml`) installs Ubuntu's `libamdhip64-dev` on the
+GH-hosted runner before building. That universe-component package
+ships the two headers `hipcore`'s wrapper includes, plus
+`libamdhip64.so`. A PR with no local `Gate-Passed` trailer therefore
+still gets a real `cargo check`/`clippy`/`nextest` pass across the
+whole workspace, `hipcore` included. On a non-ROCm host, push without
+a trailer and let that CI path attest the change.
+
+What it does not prove: the GH-hosted runner has no AMD GPU. This path
+proves the workspace compiles and links against real HIP headers/ABI —
+it never executes a HIP kernel. A change touching `.hip` sources, or
+`hipcore`/`kernels` FFI surface, still needs verification on real
+hardware (the forge-primary gate on menos, ROCm 6.4, per
+`.kanon-ci.toml`) before anyone can trust it at runtime.
+
 ## Layout
 
 Planning canonical lives in kanon, under `projects/logismos/`; see [CLAUDE.md](CLAUDE.md) for how

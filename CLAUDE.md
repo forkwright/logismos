@@ -105,6 +105,15 @@ L1-L4 gate. No haste to invent decoration.
 Rust gate is forge-primary via `.kanon-ci.toml` (ROCm 6.4 on menos
 forge). Run `kanon lint --rust` locally before push until menos returns.
 
+`kanon gate --stamp` cannot complete on a non-ROCm host: `hipcore`'s
+build script fails hard without real HIP headers (forkwright/logismos#14),
+so no `Gate-Passed` trailer is obtainable off menos. Do not chase one.
+Push untrailered; the required `gate / gate` check falls through to
+CI's `full-gate-build`, which installs real ROCm headers on the
+GH-hosted runner and genuinely compiles the workspace — see README's
+Build configuration section for exactly what that check does and does
+not verify.
+
 When `kanon lint` runs from this repo, zero open violations.
 
 ## Working with AI assistants
