@@ -24,6 +24,13 @@ All notable changes to logismos are recorded here.
 - Kernel result defaults: explicit handling in cfg-gated branches
 - Matmul CPU helper visibility: narrowed to `pub(crate)`
 
+## [1.0.5](https://github.com/forkwright/logismos/compare/v1.0.4...v1.0.5) (2026-08-15)
+
+
+### Documentation
+
+* correct push-boundary claim now that logismos is public ([#77](https://github.com/forkwright/logismos/issues/77)) ([a03687b](https://github.com/forkwright/logismos/commit/a03687b1ad8664b72a86f1ca0cde511870d6eedc))
+
 ## [1.0.4](https://github.com/forkwright/logismos/compare/v1.0.3...v1.0.4) (2026-08-09)
 
 
