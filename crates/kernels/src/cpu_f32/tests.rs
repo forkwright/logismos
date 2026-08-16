@@ -153,6 +153,61 @@ fn linear_overflowing_shape_is_rejected_not_wrapped() {
 }
 
 #[test]
+#[should_panic(expected = "linear: output shape m=")]
+fn linear_output_shape_overflow_is_rejected_not_undersized() {
+    // WHY(forkwright/logismos#29): the two read-side checks above guard
+    // `a`/`b`; the WRITE side is `c`, sized by `m * n` and then written
+    // into by `sgemm` at the caller's real (non-saturated) `m`/`n` via
+    // raw strides. A plain `m * n` has no overflow check in a release
+    // build and silently wraps, undersizing `c` while `sgemm` still
+    // writes the real extent — a heap out-of-bounds WRITE, distinct
+    // from (and unguarded by) the `a`/`b` mismatch checks.
+    //
+    // `k = 0` makes both read-side products (`m * k`, `k * n`)
+    // trivially zero regardless of `m`/`n`, so `a = []`/`b = []` pass
+    // their own checks for ANY `m`, `n` — isolating the write-side
+    // product without needing a multi-gigabyte real allocation to
+    // reach this line. `n = 2` and `m` chosen so `m * n` overflows
+    // `usize` (`m.checked_mul(n)` is `None`), the same derivation
+    // `linear_overflowing_shape_is_rejected_not_wrapped` above uses for
+    // `m * k`.
+    //
+    // INVARIANT: this test only distinguishes the fix
+    // (`checked_output_len`, which asserts before allocating) from the
+    // defect (a raw `m * n` at the `vec!` call) under a
+    // debug-assertions-off build: reverting `checked_output_len`'s call
+    // site back to plain `m * n` makes Rust's own arithmetic-overflow
+    // check panic instead (`attempt to multiply with overflow`, since
+    // overflow-checks default on in the dev/test profile), which does
+    // NOT contain the string below and so still fails this
+    // `#[should_panic]` — proven pre-fix via a throwaway scratch branch
+    // + CI run (see PR body).
+    let k = 0usize;
+    let n = 2usize;
+    let m = (usize::MAX / n) + 2; // m * n overflows usize
+    let a: [f32; 0] = [];
+    let b: [f32; 0] = [];
+    let _ = linear(&a, &b, None, m, n, k);
+}
+
+#[test]
+#[should_panic(expected = "linear_t: output shape m=")]
+fn linear_t_output_shape_overflow_is_rejected_not_undersized() {
+    // Mirrors `linear_output_shape_overflow_is_rejected_not_undersized`
+    // for `linear_t`'s independent `c` allocation and
+    // `checked_output_len` call — `k = 0` makes `checked_shape_len(m, 0)`
+    // and `checked_shape_len(n, 0)` both zero regardless of `m`/`n`, so
+    // `a = []`/`b = []` pass trivially and only the write-side `m * n`
+    // product is exercised.
+    let k = 0usize;
+    let n = 2usize;
+    let m = (usize::MAX / n) + 2;
+    let a: [f32; 0] = [];
+    let b: [f32; 0] = [];
+    let _ = linear_t(&a, &b, None, m, n, k);
+}
+
+#[test]
 #[should_panic(expected = "linear_t: a.len()=2 does not match declared shape m=1 * k=3")]
 fn linear_t_mismatched_a_len_panics() {
     let a = [1.0_f32, 2.0]; // 2 elements, m*k=3 declared

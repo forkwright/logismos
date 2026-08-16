@@ -34,22 +34,57 @@ fn usize_to_isize(value: usize) -> isize {
 
 /// Computes `rows * cols` as the element count a declared `(rows, cols)`
 /// shape implies, saturating to [`usize::MAX`] on overflow rather than
-/// silently wrapping. Mirrors `taxis::Shape::elem_count`
-/// (`crates/taxis/src/shape.rs`), which closes the identical overflow gap
-/// for the same reason.
+/// silently wrapping. Scoped to the two READ-side products in
+/// `linear`/`linear_t` (`a.len()` vs `m * k`, `b.len()` vs `k * n` /
+/// `n * k`) — each result is compared against an ALREADY-ALLOCATED real
+/// slice's `.len()`, so saturating to `usize::MAX` is safe: no real
+/// slice ever reaches that length, so the callers' own `assert_eq!`
+/// shape checks reject an overflowing product through the same path as
+/// any other mismatch, no bespoke panic branch needed here. Mirrors
+/// `taxis::Shape::elem_count` (`crates/taxis/src/shape.rs`) for that
+/// same reason.
+///
+/// This function does NOT cover the third product in play, `m * n`
+/// (the output shape sizing `c`, the buffer `sgemm` WRITES into) —
+/// there is no already-allocated slice for a saturated value to be
+/// compared against there, so saturating alone would not reject an
+/// overflow. [`checked_output_len`] covers that product.
 ///
 /// WHY: `linear`/`linear_t` compare this product against a real slice's
 /// `.len()` to validate the shape a caller declares before trusting it as
 /// a bound inside `unsafe`. A wrapped product can compare equal to a
 /// slice that is actually far too short for the declared shape — exactly
 /// the failure mode `forkwright/logismos#29` names for shapes decoded
-/// from an untrusted model header. Saturating instead means no real
-/// slice's `.len()` can ever equal the overflow case (no allocation
-/// reaches `usize::MAX` elements), so the callers' own `assert_eq!`
-/// shape checks reject it through the same path as any other mismatch —
-/// no bespoke panic branch needed here.
+/// from an untrusted model header.
 fn checked_shape_len(rows: usize, cols: usize) -> usize {
     rows.saturating_mul(cols)
+}
+
+/// Computes the element count of an `(m, n)` output shape that `sgemm`
+/// then WRITES into under `unsafe`, asserting the product does not
+/// overflow `usize` in every build profile — including release, where
+/// a plain `m * n` has no overflow checks and silently wraps.
+///
+/// Distinct from [`checked_shape_len`]: that function validates a
+/// declared shape against an already-allocated real slice, where
+/// saturating to `usize::MAX` is safe because no real slice can ever be
+/// that long. Here there is no existing allocation to compare against
+/// — `m * n` directly sizes a FRESH `Vec` that `sgemm` then writes into
+/// at the caller's real, non-saturated `m`/`n` via raw pointer +
+/// stride. A wrapped `m * n` would silently undersize `c` while `sgemm`
+/// still writes the real extent regardless — a heap out-of-bounds
+/// WRITE, not merely a comparison that happens to fail. Reported as its
+/// own diagnostic (distinct from the `a`/`b` length-mismatch messages
+/// above) because "this product overflows" and "this length doesn't
+/// match a declared shape" are different failures with different
+/// causes. `forkwright/logismos#29`.
+fn checked_output_len(context: &str, m: usize, n: usize) -> usize {
+    let product = m.checked_mul(n);
+    assert!(
+        product.is_some(),
+        "{context}: output shape m={m} * n={n} overflows usize"
+    );
+    product.unwrap_or(0)
 }
 
 /// Embedding lookup: `out[b, s, :] = weight[ids[b, s], :]`.
@@ -139,7 +174,11 @@ pub fn rms_norm(x: &[f32], weight: &[f32], rows: usize, n: usize, eps: f32) -> V
 /// `sgemm` call below unchecked in a release build
 /// (`forkwright/logismos#29`); `m * k` and `k * n` are computed via
 /// `checked_shape_len` so an overflowing shape cannot wrap to a value
-/// that spuriously matches a too-short slice.
+/// that spuriously matches a too-short slice. Also panics if `m * n`
+/// (the output shape sizing `c`, the buffer `sgemm` WRITES into) would
+/// overflow `usize` — `checked_output_len` asserts this before `c` is
+/// allocated, in every build profile, so an overflowing product cannot
+/// silently wrap to an undersized buffer that `sgemm` then writes past.
 #[must_use]
 pub fn linear(
     a: &[f32],
@@ -169,13 +208,18 @@ pub fn linear(
             bv.len()
         );
     }
-    let mut c = vec![0.0f32; m * n];
+    let mut c = vec![0.0f32; checked_output_len("linear", m, n)];
     // SAFETY: `a.len() == m * k`, `b.len() == k * n`, and any
     // `bias.len() == n` are enforced above by `assert_eq!` (not
-    // `debug_assert_eq!`), so the check runs identically in every build
-    // profile including release, and `checked_shape_len` rejects an
-    // overflowing `m`/`k`/`n` triple rather than silently wrapping;
-    // sgemm only writes into `c`; `a` and `b` live beyond the call.
+    // `debug_assert_eq!`), so the read extents sgemm derives from `m`,
+    // `k`, `n` stay in bounds in every build profile including release,
+    // and `checked_shape_len` rejects an overflowing `m`/`k`/`n` triple
+    // rather than silently wrapping. `c` is sized above via
+    // `checked_output_len`, which asserts `m * n` does not overflow
+    // `usize` before allocating, so `c.len() == m * n` exactly — the
+    // same `m`/`n` sgemm uses to compute the write extent — closing the
+    // write-side counterpart of the read-side guarantee just described;
+    // `a` and `b` live beyond the call.
     unsafe {
         matrixmultiply::sgemm(
             m,
@@ -218,7 +262,11 @@ pub fn linear(
 /// `sgemm` call below unchecked in a release build
 /// (`forkwright/logismos#29`); `m * k` and `n * k` are computed via
 /// `checked_shape_len` so an overflowing shape cannot wrap to a value
-/// that spuriously matches a too-short slice.
+/// that spuriously matches a too-short slice. Also panics if `m * n`
+/// (the output shape sizing `c`, the buffer `sgemm` WRITES into) would
+/// overflow `usize` — `checked_output_len` asserts this before `c` is
+/// allocated, in every build profile, so an overflowing product cannot
+/// silently wrap to an undersized buffer that `sgemm` then writes past.
 #[must_use]
 pub fn linear_t(
     a: &[f32],
@@ -255,14 +303,17 @@ pub fn linear_t(
     // and column strides: B^T[p, j] = B[j, p], meaning a single source
     // stride (rsb, csb) -> (1, k) encodes B as [k, n] with row stride 1
     // and column stride k. This avoids materialising a transpose.
-    let mut c = vec![0.0f32; m * n];
+    let mut c = vec![0.0f32; checked_output_len("linear_t", m, n)];
     // SAFETY: `a.len() == m * k` and `b.len() == n * k` are enforced
-    // above by `assert_eq!` (not `debug_assert_eq!`), so the check runs
-    // identically in every build profile including release, and
-    // `checked_shape_len` rejects an overflowing `m`/`k`/`n` triple
-    // rather than silently wrapping; the read extents declared by the
-    // row/col strides therefore stay in bounds. sgemm only writes into
-    // `c`, and all input slices outlive the call.
+    // above by `assert_eq!` (not `debug_assert_eq!`), so the read
+    // extents declared by the row/col strides stay in bounds in every
+    // build profile including release, and `checked_shape_len` rejects
+    // an overflowing `m`/`k`/`n` triple rather than silently wrapping.
+    // `c` is sized above via `checked_output_len`, which asserts `m * n`
+    // does not overflow `usize` before allocating, so `c.len() == m * n`
+    // exactly — the same `m`/`n` sgemm uses to compute the write extent
+    // — closing the write-side counterpart of the read-side guarantee
+    // just described; all input slices outlive the call.
     unsafe {
         matrixmultiply::sgemm(
             m,
