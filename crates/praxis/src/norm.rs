@@ -144,7 +144,7 @@ mod tests {
             .into_iter()
             .map(f16::to_f32)
             .collect();
-        let rms = (3.0_f32 * 3.0 + 4.0 * 4.0) / 2.0;
+        let rms = f32::midpoint(3.0_f32 * 3.0, 4.0 * 4.0);
         let rms = rms.sqrt();
         let want = [3.0 / rms, 4.0 / rms];
         for (g, w) in got.iter().zip(want.iter()) {
