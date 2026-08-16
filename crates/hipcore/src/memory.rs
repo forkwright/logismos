@@ -15,8 +15,12 @@ use crate::stream::Stream;
 ///
 /// `T: BytePod` enforces that every bit pattern of `T` is a valid
 /// inhabitant, so reads back from device memory cannot produce an
-/// invalid `T`. `Drop` calls `hipFree`; free errors are logged (via
-/// stderr) and leaked rather than panicking, per library policy.
+/// invalid `T`. `Drop` makes the owning device current, then calls
+/// `hipFree`; a failure at either step is logged (via stderr) and
+/// leaked rather than panicking, per library policy — `hipFree`
+/// targets whichever device is current on the calling thread, not the
+/// device the pointer was allocated on, so freeing after a failed
+/// context switch would act against an unknown device.
 pub struct DeviceBuffer<T: BytePod> {
     ptr: NonNull<T>,
     len: usize,
@@ -209,18 +213,24 @@ impl<T: BytePod> DeviceBuffer<T> {
 
 impl<T: BytePod> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
-        // SAFETY: `ptr` was returned by `hipMalloc` and is owned here.
-        // HIP accepts free from any thread after setting the device.
-        if let Err(error) = self.device.make_current()
-            && writeln!(
+        // WARNING: do not call `hipFree` when `make_current` fails. HIP
+        // frees against whichever device is current on this thread, not
+        // the device `ptr` was allocated on; proceeding here would free
+        // against an unknown (possibly wrong) device context. Skip and
+        // leak instead — consistent with the log-and-leak policy below.
+        if let Err(error) = self.device.make_current() {
+            if writeln!(
                 io::stderr().lock(),
-                "hipcore: make_current before hipFree failed: {error}"
+                "hipcore: make_current before hipFree failed: {error} — leaking buffer"
             )
             .is_err()
-        {
-            // Drop cannot surface secondary stderr failures.
+            {
+                // Drop cannot surface secondary stderr failures.
+            }
+            return;
         }
-        // SAFETY: same.
+        // SAFETY: `ptr` was returned by `hipMalloc` and is owned here;
+        // the owning device was just made current above.
         let status = unsafe { ffi::hipFree(self.ptr.as_ptr().cast::<c_void>()) };
         if status != ffi::hipError_t::hipSuccess
             && writeln!(

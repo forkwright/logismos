@@ -101,17 +101,25 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         if self.owns_handle && !self.handle.is_null() {
-            if let Err(error) = self.device.make_current()
-                && writeln!(
+            // WARNING: do not call `hipStreamDestroy` when `make_current`
+            // fails — same reasoning as `DeviceBuffer::drop`: the destroy
+            // targets whichever device is current on this thread, not
+            // the device the stream was created on. Skip and leak
+            // instead of acting against an unknown device context.
+            if let Err(error) = self.device.make_current() {
+                if writeln!(
                     io::stderr().lock(),
-                    "hipcore: make_current before hipStreamDestroy failed: {error}"
+                    "hipcore: make_current before hipStreamDestroy failed: {error} — leaking stream handle"
                 )
                 .is_err()
-            {
-                // Drop cannot surface secondary stderr failures.
+                {
+                    // Drop cannot surface secondary stderr failures.
+                }
+                return;
             }
-            // SAFETY: handle owned by this wrapper and not yet freed.
-            // Errors during teardown are logged but cannot be returned from Drop.
+            // SAFETY: handle owned by this wrapper and not yet freed;
+            // the owning device was just made current above. Errors
+            // during teardown are logged but cannot be returned from Drop.
             let status = unsafe { ffi::hipStreamDestroy(self.handle) };
             if status != ffi::hipError_t::hipSuccess
                 && writeln!(
