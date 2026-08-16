@@ -221,18 +221,7 @@ impl Reader {
         for _ in 0..metadata_count {
             let key = cur.read_string()?;
             let val = cur.read_meta_value()?;
-            // WHY(forkwright/logismos#60): `HashMap::insert` silently
-            // returns and drops the previous value. For a KV table
-            // parsed from an untrusted file that makes duplicate keys a
-            // shadowing primitive: a crafted GGUF can declare a benign
-            // value for a key, then redeclare it later with a different
-            // one, and only the second survives with nothing to say so.
-            if metadata.contains_key(&key) {
-                return Err(Error::Gguf {
-                    offset: cur.pos,
-                    msg: format!("duplicate metadata key `{key}`"),
-                });
-            }
+            reject_duplicate_metadata_key(&metadata, &key, cur.pos)?;
             metadata.insert(key, val);
         }
 
@@ -266,19 +255,7 @@ impl Reader {
             for _ in 0..n_dims {
                 dims.push(cur.read_u64()?);
             }
-            // WHY(forkwright/logismos#60): a dims entry of 0 makes the
-            // element-count product 0 regardless of the other dims, so
-            // the tensor passes every later bounds check and yields an
-            // empty byte slice while still reporting the original
-            // (non-empty-looking) `dims` in its shape. Reject it here
-            // instead of letting it silently degrade to a zero-byte
-            // tensor downstream.
-            if dims.iter().any(|&d| d == 0) {
-                return Err(Error::Gguf {
-                    offset: cur.pos,
-                    msg: format!("tensor `{name}` has a zero-length dimension: {dims:?}"),
-                });
-            }
+            reject_zero_length_dimension(&name, &dims, cur.pos)?;
             let ggml_type_id = cur.read_u32()?;
             let ggml_type = GgmlType::from_u32(ggml_type_id)?;
             let data_offset = cur.read_u64()?;
@@ -286,19 +263,7 @@ impl Reader {
                 offset: cur.pos,
                 msg: format!("tensor index {i} exceeds usize::MAX"),
             })?;
-            // WHY(forkwright/logismos#60): same shadowing-primitive
-            // rationale as the metadata-key check above — a silent
-            // overwrite here lets a crafted file redeclare a tensor
-            // name against a different index, and any consumer that
-            // walks `tensor_descriptors()` independently of
-            // `tensor_by_name` sees a different picture than name
-            // lookups do.
-            if tensor_by_name.contains_key(&name) {
-                return Err(Error::Gguf {
-                    offset: cur.pos,
-                    msg: format!("duplicate tensor name `{name}`"),
-                });
-            }
+            reject_duplicate_tensor_name(&tensor_by_name, &name, cur.pos)?;
             tensor_by_name.insert(name.clone(), idx_usize);
             tensors.push(TensorDescriptor {
                 name,
@@ -528,6 +493,61 @@ fn align_up(offset: u64, alignment: u64) -> u64 {
         return offset;
     }
     offset.div_ceil(alignment) * alignment
+}
+
+// WHY(forkwright/logismos#60): `HashMap::insert` silently returns and
+// drops the previous value. For a KV table or name index parsed from
+// an untrusted file that makes duplicate keys/names a shadowing
+// primitive: a crafted GGUF can declare a benign entry, then redeclare
+// it later with different content, and only the second survives with
+// nothing to say so. Both checks below reject the duplicate instead.
+
+/// Reject a metadata key already present in `metadata`.
+fn reject_duplicate_metadata_key(
+    metadata: &HashMap<String, MetaValue>,
+    key: &str,
+    offset: u64,
+) -> Result<()> {
+    if metadata.contains_key(key) {
+        return Err(Error::Gguf {
+            offset,
+            msg: format!("duplicate metadata key `{key}`"),
+        });
+    }
+    Ok(())
+}
+
+/// Reject a tensor name already present in `tensor_by_name`.
+fn reject_duplicate_tensor_name(
+    tensor_by_name: &HashMap<String, usize>,
+    name: &str,
+    offset: u64,
+) -> Result<()> {
+    if tensor_by_name.contains_key(name) {
+        return Err(Error::Gguf {
+            offset,
+            msg: format!("duplicate tensor name `{name}`"),
+        });
+    }
+    Ok(())
+}
+
+/// Reject a tensor `dims` vector containing a zero-length dimension.
+///
+/// WHY(forkwright/logismos#60): a dims entry of 0 makes the
+/// element-count product 0 regardless of the other dims, so the tensor
+/// passes every later bounds check and yields an empty byte slice
+/// while still reporting the original (non-empty-looking) `dims` in
+/// its shape. Reject it here instead of letting it silently degrade to
+/// a zero-byte tensor downstream.
+fn reject_zero_length_dimension(name: &str, dims: &[u64], offset: u64) -> Result<()> {
+    if dims.contains(&0) {
+        return Err(Error::Gguf {
+            offset,
+            msg: format!("tensor `{name}` has a zero-length dimension: {dims:?}"),
+        });
+    }
+    Ok(())
 }
 
 /// Tiny stream-cursor over a mmap.

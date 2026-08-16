@@ -25,6 +25,12 @@ use safetensors::tensor::Dtype as UpstreamDtype;
 use crate::error::{Error, Result};
 use crate::{TensorView, WeightProvider, check_mmap_not_truncated};
 
+/// The header's first 8 bytes are a little-endian `u64` declaring the
+/// JSON header's own byte length; `SafeTensors::read_metadata` reports
+/// that length alone, so the tensor-data region starts this many bytes
+/// further in.
+const HEADER_LEN_PREFIX: usize = 8;
+
 /// Owning safetensors archive.
 pub struct Reader {
     path: PathBuf,
@@ -79,10 +85,6 @@ impl Reader {
         // `Metadata`, whose `TensorInfo::data_offsets` is the offset
         // pair directly — no pointer arithmetic required.
         let (header_size, metadata) = SafeTensors::read_metadata(&mmap)?;
-        // The header's first 8 bytes are a u64 LE declaring the JSON
-        // header's own byte length; `read_metadata` reports that length
-        // alone, so tensor-data starts 8 bytes further in.
-        const HEADER_LEN_PREFIX: usize = 8;
         let data_region_start = header_size.checked_add(HEADER_LEN_PREFIX).ok_or_else(|| {
             Error::Safetensors("safetensors header + size prefix overflows usize".into())
         })?;
