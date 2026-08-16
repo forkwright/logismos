@@ -32,21 +32,10 @@ pub(crate) enum DevicePlacement {
 /// presence alone. Never inspects the storage itself, so it needs no
 /// HIP device and runs anywhere this crate compiles.
 pub(crate) fn classify_placement(a_is_hip: bool, b_is_hip: bool) -> DevicePlacement {
-    // DELIBERATE-BREAK(negative-fixture, forkwright/logismos#38/#39 PR):
-    // v4 -- the literal original two-arm wildcard collapse (`_ =>`),
-    // byte-for-byte the pre-fix shape, no or-pattern reshaping. v1-v3
-    // each tried to keep `Mixed` reachable while still routing
-    // `(true, false)` to `BothCpu`, and each was caught by clippy
-    // (match_same_arms, unnested_or_patterns) before nextest ever ran
-    // -- real CI rejections, but not evidence the *test* itself
-    // catches this. A bare wildcard has only two match arms with two
-    // distinct bodies, so neither clippy lint fires; this is the
-    // version that actually reaches
-    // `mixed_placement_is_neither_bothcpu_nor_bothhip` and lets it
-    // assert. Not the shipped state -- reverted in the next commit.
     match (a_is_hip, b_is_hip) {
         (true, true) => DevicePlacement::BothHip,
-        _ => DevicePlacement::BothCpu,
+        (false, false) => DevicePlacement::BothCpu,
+        (true, false) | (false, true) => DevicePlacement::Mixed,
     }
 }
 
