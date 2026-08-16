@@ -21,8 +21,8 @@
 # own WHY comment, not applicable to a GH-hosted runner; `--no-fail-fast`
 # on nextest is a behavioral choice, not a concurrency cap, so it is kept).
 #
-# WHY rust_toolchain left empty: rust-toolchain.toml pins channel 1.90 —
-# auto-detect applies (fleet convention).
+# WHY rust_toolchain left empty: rust-toolchain.toml is the one place that pins the
+# channel — auto-detect applies (fleet convention), so this workflow never restates it.
 #
 # WHY needs_fleet_repo_token false: no `git = "https://github.com/forkwright/..."`
 # dependency anywhere in the workspace (grepped directly).
