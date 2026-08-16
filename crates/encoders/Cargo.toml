@@ -14,5 +14,8 @@ taxis = { workspace = true }
 transformers = { path = "../transformers" }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+safetensors = { workspace = true }
+
 [lints]
 workspace = true
