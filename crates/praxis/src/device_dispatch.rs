@@ -32,10 +32,13 @@ pub(crate) enum DevicePlacement {
 /// presence alone. Never inspects the storage itself, so it needs no
 /// HIP device and runs anywhere this crate compiles.
 pub(crate) fn classify_placement(a_is_hip: bool, b_is_hip: bool) -> DevicePlacement {
+    // DELIBERATE-BREAK(negative-fixture, forkwright/logismos#38/#39 PR):
+    // reproduces the pre-fix wildcard collapse to watch the regression
+    // test fail on CI before restoring the real fix. Not the shipped
+    // state.
     match (a_is_hip, b_is_hip) {
         (true, true) => DevicePlacement::BothHip,
-        (false, false) => DevicePlacement::BothCpu,
-        (true, false) | (false, true) => DevicePlacement::Mixed,
+        _ => DevicePlacement::BothCpu,
     }
 }
 
