@@ -149,25 +149,12 @@ pub fn linear(
     n: usize,
     k: usize,
 ) -> Vec<f32> {
-    assert_eq!(
-        a.len(),
-        checked_shape_len(m, k),
-        "linear: a.len()={} does not match declared shape m={m} * k={k}",
-        a.len()
-    );
-    assert_eq!(
-        b.len(),
-        checked_shape_len(k, n),
-        "linear: b.len()={} does not match declared shape k={k} * n={n}",
-        b.len()
-    );
+    // SCRATCH-REGRESSION-PROOF: temporarily restores the pre-fix guard to
+    // watch the new tests fail against it under --release. Never merge.
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(b.len(), k * n);
     if let Some(bv) = bias {
-        assert_eq!(
-            bv.len(),
-            n,
-            "linear: bias.len()={} does not match declared n={n}",
-            bv.len()
-        );
+        debug_assert_eq!(bv.len(), n);
     }
     let mut c = vec![0.0f32; m * n];
     // SAFETY: `a.len() == m * k`, `b.len() == k * n`, and any
@@ -228,25 +215,12 @@ pub fn linear_t(
     n: usize,
     k: usize,
 ) -> Vec<f32> {
-    assert_eq!(
-        a.len(),
-        checked_shape_len(m, k),
-        "linear_t: a.len()={} does not match declared shape m={m} * k={k}",
-        a.len()
-    );
-    assert_eq!(
-        b.len(),
-        checked_shape_len(n, k),
-        "linear_t: b.len()={} does not match declared shape n={n} * k={k}",
-        b.len()
-    );
+    // SCRATCH-REGRESSION-PROOF: temporarily restores the pre-fix guard to
+    // watch the new tests fail against it under --release. Never merge.
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(b.len(), n * k);
     if let Some(bv) = bias {
-        assert_eq!(
-            bv.len(),
-            n,
-            "linear_t: bias.len()={} does not match declared n={n}",
-            bv.len()
-        );
+        debug_assert_eq!(bv.len(), n);
     }
 
     // C = A @ B^T  where A: [m, k] row-major, B: [n, k] row-major (the
