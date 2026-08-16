@@ -24,6 +24,23 @@ All notable changes to logismos are recorded here.
 - Kernel result defaults: explicit handling in cfg-gated branches
 - Matmul CPU helper visibility: narrowed to `pub(crate)`
 
+## [1.0.6](https://github.com/forkwright/logismos/compare/v1.0.5...v1.0.6) (2026-08-16)
+
+
+### Bug Fixes
+
+* **decode,encoders:** mask NaN in TopK, reuse its buffer; name+test the stella tensor-count guard ([#84](https://github.com/forkwright/logismos/issues/84)) ([312bd81](https://github.com/forkwright/logismos/commit/312bd815ade1c9f3fedae6175f6f394ce9c2a040))
+* **embed:** correct stella IO/prompt/shape/core-count defects; add tests ([#87](https://github.com/forkwright/logismos/issues/87)) ([dc35ba9](https://github.com/forkwright/logismos/commit/dc35ba95bb947336d13e0eac7c4323c12aaf18cb))
+* **hipcore, praxis:** audit batch — device-context Drop, odd head_dim, stream/table churn ([#85](https://github.com/forkwright/logismos/issues/85)) ([b531436](https://github.com/forkwright/logismos/commit/b531436d605099f8d1edba43e141b2cef952a10e))
+* **praxis:** reject mixed HIP/CPU device pairs in matmul and rms_norm ([#97](https://github.com/forkwright/logismos/issues/97)) ([5b4e92b](https://github.com/forkwright/logismos/commit/5b4e92be5911759c001f432b1f003d22de7770d4))
+* **taxis,kernels:** close silent-degradation gaps in shape/kernel invariants ([#88](https://github.com/forkwright/logismos/issues/88)) ([e7f1295](https://github.com/forkwright/logismos/commit/e7f129507029ff8070615b3b069b1ed8a7dc88d6))
+
+
+### Documentation
+
+* correct the residual private claim and portable-path the kanon pointers ([#80](https://github.com/forkwright/logismos/issues/80)) ([5d0c4dd](https://github.com/forkwright/logismos/commit/5d0c4ddb10d96d2965b63e4682812c56f35f7e1e))
+* **kanon-root:** complete [#65](https://github.com/forkwright/logismos/issues/65)'s portable-path fix, close the docs-sync gap ([#90](https://github.com/forkwright/logismos/issues/90)) ([f499910](https://github.com/forkwright/logismos/commit/f4999108040057ab0998143b54078d6640bd5c6d))
+
 ## [1.0.5](https://github.com/forkwright/logismos/compare/v1.0.4...v1.0.5) (2026-08-15)
 
 
