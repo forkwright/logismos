@@ -138,10 +138,15 @@ impl HipStorage {
     ///
     /// # Errors
     ///
-    /// [`Error::Hip`] on allocation failure.
+    /// [`Error::Hip`] on allocation or zero-fill failure.
     pub fn alloc(device: &Device, dtype: DType, elem_count: usize) -> Result<Self> {
         let bytes = dtype.byte_count(elem_count);
-        let buffer = DeviceBuffer::<u8>::alloc(device, bytes)?;
+        let mut buffer = DeviceBuffer::<u8>::alloc(device, bytes)?;
+        // WARNING: `hipMalloc` does not zero device memory. This
+        // constructor's name and contract promise zeroed output (see
+        // `Tensor::zeros_hip`), so callers must never observe residual
+        // memory from a prior allocation — closes forkwright/logismos#26.
+        buffer.zero_fill()?;
         Ok(Self {
             buffer: Arc::new(buffer),
             dtype,
@@ -152,10 +157,21 @@ impl HipStorage {
 
     /// Copy a typed host slice to a freshly allocated HIP storage.
     ///
+    /// `T`'s size must exactly match `dtype`'s declared element size —
+    /// a caller-supplied `dtype` that disagrees with the actual host
+    /// buffer would otherwise construct a storage whose `dtype`,
+    /// `elem_count`, and `byte_len` are mutually inconsistent, letting
+    /// dtype-dispatched kernels reinterpret the bytes at a distance
+    /// from this call site (forkwright/logismos#40).
+    ///
     /// # Errors
     ///
+    /// [`Error::Msg`] when `dtype`'s element size disagrees with
+    /// `size_of::<T>()`, or when `dtype` is sub-byte-packed (no
+    /// `T: BytePod` slice can represent it).
     /// [`Error::Hip`] on allocation or memcpy failure.
     pub fn from_host<T: BytePod>(device: &Device, dtype: DType, data: &[T]) -> Result<Self> {
+        Self::validate_dtype_matches::<T>(dtype)?;
         // SAFETY: `T: BytePod` guarantees every bit pattern is valid
         // and the type is `Copy`. Transmuting the slice to a byte
         // view is defined.
@@ -169,6 +185,31 @@ impl HipStorage {
             elem_count: data.len(),
             device: device.clone(),
         })
+    }
+
+    /// Reject a `T` / `dtype` pair whose element sizes disagree, or a
+    /// `dtype` no `T: BytePod` slice can represent (sub-byte-packed).
+    ///
+    /// Pure host-side arithmetic — no device required — so it is
+    /// unit-testable without HIP/ROCm and is the sole gate `from_host`
+    /// runs through before touching device memory.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Msg`] on disagreement, per [`Self::from_host`].
+    fn validate_dtype_matches<T: BytePod>(dtype: DType) -> Result<()> {
+        let elem_size = core::mem::size_of::<T>();
+        match dtype.size_in_bytes_exact() {
+            Some(expected) if expected == elem_size => Ok(()),
+            Some(expected) => Err(Error::Msg(format!(
+                "from_host dtype/element-size mismatch: dtype {dtype:?} is {expected}B/elem, \
+                 but T is {elem_size}B (elem_count and byte_len would disagree with dtype)"
+            ))),
+            None => Err(Error::Msg(format!(
+                "from_host: dtype {dtype:?} is sub-byte-packed and cannot be represented by \
+                 a T: BytePod slice"
+            ))),
+        }
     }
 
     /// Element count.
@@ -314,5 +355,44 @@ impl Storage {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // WHY: pure host-side arithmetic (dtype byte-size vs `size_of::<T>()`) —
+    // no `Device`/HIP runtime involved, so these run without ROCm/GPU
+    // hardware, unlike every other `HipStorage` constructor.
+
+    #[test]
+    fn validate_dtype_matches_accepts_agreeing_pair() {
+        assert!(HipStorage::validate_dtype_matches::<f32>(DType::F32).is_ok());
+        assert!(HipStorage::validate_dtype_matches::<half::f16>(DType::F16).is_ok());
+        assert!(HipStorage::validate_dtype_matches::<u8>(DType::U8).is_ok());
+    }
+
+    #[test]
+    fn validate_dtype_matches_rejects_size_mismatch() {
+        // WHY: the exact confusion #40 describes — T=f32 (4B) paired with a
+        // caller-supplied dtype declaring 2B/elem. Pre-fix, `from_host`
+        // accepted this silently and stored `dtype=F16` with
+        // `elem_count` counted in f32 units — internally inconsistent
+        // metadata a dtype-dispatched kernel would misread.
+        assert!(matches!(
+            HipStorage::validate_dtype_matches::<f32>(DType::F16),
+            Err(Error::Msg(_))
+        ));
+    }
+
+    #[test]
+    fn validate_dtype_matches_rejects_sub_byte_dtype() {
+        // WHY: no `T: BytePod` slice can represent a packed sub-byte dtype
+        // regardless of `T`; `size_in_bytes_exact()` is `None` for I4.
+        assert!(matches!(
+            HipStorage::validate_dtype_matches::<u8>(DType::I4),
+            Err(Error::Msg(_))
+        ));
     }
 }
