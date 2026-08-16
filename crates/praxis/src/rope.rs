@@ -1,8 +1,9 @@
 //! `praxis::rope_apply` — rotary position embedding.
 
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use hipcore::{Device, DeviceBuffer, Stream};
+use hipcore::{Device, DeviceBuffer};
 use taxis::{DType, Tensor};
 
 use crate::error::{Error, Result};
@@ -23,6 +24,10 @@ pub struct CosSinTable {
     pub seq: usize,
     /// Head dimension; must be even.
     pub head_dim: usize,
+    /// Device-resident upload, keyed by device ordinal. `rope_apply`
+    /// re-uploads only on the first call for a given device (or after a
+    /// different device is passed), instead of on every call.
+    device_cache: Mutex<Option<(c_int, Arc<DeviceBuffer<u8>>)>>,
 }
 
 impl CosSinTable {
@@ -34,7 +39,42 @@ impl CosSinTable {
             data: kernels::rope::cpu::build_cos_sin_table(seq, head_dim, theta),
             seq,
             head_dim,
+            device_cache: Mutex::new(None),
         }
+    }
+
+    /// Device-resident cos/sin table for `device`, uploading once and
+    /// reusing the allocation on subsequent calls for the same device.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Hip`] if the upload fails.
+    fn device_buffer(&self, device: &Device) -> Result<Arc<DeviceBuffer<u8>>> {
+        // WARNING: do not panic-unwrap a mutex poison here — `unwrap_used`
+        // is a deny-level lint in this workspace. Recovering the guard is
+        // correct: a panic while holding this lock leaves the cached
+        // upload's *content* untouched (only the cache slot's
+        // book-keeping could be mid write), so treating a poisoned lock
+        // as a normal guard is safe.
+        let mut cache = self
+            .device_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((ordinal, buf)) = cache.as_ref()
+            && *ordinal == device.ordinal()
+        {
+            return Ok(Arc::clone(buf));
+        }
+        let cs_bytes: &[u8] = unsafe {
+            // SAFETY: `f32` is BytePod; slice covers `data.len()` f32s.
+            std::slice::from_raw_parts(
+                self.data.as_ptr().cast::<u8>(),
+                self.data.len() * size_of::<f32>(),
+            )
+        };
+        let buf = Arc::new(DeviceBuffer::<u8>::from_host(device, cs_bytes)?);
+        *cache = Some((device.ordinal(), Arc::clone(&buf)));
+        Ok(buf)
     }
 }
 
@@ -81,6 +121,17 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
             ),
         });
     }
+    // WHY: the pair-rotation kernel and its CPU reference both index
+    // `2 * pair_idx` / `2 * pair_idx + 1` off `head_dim / 2`. An odd
+    // `head_dim` truncates that division, silently dropping the final
+    // element instead of rotating it — reject it here rather than
+    // letting a malformed checkpoint produce quietly wrong encoding.
+    if !head_dim.is_multiple_of(2) {
+        return Err(Error::Invalid {
+            op: "rope_apply",
+            msg: format!("head_dim must be even, got {head_dim}"),
+        });
+    }
 
     match qk.hip_storage() {
         Some(qk_hip) => {
@@ -94,27 +145,24 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
                 msg: "clone did not return HIP".into(),
             })?;
 
-            // Upload the cos_sin table.
-            let cs_bytes: &[u8] = unsafe {
-                // SAFETY: `f32` is BytePod; slice is valid.
-                std::slice::from_raw_parts(table.data.as_ptr().cast::<u8>(), table.data.len() * 4)
-            };
-            let cs_dev = DeviceBuffer::<u8>::from_host(device, cs_bytes)?;
+            let cs_dev = table.device_buffer(device)?;
 
-            let stream = Stream::new(device)?;
-            // SAFETY: device pointers valid; sizes verified above.
-            unsafe {
-                kernels::rope::launch_rope_fp16_in_place(
-                    out_hip.as_mut_device_ptr().cast::<c_void>(),
-                    cs_dev.as_device_ptr().cast::<c_void>(),
-                    dim_i32(batch, "batch")?,
-                    dim_i32(seq, "seq")?,
-                    dim_i32(heads, "heads")?,
-                    dim_i32(head_dim, "head_dim")?,
-                    &stream,
-                )?;
-            }
-            stream.synchronize()?;
+            crate::stream_pool::POOL.with_stream(device, |stream| {
+                // SAFETY: device pointers valid; sizes verified above.
+                unsafe {
+                    kernels::rope::launch_rope_fp16_in_place(
+                        out_hip.as_mut_device_ptr().cast::<c_void>(),
+                        cs_dev.as_device_ptr().cast::<c_void>(),
+                        dim_i32(batch, "batch")?,
+                        dim_i32(seq, "seq")?,
+                        dim_i32(heads, "heads")?,
+                        dim_i32(head_dim, "head_dim")?,
+                        stream,
+                    )?;
+                }
+                stream.synchronize()?;
+                Ok(())
+            })?;
             Ok(out)
         }
         None => {
@@ -151,5 +199,41 @@ fn clone_hip_tensor(t: &Tensor, device: &Device) -> Result<Tensor> {
             op: "clone_hip_tensor",
             msg: format!("unsupported dtype {other:?}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::expect_used, reason = "test assertions use expect() directly")]
+
+    use half::f16;
+    use taxis::{CpuStorage, Shape};
+
+    use super::*;
+
+    #[test]
+    fn rope_apply_rejects_odd_head_dim() {
+        let (batch, seq, heads, head_dim) = (1_usize, 2_usize, 1_usize, 5_usize);
+        let qk = Tensor::from_cpu(
+            CpuStorage::F16(vec![f16::from_f32(0.0); batch * seq * heads * head_dim]),
+            Shape::new(&[batch, seq, heads, head_dim]),
+        );
+        // Bypass `CosSinTable::new` — its CPU table builder
+        // debug_asserts an even `head_dim` itself, which would panic
+        // before `rope_apply`'s own validation ever ran. Constructing
+        // the table directly isolates the check under test.
+        let table = CosSinTable {
+            data: vec![0.0; seq * head_dim],
+            seq,
+            head_dim,
+            device_cache: Mutex::new(None),
+        };
+
+        let err = rope_apply(&qk, &table).expect_err("odd head_dim must be rejected");
+
+        assert!(
+            matches!(&err, Error::Invalid { op: "rope_apply", msg } if msg.contains("even")),
+            "expected an even-head_dim Invalid error, got {err:?}"
+        );
     }
 }

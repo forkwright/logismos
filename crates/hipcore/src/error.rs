@@ -94,7 +94,6 @@ pub enum ErrorKind {
     NotFound,
     NotReady,
     IllegalAddress,
-    MemoryFault,
     /// Catch-all for unmapped raw codes.
     Unknown(u32),
 }
@@ -196,5 +195,39 @@ pub fn check(code: ffi::hipError_t, op: &'static str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::runtime(hipError_t_code(code), op))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::expect_used, reason = "test assertions use expect() directly")]
+
+    use super::*;
+
+    /// Every raw code `hipError_t_from_u32` maps to a named variant.
+    /// Single source of truth for the round-trip test below — kept
+    /// separate from the match arms so the test fails loudly on a
+    /// forward/reverse mismatch instead of trivially agreeing with
+    /// itself.
+    const MAPPED_CODES: &[u32] = &[0, 1, 2, 3, 4, 35, 53, 500, 600, 700, 701, 702, 719];
+
+    #[test]
+    fn mapped_codes_round_trip_through_hip_error_t() {
+        for &code in MAPPED_CODES {
+            let variant =
+                hipError_t_from_u32(code).expect("MAPPED_CODES entry must have a forward mapping");
+            assert_eq!(
+                hipError_t_code(variant),
+                code,
+                "code {code} does not round-trip through hipError_t_code \
+                 (forward and reverse mappings disagree)"
+            );
+        }
+    }
+
+    #[test]
+    fn unmapped_code_falls_through_to_unknown() {
+        assert!(hipError_t_from_u32(9_999).is_none());
+        assert_eq!(ErrorKind::from_raw(9_999), ErrorKind::Unknown(9_999));
     }
 }
