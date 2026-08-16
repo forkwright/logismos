@@ -52,6 +52,6 @@ pub mod stream;
 
 pub use crate::device::{Device, DeviceProps, MemoryBudget, PciBusId};
 pub use crate::error::{Error, ErrorKind, Result, check};
-pub use crate::memory::DeviceBuffer;
+pub use crate::memory::{DeviceBuffer, PendingCopy};
 pub use crate::pod::BytePod;
 pub use crate::stream::{Event, Stream};
