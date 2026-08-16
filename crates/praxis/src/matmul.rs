@@ -4,6 +4,7 @@ use std::ffi::c_void;
 
 use taxis::{DType, Shape, Tensor};
 
+use crate::device_dispatch::{DevicePlacement, classify_placement};
 use crate::error::{Error, Result};
 
 fn dim_i32(value: usize, name: &'static str) -> Result<i32> {
@@ -73,9 +74,17 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 
     // Phase 1 dispatch: if inputs are on HIP, use the WMMA kernel for
     // 16-aligned shapes else the naive kernel. CPU tensors fall back
-    // to the CPU reference path.
-    match (a.hip_storage(), b.hip_storage()) {
-        (Some(a_hip), Some(b_hip)) => {
+    // to the CPU reference path. A mixed HIP/CPU pair is rejected —
+    // see `DevicePlacement::Mixed` below.
+    let placement = classify_placement(a.hip_storage().is_some(), b.hip_storage().is_some());
+    match placement {
+        DevicePlacement::BothHip => {
+            let (Some(a_hip), Some(b_hip)) = (a.hip_storage(), b.hip_storage()) else {
+                return Err(Error::Invalid {
+                    op: "matmul",
+                    msg: "device-pair classification invariant violated: BothHip without two HIP operands".into(),
+                });
+            };
             let device = a_hip.device();
             if device.ordinal() != b_hip.device().ordinal() {
                 return Err(Error::Invalid {
@@ -120,8 +129,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             })?;
             Ok(out)
         }
-        _ => {
-            // CPU fallback — both on CPU.
+        DevicePlacement::BothCpu => {
             let a_host = a.to_host_f16()?;
             let b_host = b.to_host_f16()?;
             let out = kernels::matmul::cpu::matmul_fp16_ref(&a_host, &b_host, m, n, ka);
@@ -130,5 +138,54 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
                 Shape::new(&[m, n]),
             ))
         }
+        // WHY(forkwright/logismos#39): a mixed pair used to fall through
+        // the old wildcard arm — commented "CPU fallback — both on
+        // CPU" while structurally matching every non-both-HIP
+        // combination — silently transferring the HIP operand to host
+        // with no error and no diagnostic. A and B must both be on CPU
+        // or both on the same HIP device; mismatched placement is a
+        // caller bug and must fail loudly (CLAUDE.md:77, AGENTS.md:29
+        // — no silent CPU fallbacks).
+        DevicePlacement::Mixed => Err(Error::Invalid {
+            op: "matmul",
+            msg: "A and B must both be on CPU or both on the same HIP device".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::expect_used,
+        reason = "test assertions use expect()/expect_err() directly"
+    )]
+
+    use half::f16;
+    use taxis::{CpuStorage, Shape, Tensor};
+
+    use super::matmul;
+
+    fn f16_tensor(values: &[f32], shape: &[usize]) -> Tensor {
+        let data: Vec<f16> = values.iter().copied().map(f16::from_f32).collect();
+        Tensor::from_cpu(CpuStorage::F16(data), Shape::new(shape))
+    }
+
+    /// WHY: exercises the `DevicePlacement::BothCpu` arm through the
+    /// real public `matmul` entry point — the same arm the mixed-device
+    /// fix (forkwright/logismos#39) sits directly beside. A HIP device
+    /// is nowhere in this fleet, so the GPU and `Mixed` arms cannot be
+    /// driven end-to-end here; this pins the CPU-only arithmetic that
+    /// CAN run, and CI confirms it on every push.
+    #[test]
+    fn both_cpu_matmul_computes_expected_product() {
+        let a = f16_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let identity = f16_tensor(&[1.0, 0.0, 0.0, 1.0], &[2, 2]);
+        let out = matmul(&a, &identity).expect("both-CPU matmul must still succeed");
+        let got = out.to_host_f16().expect("to_host_f16");
+        let want: Vec<f16> = [1.0_f32, 2.0, 3.0, 4.0]
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        assert_eq!(got, want, "A @ I must equal A");
     }
 }
