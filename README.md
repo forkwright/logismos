@@ -28,8 +28,8 @@ CPU-only, `logismos_no_gpu_kernels`-cfg'd build (this is the normal
 path on a GH-hosted CI runner and any box without ROCm).
 
 On a box that *has* ROCm installed but where a HIP kernel compile needs
-to be skipped anyway — bisecting a `hipcc` regression, working around a
-broken local ROCm install, or a fast CPU-only iteration loop — set
+to be skipped anyway - bisecting a `hipcc` regression, working around a
+broken local ROCm install, or a fast CPU-only iteration loop - set
 `LOGISMOS_SKIP_HIP_BUILD` to force the same CPU-only fallback the
 `hipcc`-absent path takes:
 
@@ -37,20 +37,22 @@ broken local ROCm install, or a fast CPU-only iteration loop — set
 LOGISMOS_SKIP_HIP_BUILD=1 cargo build
 ```
 
-Cost: the resulting build has no GPU kernels — `kernels` compiles
+Cost: the resulting build has no GPU kernels - `kernels` compiles
 against its CPU reference path only, and any HIP-backed op returns
 `Error::NoGpuBuild` at runtime instead of running on-device.
 
 ## Layout
 
-Planning canonical lives in kanon:
+Planning canonical lives in kanon, under `projects/logismos/`. Resolve the kanon
+checkout root on this box with `kanon locate kanon-repo` (never hardcode a path -
+it differs per machine):
 
-- `~/dev/kanon/projects/logismos/vision.md` - what this is and what it is not.
-- `~/dev/kanon/projects/logismos/ROADMAP.md` - phased plan.
-- `~/dev/kanon/projects/logismos/STATE.md` - current state.
-- `~/dev/kanon/projects/logismos/gnomon.md` - naming discipline inherited from the ecosystem.
-- `~/dev/kanon/projects/logismos/research/` - research dossiers.
-- `~/dev/kanon/projects/logismos/phases/NN-*/PLAN.md` - per-phase implementation specs.
+- `projects/logismos/vision.md` - what this is and what it is not.
+- `projects/logismos/ROADMAP.md` - phased plan.
+- `projects/logismos/STATE.md` - current state.
+- `projects/logismos/gnomon.md` - naming discipline inherited from the ecosystem.
+- `projects/logismos/research/` - research dossiers.
+- `projects/logismos/phases/NN-*/PLAN.md` - per-phase implementation specs.
 
 Repo-local:
 

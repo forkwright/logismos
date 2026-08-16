@@ -8,9 +8,10 @@
 //! in Phase 1 — CPU and HIP. Every HIP storage-backed tensor pins a
 //! `hipcore::Device` for kernel dispatch.
 //!
-//! Design source: `~/dev/kanon/projects/logismos/research/02-rust-frameworks.md`
-//! §3 (candle-shaped tensor) +
-//! `~/dev/kanon/projects/logismos/phases/01-foundation/PLAN.md` §6.2.
+//! Design source: kanon's `projects/logismos/research/02-rust-frameworks.md`
+//! §3 (candle-shaped tensor) + `projects/logismos/phases/01-foundation/PLAN.md`
+//! §6.2. (Resolve the kanon checkout root on this box with `kanon locate
+//! kanon-repo`.)
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]

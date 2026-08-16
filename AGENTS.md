@@ -1,12 +1,12 @@
 ---
 scope: logismos repo conventions (Rust+HIP inference runtime, ~27 peer crates, W7900 primary target)
-defers_to: kanon standards at ~/dev/kanon/crates/basanos/standards/
+defers_to: kanon standards at kanon's crates/basanos/standards/ (see CLAUDE.md for how to resolve the kanon checkout root on this box)
 tightens: no-external-ML-framework rule, HIP FFI as lowest acceptable layer, per-kernel CPU-reference-test policy
 ---
 
 # AGENTS.md - Logismos
 
-Cross-tool guide for AI coding agents (Claude Code, Kimi, Codex, Cursor, Copilot, etc.). Read [CLAUDE.md](CLAUDE.md) for operating instructions. Planning canonical lives in kanon: `~/dev/kanon/projects/logismos/{vision,ROADMAP,STATE}.md`.
+Cross-tool guide for AI coding agents (Claude Code, Kimi, Codex, Cursor, Copilot, etc.). Read [CLAUDE.md](CLAUDE.md) for operating instructions. Planning canonical lives in kanon: `projects/logismos/{vision,ROADMAP,STATE}.md` (resolve the kanon checkout root on this box with `kanon locate kanon-repo` — never hardcode a path).
 
 ## Build / Test / Lint
 
@@ -50,11 +50,11 @@ Use `CARGO_TARGET_DIR=/data/target` from `<workspace>/logismos`. Leave `CARGO_TA
 | STT pipeline | `crates/ekphrasis/` |
 | Tokenizer | `crates/tokenize/` |
 
-Crate architecture + dependency direction lives in `~/dev/kanon/projects/logismos/vision.md` (role table) and `~/dev/kanon/projects/logismos/STATE.md` (current state).
+Crate architecture + dependency direction lives in kanon's `projects/logismos/vision.md` (role table) and `projects/logismos/STATE.md` (current state).
 
 ## Standards
 
-Universal engineering policy lives in kanon at `~/dev/kanon/crates/basanos/standards/`. Read `STANDARDS.md` § Philosophy before writing code. Check `RUST.md` for language-specific rules. Logismos tightens kanon's universal rules with the no-external-ML-framework, per-kernel-CPU-test, and HIP-FFI-floor policies above.
+Universal engineering policy lives in kanon at `crates/basanos/standards/`. Read `STANDARDS.md` § Philosophy before writing code. Check `RUST.md` for language-specific rules. Logismos tightens kanon's universal rules with the no-external-ML-framework, per-kernel-CPU-test, and HIP-FFI-floor policies above.
 
 ## Boundaries
 
