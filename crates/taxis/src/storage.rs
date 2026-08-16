@@ -362,7 +362,7 @@ impl Storage {
 mod tests {
     use super::*;
 
-    // Pure host-side arithmetic (dtype byte-size vs `size_of::<T>()`) —
+    // WHY: pure host-side arithmetic (dtype byte-size vs `size_of::<T>()`) —
     // no `Device`/HIP runtime involved, so these run without ROCm/GPU
     // hardware, unlike every other `HipStorage` constructor.
 
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn validate_dtype_matches_rejects_size_mismatch() {
-        // The exact confusion #40 describes: T=f32 (4B) paired with a
+        // WHY: the exact confusion #40 describes — T=f32 (4B) paired with a
         // caller-supplied dtype declaring 2B/elem. Pre-fix, `from_host`
         // accepted this silently and stored `dtype=F16` with
         // `elem_count` counted in f32 units — internally inconsistent
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn validate_dtype_matches_rejects_sub_byte_dtype() {
-        // No `T: BytePod` slice can represent a packed sub-byte dtype
+        // WHY: no `T: BytePod` slice can represent a packed sub-byte dtype
         // regardless of `T`; `size_in_bytes_exact()` is `None` for I4.
         assert!(matches!(
             HipStorage::validate_dtype_matches::<u8>(DType::I4),
