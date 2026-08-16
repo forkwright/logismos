@@ -278,6 +278,14 @@ fn mask_additive_non_dividing_rows_panics() {
     // fix, `debug_assert!` was stripped in release and `repeat =
     // rows / mask_rows` floor-divided, silently leaving the
     // trailing row unmasked instead of erroring.
+    //
+    // INVARIANT: this test only distinguishes the fix (`assert!`) from
+    // the defect (`debug_assert!`) under a debug-assertions-off build —
+    // both panic identically otherwise. `.github/workflows/gate-attestation.yml`
+    // runs this crate a second time under `--release` for exactly that
+    // reason; a `cargo nextest run --workspace` alone (debug-assertions
+    // on by default) cannot tell the two apart and would pass unchanged
+    // if this were reverted to `debug_assert!`.
     let mut s = vec![1.0_f32; 15]; // 5 rows, 3 cols
     let mask = [1_u8, 0, 1, 1, 1, 1]; // 2 mask rows
     mask_additive_in_place(&mut s, &mask, 5, 3);
@@ -308,6 +316,14 @@ fn hadamard_mismatched_lengths_panics() {
     // kernel other GPU kernels are validated against, so a
     // silently-shorter output can make a parity test pass while
     // comparing against wrong data.
+    //
+    // INVARIANT: this test only distinguishes the fix (`assert_eq!`)
+    // from the defect (`debug_assert_eq!`) under a debug-assertions-off
+    // build — both panic identically otherwise. `.github/workflows/gate-attestation.yml`
+    // runs this crate a second time under `--release` for exactly that
+    // reason; a `cargo nextest run --workspace` alone (debug-assertions
+    // on by default) cannot tell the two apart and would pass unchanged
+    // if this were reverted to `debug_assert_eq!`.
     let a = [1.0_f32, 2.0, 3.0];
     let b = [1.0_f32, 2.0];
     let _ = hadamard(&a, &b);

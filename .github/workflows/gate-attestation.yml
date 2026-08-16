@@ -55,6 +55,20 @@
 #
 # WHY doctest_cmd is empty: .kanon-ci.toml's pipeline has no doctest stage —
 # mirroring the local gate exactly, not inventing new coverage.
+#
+# WHY nextest_cmd chains a second, `--release -p kernels` invocation
+# (forkwright/logismos#59): `kernels::cpu_f32::{hadamard,mask_additive_in_place}`
+# guard two invariants with `assert_eq!`/`assert!` specifically because release
+# builds strip `debug_assert_eq!`/`debug_assert!` (`cfg!(debug_assertions)` is
+# false, and Cargo's `release` profile sets `debug-assertions = false` by
+# default — no override exists in this workspace). The first `nextest run`
+# above builds in the default `test` profile, which inherits `dev`'s
+# `debug-assertions = true`, so `assert_eq!` and `debug_assert_eq!` panic
+# identically there — a regression back to `debug_assert_eq!` would pass that
+# run unchanged. Only a debug-assertions-off build can tell the two apart;
+# `--release` is that build. Scoped to `-p kernels` (not `--workspace`) because
+# the defect and its guard are isolated to that crate — `taxis::Shape::elem_count`
+# uses `checked_mul`, unconditional in every profile, so it needs no second run.
 name: Gate Attestation
 
 on:
@@ -85,7 +99,7 @@ jobs:
       fmt_cmd: "cargo fmt --all -- --check"
       check_cmd: "cargo check --workspace --all-targets"
       clippy_cmd: "cargo clippy --workspace --all-targets -- -D warnings"
-      nextest_cmd: "cargo nextest run --workspace --no-fail-fast"
+      nextest_cmd: "cargo nextest run --workspace --no-fail-fast && cargo nextest run --release -p kernels --no-fail-fast"
       doctest_cmd: ""
       system_packages: "libamdhip64-dev"
       needs_fleet_repo_token: false
