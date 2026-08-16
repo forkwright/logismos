@@ -33,13 +33,21 @@ impl Shape {
     }
 
     /// Total number of elements.
+    ///
+    /// The product is checked, not raw: a plain `.iter().product()`
+    /// panics on overflow in a debug build and wraps to an arbitrary
+    /// (possibly small, plausible-looking) value in release, where a
+    /// wrapped count can silently equal an unrelated storage length.
+    /// This saturates to [`usize::MAX`] instead, which no real
+    /// storage length can ever match, so downstream `elem_count`-based
+    /// validation (e.g. [`crate::Tensor::try_from_cpu`]) reliably
+    /// rejects an overflowing shape instead of silently accepting one.
     #[must_use]
     pub fn elem_count(&self) -> usize {
-        if self.0.is_empty() {
-            1
-        } else {
-            self.0.iter().product()
-        }
+        self.0
+            .iter()
+            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -58,5 +66,44 @@ impl From<Vec<usize>> for Shape {
 impl<const N: usize> From<[usize; N]> for Shape {
     fn from(v: [usize; N]) -> Self {
         Self(SmallVec::from_slice(&v))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elem_count_empty_shape_is_one() {
+        assert_eq!(Shape::scalar().elem_count(), 1);
+    }
+
+    #[test]
+    fn elem_count_normal_product() {
+        assert_eq!(Shape::new(&[2, 3, 4]).elem_count(), 24);
+    }
+
+    #[test]
+    fn elem_count_overflow_saturates_instead_of_wrapping() {
+        // WHY(forkwright/logismos#58): a raw `.iter().product()` wraps
+        // modulo 2^64 in a release build. These two dims are chosen so
+        // the wrapped product is a deceptively small, plausible-looking
+        // value (2) rather than an obviously-broken one — exactly the
+        // silent shape/length confusion a caller has no way to detect.
+        // Confirmed below via `wrapping_mul` so the fixture documents
+        // its own target rather than asserting a magic number.
+        let dims = [usize::MAX / 2 + 2, 2];
+        assert_eq!(
+            dims[0].wrapping_mul(dims[1]),
+            2,
+            "sanity: this dim pair must wrap to a small value, not saturate cleanly"
+        );
+        let shape = Shape::new(&dims);
+        assert_eq!(
+            shape.elem_count(),
+            usize::MAX,
+            "overflow must saturate to usize::MAX, not wrap to {}",
+            dims[0].wrapping_mul(dims[1])
+        );
     }
 }

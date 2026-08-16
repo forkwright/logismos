@@ -83,6 +83,7 @@ pub unsafe fn launch_rope_fp16_in_place(
         } else {
             Err(Error::Launch {
                 kernel: "rope_fp16",
+                kind: hipcore::ErrorKind::from_raw(code),
                 code,
             })
         }

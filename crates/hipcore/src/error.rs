@@ -100,8 +100,12 @@ pub enum ErrorKind {
 
 impl ErrorKind {
     /// Map a raw HIP runtime error code to a classified kind.
+    ///
+    /// Public so other tier-1 crates (e.g. `kernels::Error::Launch`)
+    /// can attach a symbolic name to a raw code they receive directly
+    /// from a kernel launch, without re-deriving this mapping.
     #[must_use]
-    pub(crate) fn from_raw(code: u32) -> Self {
+    pub fn from_raw(code: u32) -> Self {
         use ffi::hipError_t;
         match hipError_t_from_u32(code) {
             Some(hipError_t::hipErrorInvalidValue) => Self::InvalidValue,

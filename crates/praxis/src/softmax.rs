@@ -48,7 +48,11 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
             msg: "zeros_hip did not return HIP".into(),
         })?;
         crate::stream_pool::POOL.with_stream(device, |stream| {
-            // SAFETY: device pointers valid; sizes verified above.
+            // SAFETY: device pointers valid; sizes verified above. `out`
+            // was just allocated above and not yet shared with any other
+            // `Tensor` handle, so `out_hip`'s `as_mut_device_ptr`
+            // obligation (no other live pointer to this allocation) holds
+            // by construction.
             unsafe {
                 kernels::softmax::launch_softmax_fp16(
                     x_hip.as_device_ptr().cast::<c_void>(),
@@ -64,7 +68,7 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
         Ok(out)
     } else {
         let x_host = x.to_host_f16()?;
-        let y = kernels::softmax::cpu::softmax_fp16_ref(&x_host, m, n);
+        let y = kernels::softmax::cpu::softmax_fp16_ref(&x_host, m, n)?;
         Ok(Tensor::from_cpu(
             taxis::CpuStorage::F16(y),
             x.shape().clone(),

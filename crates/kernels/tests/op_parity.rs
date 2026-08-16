@@ -121,7 +121,7 @@ fn softmax_parity() {
     let m = 4;
     let n = 512;
     let x = random_f16(m * n, 7);
-    let cpu = softmax_cpu::softmax_fp16_ref(&x, m, n);
+    let cpu = softmax_cpu::softmax_fp16_ref(&x, m, n).expect("shapes match by construction");
 
     let x_dev = DeviceBuffer::<u8>::from_host(&device, f16_bytes(&x)).expect("x");
     let y_dev = DeviceBuffer::<u8>::alloc(&device, m * n * 2).expect("y");
@@ -164,7 +164,8 @@ fn rope_parity() {
 
     // CPU reference, in-place on a mutable clone.
     let mut cpu = qk_host.clone();
-    rope_cpu::rope_apply_fp16_ref(&mut cpu, &cos_sin, batch, seq, heads, head_dim);
+    rope_cpu::rope_apply_fp16_ref(&mut cpu, &cos_sin, batch, seq, heads, head_dim)
+        .expect("shapes match by construction");
 
     // GPU launch, in-place on a device copy.
     let qk_dev = DeviceBuffer::<u8>::from_host(&device, f16_bytes(&qk_host)).expect("qk");
