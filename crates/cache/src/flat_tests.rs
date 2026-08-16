@@ -346,16 +346,20 @@ fn cpu_storage_bytes_pins_little_endian_encoding() -> Result<()> {
     // externally-known IEEE-754 / two's-complement little-endian
     // encodings (verified independently of this crate) catches what
     // a round-trip cannot.
-    let f32_bytes = cpu_storage_bytes(&CpuStorage::F32(vec![1.0f32]))?;
+    let f32_storage = CpuStorage::F32(vec![1.0f32]);
+    let f32_bytes = cpu_storage_bytes(&f32_storage)?;
     assert_eq!(f32_bytes.to_vec(), vec![0x00u8, 0x00, 0x80, 0x3F]);
 
-    let i32_bytes = cpu_storage_bytes(&CpuStorage::I32(vec![0x0102_0304]))?;
+    let i32_storage = CpuStorage::I32(vec![0x0102_0304]);
+    let i32_bytes = cpu_storage_bytes(&i32_storage)?;
     assert_eq!(i32_bytes.to_vec(), vec![0x04u8, 0x03, 0x02, 0x01]);
 
-    let f16_bytes = cpu_storage_bytes(&CpuStorage::F16(vec![half::f16::from_f32(1.0)]))?;
+    let f16_storage = CpuStorage::F16(vec![half::f16::from_f32(1.0)]);
+    let f16_bytes = cpu_storage_bytes(&f16_storage)?;
     assert_eq!(f16_bytes.to_vec(), vec![0x00u8, 0x3C]);
 
-    let bf16_bytes = cpu_storage_bytes(&CpuStorage::BF16(vec![half::bf16::from_f32(1.0)]))?;
+    let bf16_storage = CpuStorage::BF16(vec![half::bf16::from_f32(1.0)]);
+    let bf16_bytes = cpu_storage_bytes(&bf16_storage)?;
     assert_eq!(bf16_bytes.to_vec(), vec![0x80u8, 0x3F]);
 
     Ok(())
