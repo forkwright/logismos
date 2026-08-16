@@ -601,9 +601,9 @@ mod tests {
     #[test]
     fn load_prompts_propagates_non_notfound_io_fault() {
         // WARNING(scope): guards `load_prompts`'s OWN `NotFound`-only
-        // narrowing (stella.rs:489-499), not the originally-reported
+        // narrowing (stella.rs:490-504), not the originally-reported
         // bug — that lived at `load()`'s call site (removed match, see
-        // stella.rs:161-169), and pre-fix `load_prompts` was already a
+        // stella.rs:157-166), and pre-fix `load_prompts` was already a
         // bare `read_to_string(&path)?`, so this exact assertion held
         // pre-fix too. The call site needs a full checkpoint to test
         // (see `phase_3_stella_parity.rs`, ignored for that); it's
