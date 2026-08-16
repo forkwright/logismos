@@ -279,7 +279,11 @@ impl KvCache for FlatKvCache {
     }
 
     fn len_of(&self, layer_idx: usize) -> Option<usize> {
-        self.lens.get(layer_idx).copied()
+        // NEGATIVE-FIXTURE INJECTION (forkwright/logismos#49): reproduces
+        // the pre-fix `unwrap_or(0)` behavior under the new signature, to
+        // watch `len_of_distinguishes_out_of_range_from_unwritten` fail
+        // in CI. Reverted before merge.
+        Some(self.lens.get(layer_idx).copied().unwrap_or(0))
     }
 
     fn num_layers(&self) -> usize {
@@ -399,7 +403,11 @@ fn chunks_to_f32(bytes: &[u8], elem: usize) -> Result<Vec<f32>> {
         b.copy_from_slice(c);
         out.push(f32::from_le_bytes(b));
     }
-    check_decoded_len(out.len(), elem, bytes.len())?;
+    // NEGATIVE-FIXTURE INJECTION (forkwright/logismos#49): the
+    // check_decoded_len(out.len(), elem, bytes.len())?; postcondition is
+    // deliberately omitted here, to watch
+    // chunks_to_f32_rejects_undersized_trailing_bytes fail in CI.
+    // Reverted before merge.
     Ok(out)
 }
 fn chunks_to_i32(bytes: &[u8], elem: usize) -> Result<Vec<i32>> {
