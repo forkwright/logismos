@@ -134,7 +134,9 @@ impl StellaWeights {
             layers.push(lw);
         }
 
-        // Account for every archive entry.
+        // PROOF-BRANCH: this is the pre-fix guard ordering (checked
+        // AFTER every per-tensor read), deliberately restored here to
+        // demonstrate the new tests fail against it. Not for merge.
         let have: Vec<String> = reader.names();
         let total_expected = expected_global.len() + cfg.n_layers * TENSORS_PER_LAYER;
         if have.len() != total_expected {
@@ -558,15 +560,20 @@ mod tests {
     fn load_rejects_checkpoint_with_too_few_tensors() -> std::result::Result<(), String> {
         let cfg = tiny_cfg();
         let mut shapes = expected_tensor_shapes(&cfg);
-        shapes.pop(); // drop the final layer tensor -> incomplete checkpoint
+        // WHY: drop one required tensor so the archive is short by
+        // exactly one entry. `load` checks the archive's raw tensor
+        // count against `total_expected` before reading any tensor by
+        // name, so this exercises the count guard's too-few branch
+        // directly rather than a per-name lookup miss.
+        shapes.pop();
         let path = fixture_path("too-few");
         write_fixture(&path, &shapes)?;
 
         let result = StellaWeights::load(&path, &cfg);
         let _ = std::fs::remove_file(&path);
         assert!(
-            matches!(&result, Err(Error::Loader(_))),
-            "a checkpoint missing a required tensor must be rejected as a loader error, got {result:?}"
+            matches!(&result, Err(Error::Layout(_))),
+            "a checkpoint short of the expected tensor count must be rejected by the count guard as a layout error, got {result:?}"
         );
         Ok(())
     }
