@@ -273,23 +273,23 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn to_tensor_cpu_converts_every_supported_dtype() -> Result<()> {
-        // WHY(forkwright/logismos#56): only F32 had coverage; the other
-        // five branches of the match in `to_tensor_cpu` had none. An
-        // all-zero-byte fixture decodes to zero under any byte order,
-        // so it cannot distinguish a correct `read_*_le` decoder from
-        // an endianness bug — every case below uses a distinct,
-        // asymmetric non-zero pattern per element and asserts the
-        // actual decoded values via `Tensor::cpu_storage`, not just
-        // `dtype()`/`dims()`.
+    // WHY(forkwright/logismos#56): only F32 had coverage; the other five
+    // branches of the match in `to_tensor_cpu` had none. An all-zero-byte
+    // fixture decodes to zero under any byte order, so it cannot
+    // distinguish a correct `read_*_le` decoder from an endianness bug —
+    // each dtype below (split into its own test to stay under
+    // clippy::too_many_lines) uses a distinct, asymmetric non-zero
+    // pattern and asserts the actual decoded values via
+    // `Tensor::cpu_storage`, not just `dtype()`/`dims()`.
 
-        let f16_vals = [
+    #[test]
+    fn to_tensor_cpu_decodes_f16() -> Result<()> {
+        let vals = [
             half::f16::from_f32(1.5),
             half::f16::from_f32(-2.25),
             half::f16::from_f32(3.0),
         ];
-        let bytes: Vec<u8> = f16_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         let view = TensorView {
             name: "t",
             dtype: taxis::DType::F16,
@@ -302,14 +302,18 @@ mod tests {
         let Some(taxis::CpuStorage::F16(v)) = tensor.cpu_storage() else {
             return Err(Error::Msg("expected F16 CPU storage".into()));
         };
-        assert_eq!(v.as_slice(), &f16_vals[..]);
+        assert_eq!(v.as_slice(), &vals[..]);
+        Ok(())
+    }
 
-        let bf16_vals = [
+    #[test]
+    fn to_tensor_cpu_decodes_bf16() -> Result<()> {
+        let vals = [
             half::bf16::from_f32(1.5),
             half::bf16::from_f32(-2.25),
             half::bf16::from_f32(3.0),
         ];
-        let bytes: Vec<u8> = bf16_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         let view = TensorView {
             name: "t",
             dtype: taxis::DType::BF16,
@@ -322,13 +326,17 @@ mod tests {
         let Some(taxis::CpuStorage::BF16(v)) = tensor.cpu_storage() else {
             return Err(Error::Msg("expected BF16 CPU storage".into()));
         };
-        assert_eq!(v.as_slice(), &bf16_vals[..]);
+        assert_eq!(v.as_slice(), &vals[..]);
+        Ok(())
+    }
 
-        // Single-byte dtype: no endianness to get wrong, but a
-        // distinct negative value still catches a sign-decode bug
+    #[test]
+    fn to_tensor_cpu_decodes_i8() -> Result<()> {
+        // Single-byte dtype: no endianness to get wrong, but a distinct
+        // negative value still catches a sign-decode bug
         // (`i8::from_ne_bytes` misreading the bit pattern).
-        let i8_vals: [i8; 3] = [-5, 0, 127];
-        let bytes: Vec<u8> = i8_vals.iter().map(|v| v.to_le_bytes()[0]).collect();
+        let vals: [i8; 3] = [-5, 0, 127];
+        let bytes: Vec<u8> = vals.iter().map(|v| v.to_le_bytes()[0]).collect();
         let view = TensorView {
             name: "t",
             dtype: taxis::DType::I8,
@@ -341,12 +349,16 @@ mod tests {
         let Some(taxis::CpuStorage::I8(v)) = tensor.cpu_storage() else {
             return Err(Error::Msg("expected I8 CPU storage".into()));
         };
-        assert_eq!(v.as_slice(), &i8_vals[..]);
+        assert_eq!(v.as_slice(), &vals[..]);
+        Ok(())
+    }
 
+    #[test]
+    fn to_tensor_cpu_decodes_i32() -> Result<()> {
         // Asymmetric byte pattern: a big-endian decode would yield a
         // completely different value, not just a sign flip.
-        let i32_vals: [i32; 3] = [0x0102_0304, -1, 42];
-        let bytes: Vec<u8> = i32_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let vals: [i32; 3] = [0x0102_0304, -1, 42];
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         let view = TensorView {
             name: "t",
             dtype: taxis::DType::I32,
@@ -359,16 +371,20 @@ mod tests {
         let Some(taxis::CpuStorage::I32(v)) = tensor.cpu_storage() else {
             return Err(Error::Msg("expected I32 CPU storage".into()));
         };
-        assert_eq!(v.as_slice(), &i32_vals[..]);
+        assert_eq!(v.as_slice(), &vals[..]);
+        Ok(())
+    }
 
+    #[test]
+    fn to_tensor_cpu_decodes_u8() -> Result<()> {
         // Identity copy: distinct values still catch an off-by-one or
         // wrong-slice bug that all-zero bytes cannot.
-        let u8_vals: [u8; 3] = [1, 2, 253];
+        let vals: [u8; 3] = [1, 2, 253];
         let view = TensorView {
             name: "t",
             dtype: taxis::DType::U8,
             shape: vec![3],
-            bytes: &u8_vals,
+            bytes: &vals,
         };
         let tensor = view.to_tensor_cpu()?;
         assert_eq!(tensor.dtype(), taxis::DType::U8);
@@ -376,8 +392,7 @@ mod tests {
         let Some(taxis::CpuStorage::U8(v)) = tensor.cpu_storage() else {
             return Err(Error::Msg("expected U8 CPU storage".into()));
         };
-        assert_eq!(v.as_slice(), &u8_vals[..]);
-
+        assert_eq!(v.as_slice(), &vals[..]);
         Ok(())
     }
 
