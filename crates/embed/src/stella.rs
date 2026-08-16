@@ -158,6 +158,11 @@ impl StellaModel {
         // sidecar falls back to no prompts. `load_prompts` itself draws
         // that line at `io::ErrorKind::NotFound` only — a permissions
         // fault or a truncated read is not "absent" and propagates.
+        //
+        // WARNING: this bare `?` is the forkwright/logismos#52 fix (a
+        // prior match here swallowed every IO fault). No unit test
+        // guards this line — see the doc comment on
+        // `load_prompts_propagates_non_notfound_io_fault`.
         let prompts = load_prompts(root)?;
 
         // Pin to physical cores. On most x86_64 hosts this is half of
@@ -424,6 +429,13 @@ fn detect_physical_cores() -> usize {
 /// `core id` numbering from 0, so a multi-socket host's second socket
 /// collides with the first under a `core id`-only `HashSet` and the
 /// true physical-core count is undercounted.
+///
+/// WARNING: `physical id` is not universal — some virtualized/container
+/// guests report `core id` with no `physical id` line, and requiring
+/// both would zero out the count there, tripping the `n > 0` fallback
+/// to the *logical* (SMT-inclusive) thread count. `physical_id`
+/// defaults to `0` when absent, so a no-socket-field host still dedupes
+/// on `core id` alone.
 fn count_physical_cores(cpuinfo: &str) -> usize {
     let mut physical_id: Option<u32> = None;
     let mut core_id: Option<u32> = None;
@@ -438,16 +450,16 @@ fn count_physical_cores(cpuinfo: &str) -> usize {
         {
             core_id = Some(id);
         } else if line.trim().is_empty() {
-            if let (Some(p), Some(c)) = (physical_id, core_id) {
-                cores.insert((p, c));
+            if let Some(c) = core_id {
+                cores.insert((physical_id.unwrap_or(0), c));
             }
             physical_id = None;
             core_id = None;
         }
     }
     // The final processor block has no trailing blank line to flush it.
-    if let (Some(p), Some(c)) = (physical_id, core_id) {
-        cores.insert((p, c));
+    if let Some(c) = core_id {
+        cores.insert((physical_id.unwrap_or(0), c));
     }
     cores.len()
 }
@@ -588,11 +600,14 @@ mod tests {
 
     #[test]
     fn load_prompts_propagates_non_notfound_io_fault() {
-        // Negative fixture for the swallowed-IO-error finding: the
-        // config path exists as a DIRECTORY, not a file -- a genuine
-        // `read_to_string` IO fault, not "absent". Pre-fix, the call
-        // site's `Err(Error::Io(_)) => HashMap::new()` folded this into
-        // an empty prompt map silently; it must now propagate.
+        // WARNING(scope): guards `load_prompts`'s OWN `NotFound`-only
+        // narrowing (stella.rs:489-499), not the originally-reported
+        // bug — that lived at `load()`'s call site (removed match, see
+        // stella.rs:161-169), and pre-fix `load_prompts` was already a
+        // bare `read_to_string(&path)?`, so this exact assertion held
+        // pre-fix too. The call site needs a full checkpoint to test
+        // (see `phase_3_stella_parity.rs`, ignored for that); it's
+        // verified by code review, not by this test.
         let dir = tempfile::TempDir::new().expect("create temp dir");
         std::fs::create_dir(dir.path().join("config_sentence_transformers.json"))
             .expect("create a directory standing in for the sidecar file");
@@ -750,6 +765,29 @@ core id\t: 1
 physical id\t: 1
 ";
         assert_eq!(count_physical_cores(cpuinfo), 4);
+    }
+
+    #[test]
+    fn count_physical_cores_without_physical_id_field_still_counts_via_core_id() {
+        // Negative fixture for requiring BOTH fields: a strict-pairing
+        // impl never completes a pair when `physical id` is absent, so
+        // this returns 0 -- tripping `detect_physical_cores`'s fallback
+        // to the SMT-inclusive logical count. Two `core id` values,
+        // zero `physical id` lines: must resolve to 2, not 0.
+        let cpuinfo = "\
+processor\t: 0
+core id\t: 0
+
+processor\t: 1
+core id\t: 0
+
+processor\t: 2
+core id\t: 1
+
+processor\t: 3
+core id\t: 1
+";
+        assert_eq!(count_physical_cores(cpuinfo), 2);
     }
 
     #[test]
