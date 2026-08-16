@@ -63,6 +63,17 @@ pub enum Error {
         msg: String,
     },
 
+    /// Tensor storage this cache cannot marshal to bytes: a non-CPU-backed
+    /// tensor, or a `CpuStorage` variant this crate does not yet decode.
+    /// Distinct from [`Error::ShapeMismatch`] — the dimensions may be
+    /// perfectly valid; the storage *representation* is what this code
+    /// path cannot handle.
+    #[error("cache: unsupported storage — {msg}")]
+    UnsupportedStorage {
+        /// Free-form description.
+        msg: String,
+    },
+
     /// Free-form error.
     #[error("cache: {0}")]
     Msg(String),

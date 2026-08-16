@@ -66,8 +66,11 @@ pub trait KvCache {
     /// `(k, v)` pair.
     fn get(&self, layer_idx: usize, len: usize) -> Result<(Tensor, Tensor)>;
 
-    /// Current written length for the given layer.
-    fn len_of(&self, layer_idx: usize) -> usize;
+    /// Current written length for the given layer, or `None` if
+    /// `layer_idx` is out of range for this cache. Kept distinct from
+    /// `Some(0)`, which means the layer is in range but nothing has been
+    /// written to it yet.
+    fn len_of(&self, layer_idx: usize) -> Option<usize>;
 
     /// Number of layers this cache was sized for.
     fn num_layers(&self) -> usize;
