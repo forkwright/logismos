@@ -273,21 +273,37 @@ impl<T: BytePod> Drop for PendingCopy<'_, T> {
         // it returned without synchronizing, `self.data` would drop
         // (freeing the host buffer) immediately afterward as part of
         // this same `Drop`, while the DMA reading it could still be in
-        // flight. Best-effort like the sibling `Drop` impls below: a
-        // synchronize failure is logged, not retried or panicked on,
-        // since `Drop` cannot propagate an error.
+        // flight.
         if self.synced {
             return;
         }
-        if let Err(error) = self.stream.synchronize()
-            && writeln!(
+        if let Err(error) = self.stream.synchronize() {
+            if writeln!(
                 io::stderr().lock(),
                 "hipcore: stream synchronize before PendingCopy drop failed: {error} — \
-                 the host buffer may still be read by an in-flight DMA"
+                 leaking host buffer, not freeing it, because an in-flight DMA may \
+                 still be reading it"
             )
             .is_err()
-        {
-            // Drop cannot surface secondary stderr failures.
+            {
+                // Drop cannot surface secondary stderr failures.
+            }
+            // WARNING: a failed synchronize does not prove the queued
+            // hipMemcpyAsync has stopped touching `data` — it only proves
+            // we could not confirm either way. Falling through here would
+            // let ordinary field-drop-glue free `data` right after this
+            // function returns, which is the exact use-after-free #25
+            // exists to prevent, now on the error path instead of the
+            // caller's. Skip-and-leak instead, matching the policy
+            // `DeviceBuffer::drop` / `Stream::drop` / `Event::drop` use
+            // for the same "acting under uncertainty is unsound" case:
+            // `mem::take` swaps in an empty, non-allocating `Vec` so the
+            // drop glue that still runs after this function returns is a
+            // no-op, and `mem::forget` discards the real one without
+            // running its destructor. `T: BytePod: Copy`, so `Vec<T>` has
+            // no destructor beyond freeing its buffer — nothing else is
+            // leaked.
+            core::mem::forget(core::mem::take(&mut self.data));
         }
     }
 }
@@ -323,5 +339,103 @@ impl<T: BytePod> Drop for DeviceBuffer<T> {
         {
             // Drop cannot surface secondary stderr failures.
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Negative-case fixture for PR #101 review finding 1
+    //! (`PendingCopy::drop` freed `data` on a failed `stream.synchronize()`,
+    //! reopening the exact use-after-free forkwright/logismos#25 closed on
+    //! the success path).
+    //!
+    //! `Device::invalid_for_test` drives a real, deterministic
+    //! `hipSetDevice` failure through the shipped `Stream::synchronize` ->
+    //! `Device::make_current` path with no physical GPU required, so this
+    //! exercises the actual `Drop for PendingCopy` impl above, not a
+    //! re-implementation of it. `WatchingAlloc` observes whether the
+    //! system allocator's `dealloc` is ever called against the exact
+    //! address `data` was allocated at — the only way to tell "leaked"
+    //! from "freed" apart without reading memory that may have been
+    //! freed, which would itself be the unsound thing this test exists to
+    //! rule out.
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// Address the running test is watching, and whether `dealloc` has
+    /// been called against it. `nextest` runs each `#[test]` in its own
+    /// process (the fleet's standard runner here — see
+    /// `.github/workflows/gate-attestation.yml`'s `nextest_cmd`), so this
+    /// process-wide allocator swap cannot observe or be polluted by any
+    /// other test's allocations.
+    static WATCH_PTR: AtomicUsize = AtomicUsize::new(0);
+    static WATCH_FREED: AtomicUsize = AtomicUsize::new(0);
+
+    struct WatchingAlloc;
+
+    // SAFETY: every method delegates directly to `System`, passing
+    // through the same pointer/layout `System` already validates;
+    // `dealloc` additionally reads (never mutates) two `AtomicUsize`s.
+    unsafe impl GlobalAlloc for WatchingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: `layout` is the caller's, unmodified; forwarded
+            // verbatim to `System`.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            if WATCH_PTR.load(Ordering::SeqCst) == ptr as usize {
+                WATCH_FREED.store(1, Ordering::SeqCst);
+            }
+            // SAFETY: `ptr`/`layout` are the caller's, unmodified;
+            // forwarded verbatim to `System`.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: WatchingAlloc = WatchingAlloc;
+
+    #[test]
+    fn drop_leaks_data_instead_of_freeing_it_when_synchronize_fails() {
+        // WHY: `Stream::synchronize` calls `self.device.make_current()`
+        // (`hipSetDevice`) before touching the stream handle at all, so
+        // an invalid device fails it deterministically without ever
+        // needing a real stream or a physical GPU.
+        let device = Device::invalid_for_test();
+        let stream = Stream::null(&device);
+
+        let data: Vec<u8> = vec![1, 2, 3, 4];
+        let watched_ptr = data.as_ptr() as usize;
+        WATCH_PTR.store(watched_ptr, Ordering::SeqCst);
+        WATCH_FREED.store(0, Ordering::SeqCst);
+
+        // Bypasses `DeviceBuffer::copy_from_host_async` deliberately: that
+        // constructor would itself fail against `device` before ever
+        // returning a `PendingCopy`, since it also calls `make_current`.
+        // This is the same `PendingCopy` the real constructor returns —
+        // same fields, same `Drop` impl — just assembled directly, which
+        // this module (a descendant of `memory`) can do because the
+        // fields are private to the crate, not faked at another layer.
+        let pending = PendingCopy {
+            data,
+            stream: &stream,
+            synced: false,
+        };
+
+        drop(pending);
+
+        assert_eq!(
+            WATCH_FREED.load(Ordering::SeqCst),
+            0,
+            "PendingCopy::drop freed `data` after stream.synchronize() failed \
+             — the DMA this copy started may still have been reading it. \
+             This reopens the exact use-after-free forkwright/logismos#25 \
+             exists to prevent, now on the error path (PR #101 review \
+             finding 1) instead of the caller's."
+        );
     }
 }

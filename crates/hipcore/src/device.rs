@@ -122,6 +122,36 @@ impl Device {
         })
     }
 
+    /// Builds a `Device` carrying an out-of-range ordinal, bypassing the
+    /// `hipGetDeviceCount` bounds check in [`Device::new`].
+    ///
+    /// WHY: exists so tests elsewhere in this crate can drive a real,
+    /// deterministic `make_current` (and therefore `hipSetDevice`)
+    /// failure without a physical GPU. An out-of-range ordinal is
+    /// `hipErrorInvalidDevice` per the HIP API contract regardless of
+    /// how many real devices are present, including zero — unlike a
+    /// genuine hardware fault, this failure mode needs no device at
+    /// all, only the runtime library CI already links against.
+    #[cfg(test)]
+    pub(crate) fn invalid_for_test() -> Self {
+        Self {
+            inner: Arc::new(DeviceInner {
+                ordinal: DeviceOrdinal::MAX,
+                props: DeviceProps {
+                    isa: String::new(),
+                    name: String::new(),
+                    total_vram_bytes: 0,
+                    compute_units: 0,
+                    wavefront_size: 0,
+                    max_threads_per_block: 0,
+                    max_shared_mem_per_block: 0,
+                    clock_rate_khz: 0,
+                    pci_bus_id: PciBusId::new(String::new()),
+                },
+            }),
+        }
+    }
+
     /// Device ordinal.
     #[must_use]
     pub fn ordinal(&self) -> DeviceOrdinal {
