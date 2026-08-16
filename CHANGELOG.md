@@ -24,6 +24,13 @@ All notable changes to logismos are recorded here.
 - Kernel result defaults: explicit handling in cfg-gated branches
 - Matmul CPU helper visibility: narrowed to `pub(crate)`
 
+## [1.0.7](https://github.com/forkwright/logismos/compare/v1.0.6...v1.0.7) (2026-08-16)
+
+
+### Bug Fixes
+
+* **kernels:** enforce sgemm shape invariant in every build profile ([#100](https://github.com/forkwright/logismos/issues/100)) ([c00bbfc](https://github.com/forkwright/logismos/commit/c00bbfcf918f05ca45bd18dfaab401385f10a8b7))
+
 ## [1.0.6](https://github.com/forkwright/logismos/compare/v1.0.5...v1.0.6) (2026-08-16)
 
 
