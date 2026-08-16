@@ -708,7 +708,7 @@ impl<'a> Cursor<'a> {
                 // read via `read_meta_value_typed`, so a claimed length
                 // that outruns the file fails fast with `Error::Gguf`.
                 let mut out = Vec::new();
-                for _ in 0..n {
+                for _ in 0..n.saturating_sub(1) {
                     out.push(self.read_meta_value_typed(inner_type)?);
                 }
                 MetaValue::Array(out)

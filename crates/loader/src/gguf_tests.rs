@@ -111,6 +111,48 @@ fn array_metadata_type_parses_elements() -> Result<()> {
 }
 
 #[test]
+fn array_metadata_round_trips_through_reader_open() -> Result<()> {
+    // WHY(forkwright/logismos#37): `array_metadata_type_parses_elements`
+    // above exercises `read_meta_value_typed(9)` directly on a bare
+    // `Cursor`; it never proves the array branch survives the full
+    // `Reader::open` path — magic/version/count parsing, the
+    // metadata-KV loop's string-key read, and storage into the
+    // `metadata()` map by key. `reads_fixture_bytes` proves that glue
+    // for a scalar `U32` value; nothing before this test proved it for
+    // a non-scalar one.
+    let dir = tempdir_for_test();
+    let path = dir.join("array-metadata-e2e.gguf");
+    let mut buf = Vec::new();
+    buf.extend_from_slice(GGUF_MAGIC);
+    buf.extend_from_slice(&GGUF_V3.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes()); // tensor count
+    buf.extend_from_slice(&1u64.to_le_bytes()); // metadata count
+    let key = "arr_key";
+    buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+    buf.extend_from_slice(key.as_bytes());
+    buf.extend_from_slice(&9u32.to_le_bytes()); // type = array
+    buf.extend_from_slice(&4u32.to_le_bytes()); // inner_type = U32
+    buf.extend_from_slice(&3u64.to_le_bytes()); // n = 3 elements
+    for v in [1u32, 2, 3] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(&path, buf)?;
+
+    let r = Reader::open(&path)?;
+    let Some(MetaValue::Array(items)) = r.metadata().get("arr_key") else {
+        return Err(Error::Gguf {
+            offset: 0,
+            msg: "expected metadata()[\"arr_key\"] to be MetaValue::Array".into(),
+        });
+    };
+    assert_eq!(items.len(), 3);
+    assert!(matches!(items[0], MetaValue::U32(1)));
+    assert!(matches!(items[1], MetaValue::U32(2)));
+    assert!(matches!(items[2], MetaValue::U32(3)));
+    Ok(())
+}
+
+#[test]
 fn nested_array_inner_type_is_rejected() {
     // WHY(forkwright/logismos#35): the GGUF v3 spec forbids
     // arrays-of-arrays. Before the fix, `inner_type = 9` recursed
