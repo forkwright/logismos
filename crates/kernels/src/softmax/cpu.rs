@@ -25,7 +25,7 @@ pub fn softmax_fp16_ref(x: &[f16], m: usize, n: usize) -> Vec<f16> {
             denom += e;
             exps.push(e);
         }
-        let inv = denom.recip() * 0.5;
+        let inv = denom.recip();
         for (j, &exp) in exps.iter().enumerate().take(n) {
             if let Some(slot) = y.get_mut(start + j) {
                 *slot = f16::from_f32(exp * inv);
