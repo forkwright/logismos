@@ -114,42 +114,36 @@ impl StellaWeights {
     pub fn load(path: &Path, cfg: &StellaConfig) -> Result<Self> {
         let reader = Reader::open(path)?;
 
-        let mut consumed = std::collections::HashSet::<String>::new();
         let expected_global = ["model.embed_tokens.weight", "model.norm.weight"];
+        let total_expected = expected_global.len() + cfg.n_layers * TENSORS_PER_LAYER;
+
+        // INVARIANT: checked against the archive's raw name count before
+        // any per-tensor read runs. Every name this loader looks up is
+        // read successfully or the read itself fails first — so a
+        // per-tensor lookup can only ever observe a *complete* set of
+        // names on top of, at worst, unconsumed extras. A short archive
+        // is therefore only detectable here, by count, not by any
+        // individual name lookup downstream.
+        let have: Vec<String> = reader.names();
+        if have.len() != total_expected {
+            return Err(Error::Layout(format!(
+                "expected {total_expected} tensors in stella archive, got {}",
+                have.len()
+            )));
+        }
 
         let tok_embed = read_f32(
             &reader,
             "model.embed_tokens.weight",
             &[cfg.vocab_size, cfg.hidden],
         )?;
-        consumed.insert("model.embed_tokens.weight".into());
-
         let final_norm = read_f32(&reader, "model.norm.weight", &[cfg.hidden])?;
-        consumed.insert("model.norm.weight".into());
 
         let kv_width = cfg.n_kv_heads * cfg.head_dim();
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
-            let lw = load_layer(&reader, cfg, i, kv_width, &mut consumed)?;
+            let lw = load_layer(&reader, cfg, i, kv_width)?;
             layers.push(lw);
-        }
-
-        // Account for every archive entry.
-        let have: Vec<String> = reader.names();
-        let total_expected = expected_global.len() + cfg.n_layers * TENSORS_PER_LAYER;
-        if have.len() != total_expected {
-            return Err(Error::Layout(format!(
-                "expected {} tensors in stella archive, got {}",
-                total_expected,
-                have.len()
-            )));
-        }
-        for name in &have {
-            if !consumed.contains(name) {
-                return Err(Error::Layout(format!(
-                    "unconsumed tensor in stella archive: {name}"
-                )));
-            }
         }
 
         Ok(Self {
@@ -313,69 +307,30 @@ fn load_layer(
     cfg: &StellaConfig,
     i: usize,
     kv_width: usize,
-    consumed: &mut std::collections::HashSet<String>,
 ) -> Result<StellaLayerWeights> {
-    let norm1 = layer_weight(r, i, "input_layernorm.weight", &[cfg.hidden], consumed)?;
-    let norm2 = layer_weight(
-        r,
-        i,
-        "post_attention_layernorm.weight",
-        &[cfg.hidden],
-        consumed,
-    )?;
+    let norm1 = layer_weight(r, i, "input_layernorm.weight", &[cfg.hidden])?;
+    let norm2 = layer_weight(r, i, "post_attention_layernorm.weight", &[cfg.hidden])?;
 
-    let wq = layer_weight(
-        r,
-        i,
-        "self_attn.q_proj.weight",
-        &[cfg.hidden, cfg.hidden],
-        consumed,
-    )?;
-    let bq = layer_weight(r, i, "self_attn.q_proj.bias", &[cfg.hidden], consumed)?;
-    let wk = layer_weight(
-        r,
-        i,
-        "self_attn.k_proj.weight",
-        &[kv_width, cfg.hidden],
-        consumed,
-    )?;
-    let bk = layer_weight(r, i, "self_attn.k_proj.bias", &[kv_width], consumed)?;
-    let wv = layer_weight(
-        r,
-        i,
-        "self_attn.v_proj.weight",
-        &[kv_width, cfg.hidden],
-        consumed,
-    )?;
-    let bv = layer_weight(r, i, "self_attn.v_proj.bias", &[kv_width], consumed)?;
-    let wo = layer_weight(
-        r,
-        i,
-        "self_attn.o_proj.weight",
-        &[cfg.hidden, cfg.hidden],
-        consumed,
-    )?;
+    let wq = layer_weight(r, i, "self_attn.q_proj.weight", &[cfg.hidden, cfg.hidden])?;
+    let bq = layer_weight(r, i, "self_attn.q_proj.bias", &[cfg.hidden])?;
+    let wk = layer_weight(r, i, "self_attn.k_proj.weight", &[kv_width, cfg.hidden])?;
+    let bk = layer_weight(r, i, "self_attn.k_proj.bias", &[kv_width])?;
+    let wv = layer_weight(r, i, "self_attn.v_proj.weight", &[kv_width, cfg.hidden])?;
+    let bv = layer_weight(r, i, "self_attn.v_proj.bias", &[kv_width])?;
+    let wo = layer_weight(r, i, "self_attn.o_proj.weight", &[cfg.hidden, cfg.hidden])?;
 
     let w_gate = layer_weight(
         r,
         i,
         "mlp.gate_proj.weight",
         &[cfg.intermediate, cfg.hidden],
-        consumed,
     )?;
-    let w_up = layer_weight(
-        r,
-        i,
-        "mlp.up_proj.weight",
-        &[cfg.intermediate, cfg.hidden],
-        consumed,
-    )?;
+    let w_up = layer_weight(r, i, "mlp.up_proj.weight", &[cfg.intermediate, cfg.hidden])?;
     let w_down = layer_weight(
         r,
         i,
         "mlp.down_proj.weight",
         &[cfg.hidden, cfg.intermediate],
-        consumed,
     )?;
 
     Ok(StellaLayerWeights {
@@ -398,17 +353,9 @@ fn load_layer(
     })
 }
 
-fn layer_weight(
-    r: &Reader,
-    i: usize,
-    suffix: &str,
-    expected_shape: &[usize],
-    consumed: &mut std::collections::HashSet<String>,
-) -> Result<Vec<f32>> {
+fn layer_weight(r: &Reader, i: usize, suffix: &str, expected_shape: &[usize]) -> Result<Vec<f32>> {
     let name = format!("model.layers.{i}.{suffix}");
-    let v = read_f32(r, &name, expected_shape)?;
-    consumed.insert(name);
-    Ok(v)
+    read_f32(r, &name, expected_shape)
 }
 
 fn read_f32(r: &Reader, name: &str, expected_shape: &[usize]) -> Result<Vec<f32>> {
@@ -558,15 +505,20 @@ mod tests {
     fn load_rejects_checkpoint_with_too_few_tensors() -> std::result::Result<(), String> {
         let cfg = tiny_cfg();
         let mut shapes = expected_tensor_shapes(&cfg);
-        shapes.pop(); // drop the final layer tensor -> incomplete checkpoint
+        // WHY: drop one required tensor so the archive is short by
+        // exactly one entry. `load` checks the archive's raw tensor
+        // count against `total_expected` before reading any tensor by
+        // name, so this exercises the count guard's too-few branch
+        // directly rather than a per-name lookup miss.
+        shapes.pop();
         let path = fixture_path("too-few");
         write_fixture(&path, &shapes)?;
 
         let result = StellaWeights::load(&path, &cfg);
         let _ = std::fs::remove_file(&path);
         assert!(
-            matches!(&result, Err(Error::Loader(_))),
-            "a checkpoint missing a required tensor must be rejected as a loader error, got {result:?}"
+            matches!(&result, Err(Error::Layout(_))),
+            "a checkpoint short of the expected tensor count must be rejected by the count guard as a layout error, got {result:?}"
         );
         Ok(())
     }

@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn top_k_masks_nan_logit() {
-        // Regression: a NaN logit always fails `*l < threshold` (NaN
+        // WHY: a NaN logit always fails `*l < threshold` (NaN
         // comparisons are never true), so the old unmasked-comparison
         // let it survive top-k untouched regardless of rank.
         let mut logits = vec![1.0, f32::NAN, 5.0, 4.0, 3.0];
@@ -260,16 +260,38 @@ mod tests {
     #[test]
     fn top_k_reuses_scratch_buffer_across_steps() {
         let mut p = TopK::new(2);
+        // WHY: reserve well beyond what collecting a 5-element iterator
+        // into a fresh `Vec` would naturally allocate (capacity ~5).
+        // Two equal-length calls can't tell "reused" from "freshly
+        // reallocated to the same size" by capacity alone — a per-step
+        // `self.scratch = logits.iter()....collect()` reproduces the
+        // same post-call capacity as a reused buffer would. Pre-reserving
+        // past that coincidence range means a reallocation is forced to
+        // *drop* the reservation (capacity falls back to ~5) and move to
+        // a new allocation (a different `as_ptr()`), so either signal
+        // alone proves reuse; both are checked for redundancy.
+        p.scratch.reserve(64);
+        let ptr_before = p.scratch.as_ptr();
+        let cap_before = p.scratch.capacity();
+        assert!(cap_before >= 64);
+
         let mut logits = vec![1.0, 3.0, 2.0, 5.0, 4.0];
         p.process(&mut logits, &ctx());
-        let cap_after_first = p.scratch.capacity();
-        assert!(cap_after_first >= logits.len());
+        assert_eq!(
+            p.scratch.as_ptr(),
+            ptr_before,
+            "scratch buffer must be reused, not reallocated, on the first step"
+        );
+        assert!(
+            p.scratch.capacity() >= cap_before,
+            "reusing the buffer must not drop its reserved capacity"
+        );
 
         let mut logits2 = vec![2.0, 1.0, 4.0, 3.0, 0.0];
         p.process(&mut logits2, &ctx());
         assert_eq!(
-            p.scratch.capacity(),
-            cap_after_first,
+            p.scratch.as_ptr(),
+            ptr_before,
             "scratch buffer must be reused, not reallocated, across decode steps"
         );
     }
