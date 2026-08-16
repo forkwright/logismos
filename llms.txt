@@ -1,7 +1,7 @@
 # llms.txt - Logismos AI navigation index
 
-> Sovereign GPU inference runtime for AMD W7900 (gfx1100). ~27 peer crates.
-> Rust + HIP + hipBLASLt. Private repo.
+> Rust-native GPU inference runtime for AMD W7900 (gfx1100). ~27 peer crates.
+> HIP + hipBLASLt. Public on GitHub: forkwright/logismos.
 
 ## LLM corpus
 
@@ -19,10 +19,13 @@ Structured reference data for AI agents is in `_llm/`:
 
 ## Planning (in kanon)
 
-- `~/dev/kanon/projects/logismos/vision.md` - what this is and what it is not
-- `~/dev/kanon/projects/logismos/ROADMAP.md` - phased plan
-- `~/dev/kanon/projects/logismos/STATE.md` - current state
-- `~/dev/kanon/projects/logismos/phases/` - per-phase PLAN.md files
+Resolve the kanon checkout root on this box with `kanon locate kanon-repo`
+(never hardcode a path — it differs per machine):
+
+- `projects/logismos/vision.md` - what this is and what it is not
+- `projects/logismos/ROADMAP.md` - phased plan
+- `projects/logismos/STATE.md` - current state
+- `projects/logismos/phases/` - per-phase PLAN.md files
 
 ## Key crates
 

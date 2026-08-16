@@ -1,14 +1,15 @@
 <!--
 scope: logismos repo conventions (Rust+HIP inference runtime, ~27 peer crates, W7900 primary target)
-defers_to: kanon standards at ~/dev/kanon/crates/basanos/standards/
+defers_to: kanon standards at kanon's crates/basanos/standards/ (checkout root: `kanon locate kanon-repo`)
 tightens: no-external-ML-framework rule, HIP FFI as lowest acceptable layer, per-kernel CPU-reference-test policy
 -->
 
 # Logismos - operating instructions
 
-Read `~/dev/kanon/projects/logismos/{vision,ROADMAP,STATE}.md` before
-substantive work. Planning canonical lives in kanon. This repo holds code plus repo-local agent
-docs (`CLAUDE.md`, `AGENTS.md`, `README.md`).
+Read kanon's `projects/logismos/{vision,ROADMAP,STATE}.md` before
+substantive work — resolve the kanon checkout root on this box with `kanon locate kanon-repo`
+(never hardcode a path; it differs per machine). Planning canonical lives in kanon. This repo
+holds code plus repo-local agent docs (`CLAUDE.md`, `AGENTS.md`, `README.md`).
 
 ## What logismos is
 
@@ -52,7 +53,7 @@ hermeneus - not kanon-X or aletheia-X). Where a role corresponds to
 an existing ecosystem-Greek name, logismos inherits that name and its
 original home eventually consolidates onto ours.
 
-Current crates (see `~/dev/kanon/projects/logismos/vision.md` for the role table):
+Current crates (see kanon's `projects/logismos/vision.md` for the role table):
 
 Greek (earned by role): `hermeneus`, `ekphrasis`, `ichneutes`,
 `melete`, `taxis`, `praxis`.
@@ -64,7 +65,7 @@ English mechanical: `hipcore`, `kernels`, `loader`, `tokenize`,
 
 Top-level facade: `logismos`.
 
-New Greek names must pass `~/dev/kanon/projects/logismos/gnomon.md`'s
+New Greek names must pass kanon's `projects/logismos/gnomon.md`'s
 L1-L4 gate. No haste to invent decoration.
 
 ## What "done" looks like
@@ -107,7 +108,7 @@ When `kanon lint` runs from this repo, zero open violations.
 Operating principle, memory system, and global constraints come from
 `~/.claude/CLAUDE.md`. Those rules apply here. Logismos-specific tightening:
 
-- Agents must scope work to the active `~/dev/kanon/projects/logismos/phases/NN-*/PLAN.md`. No scope creep into future phases.
+- Agents must scope work to the active kanon `projects/logismos/phases/NN-*/PLAN.md`. No scope creep into future phases.
 - A passing `cargo check` is not evidence of correctness. Every
  kernel carries a CPU reference test at 1e-3 tolerance.
 
