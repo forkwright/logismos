@@ -92,6 +92,138 @@ fn linear_t_matches_naive() {
 }
 
 #[test]
+#[should_panic(expected = "linear: a.len()=5 does not match declared shape m=2 * k=3")]
+fn linear_mismatched_a_len_panics() {
+    // WHY(forkwright/logismos#29): the only prior guard here was
+    // `debug_assert_eq!`, which compiles to nothing under release —
+    // this exact call would run `sgemm` with `a`'s 5-element buffer
+    // read as if it held the 6 elements `m=2, k=3` declares, an
+    // out-of-bounds read one `f32` past the end of `a` on the shipped
+    // (release) code path. `#[should_panic]` fails outright if a
+    // regression back to `debug_assert_eq!` ever lands, because
+    // `--release -p kernels` (wired by PR #88) runs this suite with
+    // debug assertions off.
+    let a = [1.0_f32, 2.0, 3.0, 4.0, 5.0]; // 5 elements, m*k=6 declared
+    let b = [1.0_f32, 0.0, 0.0, 1.0, 1.0, 1.0]; // [3, 2], correct
+    let _ = linear(&a, &b, None, 2, 2, 3);
+}
+
+#[test]
+#[should_panic(expected = "linear: b.len()=5 does not match declared shape k=3 * n=2")]
+fn linear_mismatched_b_len_panics() {
+    let a = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // [2, 3], correct
+    let b = [1.0_f32, 0.0, 0.0, 1.0, 1.0]; // 5 elements, k*n=6 declared
+    let _ = linear(&a, &b, None, 2, 2, 3);
+}
+
+#[test]
+#[should_panic(expected = "linear: bias.len()=1 does not match declared n=2")]
+fn linear_mismatched_bias_len_panics() {
+    let a = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b = [1.0_f32, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let bias = [1.0_f32]; // n=2 declared, 1 supplied
+    let _ = linear(&a, &b, Some(&bias), 2, 2, 3);
+}
+
+#[test]
+#[should_panic(expected = "linear: a.len()=2 does not match declared shape m=")]
+fn linear_overflowing_shape_is_rejected_not_wrapped() {
+    // WHY(forkwright/logismos#29): a naive `m * k` (plain multiplication,
+    // no `checked_mul`) wraps on overflow. Picking `m` so `m * k` wraps
+    // to exactly 2 and handing `linear` a real 2-element `a` would make
+    // a plain `a.len() == m * k` comparison spuriously PASS — the exact
+    // "shape decoded from an untrusted header" attack the issue names,
+    // since a huge nonsense `m` slips past the check by wrapping to
+    // match a tiny real buffer. `checked_shape_len` saturates the
+    // overflowing product to `usize::MAX` instead of wrapping, so
+    // `a.len()=2` correctly fails to match it and the ordinary
+    // shape-mismatch `assert_eq!` fires — no real slice can ever be
+    // `usize::MAX` elements long, so this path can never be bypassed by
+    // a coincidental match.
+    let k = 2usize;
+    let m = (usize::MAX / k) + 2; // m * k wraps to 2 under wrapping_mul
+    assert_eq!(
+        m.wrapping_mul(k),
+        2,
+        "test premise: chosen m*k must wrap to 2"
+    );
+    let a = [1.0_f32, 2.0]; // len == the wrapped (wrong) product
+    let b = [1.0_f32, 2.0]; // k=2, n=1 — irrelevant, panic fires on `a` first
+    let _ = linear(&a, &b, None, m, 1, k);
+}
+
+#[test]
+#[should_panic(expected = "linear: output shape m=")]
+fn linear_output_shape_overflow_is_rejected_not_undersized() {
+    // WHY(forkwright/logismos#29): the two read-side checks above guard
+    // `a`/`b`; the WRITE side is `c`, sized by `m * n` and then written
+    // into by `sgemm` at the caller's real (non-saturated) `m`/`n` via
+    // raw strides. A plain `m * n` has no overflow check in a release
+    // build and silently wraps, undersizing `c` while `sgemm` still
+    // writes the real extent — a heap out-of-bounds WRITE, distinct
+    // from (and unguarded by) the `a`/`b` mismatch checks.
+    //
+    // `k = 0` makes both read-side products (`m * k`, `k * n`)
+    // trivially zero regardless of `m`/`n`, so `a = []`/`b = []` pass
+    // their own checks for ANY `m`, `n` — isolating the write-side
+    // product without needing a multi-gigabyte real allocation to
+    // reach this line. `n = 2` and `m` chosen so `m * n` overflows
+    // `usize` (`m.checked_mul(n)` is `None`), the same derivation
+    // `linear_overflowing_shape_is_rejected_not_wrapped` above uses for
+    // `m * k`.
+    //
+    // INVARIANT: this test only distinguishes the fix
+    // (`checked_output_len`, which asserts before allocating) from the
+    // defect (a raw `m * n` at the `vec!` call) under a
+    // debug-assertions-off build: reverting `checked_output_len`'s call
+    // site back to plain `m * n` makes Rust's own arithmetic-overflow
+    // check panic instead (`attempt to multiply with overflow`, since
+    // overflow-checks default on in the dev/test profile), which does
+    // NOT contain the string below and so still fails this
+    // `#[should_panic]` — proven pre-fix via a throwaway scratch branch
+    // + CI run (see PR body).
+    let k = 0usize;
+    let n = 2usize;
+    let m = (usize::MAX / n) + 2; // m * n overflows usize
+    let a: [f32; 0] = [];
+    let b: [f32; 0] = [];
+    let _ = linear(&a, &b, None, m, n, k);
+}
+
+#[test]
+#[should_panic(expected = "linear_t: output shape m=")]
+fn linear_t_output_shape_overflow_is_rejected_not_undersized() {
+    // Mirrors `linear_output_shape_overflow_is_rejected_not_undersized`
+    // for `linear_t`'s independent `c` allocation and
+    // `checked_output_len` call — `k = 0` makes `checked_shape_len(m, 0)`
+    // and `checked_shape_len(n, 0)` both zero regardless of `m`/`n`, so
+    // `a = []`/`b = []` pass trivially and only the write-side `m * n`
+    // product is exercised.
+    let k = 0usize;
+    let n = 2usize;
+    let m = (usize::MAX / n) + 2;
+    let a: [f32; 0] = [];
+    let b: [f32; 0] = [];
+    let _ = linear_t(&a, &b, None, m, n, k);
+}
+
+#[test]
+#[should_panic(expected = "linear_t: a.len()=2 does not match declared shape m=1 * k=3")]
+fn linear_t_mismatched_a_len_panics() {
+    let a = [1.0_f32, 2.0]; // 2 elements, m*k=3 declared
+    let w = [1.0_f32, 0.0, 0.0, 0.0, 1.0, 1.0]; // [2, 3], correct
+    let _ = linear_t(&a, &w, None, 1, 2, 3);
+}
+
+#[test]
+#[should_panic(expected = "linear_t: b.len()=5 does not match declared shape n=2 * k=3")]
+fn linear_t_mismatched_b_len_panics() {
+    let a = [1.0_f32, 2.0, 3.0];
+    let w = [1.0_f32, 0.0, 0.0, 0.0, 1.0]; // 5 elements, n*k=6 declared
+    let _ = linear_t(&a, &w, None, 1, 2, 3);
+}
+
+#[test]
 fn softmax_rows_sum_to_one() {
     let x = [0.0_f32, 1.0, 2.0, -1.0, 0.0, 1.0];
     let y = softmax_last_dim(&x, 2, 3);
