@@ -43,9 +43,8 @@ against its CPU reference path only, and any HIP-backed op returns
 
 ## Layout
 
-Planning canonical lives in kanon, under `projects/logismos/`. Resolve the kanon
-checkout root on this box with `kanon locate kanon-repo` (never hardcode a path -
-it differs per machine):
+Planning canonical lives in kanon, under `projects/logismos/`; see [CLAUDE.md](CLAUDE.md) for how
+to resolve the kanon checkout root on this box:
 
 - `projects/logismos/vision.md` - what this is and what it is not.
 - `projects/logismos/ROADMAP.md` - phased plan.
@@ -70,11 +69,13 @@ PolyForm Shield 1.0.0 with AI-training prohibition. See [LICENSE](LICENSE).
 
 - Registry name: `logismos`
 - Description: Kanon-managed forkwright repository `logismos`.
-- Forge repo: `forkwright/logismos`
+- Repository identity: `forkwright/logismos`
+- Hosting: `github`
+- Push authority: GitHub-primary - push and PR through GitHub
 - Kanon prefix: `lo`
 - Config source: `workflow/kanon.toml [projects.logismos]`
 - Planning state: `projects/logismos/STATE.md`
-- Last state update: `not recorded`
+- Last state update: `2026-08-03`
 
 Run `kanon docs sync --check --repo logismos` to verify this generated
 section and `kanon docs sync --apply --repo logismos` to refresh it.

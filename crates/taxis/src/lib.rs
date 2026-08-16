@@ -10,8 +10,8 @@
 //!
 //! Design source: kanon's `projects/logismos/research/02-rust-frameworks.md`
 //! §3 (candle-shaped tensor) + `projects/logismos/phases/01-foundation/PLAN.md`
-//! §6.2. (Resolve the kanon checkout root on this box with `kanon locate
-//! kanon-repo`.)
+//! §6.2. (See this repo's `CLAUDE.md` for how to resolve the kanon
+//! checkout root on this box.)
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]

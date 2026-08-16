@@ -1,15 +1,19 @@
 <!--
 scope: logismos repo conventions (Rust+HIP inference runtime, ~27 peer crates, W7900 primary target)
-defers_to: kanon standards at kanon's crates/basanos/standards/ (checkout root: `kanon locate kanon-repo`)
+defers_to: kanon standards at kanon's crates/basanos/standards/ (checkout-root resolution below)
 tightens: no-external-ML-framework rule, HIP FFI as lowest acceptable layer, per-kernel CPU-reference-test policy
 -->
 
 # Logismos - operating instructions
 
-Read kanon's `projects/logismos/{vision,ROADMAP,STATE}.md` before
-substantive work — resolve the kanon checkout root on this box with `kanon locate kanon-repo`
-(never hardcode a path; it differs per machine). Planning canonical lives in kanon. This repo
-holds code plus repo-local agent docs (`CLAUDE.md`, `AGENTS.md`, `README.md`).
+Read kanon's `projects/logismos/{vision,ROADMAP,STATE}.md` before substantive work. Planning
+canonical lives in kanon, a separate fleet-internal checkout — resolve its root per-box with the
+MCP tool `mcp__kanon__config_location_get` (intent `kanon-repo`), which returns an already-expanded
+path. The CLI form `kanon locate kanon-repo` prints its unexpanded `$KANON_ROOT` template rather
+than resolving it (tracked as forkwright/kanon#3484) — do not treat that output as a filesystem path.
+Without MCP access, ask the operator for the current checkout root; never hardcode one, it differs
+per machine. This repo holds code plus repo-local agent docs (`CLAUDE.md`, `AGENTS.md`,
+`README.md`).
 
 ## What logismos is
 
@@ -116,7 +120,9 @@ Operating principle, memory system, and global constraints come from
 ## Generated kanon context
 
 - Registry name: `logismos`
-- Forge repo: `forkwright/logismos`
+- Repository identity: `forkwright/logismos`
+- Hosting: `github`
+- Push authority: GitHub-primary - push and PR through GitHub
 - Kanon prefix: `lo`
 - Config source: `workflow/kanon.toml [projects.logismos]`
 - Standards source: `crates/basanos/standards/STANDARDS.md`

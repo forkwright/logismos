@@ -19,8 +19,7 @@ Structured reference data for AI agents is in `_llm/`:
 
 ## Planning (in kanon)
 
-Resolve the kanon checkout root on this box with `kanon locate kanon-repo`
-(never hardcode a path — it differs per machine):
+See [CLAUDE.md](CLAUDE.md) for how to resolve the kanon checkout root on this box:
 
 - `projects/logismos/vision.md` - what this is and what it is not
 - `projects/logismos/ROADMAP.md` - phased plan

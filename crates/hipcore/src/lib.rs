@@ -19,8 +19,8 @@
 //! Dossier kanon's `projects/logismos/research/01-rocm-hip-rdna3.md`
 //! locks the design decisions; see kanon's
 //! `projects/logismos/phases/01-foundation/PLAN.md` for per-item
-//! acceptance criteria. (Resolve the kanon checkout root on this box
-//! with `kanon locate kanon-repo`.)
+//! acceptance criteria. (See this repo's `CLAUDE.md` for how to resolve
+//! the kanon checkout root on this box.)
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
