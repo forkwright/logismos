@@ -57,6 +57,9 @@ matrixmultiply = "0.3"
 # Test-only tier-1 deps.
 approx = "0.5"
 rand = { version = "0.8", features = ["small_rng"] }
+# tempfile: fleet-canonical test-fixture temp dirs (RUST.md "Test fixtures:
+# tempfile over /tmp/<hardcoded>", D-057) -- parallel-scope-safe, RAII cleanup.
+tempfile = "3"
 
 # Serialization (used by rerank config, brought in by tokenizers/safetensors
 # transitively; made explicit for workspace members).

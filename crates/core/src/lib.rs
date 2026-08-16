@@ -90,6 +90,12 @@ pub enum EmbeddingError {
     /// IO / weight-loading failure.
     #[error("io: {0}")]
     Io(String),
+    /// Caller supplied a [`Prompt`] variant this model build does not
+    /// recognise. Reachable because `Prompt` is `#[non_exhaustive]`: a
+    /// caller compiled against a newer `core` than the model may pass a
+    /// variant added after this model was built.
+    #[error("unsupported prompt variant")]
+    UnsupportedPrompt,
 }
 
 /// Contract every embedding model implements.
@@ -195,6 +201,12 @@ mod tests {
     fn embedding_error_unsupported_dim_display() {
         let err = EmbeddingError::UnsupportedDim(7);
         assert_eq!(err.to_string(), "unsupported dim 7");
+    }
+
+    #[test]
+    fn embedding_error_unsupported_prompt_display() {
+        let err = EmbeddingError::UnsupportedPrompt;
+        assert_eq!(err.to_string(), "unsupported prompt variant");
     }
 
     #[test]
