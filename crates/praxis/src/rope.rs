@@ -149,6 +149,10 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
 
             crate::stream_pool::POOL.with_stream(device, |stream| {
                 // SAFETY: device pointers valid; sizes verified above.
+                // `out` was cloned into a fresh device allocation above and
+                // not yet shared with any other `Tensor` handle, so
+                // `out_hip`'s `as_mut_device_ptr` obligation (no other live
+                // pointer to this allocation) holds by construction.
                 unsafe {
                     kernels::rope::launch_rope_fp16_in_place(
                         out_hip.as_mut_device_ptr().cast::<c_void>(),
@@ -174,7 +178,7 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
                 seq,
                 heads,
                 head_dim,
-            );
+            )?;
             Ok(Tensor::from_cpu(
                 taxis::CpuStorage::F16(host),
                 qk.shape().clone(),
