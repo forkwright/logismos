@@ -32,25 +32,10 @@ fn usize_to_isize(value: usize) -> isize {
     isize::try_from(value).unwrap_or(isize::MAX)
 }
 
-/// Computes `rows * cols` as the element count a declared `(rows, cols)`
-/// shape implies, saturating to [`usize::MAX`] on overflow rather than
-/// silently wrapping. Mirrors `taxis::Shape::elem_count`
-/// (`crates/taxis/src/shape.rs`), which closes the identical overflow gap
-/// for the same reason.
-///
-/// WHY: `linear`/`linear_t` compare this product against a real slice's
-/// `.len()` to validate the shape a caller declares before trusting it as
-/// a bound inside `unsafe`. A wrapped product can compare equal to a
-/// slice that is actually far too short for the declared shape — exactly
-/// the failure mode `forkwright/logismos#29` names for shapes decoded
-/// from an untrusted model header. Saturating instead means no real
-/// slice's `.len()` can ever equal the overflow case (no allocation
-/// reaches `usize::MAX` elements), so the callers' own `assert_eq!`
-/// shape checks reject it through the same path as any other mismatch —
-/// no bespoke panic branch needed here.
-fn checked_shape_len(rows: usize, cols: usize) -> usize {
-    rows.checked_mul(cols).unwrap_or(usize::MAX)
-}
+// SCRATCH-REGRESSION-PROOF: checked_shape_len removed on this throwaway
+// branch (unused now that both call sites below are reverted to
+// debug_assert_eq!; keeping it would fail the build on dead_code, not on
+// the regression this branch exists to demonstrate). Never merge.
 
 /// Embedding lookup: `out[b, s, :] = weight[ids[b, s], :]`.
 ///
