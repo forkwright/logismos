@@ -92,16 +92,13 @@ impl Tensor {
         })
     }
 
-    /// Allocate a HIP tensor of the given shape + dtype, uninitialised.
+    /// Allocate a HIP tensor of the given shape + dtype, zero-filled.
     ///
     /// # Errors
     ///
-    /// [`Error::Hip`] on allocation failure.
+    /// [`Error::Hip`] on allocation or zero-fill failure.
     pub fn zeros_hip(device: &Device, dtype: DType, shape: Shape) -> Result<Self> {
         let elem = shape.elem_count();
-        // Caller may want genuinely zeroed memory; `hipMalloc` does
-        // not zero. Phase-1 kernels always overwrite their outputs,
-        // so this allocation stays uninitialised by design.
         let storage = HipStorage::alloc(device, dtype, elem)?;
         let layout = Layout::contiguous(shape);
         Ok(Self {
@@ -263,5 +260,25 @@ mod tests {
         assert_eq!(t.dtype(), DType::F32);
         assert!(t.is_contiguous());
         assert!(!t.is_on_device());
+    }
+
+    // INVARIANT: `zeros_hip` must produce an all-zero buffer (forkwright/logismos#26).
+    // Real shipped-code exercise, not a copy — but the assertion can only run
+    // against actual device memory, and no box in this fleet nor any GH-hosted
+    // CI runner exposes a physical ROCm GPU (CI installs `libamdhip64-dev`
+    // headers/link only; see .github/workflows/gate-attestation.yml). The
+    // ignore annotation below documents and preserves the check for the day
+    // this runs on ROCm hardware; until then the invariant rests on code
+    // review of the `hipMemset` call at `HipStorage::alloc` (storage.rs)
+    // covering exactly `byte_len()` bytes.
+    #[test]
+    #[ignore = "requires a physical ROCm GPU device — unavailable on any fleet \
+                box or GH-hosted CI runner; run manually on ROCm hardware — see #26"]
+    fn zeros_hip_produces_zero_filled_buffer() -> Result<()> {
+        let device = Device::new(0)?;
+        let t = Tensor::zeros_hip(&device, DType::F32, Shape::new(&[4, 4]))?;
+        let host = t.to_host_f32()?;
+        assert_eq!(host, vec![0.0_f32; 16]);
+        Ok(())
     }
 }

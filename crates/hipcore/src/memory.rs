@@ -148,6 +148,27 @@ impl<T: BytePod> DeviceBuffer<T> {
         )
     }
 
+    /// Zero-fill the entire allocation via `hipMemset`.
+    ///
+    /// `hipMalloc` does not zero device memory — callers that need a
+    /// genuinely zeroed buffer (as opposed to one about to be fully
+    /// overwritten, e.g. by [`Self::copy_from_host`]) must call this
+    /// explicitly.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Runtime`] on HIP failure.
+    pub fn zero_fill(&mut self) -> Result<()> {
+        self.device.make_current()?;
+        // SAFETY: `ptr` is owned, sized `byte_len()` bytes, and the
+        // device was just made current. `hipMemset` writes exactly
+        // `byte_len()` bytes starting at `ptr`, matching the allocation.
+        check(
+            unsafe { ffi::hipMemset(self.ptr.as_ptr().cast::<c_void>(), 0, self.byte_len()) },
+            "hipMemset",
+        )
+    }
+
     /// Device → host memcpy (synchronous).
     ///
     /// # Errors
