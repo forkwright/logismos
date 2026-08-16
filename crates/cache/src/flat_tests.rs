@@ -266,6 +266,10 @@ fn layer_out_of_range_errors() {
 }
 
 #[test]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "usize test indices (n_tokens * row_elems) stay single-digit here, far below f32's 24-bit exact-integer bound, so the cast is lossless"
+)]
 fn put_multi_token_batch_verifies_values() -> Result<()> {
     // WHY(forkwright/logismos-archive#70): every prior put/get test
     // writes exactly one row per call — including the multi-call
