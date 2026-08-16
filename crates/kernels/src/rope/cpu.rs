@@ -40,9 +40,19 @@ pub fn build_cos_sin_table(seq: usize, head_dim: usize, theta_base: f32) -> Vec<
 
 /// Apply RoPE in-place on a `(B, S, H, D)` fp16 tensor.
 ///
+/// # Errors
+///
+/// [`crate::error::Error::UnsupportedShape`] when `qk.len() !=
+/// batch*seq*heads*head_dim` or `cos_sin.len() != seq*head_dim`.
+/// Previously these mismatches were only checked by `debug_assert`,
+/// stripped in release, and the loop below silently skipped the
+/// affected rows via `.get(..).else { continue }` — a coordinate bug
+/// upstream produced an unrotated (not obviously wrong) output row
+/// instead of a diagnosable failure.
+///
 /// # Panics
 ///
-/// Debug-mode: shape / table-length mismatch.
+/// Debug-mode: `head_dim` is odd.
 pub fn rope_apply_fp16_ref(
     qk: &mut [f16],
     cos_sin: &[f32],
@@ -50,14 +60,37 @@ pub fn rope_apply_fp16_ref(
     seq: usize,
     heads: usize,
     head_dim: usize,
-) {
-    debug_assert_eq!(qk.len(), batch * seq * heads * head_dim);
-    debug_assert_eq!(cos_sin.len(), seq * head_dim);
+) -> crate::error::Result<()> {
+    let expected_qk_len = batch * seq * heads * head_dim;
+    if qk.len() != expected_qk_len {
+        return Err(crate::error::Error::UnsupportedShape {
+            kernel: "rope_apply_fp16_ref",
+            msg: format!(
+                "qk.len()={} != batch*seq*heads*head_dim={expected_qk_len}",
+                qk.len()
+            ),
+        });
+    }
+    let expected_table_len = seq * head_dim;
+    if cos_sin.len() != expected_table_len {
+        return Err(crate::error::Error::UnsupportedShape {
+            kernel: "rope_apply_fp16_ref",
+            msg: format!(
+                "cos_sin.len()={} != seq*head_dim={expected_table_len}",
+                cos_sin.len()
+            ),
+        });
+    }
     debug_assert!(head_dim.is_multiple_of(2));
     let pairs = head_dim / 2;
 
     for b in 0..batch {
         for s in 0..seq {
+            // INVARIANT: `cos_sin.len() == seq * head_dim` was checked
+            // above and `s < seq`, so this slice is always in range —
+            // `.get()` + `continue` stays as defense-in-depth rather
+            // than indexing directly, matching this module's checked-
+            // access convention.
             let Some(row) = cos_sin.get(s * head_dim..(s + 1) * head_dim) else {
                 continue;
             };
@@ -88,6 +121,7 @@ pub fn rope_apply_fp16_ref(
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -95,7 +129,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zero_positions_are_identity() {
+    fn zero_positions_are_identity() -> crate::error::Result<()> {
         let batch = 1;
         let seq = 1;
         let heads = 1;
@@ -114,9 +148,35 @@ mod tests {
             .map(|&f| f16::from_f32(f))
             .collect();
         let mut work = orig.clone();
-        rope_apply_fp16_ref(&mut work, &table, batch, seq, heads, head_dim);
+        rope_apply_fp16_ref(&mut work, &table, batch, seq, heads, head_dim)?;
         for (a, b) in orig.iter().zip(work.iter()) {
             assert_eq!(a, b);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn table_length_mismatch_is_rejected() {
+        // WHY(forkwright/logismos#59): before this fix, a `cos_sin`
+        // table shorter than `seq * head_dim` was only checked by
+        // `debug_assert`, stripped in release; the loop's
+        // `.get(..).else { continue }` then silently skipped every
+        // affected `s` row (leaving it unrotated) instead of erroring.
+        // This fails against that prior behaviour (no error to unwrap)
+        // and passes against the validated version.
+        let batch = 1;
+        let seq = 2;
+        let heads = 1;
+        let head_dim = 4;
+        let short_table = vec![0.0f32; head_dim]; // seq*head_dim=8, only 4 present
+        let mut qk: Vec<f16> = vec![f16::from_f32(1.0); batch * seq * heads * head_dim];
+        let result = rope_apply_fp16_ref(&mut qk, &short_table, batch, seq, heads, head_dim);
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::UnsupportedShape {
+                kernel: "rope_apply_fp16_ref",
+                ..
+            })
+        ));
     }
 }

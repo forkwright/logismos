@@ -236,10 +236,19 @@ impl HipStorage {
         self.buffer.as_device_ptr()
     }
 
-    /// Mutable device pointer (bytes). Callers must uphold aliasing
-    /// themselves; `HipStorage` does not enforce unique access.
+    /// Mutable device pointer (bytes).
+    ///
+    /// # Safety
+    ///
+    /// `HipStorage` does not enforce unique access — it is held behind
+    /// `Arc` so `Tensor` clones stay cheap, and kernel launches are
+    /// asynchronous, so no Rust borrow scope can bound the true
+    /// in-flight write window on the device. The caller must ensure no
+    /// other live pointer (from this handle, a cloned `Arc`, or another
+    /// in-flight kernel) reads or writes this allocation for as long as
+    /// the returned pointer is used for a write.
     #[must_use]
-    pub fn as_mut_device_ptr(&self) -> *mut u8 {
+    pub unsafe fn as_mut_device_ptr(&self) -> *mut u8 {
         self.buffer.as_device_ptr()
     }
 

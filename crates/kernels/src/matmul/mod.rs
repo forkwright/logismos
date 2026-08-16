@@ -110,6 +110,7 @@ pub unsafe fn launch_matmul_fp16(
                     Variant::Naive => "matmul_naive_fp16",
                     Variant::Wmma => "matmul_wmma_fp16",
                 },
+                kind: hipcore::ErrorKind::from_raw(code),
                 code,
             })
         }

@@ -24,6 +24,14 @@ struct TensorInner {
 
 impl Tensor {
     /// Construct a CPU tensor from a typed `Vec`.
+    ///
+    /// Does **not** validate `storage.len() == shape.elem_count()` — a
+    /// mismatched pair silently produces a `Tensor` whose declared
+    /// shape disagrees with its backing storage, through safe API,
+    /// with no error. The caller must uphold the invariant itself.
+    /// Prefer [`Self::try_from_cpu`] whenever the storage/shape pairing
+    /// is not already guaranteed correct by construction — e.g. data
+    /// copied from an external archive.
     #[must_use]
     pub fn from_cpu(storage: CpuStorage, shape: Shape) -> Self {
         let dtype = storage.dtype();
@@ -35,6 +43,26 @@ impl Tensor {
                 layout,
             }),
         }
+    }
+
+    /// Construct a CPU tensor from a typed `Vec`, validating that the
+    /// storage's element count matches the shape's.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ShapeMismatch`] when `storage.len() != shape.elem_count()`.
+    pub fn try_from_cpu(storage: CpuStorage, shape: Shape) -> Result<Self> {
+        let elem_count = shape.elem_count();
+        if storage.len() != elem_count {
+            return Err(Error::ShapeMismatch {
+                op: "try_from_cpu",
+                msg: format!(
+                    "storage.len()={} != shape.elem_count()={elem_count}",
+                    storage.len()
+                ),
+            });
+        }
+        Ok(Self::from_cpu(storage, shape))
     }
 
     /// Construct a HIP tensor from a host slice of `f32`.
@@ -280,5 +308,29 @@ mod tests {
         let host = t.to_host_f32()?;
         assert_eq!(host, vec![0.0_f32; 16]);
         Ok(())
+    }
+
+    #[test]
+    fn try_from_cpu_accepts_matching_pair() -> Result<()> {
+        let t = Tensor::try_from_cpu(
+            CpuStorage::F32(vec![1.0, 2.0, 3.0, 4.0]),
+            Shape::new(&[2, 2]),
+        )?;
+        assert_eq!(t.elem_count(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn try_from_cpu_rejects_length_mismatch() {
+        // WHY(forkwright/logismos#58): `from_cpu` never validated
+        // `storage.len()` against `shape.elem_count()`, so a caller
+        // passing a mismatched pair got a `Tensor` that silently lies
+        // about its own shape — no panic, no error, through safe API.
+        // `try_from_cpu` is the validating counterpart; this fails
+        // against `from_cpu` (which has no error path to return) and
+        // passes against `try_from_cpu`.
+        let result =
+            Tensor::try_from_cpu(CpuStorage::F32(vec![1.0, 2.0, 3.0]), Shape::new(&[2, 2]));
+        assert!(matches!(result, Err(Error::ShapeMismatch { .. })));
     }
 }

@@ -114,4 +114,19 @@ mod tests {
         let l = Layout::contiguous(Shape::new(&[2, 1, 4]));
         assert!(l.is_contiguous());
     }
+
+    #[test]
+    fn non_zero_start_offset_is_not_contiguous() {
+        // WHY(forkwright/logismos#58): the only prior tests build via
+        // `Layout::contiguous`, where `start_offset` is always 0 — the
+        // `start_offset != 0` branch in `is_contiguous` had zero
+        // coverage. `from_parts` is the only way to set a non-zero
+        // offset (e.g. a future view/slice API). This is the
+        // negative-case fixture for that branch: it fails if the
+        // `start_offset != 0 { return false }` guard is ever dropped.
+        let base = Layout::contiguous(Shape::new(&[2, 3]));
+        let sliced =
+            Layout::from_parts(base.shape().clone(), SmallVec::from_slice(base.stride()), 3);
+        assert!(!sliced.is_contiguous());
+    }
 }

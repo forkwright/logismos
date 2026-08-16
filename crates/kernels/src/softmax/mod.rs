@@ -62,6 +62,7 @@ pub unsafe fn launch_softmax_fp16(
         } else {
             Err(Error::Launch {
                 kernel: "softmax_fp16",
+                kind: hipcore::ErrorKind::from_raw(code),
                 code,
             })
         }

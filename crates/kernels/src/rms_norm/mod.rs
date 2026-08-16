@@ -73,6 +73,7 @@ pub unsafe fn launch_rms_norm_fp16(
         } else {
             Err(Error::Launch {
                 kernel: "rms_norm_fp16",
+                kind: hipcore::ErrorKind::from_raw(code),
                 code,
             })
         }

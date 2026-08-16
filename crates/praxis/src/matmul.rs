@@ -99,7 +99,10 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
                 // allocations and are valid on `stream`'s device for the
                 // duration of the launch; shapes derived from the tensor
                 // metadata; no aliasing between A, B, and the fresh out
-                // buffer.
+                // buffer. `out` was just allocated above and not yet
+                // shared with any other `Tensor` handle, so `out_hip`'s
+                // `as_mut_device_ptr` obligation (no other live pointer to
+                // this allocation) holds by construction.
                 unsafe {
                     kernels::matmul::launch_matmul_fp16(
                         variant,
