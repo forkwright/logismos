@@ -84,7 +84,7 @@ fn praxis_softmax_runs() {
             .iter()
             .map(|v| v.to_f32())
             .sum();
-        assert!((s - 1.0).abs() < 5e-2, "row sum {s}");
+        assert!((s - 1.0).abs() < 1e-3, "row sum {s}");
     }
 }
 

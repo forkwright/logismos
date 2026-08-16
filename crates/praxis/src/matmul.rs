@@ -2,7 +2,6 @@
 
 use std::ffi::c_void;
 
-use hipcore::Stream;
 use taxis::{DType, Shape, Tensor};
 
 use crate::error::{Error, Result};
@@ -89,32 +88,33 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
                 op: "matmul",
                 msg: "zeros_hip did not return a HIP tensor".into(),
             })?;
-            let stream = Stream::new(device)?;
-
             let variant = if m % 16 == 0 && n % 16 == 0 && ka % 16 == 0 {
                 kernels::matmul::Variant::Wmma
             } else {
                 kernels::matmul::Variant::Naive
             };
 
-            // SAFETY: pointers originate from our own device
-            // allocations and are valid on `stream`'s device for the
-            // duration of the launch; shapes derived from the tensor
-            // metadata; no aliasing between A, B, and the fresh out
-            // buffer.
-            unsafe {
-                kernels::matmul::launch_matmul_fp16(
-                    variant,
-                    a_hip.as_device_ptr().cast::<c_void>(),
-                    b_hip.as_device_ptr().cast::<c_void>(),
-                    out_hip.as_mut_device_ptr().cast::<c_void>(),
-                    dim_i32(m, "M")?,
-                    dim_i32(n, "N")?,
-                    dim_i32(ka, "K")?,
-                    &stream,
-                )?;
-            }
-            stream.synchronize()?;
+            crate::stream_pool::POOL.with_stream(device, |stream| {
+                // SAFETY: pointers originate from our own device
+                // allocations and are valid on `stream`'s device for the
+                // duration of the launch; shapes derived from the tensor
+                // metadata; no aliasing between A, B, and the fresh out
+                // buffer.
+                unsafe {
+                    kernels::matmul::launch_matmul_fp16(
+                        variant,
+                        a_hip.as_device_ptr().cast::<c_void>(),
+                        b_hip.as_device_ptr().cast::<c_void>(),
+                        out_hip.as_mut_device_ptr().cast::<c_void>(),
+                        dim_i32(m, "M")?,
+                        dim_i32(n, "N")?,
+                        dim_i32(ka, "K")?,
+                        stream,
+                    )?;
+                }
+                stream.synchronize()?;
+                Ok(())
+            })?;
             Ok(out)
         }
         _ => {

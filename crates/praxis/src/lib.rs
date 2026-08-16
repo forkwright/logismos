@@ -35,6 +35,7 @@ mod matmul;
 mod norm;
 mod rope;
 mod softmax;
+mod stream_pool;
 
 pub use crate::error::{Error, Result};
 pub use crate::matmul::matmul;
