@@ -279,16 +279,15 @@ impl<T: BytePod> Drop for PendingCopy<'_, T> {
         if self.synced {
             return;
         }
-        if let Err(error) = self.stream.synchronize() {
-            if writeln!(
+        if let Err(error) = self.stream.synchronize()
+            && writeln!(
                 io::stderr().lock(),
                 "hipcore: stream synchronize before PendingCopy drop failed: {error} — \
                  the host buffer may still be read by an in-flight DMA"
             )
             .is_err()
-            {
-                // Drop cannot surface secondary stderr failures.
-            }
+        {
+            // Drop cannot surface secondary stderr failures.
         }
     }
 }
