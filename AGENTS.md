@@ -6,7 +6,7 @@ tightens: no-external-ML-framework rule, HIP FFI as lowest acceptable layer, per
 
 # AGENTS.md - Logismos
 
-Cross-tool guide for AI coding agents (Claude Code, Kimi, Codex, Cursor, Copilot, etc.). Read [CLAUDE.md](CLAUDE.md) for operating instructions. Planning canonical lives in kanon: `projects/logismos/{vision,ROADMAP,STATE}.md` (resolve the kanon checkout root on this box with `kanon locate kanon-repo` — never hardcode a path).
+Cross-tool guide for AI coding agents (Claude Code, Kimi, Codex, Cursor, Copilot, etc.). Read [CLAUDE.md](CLAUDE.md) for operating instructions, including how to resolve the kanon checkout root on this box. Planning canonical lives in kanon: `projects/logismos/{vision,ROADMAP,STATE}.md`.
 
 ## Build / Test / Lint
 
@@ -65,3 +65,71 @@ Universal engineering policy lives in kanon at `crates/basanos/standards/`. Read
 ## Gate trailer
 
 Run `kanon gate --stamp` before pushing, then prefix every commit body with `Gate-Passed: kanon 0.1.0` once the stamp succeeds. Kanon holds trailer authority until logismos has its own dispatched CI.
+
+<!-- kanon:auto-start -->
+<!--
+scope: logismos repo cross-tool agent guide (Claude Code, Kimi, Codex, Cursor, Windsurf, Copilot)
+generated_by: kanon docs sync
+defers_to: CLAUDE.md for Claude Code-specific behavior; ~/menos-ops/CLAUDE.md for machine + service topology
+tightens: workflow/AGENTS-mcp-tools.md catalog routing; crates/basanos/standards/AGENT-DOCS.md authoring rules
+-->
+
+# logismos
+
+Kanon-managed forkwright repository `logismos`.
+
+## Commands
+
+Run `kanon --help` for all kanon-managed workflow commands. Run project-local
+build, test, and lint commands from this repository root.
+
+- `kanon gate` - full local gate for kanon-managed PRs
+- `kanon lint --fix` - deterministic standards fixes
+- `kanon lint --explain <RULE>` - rule rationale and fix guidance
+- `kanon pr open <head_ref> --title "..."` - open a forge PR
+- `kanon pr merge <N> [--strategy squash|ff|rebase]` - merge after CI and gate checks
+- `kanon docs sync --check --repo logismos` - verify derived bootstrap docs
+- `kanon docs sync --apply --repo logismos` - regenerate derived bootstrap docs
+
+For agent-native operations, prefer the `mcp__kanon__*` tool family. See
+[workflow/AGENTS-mcp-tools.md](workflow/AGENTS-mcp-tools.md) for routing and fallback rules.
+
+## Standards
+
+Read `crates/basanos/standards/STANDARDS.md` § Philosophy before writing code. Key principles:
+no workarounds, define once, reference everywhere, no shortcuts, no compromise on quality.
+Rust work also reads `crates/basanos/standards/RUST.md` before editing Rust code.
+
+## Rules
+
+- Structured comment tags only: WHY, NOTE, WARNING, PERF, SAFETY, INVARIANT, TODO(#NNN), FIXME(#NNN)
+- Conventional commits: `type(scope): description`
+- Add `Gate-Passed: kanon 0.1.0` to validated commit bodies
+- Never add `#[allow]` suppressions; use `#[expect(lint, reason = "...")]` only when justified
+- Prefer MCP tools first; CLI commands are resilience fallbacks
+
+## Architecture
+
+- Registry name: `logismos`
+- Repository identity: `forkwright/logismos`
+- Hosting: `github`
+- Push authority: GitHub-primary - push and PR through GitHub
+- Kanon prefix: `lo`
+- Config source: `workflow/kanon.toml [projects.logismos]`
+
+## Boundaries
+
+Always: run the applicable gate before pushing, stay inside the declared blast radius.
+Ask first: workflow, service, credential, schema, or deployment changes.
+Never: bypass CI, push to protected upstream refs, commit secrets, or suppress warnings.
+
+## Blast zone
+
+- Paths explicitly named by the rendered prompt, role, or template input.
+
+## Acceptance verifier
+
+```bash
+kanon gate
+```
+<!-- kanon:auto-end -->

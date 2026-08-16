@@ -24,6 +24,13 @@
 # WHY rust_toolchain left empty: rust-toolchain.toml pins channel 1.90 —
 # auto-detect applies (fleet convention).
 #
+# WHY fmt_cmd carries a second command (kanon#3459/#3478/#3484/#3488): the
+# hybrid-gate reusable workflow has no free-form "extra check" input, so the
+# SSOT guard (scripts/check-kanon-root-ssot.sh — fails if any file other than
+# CLAUDE.md restates the kanon-checkout-root resolution mechanism) rides the
+# fmt stage, which is cheap and unrelated in content so a guard failure there
+# reads unambiguously as the guard, not a formatting regression.
+#
 # WHY needs_fleet_repo_token false: no `git = "https://github.com/forkwright/..."`
 # dependency anywhere in the workspace (grepped directly).
 #
@@ -82,7 +89,7 @@ jobs:
   gate:
     uses: forkwright/.github/.github/workflows/hybrid-gate.yml@main
     with:
-      fmt_cmd: "cargo fmt --all -- --check"
+      fmt_cmd: "cargo fmt --all -- --check && bash scripts/check-kanon-root-ssot.sh"
       check_cmd: "cargo check --workspace --all-targets"
       clippy_cmd: "cargo clippy --workspace --all-targets -- -D warnings"
       nextest_cmd: "cargo nextest run --workspace --no-fail-fast"
