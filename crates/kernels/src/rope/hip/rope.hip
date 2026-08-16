@@ -1,6 +1,7 @@
 // RoPE kernel, in-place on fp16 (B, S, H, D). Interleaved cos/sin
 // table layout matches the CPU reference.
 
+#include <cstdint>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -20,11 +21,19 @@ extern "C" __global__ void logismos_rope_fp16_kernel(
     const int pairs = head_dim / 2;
     if (pair_idx >= pairs || h >= heads || s >= seq || b >= batch) return;
 
-    const float* row = cos_sin + s * head_dim;
+    // WARNING: index arithmetic in int64_t, not int. batch*seq*heads*head_dim
+    // overflows a 32-bit signed product at long-context dimensions
+    // (forkwright/logismos#33); the launcher rejects any shape whose
+    // product would exceed i32::MAX before this kernel ever launches
+    // (`kernels::rope::check_rope_shape`), but the kernel's own arithmetic
+    // must not depend solely on that upstream promise to stay defined.
+    const std::int64_t row_offset = static_cast<std::int64_t>(s) * head_dim;
+    const float* row = cos_sin + row_offset;
     float cos_v = row[2 * pair_idx];
     float sin_v = row[2 * pair_idx + 1];
 
-    int base = ((b * seq + s) * heads + h) * head_dim;
+    std::int64_t base = (static_cast<std::int64_t>(b) * seq + s) * heads + h;
+    base *= head_dim;
     float x0 = __half2float(qk[base + 2 * pair_idx]);
     float x1 = __half2float(qk[base + 2 * pair_idx + 1]);
     float y0 = x0 * cos_v - x1 * sin_v;

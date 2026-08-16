@@ -53,6 +53,53 @@ pub enum Variant {
     Wmma,
 }
 
+/// Rejects an `M`/`N`/`K` combination whose element-index products the
+/// naive/WMMA kernels cannot address without their 32-bit-derived
+/// intermediates overflowing.
+///
+/// WHY here and not only in `praxis::matmul::dim_i32`: that check
+/// confirms each of `M`/`N`/`K` individually fits `i32`, but
+/// `matmul_naive.hip`'s element-index products `row*K+i` and `i*N+col`
+/// overflow a 32-bit product for large dimensions even when `M`, `N`,
+/// and `K` are each individually small (forkwright/logismos#32) — a
+/// defect in the composite index, not in any one operand, so a
+/// per-operand check cannot catch it. Both
+/// `logismos_launch_matmul_naive_fp16` and
+/// `logismos_launch_matmul_wmma_fp16` above are declared without `pub`
+/// inside this module's private `extern "C"` block, so
+/// [`launch_matmul_fp16`] is the only Rust path able to reach either —
+/// checking here, once, covers `Variant::Wmma` too (its tile-indexed
+/// reads/store share the identical `M*K`/`K*N`/`M*N` bound), without a
+/// second check per variant and without a future caller able to route
+/// around it by skipping `praxis`.
+fn check_matmul_shape(m: i32, n: i32, k: i32) -> Result<()> {
+    for (value, name) in [(m, "M"), (n, "N"), (k, "K")] {
+        if value <= 0 {
+            return Err(Error::UnsupportedShape {
+                kernel: "matmul_fp16",
+                msg: format!("{name} must be positive, got {value}"),
+            });
+        }
+    }
+    // INVARIANT: all three operands are positive `i32` here, so each
+    // `i64` product is bounded by `i32::MAX as i64` squared — far
+    // under `i64::MAX` — and cannot itself overflow.
+    let (m64, n64, k64) = (i64::from(m), i64::from(n), i64::from(k));
+    for (label, product) in [("M*K", m64 * k64), ("K*N", k64 * n64), ("M*N", m64 * n64)] {
+        if product > i64::from(i32::MAX) {
+            return Err(Error::UnsupportedShape {
+                kernel: "matmul_fp16",
+                msg: format!(
+                    "{label} = {product} exceeds i32::MAX ({}); matmul_naive.hip's \
+                     element-index products cannot address this shape",
+                    i32::MAX
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Launch `D = A @ B` on the given stream.
 ///
 /// # Arguments
@@ -63,6 +110,8 @@ pub enum Variant {
 ///
 /// # Errors
 ///
+/// - [`Error::UnsupportedShape`] if `M`/`N`/`K` would drive an
+///   element-index product past `i32::MAX` inside the kernel.
 /// - [`Error::NoGpuBuild`] if `hipcc` wasn't available at build time.
 /// - [`Error::Launch`] if the kernel fails.
 ///
@@ -82,6 +131,8 @@ pub unsafe fn launch_matmul_fp16(
     k: i32,
     stream: &Stream,
 ) -> Result<()> {
+    check_matmul_shape(m, n, k)?;
+
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (variant, a, b, d, m, n, k, stream);
@@ -114,5 +165,60 @@ pub unsafe fn launch_matmul_fp16(
                 code,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // WHY host-side only: `check_matmul_shape` is pure `i32`/`i64`
+    // arithmetic with no device access, so it needs neither `hipcc` (HIP
+    // kernel compile) nor a physical HIP device to run. That is
+    // deliberate — the device read this guards
+    // (`matmul_naive.hip`'s `a[row*k+i]` / `b[i*n+col]`) cannot be
+    // exercised on any box in this fleet, metis or CI
+    // (forkwright/logismos#95): no box carries a physical AMD GPU, and
+    // CI's `libamdhip64-dev` package supplies headers/link only. This
+    // test is what stands in for that unreachable coverage — it pins
+    // the exact boundary the launcher enforces before a kernel launch
+    // is even attempted, and it calls `check_matmul_shape` itself
+    // rather than a re-derivation of its arithmetic.
+
+    #[test]
+    fn check_matmul_shape_rejects_overflowing_product() {
+        // M=32_768, N=1, K=65_538: M*K = 2_147_549_184, which is 65_537
+        // past i32::MAX (2_147_483_647). Exactly the dimensions
+        // forkwright/logismos#32 cites (row=32_767 zero-indexed => M=32_768,
+        // K=65_538) as the attacker-reachable case: a GGUF file can
+        // declare matrix dimensions this large legitimately.
+        let err =
+            check_matmul_shape(32_768, 1, 65_538).expect_err("overflowing shape must be rejected");
+        assert!(
+            matches!(
+                &err,
+                Error::UnsupportedShape { kernel: "matmul_fp16", msg }
+                    if msg.contains("2147549184") && msg.contains("i32::MAX")
+            ),
+            "expected UnsupportedShape citing the overflowing product, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_matmul_shape_accepts_in_range_shapes() {
+        // The exact shapes `matmul_parity.rs` launches — this check
+        // must never reject a shape the kernels can actually address,
+        // or the guard becomes a false-positive outage. Covers both
+        // the naive-dispatch and WMMA-dispatch parity cases; the check
+        // is variant-agnostic (see the WHY above `check_matmul_shape`).
+        assert!(check_matmul_shape(32, 48, 64).is_ok());
+        assert!(check_matmul_shape(256, 256, 256).is_ok());
+    }
+
+    #[test]
+    fn check_matmul_shape_rejects_nonpositive_dims() {
+        assert!(check_matmul_shape(0, 48, 64).is_err());
+        assert!(check_matmul_shape(32, -48, 64).is_err());
+        assert!(check_matmul_shape(32, 48, 0).is_err());
     }
 }
