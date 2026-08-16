@@ -8,7 +8,7 @@
 //! use decode::{DecodeChain, GreedySampler, TemperatureScale, TopK, TopP};
 //! let mut chain = DecodeChain::new(GreedySampler)
 //!     .push(TemperatureScale(0.8))
-//!     .push(TopK(50))
+//!     .push(TopK::new(50))
 //!     .push(TopP(0.95));
 //! # let _ = chain;
 //! ```
@@ -132,7 +132,7 @@ mod tests {
     fn chain_length_tracks_push_calls() {
         let chain = DecodeChain::new(GreedySampler)
             .push(TemperatureScale(0.8))
-            .push(TopK(50));
+            .push(TopK::new(50));
         assert_eq!(chain.len(), 2);
         assert!(!chain.is_empty());
     }

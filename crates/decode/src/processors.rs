@@ -27,26 +27,52 @@ impl LogitProcessor for TemperatureScale {
 }
 
 /// Keep the `k` highest-scoring tokens; mask the rest to `-inf`.
-#[derive(Debug, Clone, Copy)]
-pub struct TopK(pub usize);
+///
+/// Owns a reusable scratch buffer so the per-step partial sort does not
+/// allocate a vocab-sized `Vec` on every decode step.
+#[derive(Debug, Clone)]
+pub struct TopK {
+    k: usize,
+    scratch: Vec<f32>,
+}
+
+impl TopK {
+    /// New `TopK` processor keeping the `k` highest-scoring tokens.
+    #[must_use]
+    pub fn new(k: usize) -> Self {
+        Self {
+            k,
+            scratch: Vec::new(),
+        }
+    }
+}
 
 impl LogitProcessor for TopK {
     fn process(&mut self, logits: &mut [f32], _ctx: &TokenContext<'_>) {
-        let k = self.0;
+        let k = self.k;
         if k == 0 || k >= logits.len() {
             return;
         }
         // Partial-sort: find the kth-largest score, mask everything below.
-        let mut sorted: Vec<f32> = logits.to_vec();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(core::cmp::Ordering::Equal));
+        // WHY: NaN is folded to -inf before the sort rather than masked
+        // afterward — `*l < threshold` is always false when `l` is NaN, so a
+        // NaN masked only via that comparison would survive top-k untouched.
+        self.scratch.clear();
+        self.scratch.extend(
+            logits
+                .iter()
+                .map(|&l| if l.is_nan() { f32::NEG_INFINITY } else { l }),
+        );
+        self.scratch
+            .sort_by(|a, b| b.partial_cmp(a).unwrap_or(core::cmp::Ordering::Equal));
         // k >= 1 (the k==0 branch returned) and k < logits.len(),
         // so the (k-1)th sorted entry exists. If the invariant ever
         // breaks, fail open (leave logits untouched).
-        let Some(&threshold) = sorted.get(k.saturating_sub(1)) else {
+        let Some(&threshold) = self.scratch.get(k.saturating_sub(1)) else {
             return;
         };
         for l in logits.iter_mut() {
-            if *l < threshold {
+            if l.is_nan() || *l < threshold {
                 *l = f32::NEG_INFINITY;
             }
         }
@@ -202,7 +228,7 @@ mod tests {
     #[test]
     fn top_k_masks_below_kth() {
         let mut logits = vec![1.0, 3.0, 2.0, 5.0, 4.0];
-        let mut p = TopK(2);
+        let mut p = TopK::new(2);
         p.process(&mut logits, &ctx());
         // Top 2 are 5.0 and 4.0. Others -> -inf.
         assert_eq!(logits[3], 5.0);
@@ -210,6 +236,42 @@ mod tests {
         assert!(logits[0].is_infinite() && logits[0] < 0.0);
         assert!(logits[1].is_infinite() && logits[1] < 0.0);
         assert!(logits[2].is_infinite() && logits[2] < 0.0);
+    }
+
+    #[test]
+    fn top_k_masks_nan_logit() {
+        // Regression: a NaN logit always fails `*l < threshold` (NaN
+        // comparisons are never true), so the old unmasked-comparison
+        // let it survive top-k untouched regardless of rank.
+        let mut logits = vec![1.0, f32::NAN, 5.0, 4.0, 3.0];
+        let mut p = TopK::new(2);
+        p.process(&mut logits, &ctx());
+        assert_eq!(logits[2], 5.0);
+        assert_eq!(logits[3], 4.0);
+        assert_eq!(
+            logits[1],
+            f32::NEG_INFINITY,
+            "NaN logit must be masked, not left to bypass the threshold comparison"
+        );
+        assert!(logits[0].is_infinite() && logits[0] < 0.0);
+        assert!(logits[4].is_infinite() && logits[4] < 0.0);
+    }
+
+    #[test]
+    fn top_k_reuses_scratch_buffer_across_steps() {
+        let mut p = TopK::new(2);
+        let mut logits = vec![1.0, 3.0, 2.0, 5.0, 4.0];
+        p.process(&mut logits, &ctx());
+        let cap_after_first = p.scratch.capacity();
+        assert!(cap_after_first >= logits.len());
+
+        let mut logits2 = vec![2.0, 1.0, 4.0, 3.0, 0.0];
+        p.process(&mut logits2, &ctx());
+        assert_eq!(
+            p.scratch.capacity(),
+            cap_after_first,
+            "scratch buffer must be reused, not reallocated, across decode steps"
+        );
     }
 
     #[test]
