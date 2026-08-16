@@ -32,6 +32,26 @@ fn usize_to_isize(value: usize) -> isize {
     isize::try_from(value).unwrap_or(isize::MAX)
 }
 
+/// Computes `rows * cols` as the element count a declared `(rows, cols)`
+/// shape implies, saturating to [`usize::MAX`] on overflow rather than
+/// silently wrapping. Mirrors `taxis::Shape::elem_count`
+/// (`crates/taxis/src/shape.rs`), which closes the identical overflow gap
+/// for the same reason.
+///
+/// WHY: `linear`/`linear_t` compare this product against a real slice's
+/// `.len()` to validate the shape a caller declares before trusting it as
+/// a bound inside `unsafe`. A wrapped product can compare equal to a
+/// slice that is actually far too short for the declared shape — exactly
+/// the failure mode `forkwright/logismos#29` names for shapes decoded
+/// from an untrusted model header. Saturating instead means no real
+/// slice's `.len()` can ever equal the overflow case (no allocation
+/// reaches `usize::MAX` elements), so the callers' own `assert_eq!`
+/// shape checks reject it through the same path as any other mismatch —
+/// no bespoke panic branch needed here.
+fn checked_shape_len(rows: usize, cols: usize) -> usize {
+    rows.checked_mul(cols).unwrap_or(usize::MAX)
+}
+
 /// Embedding lookup: `out[b, s, :] = weight[ids[b, s], :]`.
 ///
 /// - `weight`: `[vocab, hidden]`
@@ -110,6 +130,16 @@ pub fn rms_norm(x: &[f32], weight: &[f32], rows: usize, n: usize, eps: f32) -> V
 /// Parallelised across rows of the output via rayon. For small `m` the
 /// fallback is still a row-at-a-time loop; rayon's scheduler folds small
 /// batches onto a single worker.
+///
+/// # Panics
+///
+/// Panics if `a.len() != m * k`, `b.len() != k * n`, or a supplied
+/// `bias.len() != n`. This is a real `assert_eq!`, not `debug_assert_eq!`
+/// — a stripped debug guard let a mismatched shape reach the `unsafe`
+/// `sgemm` call below unchecked in a release build
+/// (`forkwright/logismos#29`); `m * k` and `k * n` are computed via
+/// `checked_shape_len` so an overflowing shape cannot wrap to a value
+/// that spuriously matches a too-short slice.
 #[must_use]
 pub fn linear(
     a: &[f32],
@@ -119,14 +149,33 @@ pub fn linear(
     n: usize,
     k: usize,
 ) -> Vec<f32> {
-    debug_assert_eq!(a.len(), m * k);
-    debug_assert_eq!(b.len(), k * n);
+    assert_eq!(
+        a.len(),
+        checked_shape_len(m, k),
+        "linear: a.len()={} does not match declared shape m={m} * k={k}",
+        a.len()
+    );
+    assert_eq!(
+        b.len(),
+        checked_shape_len(k, n),
+        "linear: b.len()={} does not match declared shape k={k} * n={n}",
+        b.len()
+    );
     if let Some(bv) = bias {
-        debug_assert_eq!(bv.len(), n);
+        assert_eq!(
+            bv.len(),
+            n,
+            "linear: bias.len()={} does not match declared n={n}",
+            bv.len()
+        );
     }
     let mut c = vec![0.0f32; m * n];
-    // SAFETY: strides / sizes match the declared shapes; sgemm only
-    // writes into `c`; `a` and `b` live beyond the call.
+    // SAFETY: `a.len() == m * k`, `b.len() == k * n`, and any
+    // `bias.len() == n` are enforced above by `assert_eq!` (not
+    // `debug_assert_eq!`), so the check runs identically in every build
+    // profile including release, and `checked_shape_len` rejects an
+    // overflowing `m`/`k`/`n` triple rather than silently wrapping;
+    // sgemm only writes into `c`; `a` and `b` live beyond the call.
     unsafe {
         matrixmultiply::sgemm(
             m,
@@ -160,6 +209,16 @@ pub fn linear(
 /// transpose into the inner loop; much cheaper than a materialised transpose.
 ///
 /// `a`: `[m, k]`, `b`: `[n, k]` (the untransposed weight). Output `[m, n]`.
+///
+/// # Panics
+///
+/// Panics if `a.len() != m * k`, `b.len() != n * k`, or a supplied
+/// `bias.len() != n`. This is a real `assert_eq!`, not `debug_assert_eq!`
+/// — a stripped debug guard let a mismatched shape reach the `unsafe`
+/// `sgemm` call below unchecked in a release build
+/// (`forkwright/logismos#29`); `m * k` and `n * k` are computed via
+/// `checked_shape_len` so an overflowing shape cannot wrap to a value
+/// that spuriously matches a too-short slice.
 #[must_use]
 pub fn linear_t(
     a: &[f32],
@@ -169,10 +228,25 @@ pub fn linear_t(
     n: usize,
     k: usize,
 ) -> Vec<f32> {
-    debug_assert_eq!(a.len(), m * k);
-    debug_assert_eq!(b.len(), n * k);
+    assert_eq!(
+        a.len(),
+        checked_shape_len(m, k),
+        "linear_t: a.len()={} does not match declared shape m={m} * k={k}",
+        a.len()
+    );
+    assert_eq!(
+        b.len(),
+        checked_shape_len(n, k),
+        "linear_t: b.len()={} does not match declared shape n={n} * k={k}",
+        b.len()
+    );
     if let Some(bv) = bias {
-        debug_assert_eq!(bv.len(), n);
+        assert_eq!(
+            bv.len(),
+            n,
+            "linear_t: bias.len()={} does not match declared n={n}",
+            bv.len()
+        );
     }
 
     // C = A @ B^T  where A: [m, k] row-major, B: [n, k] row-major (the
@@ -182,9 +256,13 @@ pub fn linear_t(
     // stride (rsb, csb) -> (1, k) encodes B as [k, n] with row stride 1
     // and column stride k. This avoids materialising a transpose.
     let mut c = vec![0.0f32; m * n];
-    // SAFETY: the buffer lengths / strides match the declared shapes;
-    // matrixmultiply::sgemm only writes into `c`, and all input slices
-    // are valid for the read extents declared by the row/col strides.
+    // SAFETY: `a.len() == m * k` and `b.len() == n * k` are enforced
+    // above by `assert_eq!` (not `debug_assert_eq!`), so the check runs
+    // identically in every build profile including release, and
+    // `checked_shape_len` rejects an overflowing `m`/`k`/`n` triple
+    // rather than silently wrapping; the read extents declared by the
+    // row/col strides therefore stay in bounds. sgemm only writes into
+    // `c`, and all input slices outlive the call.
     unsafe {
         matrixmultiply::sgemm(
             m,
