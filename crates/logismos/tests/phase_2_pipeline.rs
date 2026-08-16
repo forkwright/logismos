@@ -167,7 +167,7 @@ fn exercise_decode() {
     // And through a chain for the fuller shape.
     let mut chain = DecodeChain::new(GreedySampler)
         .push(TemperatureScale(0.7))
-        .push(TopK(3))
+        .push(TopK::new(3))
         .push(TopP(0.95));
     let mut log_buf = logits.clone();
     let ctx = TokenContext {
