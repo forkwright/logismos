@@ -30,6 +30,7 @@
     clippy::single_match_else
 )]
 
+mod device_dispatch;
 pub mod error;
 mod matmul;
 mod norm;
