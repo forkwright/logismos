@@ -188,15 +188,11 @@ impl Archive {
     /// format; otherwise propagates whatever the matched format's
     /// `Reader::open` returns.
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        // WHY(forkwright/logismos#60): matching the raw extension
-        // rejected a valid `.GGUF` or `.SafeTensors` file as unknown —
-        // case doesn't carry format information on any filesystem this
-        // loader targets.
-        let ext = path
-            .extension()
-            .and_then(std::ffi::OsStr::to_str)
-            .map(str::to_ascii_lowercase);
-        match ext.as_deref() {
+        // PROOF-BRANCH: case-insensitive dispatch reverted to
+        // demonstrate `archive_open_dispatches_by_extension_case_insensitively`
+        // fails against it. Not for merge.
+        let ext = path.extension().and_then(std::ffi::OsStr::to_str);
+        match ext {
             Some("safetensors") => Ok(Self::Safetensors(crate::safetensors::Reader::open(path)?)),
             Some("gguf") => Ok(Self::Gguf(crate::gguf::Reader::open(path)?)),
             _ => Err(Error::UnknownFormat {

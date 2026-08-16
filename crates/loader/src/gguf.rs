@@ -221,7 +221,8 @@ impl Reader {
         for _ in 0..metadata_count {
             let key = cur.read_string()?;
             let val = cur.read_meta_value()?;
-            reject_duplicate_metadata_key(&metadata, &key, cur.pos)?;
+            // PROOF-BRANCH: duplicate-key check reverted to demonstrate
+            // `rejects_duplicate_metadata_key` fails against it. Not for merge.
             metadata.insert(key, val);
         }
 
@@ -255,7 +256,8 @@ impl Reader {
             for _ in 0..n_dims {
                 dims.push(cur.read_u64()?);
             }
-            reject_zero_length_dimension(&name, &dims, cur.pos)?;
+            // PROOF-BRANCH: zero-dim check reverted to demonstrate
+            // `rejects_zero_length_dimension` fails against it. Not for merge.
             let ggml_type_id = cur.read_u32()?;
             let ggml_type = GgmlType::from_u32(ggml_type_id)?;
             let data_offset = cur.read_u64()?;
@@ -263,7 +265,8 @@ impl Reader {
                 offset: cur.pos,
                 msg: format!("tensor index {i} exceeds usize::MAX"),
             })?;
-            reject_duplicate_tensor_name(&tensor_by_name, &name, cur.pos)?;
+            // PROOF-BRANCH: duplicate-name check reverted to demonstrate
+            // `rejects_duplicate_tensor_name` fails against it. Not for merge.
             tensor_by_name.insert(name.clone(), idx_usize);
             tensors.push(TensorDescriptor {
                 name,
@@ -369,21 +372,10 @@ impl Reader {
                 desc.name, desc.ggml_type
             ),
         })?;
-        // WHY(forkwright/logismos#56): `saturating_mul` clamped to
-        // `usize::MAX` on overflow instead of erroring, which turns a
-        // genuine overflow into a misleading "out of file bounds" error
-        // later (the clamped byte count is a real number, just the
-        // wrong one). `checked_mul` reports the overflow itself.
-        let byte_count = bits
-            .checked_mul(elem_count)
-            .ok_or_else(|| Error::Gguf {
-                offset: 0,
-                msg: format!(
-                    "tensor `{}` byte count overflows usize: {bits} bits * {elem_count} elements",
-                    desc.name
-                ),
-            })?
-            .div_ceil(8);
+        // PROOF-BRANCH: checked_mul reverted to saturating_mul to
+        // demonstrate `byte_range_for_rejects_byte_count_overflow`
+        // fails against it. Not for merge.
+        let byte_count = bits.saturating_mul(elem_count).div_ceil(8);
         let byte_count_u64 = u64::try_from(byte_count).map_err(|_| Error::Gguf {
             offset: 0,
             msg: format!(
