@@ -179,13 +179,29 @@ impl<T: BytePod> DeviceBuffer<T> {
 
     /// Async host → device memcpy on `stream`.
     ///
-    /// The caller must ensure `data` outlives the copy (normally via
-    /// `stream.synchronize()` before `data` is dropped).
+    /// Takes ownership of `data`, returning a [`PendingCopy`] that holds
+    /// it until the copy completes. A safe caller cannot free or mutate
+    /// the source buffer while the GPU DMA may still be reading it:
+    /// `data` is moved into this call, so any attempt to reuse the
+    /// caller's original binding afterward is a compile-time "use of
+    /// moved value" error. Even `std::mem::forget`-ing the returned
+    /// [`PendingCopy`] only leaks the owned buffer (safe) — it can
+    /// never free memory the DMA is still reading (unsound), which is
+    /// the failure mode a borrow-plus-`Drop`-guard design would not
+    /// have closed.
+    ///
+    /// Call [`PendingCopy::wait`] to block until the copy finishes and
+    /// reclaim `data`, or simply drop the value — its `Drop` blocks on
+    /// the stream for you.
     ///
     /// # Errors
     ///
     /// As [`Self::copy_from_host`].
-    pub fn copy_from_host_async(&mut self, data: &[T], stream: &Stream) -> Result<()> {
+    pub fn copy_from_host_async<'s>(
+        &mut self,
+        data: Vec<T>,
+        stream: &'s Stream,
+    ) -> Result<PendingCopy<'s, T>> {
         if data.len() != self.len {
             return Err(Error::Internal(format!(
                 "copy_from_host_async length mismatch: buffer {} vs slice {}",
@@ -194,8 +210,13 @@ impl<T: BytePod> DeviceBuffer<T> {
             )));
         }
         self.device.make_current()?;
-        // SAFETY: pointers valid for at least the duration of the
-        // submission; caller is responsible for outliving the async op.
+        // SAFETY: destination pointer is owned and sized. `data` is
+        // moved into the `PendingCopy` this returns on success, which
+        // keeps the allocation (and therefore the source pointer)
+        // alive until the caller synchronizes with `stream` via
+        // `PendingCopy::wait` or `Drop` — so the pointer stays valid
+        // for the full duration of the async copy regardless of what
+        // the caller does with the return value.
         check(
             unsafe {
                 ffi::hipMemcpyAsync(
@@ -207,7 +228,68 @@ impl<T: BytePod> DeviceBuffer<T> {
                 )
             },
             "hipMemcpyAsync(HtoD)",
-        )
+        )?;
+        Ok(PendingCopy {
+            data,
+            stream,
+            synced: false,
+        })
+    }
+}
+
+/// A host → device copy still in flight on a [`Stream`].
+///
+/// Returned by [`DeviceBuffer::copy_from_host_async`]. Owns the source
+/// host buffer until the copy completes, so a safe caller cannot free
+/// or mutate it while the GPU DMA may still be reading it — see that
+/// method's docs for why ownership (rather than a borrow) is what
+/// makes this sound even against `std::mem::forget`.
+#[must_use = "dropping this immediately still blocks in `Drop` to keep the copy \
+              sound, but discarding it early gives up the chance to overlap host \
+              work with the copy — call `wait()` to reclaim `data` explicitly"]
+pub struct PendingCopy<'s, T: BytePod> {
+    data: Vec<T>,
+    stream: &'s Stream,
+    synced: bool,
+}
+
+impl<T: BytePod> PendingCopy<'_, T> {
+    /// Block until the copy completes, returning the host buffer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Runtime`] on HIP failure.
+    pub fn wait(mut self) -> Result<Vec<T>> {
+        self.synced = true;
+        self.stream.synchronize()?;
+        Ok(core::mem::take(&mut self.data))
+    }
+}
+
+impl<T: BytePod> Drop for PendingCopy<'_, T> {
+    fn drop(&mut self) {
+        // WARNING: this is the safety net for a caller that never calls
+        // `wait()`. It must block on the stream, not skip the sync — if
+        // it returned without synchronizing, `self.data` would drop
+        // (freeing the host buffer) immediately afterward as part of
+        // this same `Drop`, while the DMA reading it could still be in
+        // flight. Best-effort like the sibling `Drop` impls below: a
+        // synchronize failure is logged, not retried or panicked on,
+        // since `Drop` cannot propagate an error.
+        if self.synced {
+            return;
+        }
+        if let Err(error) = self.stream.synchronize() {
+            if writeln!(
+                io::stderr().lock(),
+                "hipcore: stream synchronize before PendingCopy drop failed: {error} — \
+                 the host buffer may still be read by an in-flight DMA"
+            )
+            .is_err()
+            {
+                // Drop cannot surface secondary stderr failures.
+            }
+        }
     }
 }
 

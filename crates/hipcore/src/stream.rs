@@ -139,11 +139,14 @@ impl Drop for Stream {
 /// ordering.
 pub struct Event {
     handle: ffi::hipEvent_t,
+    device: Device,
     owns_handle: bool,
 }
 
 // SAFETY: `hipEvent_t` is an opaque pointer; HIP permits cross-thread
-// recording / synchronisation once the device is current.
+// recording / synchronisation once the device is current. `Event`
+// retains the creating `Device` so `Drop` can restore its context
+// before destroying the handle, however this value migrates threads.
 unsafe impl Send for Event {}
 
 impl Event {
@@ -162,6 +165,7 @@ impl Event {
         )?;
         Ok(Self {
             handle,
+            device: device.clone(),
             owns_handle: true,
         })
     }
@@ -200,12 +204,38 @@ impl Event {
     pub fn raw(&self) -> ffi::hipEvent_t {
         self.handle
     }
+
+    /// Device this event was created on.
+    #[must_use]
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
 }
 
 impl Drop for Event {
     fn drop(&mut self) {
         if self.owns_handle && !self.handle.is_null() {
-            // SAFETY: handle owned and not yet destroyed.
+            // WARNING: do not call `hipEventDestroy` when `make_current`
+            // fails — same reasoning as `DeviceBuffer::drop` and
+            // `Stream::drop`: destroy targets whichever device is
+            // current on this thread, not the device the event was
+            // created on. `Event` is `Send`, so a handle created on one
+            // device can be dropped on a thread where a different
+            // device is current; skip and leak rather than destroying
+            // against an unknown (possibly wrong) device context.
+            if let Err(error) = self.device.make_current() {
+                if writeln!(
+                    io::stderr().lock(),
+                    "hipcore: make_current before hipEventDestroy failed: {error} — leaking event handle"
+                )
+                .is_err()
+                {
+                    // Drop cannot surface secondary stderr failures.
+                }
+                return;
+            }
+            // SAFETY: handle owned and not yet destroyed; the owning
+            // device was just made current above.
             let status = unsafe { ffi::hipEventDestroy(self.handle) };
             if status != ffi::hipError_t::hipSuccess
                 && writeln!(
