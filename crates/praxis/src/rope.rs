@@ -126,7 +126,7 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
     // `head_dim` truncates that division, silently dropping the final
     // element instead of rotating it — reject it here rather than
     // letting a malformed checkpoint produce quietly wrong encoding.
-    if !head_dim.is_multiple_of(2) {
+    if head_dim.is_multiple_of(2) {
         return Err(Error::Invalid {
             op: "rope_apply",
             msg: format!("head_dim must be even, got {head_dim}"),
