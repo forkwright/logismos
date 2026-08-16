@@ -81,12 +81,12 @@ fn check_rope_shape(batch: i32, seq: i32, heads: i32, head_dim: i32) -> Result<(
     // far under `i64::MAX` — and cannot itself overflow.
     let total = i64::from(batch) * i64::from(seq) * i64::from(heads) * i64::from(head_dim);
     if total > i64::from(i32::MAX) {
+        let max = i32::MAX;
         return Err(Error::UnsupportedShape {
             kernel: "rope_fp16",
             msg: format!(
-                "batch*seq*heads*head_dim = {total} exceeds i32::MAX ({}); \
-                 rope.hip's composite base index cannot address this shape",
-                i32::MAX
+                "batch*seq*heads*head_dim = {total} exceeds i32::MAX ({max}); \
+                 rope.hip's composite base index cannot address this shape"
             ),
         });
     }
@@ -150,6 +150,8 @@ pub unsafe fn launch_rope_fp16_in_place(
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::expect_used, reason = "test assertions use expect() directly")]
+
     use super::*;
 
     // WHY host-side only: `check_rope_shape` is pure `i32`/`i64`

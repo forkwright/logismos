@@ -87,12 +87,12 @@ fn check_matmul_shape(m: i32, n: i32, k: i32) -> Result<()> {
     let (m64, n64, k64) = (i64::from(m), i64::from(n), i64::from(k));
     for (label, product) in [("M*K", m64 * k64), ("K*N", k64 * n64), ("M*N", m64 * n64)] {
         if product > i64::from(i32::MAX) {
+            let max = i32::MAX;
             return Err(Error::UnsupportedShape {
                 kernel: "matmul_fp16",
                 msg: format!(
-                    "{label} = {product} exceeds i32::MAX ({}); matmul_naive.hip's \
-                     element-index products cannot address this shape",
-                    i32::MAX
+                    "{label} = {product} exceeds i32::MAX ({max}); matmul_naive.hip's \
+                     element-index products cannot address this shape"
                 ),
             });
         }
@@ -170,6 +170,8 @@ pub unsafe fn launch_matmul_fp16(
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::expect_used, reason = "test assertions use expect() directly")]
+
     use super::*;
 
     // WHY host-side only: `check_matmul_shape` is pure `i32`/`i64`
