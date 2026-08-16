@@ -49,7 +49,7 @@ fn usize_to_isize(value: usize) -> isize {
 /// shape checks reject it through the same path as any other mismatch —
 /// no bespoke panic branch needed here.
 fn checked_shape_len(rows: usize, cols: usize) -> usize {
-    rows.checked_mul(cols).unwrap_or(usize::MAX)
+    rows.saturating_mul(cols)
 }
 
 /// Embedding lookup: `out[b, s, :] = weight[ids[b, s], :]`.
