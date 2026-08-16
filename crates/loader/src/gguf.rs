@@ -32,7 +32,7 @@ use std::sync::Arc;
 use memmap2::Mmap;
 
 use crate::error::{Error, Result};
-use crate::{TensorView, WeightProvider};
+use crate::{TensorView, WeightProvider, check_mmap_not_truncated};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_V3: u32 = 3;
@@ -192,6 +192,13 @@ pub struct Reader {
 
 impl Reader {
     /// Open a GGUF file from disk.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] on fs / mmap failure; [`Error::Gguf`] on a
+    /// malformed header, an unsupported version, an out-of-range count,
+    /// a duplicate metadata key, a duplicate tensor name, or a
+    /// zero-length tensor dimension.
     pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         // SAFETY: see `safetensors::Reader::open`.
@@ -214,6 +221,18 @@ impl Reader {
         for _ in 0..metadata_count {
             let key = cur.read_string()?;
             let val = cur.read_meta_value()?;
+            // WHY(forkwright/logismos#60): `HashMap::insert` silently
+            // returns and drops the previous value. For a KV table
+            // parsed from an untrusted file that makes duplicate keys a
+            // shadowing primitive: a crafted GGUF can declare a benign
+            // value for a key, then redeclare it later with a different
+            // one, and only the second survives with nothing to say so.
+            if metadata.contains_key(&key) {
+                return Err(Error::Gguf {
+                    offset: cur.pos,
+                    msg: format!("duplicate metadata key `{key}`"),
+                });
+            }
             metadata.insert(key, val);
         }
 
@@ -247,6 +266,19 @@ impl Reader {
             for _ in 0..n_dims {
                 dims.push(cur.read_u64()?);
             }
+            // WHY(forkwright/logismos#60): a dims entry of 0 makes the
+            // element-count product 0 regardless of the other dims, so
+            // the tensor passes every later bounds check and yields an
+            // empty byte slice while still reporting the original
+            // (non-empty-looking) `dims` in its shape. Reject it here
+            // instead of letting it silently degrade to a zero-byte
+            // tensor downstream.
+            if dims.iter().any(|&d| d == 0) {
+                return Err(Error::Gguf {
+                    offset: cur.pos,
+                    msg: format!("tensor `{name}` has a zero-length dimension: {dims:?}"),
+                });
+            }
             let ggml_type_id = cur.read_u32()?;
             let ggml_type = GgmlType::from_u32(ggml_type_id)?;
             let data_offset = cur.read_u64()?;
@@ -254,6 +286,19 @@ impl Reader {
                 offset: cur.pos,
                 msg: format!("tensor index {i} exceeds usize::MAX"),
             })?;
+            // WHY(forkwright/logismos#60): same shadowing-primitive
+            // rationale as the metadata-key check above — a silent
+            // overwrite here lets a crafted file redeclare a tensor
+            // name against a different index, and any consumer that
+            // walks `tensor_descriptors()` independently of
+            // `tensor_by_name` sees a different picture than name
+            // lookups do.
+            if tensor_by_name.contains_key(&name) {
+                return Err(Error::Gguf {
+                    offset: cur.pos,
+                    msg: format!("duplicate tensor name `{name}`"),
+                });
+            }
             tensor_by_name.insert(name.clone(), idx_usize);
             tensors.push(TensorDescriptor {
                 name,
@@ -359,7 +404,21 @@ impl Reader {
                 desc.name, desc.ggml_type
             ),
         })?;
-        let byte_count = bits.saturating_mul(elem_count).div_ceil(8);
+        // WHY(forkwright/logismos#56): `saturating_mul` clamped to
+        // `usize::MAX` on overflow instead of erroring, which turns a
+        // genuine overflow into a misleading "out of file bounds" error
+        // later (the clamped byte count is a real number, just the
+        // wrong one). `checked_mul` reports the overflow itself.
+        let byte_count = bits
+            .checked_mul(elem_count)
+            .ok_or_else(|| Error::Gguf {
+                offset: 0,
+                msg: format!(
+                    "tensor `{}` byte count overflows usize: {bits} bits * {elem_count} elements",
+                    desc.name
+                ),
+            })?
+            .div_ceil(8);
         let byte_count_u64 = u64::try_from(byte_count).map_err(|_| Error::Gguf {
             offset: 0,
             msg: format!(
@@ -368,8 +427,29 @@ impl Reader {
             ),
         })?;
 
-        let start = self.data_region_start + desc.data_offset;
-        let end = start + byte_count_u64;
+        // WHY(forkwright/logismos#56): both additions are on untrusted
+        // u64s straight off the wire (the file-supplied `data_offset`,
+        // and a byte count derived from file-supplied dims/dtype) and
+        // wrap silently in a release build, which can land `start`/`end`
+        // on an arbitrary in-bounds-looking mmap offset instead of
+        // failing loudly. `checked_add` turns the wrap into `Err`.
+        let start = self
+            .data_region_start
+            .checked_add(desc.data_offset)
+            .ok_or_else(|| Error::Gguf {
+                offset: 0,
+                msg: format!(
+                    "tensor `{}` start offset overflows u64: region_start={} + data_offset={}",
+                    desc.name, self.data_region_start, desc.data_offset
+                ),
+            })?;
+        let end = start.checked_add(byte_count_u64).ok_or_else(|| Error::Gguf {
+            offset: start,
+            msg: format!(
+                "tensor `{}` end offset overflows u64: start={start} + byte_count={byte_count_u64}",
+                desc.name
+            ),
+        })?;
         let start_usize = usize::try_from(start).map_err(|_| Error::Gguf {
             offset: start,
             msg: format!(
@@ -397,6 +477,7 @@ impl Reader {
 
 impl WeightProvider for Reader {
     fn get(&self, name: &str) -> Result<TensorView<'_>> {
+        check_mmap_not_truncated(&self.path, self.mmap.len())?;
         let desc = self.descriptor_by_name(name)?;
         let dtype = desc.ggml_type.to_taxis_dtype()?;
         let (start_usize, end_usize) = self.byte_range_for(desc)?;
@@ -626,172 +707,5 @@ impl<'a> Cursor<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build a minimal v3 GGUF file in memory with:
-    /// - magic + version
-    /// - one metadata KV: "answer" = u32(42)
-    /// - one tensor: "one", shape=[3], F32, bytes = [1.0, 2.0, 3.0]
-    fn fixture_bytes() -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(GGUF_MAGIC);
-        buf.extend_from_slice(&GGUF_V3.to_le_bytes());
-        // tensor count, metadata count
-        buf.extend_from_slice(&1u64.to_le_bytes());
-        buf.extend_from_slice(&2u64.to_le_bytes());
-        // metadata kv 1: "answer" u32 42
-        let key = "answer";
-        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        buf.extend_from_slice(key.as_bytes());
-        buf.extend_from_slice(&4u32.to_le_bytes()); // type = U32
-        buf.extend_from_slice(&42u32.to_le_bytes());
-        // metadata kv 2: "general.alignment" u32 32 (default, but
-        // explicit so the test doubles as an alignment parse test)
-        let key = "general.alignment";
-        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        buf.extend_from_slice(key.as_bytes());
-        buf.extend_from_slice(&4u32.to_le_bytes());
-        buf.extend_from_slice(&32u32.to_le_bytes());
-        // tensor 1: "one" F32 [3] offset 0
-        let tname = "one";
-        buf.extend_from_slice(&(tname.len() as u64).to_le_bytes());
-        buf.extend_from_slice(tname.as_bytes());
-        buf.extend_from_slice(&1u32.to_le_bytes()); // n_dims
-        buf.extend_from_slice(&3u64.to_le_bytes()); // dim 0
-        buf.extend_from_slice(&0u32.to_le_bytes()); // ggml_type F32
-        buf.extend_from_slice(&0u64.to_le_bytes()); // data offset
-        // align to 32
-        let pad = align_up(buf.len() as u64, 32) as usize - buf.len();
-        buf.extend(std::iter::repeat_n(0u8, pad));
-        // payload: [1.0, 2.0, 3.0] as f32 LE
-        for v in [1.0_f32, 2.0, 3.0] {
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        buf
-    }
-
-    #[test]
-    fn align_up_rounds_correctly() {
-        assert_eq!(align_up(0, 32), 0);
-        assert_eq!(align_up(1, 32), 32);
-        assert_eq!(align_up(32, 32), 32);
-        assert_eq!(align_up(33, 32), 64);
-    }
-
-    #[test]
-    fn reads_fixture_bytes() -> Result<()> {
-        let dir = tempdir_for_test();
-        let path = dir.join("fixture.gguf");
-        std::fs::write(&path, fixture_bytes())?;
-
-        let r = Reader::open(&path)?;
-        assert_eq!(r.len(), 1);
-        assert_eq!(r.names(), vec!["one"]);
-        assert!(matches!(
-            r.metadata().get("answer"),
-            Some(MetaValue::U32(42))
-        ));
-        let tv = r.get("one")?;
-        assert_eq!(tv.dtype, taxis::DType::F32);
-        assert_eq!(tv.shape, vec![3]);
-        assert_eq!(tv.bytes.len(), 12);
-        Ok(())
-    }
-
-    #[test]
-    fn array_metadata_type_parses_elements() -> Result<()> {
-        // WHY(forkwright/logismos#37): the array branch (type id 9) of
-        // `read_meta_value_typed` had no test coverage at all — this
-        // exercises length read, inner_type read, allocation, and the
-        // per-element recursive decode.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&4u32.to_le_bytes()); // inner_type = U32
-        buf.extend_from_slice(&3u64.to_le_bytes()); // n = 3 elements
-        for v in [10u32, 20, 30] {
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        let mut cur = Cursor::new(&buf);
-        let value = cur.read_meta_value_typed(9)?;
-        let MetaValue::Array(items) = value else {
-            return Err(Error::Gguf {
-                offset: 0,
-                msg: "expected MetaValue::Array".into(),
-            });
-        };
-        assert_eq!(items.len(), 3);
-        assert!(matches!(items[0], MetaValue::U32(10)));
-        assert!(matches!(items[1], MetaValue::U32(20)));
-        assert!(matches!(items[2], MetaValue::U32(30)));
-        Ok(())
-    }
-
-    #[test]
-    fn nested_array_inner_type_is_rejected() {
-        // WHY(forkwright/logismos#35): the GGUF v3 spec forbids
-        // arrays-of-arrays. Before the fix, `inner_type = 9` recursed
-        // unboundedly — a crafted file chaining this at every nesting
-        // level exhausts the thread stack (an unrecoverable SIGSEGV, not
-        // a catchable error). The very first nested level must instead
-        // return `Err`.
-        let inner_type_bytes = 9u32.to_le_bytes();
-        let mut cur = Cursor::new(&inner_type_bytes);
-        let result = cur.read_meta_value_typed(9);
-        assert!(matches!(result, Err(Error::Gguf { .. })));
-    }
-
-    #[test]
-    fn huge_tensor_count_returns_err_not_abort() -> Result<()> {
-        // WHY(forkwright/logismos#34): before the fix this pre-allocated
-        // `Vec::with_capacity(tensor_count_usize)` for an untrusted,
-        // attacker-controlled count straight off the wire — enough to
-        // abort the process through the allocator rather than returning
-        // a `Result::Err` a caller could handle. A file that claims an
-        // enormous tensor count but has no data behind it must fail fast
-        // with a returned error instead.
-        let dir = tempdir_for_test();
-        let path = dir.join("huge-tensor-count.gguf");
-        let mut buf = Vec::new();
-        buf.extend_from_slice(GGUF_MAGIC);
-        buf.extend_from_slice(&GGUF_V3.to_le_bytes());
-        buf.extend_from_slice(&u64::MAX.to_le_bytes()); // tensor count
-        buf.extend_from_slice(&0u64.to_le_bytes()); // metadata count
-        std::fs::write(&path, buf)?;
-
-        let result = Reader::open(&path);
-        assert!(matches!(result, Err(Error::Gguf { .. })));
-        Ok(())
-    }
-
-    #[test]
-    fn dims_product_overflow_is_rejected_not_wrapped_to_zero() -> Result<()> {
-        // WHY(forkwright/logismos#36): `desc.dims.iter().product()` used
-        // ordinary wrapping multiplication in a release build. A dims
-        // vector whose product exceeds `u64::MAX` could silently wrap to
-        // `0`, producing a zero-byte `TensorView` that still reports the
-        // original (enormous) `dims` in its `shape` — passing every
-        // bounds check unchanged. The checked-multiply loop must instead
-        // return `Err`.
-        let dir = tempdir_for_test();
-        let path = dir.join("dims-overflow.gguf");
-        std::fs::write(&path, fixture_bytes())?;
-        let r = Reader::open(&path)?;
-
-        let desc = TensorDescriptor {
-            name: "overflow".to_string(),
-            dims: vec![u64::MAX, 2],
-            ggml_type: GgmlType::F32,
-            data_offset: 0,
-        };
-        let result = r.byte_range_for(&desc);
-        assert!(matches!(result, Err(Error::Gguf { .. })));
-        Ok(())
-    }
-
-    fn tempdir_for_test() -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("logismos-gguf-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&p);
-        p
-    }
-}
+#[path = "gguf_tests.rs"]
+pub(crate) mod tests;
