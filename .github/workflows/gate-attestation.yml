@@ -21,8 +21,8 @@
 # own WHY comment, not applicable to a GH-hosted runner; `--no-fail-fast`
 # on nextest is a behavioral choice, not a concurrency cap, so it is kept).
 #
-# WHY rust_toolchain left empty: rust-toolchain.toml pins channel 1.90 —
-# auto-detect applies (fleet convention).
+# WHY rust_toolchain left empty: rust-toolchain.toml is the one place that pins the
+# channel — auto-detect applies (fleet convention), so this workflow never restates it.
 #
 # WHY fmt_cmd carries a second command (kanon#3459/#3478/#3484/#3488): the
 # hybrid-gate reusable workflow has no free-form "extra check" input, so the
