@@ -33,12 +33,15 @@ pub(crate) enum DevicePlacement {
 /// HIP device and runs anywhere this crate compiles.
 pub(crate) fn classify_placement(a_is_hip: bool, b_is_hip: bool) -> DevicePlacement {
     // DELIBERATE-BREAK(negative-fixture, forkwright/logismos#38/#39 PR):
-    // reproduces the pre-fix wildcard collapse to watch the regression
-    // test fail on CI before restoring the real fix. Not the shipped
-    // state.
+    // reproduces the pre-fix wildcard collapse for the (true, false)
+    // permutation only (keeps `Mixed` reachable via (false, true) so
+    // `cargo check`'s dead-code lint does not mask the assertion
+    // failure this is meant to watch on CI). Not the shipped state.
     match (a_is_hip, b_is_hip) {
         (true, true) => DevicePlacement::BothHip,
-        _ => DevicePlacement::BothCpu,
+        (false, false) => DevicePlacement::BothCpu,
+        (true, false) => DevicePlacement::BothCpu,
+        (false, true) => DevicePlacement::Mixed,
     }
 }
 
