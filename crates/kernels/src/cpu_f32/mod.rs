@@ -103,6 +103,44 @@ pub fn rms_norm(x: &[f32], weight: &[f32], rows: usize, n: usize, eps: f32) -> V
     y
 }
 
+/// Computes `rows * cols`, panicking (in every build profile) if the
+/// product overflows `usize`.
+///
+/// # Panics
+///
+/// Panics when `rows.checked_mul(cols)` overflows.
+fn declared_elems(what: &str, rows: usize, cols: usize) -> usize {
+    let product = rows.checked_mul(cols);
+    assert!(
+        product.is_some(),
+        "kernels::cpu_f32::{what}: shape {rows}x{cols} overflows usize"
+    );
+    product.unwrap_or(0)
+}
+
+/// Validates a flat buffer's length against its declared `(rows, cols)`
+/// shape. This is the actual runtime enforcement behind the `unsafe`
+/// `sgemm` calls in [`linear`] / [`linear_t`]: unlike a `debug_assert!`,
+/// it is never compiled out, so it holds in release builds too.
+/// `rows * cols` goes through [`declared_elems`]'s `checked_mul` rather
+/// than a bare `*`, so a shape whose true product overflows `usize`
+/// cannot silently wrap around into a value that happens to equal
+/// `buf_len` and defeat the check (a wrapped `(2^63+2) * 2 = 4` is the
+/// concrete case the regression test below drives).
+///
+/// # Panics
+///
+/// Panics when `buf_len != rows * cols`, or when `rows * cols` overflows
+/// `usize` (see [`declared_elems`]).
+fn assert_shape(what: &str, buf_len: usize, rows: usize, cols: usize) -> usize {
+    let expected = declared_elems(what, rows, cols);
+    assert_eq!(
+        buf_len, expected,
+        "kernels::cpu_f32::{what}: buffer length {buf_len} does not match declared shape {rows}x{cols} = {expected} elements"
+    );
+    expected
+}
+
 /// `C = A @ B` plus optional bias, all fp32.
 ///
 /// `a`: `[m, k]`, `b`: `[k, n]`, `bias`: `[n]` or empty. Output `[m, n]`.
@@ -110,6 +148,15 @@ pub fn rms_norm(x: &[f32], weight: &[f32], rows: usize, n: usize, eps: f32) -> V
 /// Parallelised across rows of the output via rayon. For small `m` the
 /// fallback is still a row-at-a-time loop; rayon's scheduler folds small
 /// batches onto a single worker.
+///
+/// # Panics
+///
+/// Panics, in every build profile, when `a.len() != m * k`,
+/// `b.len() != k * n`, a supplied `bias`'s length is not `n`, or any of
+/// `m * k`, `k * n`, `m * n` overflow `usize`. This is what keeps the
+/// `unsafe` `sgemm` call below sound: the shape it is told (`m`, `n`,
+/// `k`) is checked against the buffers it actually reads/writes before
+/// the call, not merely asserted in debug builds.
 #[must_use]
 pub fn linear(
     a: &[f32],
@@ -119,14 +166,23 @@ pub fn linear(
     n: usize,
     k: usize,
 ) -> Vec<f32> {
-    debug_assert_eq!(a.len(), m * k);
-    debug_assert_eq!(b.len(), k * n);
+    assert_shape("linear: a", a.len(), m, k);
+    assert_shape("linear: b", b.len(), k, n);
     if let Some(bv) = bias {
-        debug_assert_eq!(bv.len(), n);
+        assert_eq!(
+            bv.len(),
+            n,
+            "kernels::cpu_f32::linear: bias.len()={} != n={n}",
+            bv.len()
+        );
     }
-    let mut c = vec![0.0f32; m * n];
-    // SAFETY: strides / sizes match the declared shapes; sgemm only
-    // writes into `c`; `a` and `b` live beyond the call.
+    let mn = declared_elems("linear: c", m, n);
+    let mut c = vec![0.0f32; mn];
+    // SAFETY: the three `assert_shape`/`declared_elems` checks above
+    // enforce, in every build profile, that `a.len() == m * k`,
+    // `b.len() == k * n`, and `c.len() == m * n` — exactly the extents
+    // the strides below declare to `sgemm`. `sgemm` only writes into
+    // `c`, and `a` and `b` live beyond the call.
     unsafe {
         matrixmultiply::sgemm(
             m,
@@ -160,6 +216,13 @@ pub fn linear(
 /// transpose into the inner loop; much cheaper than a materialised transpose.
 ///
 /// `a`: `[m, k]`, `b`: `[n, k]` (the untransposed weight). Output `[m, n]`.
+///
+/// # Panics
+///
+/// Panics, in every build profile, when `a.len() != m * k`,
+/// `b.len() != n * k`, a supplied `bias`'s length is not `n`, or any of
+/// `m * k`, `n * k`, `m * n` overflow `usize` — see [`linear`]'s `#
+/// Panics` for why an unconditional check is required here.
 #[must_use]
 pub fn linear_t(
     a: &[f32],
@@ -169,10 +232,15 @@ pub fn linear_t(
     n: usize,
     k: usize,
 ) -> Vec<f32> {
-    debug_assert_eq!(a.len(), m * k);
-    debug_assert_eq!(b.len(), n * k);
+    assert_shape("linear_t: a", a.len(), m, k);
+    assert_shape("linear_t: b", b.len(), n, k);
     if let Some(bv) = bias {
-        debug_assert_eq!(bv.len(), n);
+        assert_eq!(
+            bv.len(),
+            n,
+            "kernels::cpu_f32::linear_t: bias.len()={} != n={n}",
+            bv.len()
+        );
     }
 
     // C = A @ B^T  where A: [m, k] row-major, B: [n, k] row-major (the
@@ -181,10 +249,13 @@ pub fn linear_t(
     // and column strides: B^T[p, j] = B[j, p], meaning a single source
     // stride (rsb, csb) -> (1, k) encodes B as [k, n] with row stride 1
     // and column stride k. This avoids materialising a transpose.
-    let mut c = vec![0.0f32; m * n];
-    // SAFETY: the buffer lengths / strides match the declared shapes;
-    // matrixmultiply::sgemm only writes into `c`, and all input slices
-    // are valid for the read extents declared by the row/col strides.
+    let mn = declared_elems("linear_t: c", m, n);
+    let mut c = vec![0.0f32; mn];
+    // SAFETY: the `assert_shape`/`declared_elems` checks above enforce,
+    // in every build profile, that `a.len() == m * k`, `b.len() == n *
+    // k`, and `c.len() == m * n` — exactly the extents the strides below
+    // declare to `sgemm`. `sgemm` only writes into `c`, and `a`/`b` are
+    // valid for the read extents the row/col strides describe.
     unsafe {
         matrixmultiply::sgemm(
             m,

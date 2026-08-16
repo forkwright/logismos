@@ -63,6 +63,67 @@ fn linear_matches_hand_computed() {
 }
 
 #[test]
+#[should_panic(expected = "does not match declared shape")]
+fn linear_mismatched_a_shape_panics_not_ub() {
+    // WHY: regression test for forkwright/logismos#29 — `linear`
+    // used to guard `a.len() == m * k` with `debug_assert_eq!`
+    // only, which compiles out in release, so a caller passing an
+    // `a` shorter than `m * k` drove `sgemm` to read past `a`'s
+    // allocation with no signal at all. `a` here has 3 elements but
+    // m=2, k=2 declares 4 — this must panic in every profile,
+    // including release, instead of reaching the `unsafe` block.
+    let a = [1.0_f32, 2.0, 3.0];
+    let b = [1.0_f32, 0.0, 0.0, 1.0]; // [2, 2]
+    let _ = linear(&a, &b, None, 2, 2, 2);
+}
+
+#[test]
+#[should_panic(expected = "does not match declared shape")]
+fn linear_t_mismatched_b_shape_panics_not_ub() {
+    // WHY: regression test for forkwright/logismos#29's `linear_t`
+    // sibling (same debug_assert_eq!-only guard on `b.len() == n *
+    // k`). `b` here has 3 elements but n=2, k=2 declares 4.
+    let a = [1.0_f32, 2.0, 3.0, 4.0]; // [2, 2]
+    let b = [1.0_f32, 0.0, 0.0];
+    let _ = linear_t(&a, &b, None, 2, 2, 2);
+}
+
+#[test]
+#[should_panic(expected = "bias.len()")]
+fn linear_mismatched_bias_panics_not_silent_corruption() {
+    // WHY: the bias-length guard was also `debug_assert_eq!`-only;
+    // a short bias reads out of bounds in the post-sgemm add loop
+    // in release (the loop zips `row.iter_mut().zip(bv.iter())`,
+    // which would merely truncate here rather than panic, so a
+    // bias longer/shorter than `n` must be rejected before that
+    // loop runs, not discovered by its silently-partial effect).
+    let a = [1.0_f32, 2.0]; // [1, 2]
+    let b = [1.0_f32, 0.0, 0.0, 1.0]; // [2, 2]
+    let bias = [1.0_f32]; // len 1, but n=2
+    let _ = linear(&a, &b, Some(&bias), 1, 2, 2);
+}
+
+#[test]
+#[should_panic(expected = "overflows usize")]
+fn linear_shape_overflow_cannot_wrap_into_a_matching_length() {
+    // WHY: regression test for forkwright/logismos#29's explicit
+    // `checked_mul` requirement. `m * k` here overflows `usize` and
+    // WRAPS to exactly 4: (2^63 + 2) * 2 = 2^64 + 4 ≡ 4 (mod 2^64),
+    // the same length as `a` below. A bare `a.len() == m * k`
+    // comparison — what `debug_assert_eq!` did, and what a plain
+    // `*` recomputation would do in a release build where overflow
+    // checks are off — would silently pass and let `sgemm` treat
+    // `a` as if it had `huge_m` rows, reading/writing far past
+    // every real allocation. `checked_mul` must catch the overflow
+    // itself, before any length comparison happens, so this must
+    // panic instead of proceeding to `sgemm` with `4 == 4`.
+    let a = [1.0_f32; 4];
+    let b = [1.0_f32; 2];
+    let huge_m = (1usize << 63) + 2;
+    let _ = linear(&a, &b, None, huge_m, 1, 2);
+}
+
+#[test]
 fn linear_matches_linear_t_with_transposed_weight() {
     // Cross-check: `linear_t(a, b_t, ...)` where `b_t` is `b`
     // transposed must equal `linear(a, b, ...)` — the two functions
