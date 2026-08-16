@@ -60,32 +60,10 @@ fn checked_shape_len(rows: usize, cols: usize) -> usize {
     rows.saturating_mul(cols)
 }
 
-/// Computes the element count of an `(m, n)` output shape that `sgemm`
-/// then WRITES into under `unsafe`, asserting the product does not
-/// overflow `usize` in every build profile — including release, where
-/// a plain `m * n` has no overflow checks and silently wraps.
-///
-/// Distinct from [`checked_shape_len`]: that function validates a
-/// declared shape against an already-allocated real slice, where
-/// saturating to `usize::MAX` is safe because no real slice can ever be
-/// that long. Here there is no existing allocation to compare against
-/// — `m * n` directly sizes a FRESH `Vec` that `sgemm` then writes into
-/// at the caller's real, non-saturated `m`/`n` via raw pointer +
-/// stride. A wrapped `m * n` would silently undersize `c` while `sgemm`
-/// still writes the real extent regardless — a heap out-of-bounds
-/// WRITE, not merely a comparison that happens to fail. Reported as its
-/// own diagnostic (distinct from the `a`/`b` length-mismatch messages
-/// above) because "this product overflows" and "this length doesn't
-/// match a declared shape" are different failures with different
-/// causes. `forkwright/logismos#29`.
-fn checked_output_len(context: &str, m: usize, n: usize) -> usize {
-    let product = m.checked_mul(n);
-    assert!(
-        product.is_some(),
-        "{context}: output shape m={m} * n={n} overflows usize"
-    );
-    product.unwrap_or(0)
-}
+// SCRATCH-REGRESSION-PROOF: checked_output_len removed on this throwaway
+// branch (unused now that both call sites below are reverted to plain
+// `m * n`; keeping it would fail the build on dead_code, not on the
+// regression this branch exists to demonstrate). Never merge.
 
 /// Embedding lookup: `out[b, s, :] = weight[ids[b, s], :]`.
 ///
@@ -208,7 +186,7 @@ pub fn linear(
             bv.len()
         );
     }
-    let mut c = vec![0.0f32; checked_output_len("linear", m, n)];
+    let mut c = vec![0.0f32; m * n];
     // SAFETY: `a.len() == m * k`, `b.len() == k * n`, and any
     // `bias.len() == n` are enforced above by `assert_eq!` (not
     // `debug_assert_eq!`), so the read extents sgemm derives from `m`,
@@ -303,7 +281,7 @@ pub fn linear_t(
     // and column strides: B^T[p, j] = B[j, p], meaning a single source
     // stride (rsb, csb) -> (1, k) encodes B as [k, n] with row stride 1
     // and column stride k. This avoids materialising a transpose.
-    let mut c = vec![0.0f32; checked_output_len("linear_t", m, n)];
+    let mut c = vec![0.0f32; m * n];
     // SAFETY: `a.len() == m * k` and `b.len() == n * k` are enforced
     // above by `assert_eq!` (not `debug_assert_eq!`), so the read
     // extents declared by the row/col strides stay in bounds in every
