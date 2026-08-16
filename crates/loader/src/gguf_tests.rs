@@ -71,7 +71,15 @@ fn reads_fixture_bytes() -> Result<()> {
     let tv = r.get("one")?;
     assert_eq!(tv.dtype, taxis::DType::F32);
     assert_eq!(tv.shape, vec![3]);
-    assert_eq!(tv.bytes.len(), 12);
+    // WHY(forkwright/logismos#56): a length-only assertion cannot pin
+    // `byte_range_for`'s `checked_add` rewrite — an off-by-N in
+    // `start`/`end` still yields a 12-byte slice of the correct
+    // dtype/shape, just the wrong bytes. Assert the decoded content.
+    let expected: Vec<u8> = [1.0_f32, 2.0, 3.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    assert_eq!(tv.bytes, expected.as_slice());
     Ok(())
 }
 

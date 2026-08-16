@@ -238,12 +238,40 @@ pub(crate) mod tests {
         let names = r.names();
         assert!(names.iter().any(|n| n == "a"));
         assert!(names.iter().any(|n| n == "b"));
+
+        // WHY(forkwright/logismos#56): the offset-computation rewrite
+        // (pointer-address subtraction -> `TensorInfo::data_offsets`)
+        // is only pinned if the actual decoded bytes are checked — a
+        // length-only assertion passes on a slice shifted by any
+        // constant, since `rel_end - rel_start` is invariant to a
+        // shift in `data_region_start`. Both fixture tensors are
+        // checked so an error confined to a non-first tensor (e.g.
+        // cumulative-offset drift) is also caught.
+        let expected_a: Vec<u8> = [1.0_f32, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let expected_b: Vec<u8> = [10.0_f32, 20.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
         let tv_a = r.get("a")?;
         assert_eq!(tv_a.dtype, taxis::DType::F32);
         assert_eq!(tv_a.shape, vec![2, 2]);
-        assert_eq!(tv_a.bytes.len(), 16);
+        assert_eq!(tv_a.bytes, expected_a.as_slice());
+
+        let tv_b = r.get("b")?;
+        assert_eq!(tv_b.dtype, taxis::DType::F32);
+        assert_eq!(tv_b.shape, vec![2]);
+        assert_eq!(tv_b.bytes, expected_b.as_slice());
+
         let tensor = tv_a.to_tensor_cpu()?;
         assert_eq!(tensor.dims(), &[2, 2]);
+        let Some(taxis::CpuStorage::F32(v)) = tensor.cpu_storage() else {
+            return Err(Error::Msg("expected F32 CPU storage".into()));
+        };
+        assert_eq!(v.as_slice(), &[1.0_f32, 2.0, 3.0, 4.0][..]);
         let _ = std::fs::remove_file(&tmp);
         Ok(())
     }
