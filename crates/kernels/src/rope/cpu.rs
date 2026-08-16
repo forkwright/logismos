@@ -129,7 +129,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zero_positions_are_identity() {
+    fn zero_positions_are_identity() -> crate::error::Result<()> {
         let batch = 1;
         let seq = 1;
         let heads = 1;
@@ -148,11 +148,11 @@ mod tests {
             .map(|&f| f16::from_f32(f))
             .collect();
         let mut work = orig.clone();
-        rope_apply_fp16_ref(&mut work, &table, batch, seq, heads, head_dim)
-            .expect("matching shapes must not error");
+        rope_apply_fp16_ref(&mut work, &table, batch, seq, heads, head_dim)?;
         for (a, b) in orig.iter().zip(work.iter()) {
             assert_eq!(a, b);
         }
+        Ok(())
     }
 
     #[test]
@@ -170,14 +170,13 @@ mod tests {
         let head_dim = 4;
         let short_table = vec![0.0f32; head_dim]; // seq*head_dim=8, only 4 present
         let mut qk: Vec<f16> = vec![f16::from_f32(1.0); batch * seq * heads * head_dim];
-        let err = rope_apply_fp16_ref(&mut qk, &short_table, batch, seq, heads, head_dim)
-            .expect_err("short cos_sin table must be rejected, not silently skipped");
+        let result = rope_apply_fp16_ref(&mut qk, &short_table, batch, seq, heads, head_dim);
         assert!(matches!(
-            err,
-            crate::error::Error::UnsupportedShape {
+            result,
+            Err(crate::error::Error::UnsupportedShape {
                 kernel: "rope_apply_fp16_ref",
                 ..
-            }
+            })
         ));
     }
 }

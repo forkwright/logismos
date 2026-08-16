@@ -80,17 +80,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn row_sums_to_one() {
+    fn row_sums_to_one() -> crate::error::Result<()> {
         let m = 2;
         let n = 5;
         let x: Vec<f16> = (0_u32..10)
             .map(|i| f16::from_f32(i.to_f32().unwrap_or_default() / 3.0))
             .collect();
-        let y = softmax_fp16_ref(&x, m, n).expect("shapes match");
+        let y = softmax_fp16_ref(&x, m, n)?;
         for row in 0..m {
             let sum: f32 = y[row * n..(row + 1) * n].iter().map(|v| v.to_f32()).sum();
             assert!((sum - 1.0).abs() < 1e-2, "row {row} sum = {sum}");
         }
+        Ok(())
     }
 
     #[test]
@@ -102,18 +103,18 @@ mod tests {
         // that prior behaviour (no error to unwrap) and passes against
         // the validated version.
         let x = vec![f16::from_f32(1.0); 9]; // m*n=10, only 9 present
-        let err = softmax_fp16_ref(&x, 2, 5).expect_err("short input must be rejected");
+        let result = softmax_fp16_ref(&x, 2, 5);
         assert!(matches!(
-            err,
-            crate::error::Error::UnsupportedShape {
+            result,
+            Err(crate::error::Error::UnsupportedShape {
                 kernel: "softmax_fp16_ref",
                 ..
-            }
+            })
         ));
     }
 
     #[test]
-    fn fully_masked_row_is_uniform_not_nan() {
+    fn fully_masked_row_is_uniform_not_nan() -> crate::error::Result<()> {
         // WHY(forkwright/logismos#59): the CPU-reference twin of the
         // `cpu_f32::softmax_last_dim` all-`-inf`-row defect
         // (forkwright/logismos#30). Before this guard,
@@ -121,7 +122,7 @@ mod tests {
         // every slot in a fully-masked row.
         let n = 4;
         let x = vec![f16::from_f32(f32::NEG_INFINITY); n];
-        let y = softmax_fp16_ref(&x, 1, n).expect("shapes match");
+        let y = softmax_fp16_ref(&x, 1, n)?;
         let vals: Vec<f32> = y.iter().map(|v| v.to_f32()).collect();
         assert!(
             vals.iter().all(|v| v.is_finite()),
@@ -132,5 +133,6 @@ mod tests {
         for v in &vals {
             assert!((v - 0.25).abs() < 1e-2, "row is not uniform: {vals:?}");
         }
+        Ok(())
     }
 }

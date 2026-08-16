@@ -294,13 +294,13 @@ mod tests {
     }
 
     #[test]
-    fn try_from_cpu_accepts_matching_pair() {
+    fn try_from_cpu_accepts_matching_pair() -> Result<()> {
         let t = Tensor::try_from_cpu(
             CpuStorage::F32(vec![1.0, 2.0, 3.0, 4.0]),
             Shape::new(&[2, 2]),
-        )
-        .expect("matching storage/shape must construct");
+        )?;
         assert_eq!(t.elem_count(), 4);
+        Ok(())
     }
 
     #[test]
@@ -312,8 +312,8 @@ mod tests {
         // `try_from_cpu` is the validating counterpart; this fails
         // against `from_cpu` (which has no error path to return) and
         // passes against `try_from_cpu`.
-        let err = Tensor::try_from_cpu(CpuStorage::F32(vec![1.0, 2.0, 3.0]), Shape::new(&[2, 2]))
-            .expect_err("3-element storage must not satisfy a [2, 2] (4-element) shape");
-        assert!(matches!(err, Error::ShapeMismatch { .. }));
+        let result =
+            Tensor::try_from_cpu(CpuStorage::F32(vec![1.0, 2.0, 3.0]), Shape::new(&[2, 2]));
+        assert!(matches!(result, Err(Error::ShapeMismatch { .. })));
     }
 }
