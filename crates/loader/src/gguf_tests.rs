@@ -194,7 +194,28 @@ fn byte_range_for_rejects_byte_count_overflow() -> Result<()> {
         data_offset: 0,
     };
     let result = r.byte_range_for(&desc);
-    assert!(matches!(result, Err(Error::Gguf { .. })));
+    // WHY(forkwright/logismos#56, redden-verified): a bare
+    // `matches!(.., Err(Error::Gguf { .. }))` here would also pass
+    // against a REVERTED `saturating_mul` — the clamped byte count is
+    // so large it still trips the downstream `end_usize >
+    // self.mmap.len()` bounds check with a *different* message, so the
+    // outer error variant alone can't tell "rejected at the multiply"
+    // from "rejected later for an unrelated reason". Confirmed by
+    // actually reverting checked_mul on a throwaway branch and running
+    // this exact assertion: it passed unchanged (CI run 31924612522,
+    // job 95110102176, `byte_range_for_rejects_byte_count_overflow`
+    // logged PASS). Asserting the message distinguishes them: only the
+    // checked_mul path says "overflows usize".
+    let Err(Error::Gguf { msg, .. }) = &result else {
+        return Err(Error::Gguf {
+            offset: 0,
+            msg: format!("expected Error::Gguf, got {result:?}"),
+        });
+    };
+    assert!(
+        msg.contains("overflows usize"),
+        "expected the checked_mul overflow message, got: {msg}"
+    );
     Ok(())
 }
 
