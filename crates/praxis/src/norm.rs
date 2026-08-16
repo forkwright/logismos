@@ -2,7 +2,6 @@
 
 use std::ffi::c_void;
 
-use hipcore::Stream;
 use taxis::{DType, Tensor};
 
 use crate::error::{Error, Result};
@@ -58,20 +57,22 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
                 op: "rms_norm",
                 msg: "zeros_hip did not return HIP".into(),
             })?;
-            let stream = Stream::new(device)?;
-            // SAFETY: device pointers valid; sizes verified above.
-            unsafe {
-                kernels::rms_norm::launch_rms_norm_fp16(
-                    x_hip.as_device_ptr().cast::<c_void>(),
-                    w_hip.as_device_ptr().cast::<c_void>(),
-                    out_hip.as_mut_device_ptr().cast::<c_void>(),
-                    dim_i32(m, "M")?,
-                    dim_i32(n, "N")?,
-                    eps,
-                    &stream,
-                )?;
-            }
-            stream.synchronize()?;
+            crate::stream_pool::POOL.with_stream(device, |stream| {
+                // SAFETY: device pointers valid; sizes verified above.
+                unsafe {
+                    kernels::rms_norm::launch_rms_norm_fp16(
+                        x_hip.as_device_ptr().cast::<c_void>(),
+                        w_hip.as_device_ptr().cast::<c_void>(),
+                        out_hip.as_mut_device_ptr().cast::<c_void>(),
+                        dim_i32(m, "M")?,
+                        dim_i32(n, "N")?,
+                        eps,
+                        stream,
+                    )?;
+                }
+                stream.synchronize()?;
+                Ok(())
+            })?;
             Ok(out)
         }
         _ => {

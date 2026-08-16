@@ -2,7 +2,6 @@
 
 use std::ffi::c_void;
 
-use hipcore::Stream;
 use taxis::{DType, Tensor};
 
 use crate::error::{Error, Result};
@@ -48,18 +47,20 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
             op: "softmax",
             msg: "zeros_hip did not return HIP".into(),
         })?;
-        let stream = Stream::new(device)?;
-        // SAFETY: device pointers valid; sizes verified above.
-        unsafe {
-            kernels::softmax::launch_softmax_fp16(
-                x_hip.as_device_ptr().cast::<c_void>(),
-                out_hip.as_mut_device_ptr().cast::<c_void>(),
-                dim_i32(m, "M")?,
-                dim_i32(n, "N")?,
-                &stream,
-            )?;
-        }
-        stream.synchronize()?;
+        crate::stream_pool::POOL.with_stream(device, |stream| {
+            // SAFETY: device pointers valid; sizes verified above.
+            unsafe {
+                kernels::softmax::launch_softmax_fp16(
+                    x_hip.as_device_ptr().cast::<c_void>(),
+                    out_hip.as_mut_device_ptr().cast::<c_void>(),
+                    dim_i32(m, "M")?,
+                    dim_i32(n, "N")?,
+                    stream,
+                )?;
+            }
+            stream.synchronize()?;
+            Ok(())
+        })?;
         Ok(out)
     } else {
         let x_host = x.to_host_f16()?;
@@ -68,5 +69,40 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
             taxis::CpuStorage::F16(y),
             x.shape().clone(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::expect_used, reason = "test assertions use expect() directly")]
+
+    use half::f16;
+    use taxis::{CpuStorage, Shape};
+
+    use super::*;
+
+    /// Direct coverage of the CPU-fallback branch: `praxis::softmax`
+    /// never routes through HIP when the input is a CPU tensor, so
+    /// this needs no GPU device and — unlike
+    /// `crates/praxis/tests/end_to_end.rs::praxis_softmax_runs`, which
+    /// skips entirely when no HIP device is visible — always runs.
+    #[test]
+    fn cpu_path_rows_sum_to_one() {
+        let (m, n) = (3_usize, 17_usize);
+        let x_host: Vec<f16> = (0..(m * n))
+            .map(|i| f16::from_f32((i % 7) as f32 - 3.0))
+            .collect();
+        let x = Tensor::from_cpu(CpuStorage::F16(x_host), Shape::new(&[m, n]));
+
+        let y = softmax(&x).expect("cpu softmax");
+        let host = y.to_host_f16().expect("host readback");
+
+        for row in 0..m {
+            let sum: f32 = host[row * n..(row + 1) * n]
+                .iter()
+                .map(|v| v.to_f32())
+                .sum();
+            assert!((sum - 1.0).abs() < 1e-3, "row {row} sum = {sum}");
+        }
     }
 }

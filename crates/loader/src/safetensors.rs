@@ -23,7 +23,13 @@ use safetensors::SafeTensors;
 use safetensors::tensor::Dtype as UpstreamDtype;
 
 use crate::error::{Error, Result};
-use crate::{TensorView, WeightProvider};
+use crate::{TensorView, WeightProvider, check_mmap_not_truncated};
+
+/// The header's first 8 bytes are a little-endian `u64` declaring the
+/// JSON header's own byte length; `SafeTensors::read_metadata` reports
+/// that length alone, so the tensor-data region starts this many bytes
+/// further in.
+const HEADER_LEN_PREFIX: usize = 8;
 
 /// Owning safetensors archive.
 pub struct Reader {
@@ -57,56 +63,55 @@ impl Reader {
         let file = std::fs::File::open(path)?;
         // SAFETY: mmap is sound for a read-only mapping as long as the
         // underlying file is not mutated under us. logismos owns its
-        // weight directories and doesn't mutate them at inference.
+        // weight directories and doesn't mutate them at inference; `get`
+        // additionally re-stats the file before every access as a
+        // best-effort guard against a mapping outliving the file it was
+        // taken from (see `check_mmap_not_truncated`) — that narrows,
+        // but cannot close, the race between an external writer and a
+        // concurrent read of the mapped bytes.
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // Resolve once. We re-parse with `deserialize` to walk tensor
-        // entries (read_metadata returns a bare Metadata object that
-        // doesn't give us per-tensor byte ranges ergonomically).
-        let st = SafeTensors::deserialize(&mmap)?;
-        let header_plus_size_prefix = {
-            // The header's first 8 bytes are a u64 LE declaring header
-            // JSON size; tensor-data starts at 8 + that.
-            if mmap.len() < 8 {
-                return Err(Error::Safetensors(
-                    "file too short for safetensors header".into(),
-                ));
-            }
-            let mut sz = [0u8; 8];
-            let prefix = mmap
-                .get(..8)
-                .ok_or_else(|| Error::Safetensors("missing header length prefix".into()))?;
-            sz.copy_from_slice(prefix);
-            let header_size_u64 = u64::from_le_bytes(sz);
-            let header_size = usize::try_from(header_size_u64).map_err(|_| {
+        // WHY(forkwright/logismos#56): the previous implementation
+        // called `SafeTensors::deserialize` and then recovered each
+        // tensor's byte range by subtracting `TensorView::data().as_ptr()`
+        // from the mmap's base pointer. That's brittle against upstream
+        // changes: nothing in the API contracts that `data()` returns a
+        // pointer into the original buffer rather than a copy, and
+        // pointer-address subtraction is meaningless if it ever doesn't.
+        // `SafeTensors::read_metadata` performs the identical validation
+        // `deserialize` does (offsets monotonic/non-overlapping, each
+        // tensor's byte length matches its declared dtype × shape, and
+        // the total matches the buffer length) but hands back the parsed
+        // `Metadata`, whose `TensorInfo::data_offsets` is the offset
+        // pair directly — no pointer arithmetic required.
+        let (header_size, metadata) = SafeTensors::read_metadata(&mmap)?;
+        let data_region_start = header_size.checked_add(HEADER_LEN_PREFIX).ok_or_else(|| {
+            Error::Safetensors("safetensors header + size prefix overflows usize".into())
+        })?;
+
+        // `offset_keys()` orders names by on-disk tensor offset, which
+        // is what `ordering`'s doc comment ("archive ordering") means.
+        let ordering = metadata.offset_keys();
+        let mut index = HashMap::with_capacity(ordering.len());
+        for name in &ordering {
+            let info = metadata.info(name).ok_or_else(|| {
                 Error::Safetensors(format!(
-                    "safetensors header size {header_size_u64} exceeds usize::MAX"
+                    "tensor `{name}` in offset_keys but missing from metadata"
                 ))
             })?;
-            header_size.checked_add(8).ok_or_else(|| {
-                Error::Safetensors("safetensors header + size prefix overflows usize".into())
-            })?
-        };
-
-        let mut ordering = Vec::with_capacity(st.len());
-        let mut index = HashMap::with_capacity(st.len());
-        for (name, tv) in st.iter() {
-            let dtype = map_dtype(tv.dtype(), name)?;
-            let shape = tv.shape().to_vec();
-            let data_ptr = tv.data().as_ptr().addr();
-            let mmap_ptr = mmap.as_ptr().addr();
-            let start = data_ptr.checked_sub(mmap_ptr).ok_or_else(|| {
-                Error::Safetensors(format!("tensor `{name}` data pointer precedes mmap base"))
+            let dtype = map_dtype(info.dtype, name)?;
+            let (rel_start, rel_end) = info.data_offsets;
+            let start = data_region_start.checked_add(rel_start).ok_or_else(|| {
+                Error::Safetensors(format!("tensor `{name}` start offset overflows usize"))
             })?;
-            let end = start.checked_add(tv.data().len()).ok_or_else(|| {
-                Error::Safetensors(format!("tensor `{name}` byte range overflows usize"))
+            let end = data_region_start.checked_add(rel_end).ok_or_else(|| {
+                Error::Safetensors(format!("tensor `{name}` end offset overflows usize"))
             })?;
-            ordering.push(name.to_string());
             index.insert(
-                name.to_string(),
+                name.clone(),
                 Entry {
                     dtype,
-                    shape,
+                    shape: info.shape.clone(),
                     start,
                     end,
                 },
@@ -116,7 +121,7 @@ impl Reader {
         Ok(Self {
             path: path.to_path_buf(),
             mmap: Arc::new(mmap),
-            data_region_start: header_plus_size_prefix,
+            data_region_start,
             ordering,
             index,
         })
@@ -135,18 +140,16 @@ impl Reader {
 
 impl WeightProvider for Reader {
     fn get(&self, name: &str) -> Result<TensorView<'_>> {
-        let entry = self.index.get(name).ok_or_else(|| Error::TensorNotFound {
-            name: name.to_string(),
-        })?;
-        // Key the TensorView name to the stored String in `ordering`
-        // so the `&str` is `&self`-bound rather than outlived by the
-        // local caller-supplied `name`.
-        let stored_name: &str = self.ordering.iter().find(|n| n.as_str() == name).map_or(
-            // Should never fire: we just succeeded on
-            // `self.index.get(name)`.
-            self.ordering.first().map_or("", String::as_str),
-            String::as_str,
-        );
+        check_mmap_not_truncated(&self.path, self.mmap.len())?;
+        // `get_key_value` ties the returned name to the `String` owned
+        // by `self.index` (== `&self`-bound) in one lookup, rather than
+        // a second linear scan through `ordering` to recover it.
+        let (stored_name, entry) =
+            self.index
+                .get_key_value(name)
+                .ok_or_else(|| Error::TensorNotFound {
+                    name: name.to_string(),
+                })?;
         let bytes = self.mmap.get(entry.start..entry.end).ok_or_else(|| {
             Error::Safetensors(format!(
                 "tensor `{name}` byte range [{start}..{end}] out of mmap bounds",
@@ -190,7 +193,7 @@ fn map_dtype(d: UpstreamDtype, name: &str) -> Result<taxis::DType> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap as StdMap;
 
     use safetensors::serialize_to_file;
@@ -198,7 +201,9 @@ mod tests {
 
     use super::*;
 
-    fn write_tiny_fixture(path: &Path) -> Result<()> {
+    /// `pub(crate)` so `lib.rs`'s `Archive::open` dispatch test can
+    /// reuse it rather than duplicating a fixture builder.
+    pub(crate) fn write_tiny_fixture(path: &Path) -> Result<()> {
         // Two tiny F32 tensors, written via the upstream serializer so
         // the test exercises the real on-disk layout.
         let a: Vec<u8> = [1.0_f32, 2.0, 3.0, 4.0]
@@ -233,12 +238,62 @@ mod tests {
         let names = r.names();
         assert!(names.iter().any(|n| n == "a"));
         assert!(names.iter().any(|n| n == "b"));
+
+        // WHY(forkwright/logismos#56): the offset-computation rewrite
+        // (pointer-address subtraction -> `TensorInfo::data_offsets`)
+        // is only pinned if the actual decoded bytes are checked — a
+        // length-only assertion passes on a slice shifted by any
+        // constant, since `rel_end - rel_start` is invariant to a
+        // shift in `data_region_start`. Both fixture tensors are
+        // checked so an error confined to a non-first tensor (e.g.
+        // cumulative-offset drift) is also caught.
+        let expected_a: Vec<u8> = [1.0_f32, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let expected_b: Vec<u8> = [10.0_f32, 20.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
         let tv_a = r.get("a")?;
         assert_eq!(tv_a.dtype, taxis::DType::F32);
         assert_eq!(tv_a.shape, vec![2, 2]);
-        assert_eq!(tv_a.bytes.len(), 16);
+        assert_eq!(tv_a.bytes, expected_a.as_slice());
+
+        let tv_b = r.get("b")?;
+        assert_eq!(tv_b.dtype, taxis::DType::F32);
+        assert_eq!(tv_b.shape, vec![2]);
+        assert_eq!(tv_b.bytes, expected_b.as_slice());
+
         let tensor = tv_a.to_tensor_cpu()?;
         assert_eq!(tensor.dims(), &[2, 2]);
+        let Some(taxis::CpuStorage::F32(v)) = tensor.cpu_storage() else {
+            return Err(Error::Msg("expected F32 CPU storage".into()));
+        };
+        assert_eq!(v.as_slice(), &[1.0_f32, 2.0, 3.0, 4.0][..]);
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn get_rejects_after_external_truncation() -> Result<()> {
+        // WHY(forkwright/logismos#60): the mmap SAFETY comment states
+        // the backing file must not be mutated while the mapping is
+        // open; nothing enforced that. `get` now re-stats the file and
+        // refuses a mapping whose backing file has changed size since
+        // it was opened.
+        let tmp = std::env::temp_dir().join(format!(
+            "logismos-st-truncation-test-{}.safetensors",
+            std::process::id()
+        ));
+        write_tiny_fixture(&tmp)?;
+        let r = Reader::open(&tmp)?;
+        std::fs::write(&tmp, b"short")?;
+
+        let result = r.get("a");
+        assert!(matches!(result, Err(Error::MmapStale { .. })));
+
         let _ = std::fs::remove_file(&tmp);
         Ok(())
     }

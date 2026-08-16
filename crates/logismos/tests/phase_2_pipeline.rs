@@ -147,13 +147,13 @@ fn exercise_kv_cache() -> Result<(), TestError> {
             kv.put(layer, &k, &v)?;
         }
     }
-    assert_eq!(kv.len_of(0), 3);
-    assert_eq!(kv.len_of(1), 3);
+    assert_eq!(kv.len_of(0), Some(3));
+    assert_eq!(kv.len_of(1), Some(3));
     let (k_read, v_read) = kv.get(0, 3)?;
     assert_eq!(k_read.dims(), &[3, row_elems]);
     assert_eq!(v_read.dims(), &[3, row_elems]);
     kv.reset();
-    assert_eq!(kv.len_of(0), 0);
+    assert_eq!(kv.len_of(0), Some(0));
     eprintln!("[phase-2] cache: put 3 rows × 2 layers → read back → reset OK");
     Ok(())
 }
@@ -167,7 +167,7 @@ fn exercise_decode() {
     // And through a chain for the fuller shape.
     let mut chain = DecodeChain::new(GreedySampler)
         .push(TemperatureScale(0.7))
-        .push(TopK(3))
+        .push(TopK::new(3))
         .push(TopP(0.95));
     let mut log_buf = logits.clone();
     let ctx = TokenContext {

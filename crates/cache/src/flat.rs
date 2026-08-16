@@ -11,6 +11,17 @@
 //!
 //! Paged + radix layouts (Phases 6 + 12) will replace the flat arrays
 //! with block tables but keep the same `KvCache` trait contract.
+//!
+//! ## Byte-marshalling convention
+//!
+//! Every multi-byte dtype this crate stores (f32/f16/bf16/i32) is
+//! marshalled **little-endian**, both directions: [`cpu_storage_bytes`]
+//! writes it, the `chunks_to_*` functions read it back. This is stated
+//! once, here — the write side used to reinterpret native-endian bytes
+//! directly, which agreed with the little-endian readers only on a
+//! little-endian host.
+
+use std::borrow::Cow;
 
 use taxis::{CpuStorage, DType, Shape, Tensor};
 
@@ -57,7 +68,7 @@ impl CacheLayout {
 /// Validated view of a CPU-backed `[n_tokens, row_elems]` tensor's raw bytes.
 struct TensorBytes<'t> {
     n_tokens: usize,
-    bytes: &'t [u8],
+    bytes: Cow<'t, [u8]>,
 }
 
 /// Flat KV cache.
@@ -126,7 +137,7 @@ impl FlatKvCache {
                 ),
             });
         }
-        let storage = t.cpu_storage().ok_or_else(|| Error::ShapeMismatch {
+        let storage = t.cpu_storage().ok_or_else(|| Error::UnsupportedStorage {
             msg: "Phase-2 FlatKvCache only accepts CPU-backed tensors".into(),
         })?;
         let bytes = cpu_storage_bytes(storage)?;
@@ -205,7 +216,7 @@ impl KvCache for FlatKvCache {
         k_buf
             .get_mut(off..end)
             .ok_or_else(shape_err)?
-            .copy_from_slice(k_bytes);
+            .copy_from_slice(&k_bytes);
         let v_buf = self
             .v_buffers
             .get_mut(layer_idx)
@@ -216,7 +227,7 @@ impl KvCache for FlatKvCache {
         v_buf
             .get_mut(off..end)
             .ok_or_else(shape_err)?
-            .copy_from_slice(v_bytes);
+            .copy_from_slice(&v_bytes);
         if let Some(slot) = self.lens.get_mut(layer_idx) {
             *slot = current + n_k;
         }
@@ -267,8 +278,8 @@ impl KvCache for FlatKvCache {
         Ok((k, v))
     }
 
-    fn len_of(&self, layer_idx: usize) -> usize {
-        self.lens.get(layer_idx).copied().unwrap_or(0)
+    fn len_of(&self, layer_idx: usize) -> Option<usize> {
+        self.lens.get(layer_idx).copied()
     }
 
     fn num_layers(&self) -> usize {
@@ -282,47 +293,58 @@ impl KvCache for FlatKvCache {
     }
 }
 
-fn cpu_storage_bytes(s: &CpuStorage) -> Result<&[u8]> {
-    // SAFETY: each variant holds a `Vec<T>` of a `BytePod`-compatible
-    // `T`. Reinterpreting as a byte slice is defined because `T` has
-    // `Copy` + every bit pattern is valid (f32/f16/bf16/i*/u8).
-    unsafe {
-        match s {
-            CpuStorage::F32(v) => Ok(core::slice::from_raw_parts(
-                v.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(v.as_slice()),
-            )),
-            CpuStorage::F16(v) => Ok(core::slice::from_raw_parts(
-                v.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(v.as_slice()),
-            )),
-            CpuStorage::BF16(v) => Ok(core::slice::from_raw_parts(
-                v.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(v.as_slice()),
-            )),
-            CpuStorage::I32(v) => Ok(core::slice::from_raw_parts(
-                v.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(v.as_slice()),
-            )),
-            CpuStorage::I8(v) => Ok(core::slice::from_raw_parts(
-                v.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(v.as_slice()),
-            )),
-            CpuStorage::U8(v) => Ok(v.as_slice()),
-            _ => Err(Error::ShapeMismatch {
-                msg: "unsupported future CpuStorage variant".into(),
-            }),
-        }
+/// Little-endian byte view of `v` — the write-side half of this crate's
+/// byte-marshalling convention (see the module doc). Zero-copy: on a
+/// little-endian target, an element's native in-memory layout already IS
+/// its little-endian encoding, so `_to_le` goes unused by construction —
+/// kept in the signature so this and its big-endian sibling below share
+/// one call-site shape.
+#[cfg(target_endian = "little")]
+fn le_bytes_of<T: Copy, const N: usize>(v: &[T], _to_le: impl Fn(T) -> [u8; N]) -> Cow<'_, [u8]> {
+    // SAFETY: `T` is `Copy` + every bit pattern is valid
+    // (f32/f16/bf16/i32/i8), and on this little-endian target the native
+    // representation already equals the little-endian encoding `_to_le`
+    // would produce, so this reinterpret is bit-for-bit identical to
+    // calling `_to_le` on every element.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v)) };
+    Cow::Borrowed(bytes)
+}
+
+/// Little-endian byte view of `v`, explicit-encode fallback for a
+/// big-endian target — correctness here never depends on host
+/// endianness (see the little-endian sibling above for the zero-copy
+/// case, which covers every target this crate currently ships on).
+#[cfg(not(target_endian = "little"))]
+fn le_bytes_of<T: Copy, const N: usize>(v: &[T], to_le: impl Fn(T) -> [u8; N]) -> Cow<'_, [u8]> {
+    let mut out = Vec::with_capacity(v.len() * N);
+    for &x in v {
+        out.extend_from_slice(&to_le(x));
+    }
+    Cow::Owned(out)
+}
+
+fn cpu_storage_bytes(s: &CpuStorage) -> Result<Cow<'_, [u8]>> {
+    match s {
+        CpuStorage::F32(v) => Ok(le_bytes_of(v, f32::to_le_bytes)),
+        CpuStorage::F16(v) => Ok(le_bytes_of(v, half::f16::to_le_bytes)),
+        CpuStorage::BF16(v) => Ok(le_bytes_of(v, half::bf16::to_le_bytes)),
+        CpuStorage::I32(v) => Ok(le_bytes_of(v, i32::to_le_bytes)),
+        CpuStorage::I8(v) => Ok(le_bytes_of(v, i8::to_le_bytes)),
+        CpuStorage::U8(v) => Ok(Cow::Borrowed(v.as_slice())),
+        _ => Err(Error::UnsupportedStorage {
+            msg: "unsupported future CpuStorage variant".into(),
+        }),
     }
 }
 
 fn cpu_tensor_from_bytes(dtype: DType, bytes: &[u8], shape: Shape) -> Result<Tensor> {
     let elem_count = shape.elem_count();
     let storage = match dtype {
-        DType::F32 => CpuStorage::F32(chunks_to_f32(bytes, elem_count)),
-        DType::F16 => CpuStorage::F16(chunks_to_f16(bytes, elem_count)),
-        DType::BF16 => CpuStorage::BF16(chunks_to_bf16(bytes, elem_count)),
-        DType::I32 => CpuStorage::I32(chunks_to_i32(bytes, elem_count)),
+        DType::F32 => CpuStorage::F32(chunks_to_f32(bytes, elem_count)?),
+        DType::F16 => CpuStorage::F16(chunks_to_f16(bytes, elem_count)?),
+        DType::BF16 => CpuStorage::BF16(chunks_to_bf16(bytes, elem_count)?),
+        DType::I32 => CpuStorage::I32(chunks_to_i32(bytes, elem_count)?),
         DType::I8 => CpuStorage::I8(bytes_to_i8(bytes)),
         DType::U8 => CpuStorage::U8(bytes.to_vec()),
         other => {
@@ -332,6 +354,25 @@ fn cpu_tensor_from_bytes(dtype: DType, bytes: &[u8], shape: Shape) -> Result<Ten
         }
     };
     Ok(Tensor::from_cpu(storage, shape))
+}
+
+/// Postcondition on every `chunks_exact`-based decoder: `chunks_exact`
+/// silently drops a trailing partial chunk, so a byte length that isn't
+/// a whole multiple of the dtype width would otherwise produce a `Vec`
+/// shorter than `expected` — and `Tensor::from_cpu` performs no length
+/// check of its own against the `Shape` it's handed, so that mismatch
+/// would surface later as an out-of-bounds read, not a construction
+/// error.
+fn check_decoded_len(produced: usize, expected: usize, byte_len: usize) -> Result<()> {
+    if produced != expected {
+        return Err(Error::ShapeMismatch {
+            msg: format!(
+                "decoded {produced} elements from {byte_len} bytes, expected {expected} \
+                 (dtype width does not evenly divide the supplied bytes)"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn bytes_to_i8(bytes: &[u8]) -> Vec<i8> {
@@ -351,318 +392,47 @@ fn bytes_to_i8(bytes: &[u8]) -> Vec<i8> {
     out
 }
 
-fn chunks_to_f32(bytes: &[u8], elem: usize) -> Vec<f32> {
+fn chunks_to_f32(bytes: &[u8], elem: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(elem);
     for c in bytes.chunks_exact(4) {
         let mut b = [0u8; 4];
         b.copy_from_slice(c);
         out.push(f32::from_le_bytes(b));
     }
-    out
+    check_decoded_len(out.len(), elem, bytes.len())?;
+    Ok(out)
 }
-fn chunks_to_i32(bytes: &[u8], elem: usize) -> Vec<i32> {
+fn chunks_to_i32(bytes: &[u8], elem: usize) -> Result<Vec<i32>> {
     let mut out = Vec::with_capacity(elem);
     for c in bytes.chunks_exact(4) {
         let mut b = [0u8; 4];
         b.copy_from_slice(c);
         out.push(i32::from_le_bytes(b));
     }
-    out
+    check_decoded_len(out.len(), elem, bytes.len())?;
+    Ok(out)
 }
-fn chunks_to_f16(bytes: &[u8], elem: usize) -> Vec<half::f16> {
+fn chunks_to_f16(bytes: &[u8], elem: usize) -> Result<Vec<half::f16>> {
     let mut out = Vec::with_capacity(elem);
     for c in bytes.chunks_exact(2) {
         let mut b = [0u8; 2];
         b.copy_from_slice(c);
         out.push(half::f16::from_le_bytes(b));
     }
-    out
+    check_decoded_len(out.len(), elem, bytes.len())?;
+    Ok(out)
 }
-fn chunks_to_bf16(bytes: &[u8], elem: usize) -> Vec<half::bf16> {
+fn chunks_to_bf16(bytes: &[u8], elem: usize) -> Result<Vec<half::bf16>> {
     let mut out = Vec::with_capacity(elem);
     for c in bytes.chunks_exact(2) {
         let mut b = [0u8; 2];
         b.copy_from_slice(c);
         out.push(half::bf16::from_le_bytes(b));
     }
-    out
+    check_decoded_len(out.len(), elem, bytes.len())?;
+    Ok(out)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn layout_small() -> CacheLayout {
-        CacheLayout {
-            num_layers: 4,
-            num_kv_heads: 2,
-            head_dim: 3,
-            max_seq_len: 8,
-            dtype: DType::F32,
-        }
-    }
-
-    fn one_row_tensor(val: f32, layout: &CacheLayout) -> Tensor {
-        let row = vec![val; layout.row_elems()];
-        Tensor::from_cpu(CpuStorage::F32(row), Shape::new(&[1, layout.row_elems()]))
-    }
-
-    fn host_f32(t: &Tensor) -> Vec<f32> {
-        match t.cpu_storage() {
-            Some(CpuStorage::F32(v)) => v.clone(),
-            _ => Vec::new(),
-        }
-    }
-
-    #[test]
-    fn put_then_get_round_trip() -> Result<()> {
-        let layout = layout_small();
-        let mut c = FlatKvCache::new(layout);
-        let k = one_row_tensor(1.5, &layout);
-        let v = one_row_tensor(2.5, &layout);
-        c.put(0, &k, &v)?;
-        assert_eq!(c.len_of(0), 1);
-        let (k_out, v_out) = c.get(0, 1)?;
-        assert_eq!(k_out.dims(), &[1, layout.row_elems()]);
-        let k_host = host_f32(&k_out);
-        assert_eq!(k_host.len(), layout.row_elems());
-        for x in &k_host {
-            assert!((x - 1.5).abs() < 1e-6);
-        }
-        let v_host = host_f32(&v_out);
-        for x in &v_host {
-            assert!((x - 2.5).abs() < 1e-6);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn put_then_get_round_trip_f16() -> Result<()> {
-        // WHY(forkwright/logismos#42): every prior round-trip test used
-        // only DType::F32. F16 goes through `chunks_to_f16` on read and
-        // a native-endian raw-byte reinterpret on write — a path never
-        // exercised before this test.
-        let layout = CacheLayout {
-            dtype: DType::F16,
-            ..layout_small()
-        };
-        let mut c = FlatKvCache::new(layout);
-        let val = half::f16::from_f32(1.5);
-        let row = vec![val; layout.row_elems()];
-        let k = Tensor::from_cpu(
-            CpuStorage::F16(row.clone()),
-            Shape::new(&[1, layout.row_elems()]),
-        );
-        let v = Tensor::from_cpu(CpuStorage::F16(row), Shape::new(&[1, layout.row_elems()]));
-        c.put(0, &k, &v)?;
-        let (k_out, v_out) = c.get(0, 1)?;
-        let Some(CpuStorage::F16(k_host)) = k_out.cpu_storage() else {
-            return Err(Error::Msg("expected F16 storage".into()));
-        };
-        assert_eq!(k_host, &vec![val; layout.row_elems()]);
-        let Some(CpuStorage::F16(v_host)) = v_out.cpu_storage() else {
-            return Err(Error::Msg("expected F16 storage".into()));
-        };
-        assert_eq!(v_host, &vec![val; layout.row_elems()]);
-        Ok(())
-    }
-
-    #[test]
-    fn put_then_get_round_trip_bf16() -> Result<()> {
-        let layout = CacheLayout {
-            dtype: DType::BF16,
-            ..layout_small()
-        };
-        let mut c = FlatKvCache::new(layout);
-        let val = half::bf16::from_f32(-2.25);
-        let row = vec![val; layout.row_elems()];
-        let k = Tensor::from_cpu(
-            CpuStorage::BF16(row.clone()),
-            Shape::new(&[1, layout.row_elems()]),
-        );
-        let v = Tensor::from_cpu(CpuStorage::BF16(row), Shape::new(&[1, layout.row_elems()]));
-        c.put(0, &k, &v)?;
-        let (k_out, v_out) = c.get(0, 1)?;
-        let Some(CpuStorage::BF16(k_host)) = k_out.cpu_storage() else {
-            return Err(Error::Msg("expected BF16 storage".into()));
-        };
-        assert_eq!(k_host, &vec![val; layout.row_elems()]);
-        let Some(CpuStorage::BF16(v_host)) = v_out.cpu_storage() else {
-            return Err(Error::Msg("expected BF16 storage".into()));
-        };
-        assert_eq!(v_host, &vec![val; layout.row_elems()]);
-        Ok(())
-    }
-
-    #[test]
-    fn put_then_get_round_trip_i32() -> Result<()> {
-        let layout = CacheLayout {
-            dtype: DType::I32,
-            ..layout_small()
-        };
-        let mut c = FlatKvCache::new(layout);
-        let row_k = vec![7_i32; layout.row_elems()];
-        let row_v = vec![-3_i32; layout.row_elems()];
-        let k = Tensor::from_cpu(
-            CpuStorage::I32(row_k.clone()),
-            Shape::new(&[1, layout.row_elems()]),
-        );
-        let v = Tensor::from_cpu(
-            CpuStorage::I32(row_v.clone()),
-            Shape::new(&[1, layout.row_elems()]),
-        );
-        c.put(0, &k, &v)?;
-        let (k_out, v_out) = c.get(0, 1)?;
-        let Some(CpuStorage::I32(k_host)) = k_out.cpu_storage() else {
-            return Err(Error::Msg("expected I32 storage".into()));
-        };
-        assert_eq!(k_host, &row_k);
-        let Some(CpuStorage::I32(v_host)) = v_out.cpu_storage() else {
-            return Err(Error::Msg("expected I32 storage".into()));
-        };
-        assert_eq!(v_host, &row_v);
-        Ok(())
-    }
-
-    #[test]
-    fn put_then_get_round_trip_i8() -> Result<()> {
-        // WHY(forkwright/logismos#42): this is the dtype whose reader
-        // used `from_ne_bytes` instead of the little-endian convention
-        // every other reader uses — a quantized (I8) on-device model is
-        // exactly the path this cache exists to serve.
-        let layout = CacheLayout {
-            dtype: DType::I8,
-            ..layout_small()
-        };
-        let mut c = FlatKvCache::new(layout);
-        let row_k = vec![i8::MIN; layout.row_elems()];
-        let row_v = vec![i8::MAX; layout.row_elems()];
-        let k = Tensor::from_cpu(
-            CpuStorage::I8(row_k.clone()),
-            Shape::new(&[1, layout.row_elems()]),
-        );
-        let v = Tensor::from_cpu(
-            CpuStorage::I8(row_v.clone()),
-            Shape::new(&[1, layout.row_elems()]),
-        );
-        c.put(0, &k, &v)?;
-        let (k_out, v_out) = c.get(0, 1)?;
-        let Some(CpuStorage::I8(k_host)) = k_out.cpu_storage() else {
-            return Err(Error::Msg("expected I8 storage".into()));
-        };
-        assert_eq!(k_host, &row_k);
-        let Some(CpuStorage::I8(v_host)) = v_out.cpu_storage() else {
-            return Err(Error::Msg("expected I8 storage".into()));
-        };
-        assert_eq!(v_host, &row_v);
-        Ok(())
-    }
-
-    #[test]
-    fn put_then_get_round_trip_u8() -> Result<()> {
-        let layout = CacheLayout {
-            dtype: DType::U8,
-            ..layout_small()
-        };
-        let mut c = FlatKvCache::new(layout);
-        let row_k = vec![200_u8; layout.row_elems()];
-        let row_v = vec![1_u8; layout.row_elems()];
-        let k = Tensor::from_cpu(
-            CpuStorage::U8(row_k.clone()),
-            Shape::new(&[1, layout.row_elems()]),
-        );
-        let v = Tensor::from_cpu(
-            CpuStorage::U8(row_v.clone()),
-            Shape::new(&[1, layout.row_elems()]),
-        );
-        c.put(0, &k, &v)?;
-        let (k_out, v_out) = c.get(0, 1)?;
-        let Some(CpuStorage::U8(k_host)) = k_out.cpu_storage() else {
-            return Err(Error::Msg("expected U8 storage".into()));
-        };
-        assert_eq!(k_host, &row_k);
-        let Some(CpuStorage::U8(v_host)) = v_out.cpu_storage() else {
-            return Err(Error::Msg("expected U8 storage".into()));
-        };
-        assert_eq!(v_host, &row_v);
-        Ok(())
-    }
-
-    #[test]
-    fn grows_monotonically_across_layers() -> Result<()> {
-        let layout = layout_small();
-        let mut c = FlatKvCache::new(layout);
-        for _ in 0..3 {
-            for layer in 0..layout.num_layers {
-                let k = one_row_tensor(0.1, &layout);
-                let v = one_row_tensor(0.2, &layout);
-                c.put(layer, &k, &v)?;
-            }
-        }
-        for layer in 0..layout.num_layers {
-            assert_eq!(c.len_of(layer), 3);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn reset_zeros_lengths() -> Result<()> {
-        let layout = layout_small();
-        let mut c = FlatKvCache::new(layout);
-        let k = one_row_tensor(1.0, &layout);
-        let v = one_row_tensor(1.0, &layout);
-        c.put(0, &k, &v)?;
-        c.put(1, &k, &v)?;
-        c.reset();
-        assert_eq!(c.len_of(0), 0);
-        assert_eq!(c.len_of(1), 0);
-        // Re-write after reset stays consistent.
-        c.put(0, &k, &v)?;
-        assert_eq!(c.len_of(0), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn overflow_errors_cleanly() -> Result<()> {
-        let layout = CacheLayout {
-            num_layers: 1,
-            num_kv_heads: 1,
-            head_dim: 1,
-            max_seq_len: 2,
-            dtype: DType::F32,
-        };
-        let mut c = FlatKvCache::new(layout);
-        let k = one_row_tensor(1.0, &layout);
-        let v = one_row_tensor(1.0, &layout);
-        c.put(0, &k, &v)?;
-        c.put(0, &k, &v)?;
-        let err = c.put(0, &k, &v);
-        assert!(matches!(err, Err(Error::LenOverflow { .. })));
-        Ok(())
-    }
-
-    #[test]
-    fn read_beyond_written_errors() {
-        let layout = layout_small();
-        let c = FlatKvCache::new(layout);
-        let err = c.get(0, 1);
-        assert!(matches!(err, Err(Error::ReadBeyondWritten { .. })));
-    }
-
-    #[test]
-    fn layer_out_of_range_errors() {
-        let layout = layout_small();
-        let c = FlatKvCache::new(layout);
-        let err = c.get(99, 0);
-        assert!(matches!(err, Err(Error::LayerOutOfRange { .. })));
-    }
-
-    #[test]
-    fn buffer_bytes_computed_correctly() {
-        let layout = layout_small();
-        // dtype F32 (4B) × 2 heads × 3 head_dim × 8 max_seq = 192 B
-        assert_eq!(layout.buffer_bytes(), 192);
-        assert_eq!(layout.row_elems(), 6);
-        assert_eq!(layout.row_bytes(), 24);
-    }
-}
+#[path = "flat_tests.rs"]
+mod tests;

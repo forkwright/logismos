@@ -83,6 +83,22 @@ mod tests {
     }
 
     #[test]
+    fn exact_match_wins_over_a_matching_prefix_rule() {
+        // WHY(forkwright/logismos#56): `exact_match_wins` only ever
+        // registered exact rules, and `prefix_rewrites_in_order` only
+        // ever registered prefix rules — neither exercised the case
+        // where both are registered and both match the same key, which
+        // is exactly the precedence `apply`'s doc comment promises.
+        let mut m = NameMap::new();
+        m.insert_prefix("model.", "m.");
+        m.insert_exact("model.norm.weight", "final_norm.weight");
+        assert_eq!(m.apply("model.norm.weight"), "final_norm.weight");
+        // Sanity: the prefix rule still fires for keys the exact rule
+        // doesn't cover, so this isn't just an empty prefix table.
+        assert_eq!(m.apply("model.other.weight"), "m.other.weight");
+    }
+
+    #[test]
     fn prefix_rewrites_in_order() {
         let mut m = NameMap::new();
         m.insert_prefix("model.embed_tokens.", "tok_embed.");
