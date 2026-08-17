@@ -164,6 +164,21 @@ impl Device {
         &self.inner.props
     }
 
+    /// Number of live `Device` handles (clones of this value, or clones
+    /// held inside another type such as `DeviceBuffer` or `Stream`)
+    /// sharing the same underlying device state.
+    ///
+    /// WHY: exists so tests elsewhere in this crate can observe whether
+    /// a value holding a cloned `Device` (e.g. `memory::PendingCopy`'s
+    /// wrapped `DeviceBuffer`) was actually dropped, without needing
+    /// real HIP device state to exercise the drop path end-to-end — a
+    /// dropped clone decrements this count, an un-dropped (leaked) one
+    /// does not, and that difference is observable with no hardware.
+    #[cfg(test)]
+    pub(crate) fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
     /// Make this device current on the calling thread.
     ///
     /// # Errors

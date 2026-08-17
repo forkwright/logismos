@@ -12,13 +12,18 @@
 //! guaranteed done). Under the fixed signature `data` is moved into
 //! the call, so reusing it below is a compile-time "use of moved
 //! value" (E0382).
+//!
+//! `buf` is not `mut`: forkwright/logismos#104 changed
+//! `copy_from_host_async` to consume the destination by value too (see
+//! the sibling `copy_from_host_async_destination_uaf.rs` fixture), so
+//! this call no longer takes `&mut buf` by autoref.
 
 use hipcore::{Device, DeviceBuffer, Stream};
 
 fn main() {
     let device = Device::new(0).expect("device");
     let stream = Stream::new(&device).expect("stream");
-    let mut buf: DeviceBuffer<u8> = DeviceBuffer::alloc(&device, 4).expect("alloc");
+    let buf: DeviceBuffer<u8> = DeviceBuffer::alloc(&device, 4).expect("alloc");
     let data = vec![0_u8; 4];
     // `data` moves into `copy_from_host_async`, which owns it until the
     // returned `PendingCopy` is waited on or dropped. Reusing the
