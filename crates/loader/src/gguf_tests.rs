@@ -114,18 +114,27 @@ fn array_metadata_type_parses_elements() -> Result<()> {
 fn array_metadata_round_trips_through_reader_open() -> Result<()> {
     // WHY(forkwright/logismos#37): `array_metadata_type_parses_elements`
     // above exercises `read_meta_value_typed(9)` directly on a bare
-    // `Cursor`; it never proves the array branch survives the full
-    // `Reader::open` path — magic/version/count parsing, the
-    // metadata-KV loop's string-key read, and storage into the
-    // `metadata()` map by key. `reads_fixture_bytes` proves that glue
-    // for a scalar `U32` value; nothing before this test proved it for
-    // a non-scalar one. Negative-fixture provenance: with the array
+    // `Cursor`; nothing before this test combined an array-typed
+    // metadata value with the full `Reader::open` path (magic/version/
+    // count parsing, the metadata-KV loop's string-key read, and
+    // storage into the `metadata()` map). `reads_fixture_bytes` proves
+    // that glue for a scalar `U32`; this is the first test to prove it
+    // for `MetaValue::Array` — closing an untested *composition*, not
+    // a new failure mode. NOTE: the KV loop's insert/lookup
+    // (`gguf.rs:220-226`, `reject_duplicate_metadata_key`) is generic
+    // over `MetaValue`'s variant, so no fixture can distinguish this
+    // test's regression coverage from `reads_fixture_bytes`'s at that
+    // seam specifically. Negative-fixture provenance: with the array
     // decode loop's element count deliberately shortened to
     // `0..n.saturating_sub(1)` on a throwaway branch (PR #107, closed
     // without merging, branch deleted after capture), this test failed
     // at the `items.len()` assertion below (`assertion `left == right`
-    // failed` / `left: 2` / `right: 3`) — CI run 31978345640, job
-    // 95241145081 — and passes unchanged against the real `0..n` loop.
+    // failed` / `left: 2` / `right: 3` — CI run 31978345640, job
+    // 95241145081) alongside `array_metadata_type_parses_elements`,
+    // which fails identically since both bottom out in the same decode
+    // loop; the fixture pins that shared loop, not this test's own
+    // KV-loop/storage seam. Passes unchanged against the real `0..n`
+    // loop.
     let dir = tempdir_for_test();
     let path = dir.join("array-metadata-e2e.gguf");
     let mut buf = Vec::new();
