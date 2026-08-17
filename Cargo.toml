@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "1.0.7"
+version = "1.0.8"
 edition = "2024"
 rust-version = "1.90"
 license = "LicenseRef-PolyForm-Shield-1.0.0"
