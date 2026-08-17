@@ -5,7 +5,16 @@ use std::sync::Arc;
 use hipcore::{BytePod, Device, DeviceBuffer};
 
 use crate::dtype::DType;
-use crate::error::{DTypeMismatchSnafu, Error, MsgSnafu, Result};
+use crate::error::{DTypeMismatchSnafu, MsgSnafu, Result};
+// WHY imported without a code reference: the `# Errors` sections below link to
+// `Error` variants by intra-doc path, which rustdoc resolves only against items
+// in scope. Split from the group above so the expectation covers this import
+// alone -- a later genuinely-unused import in the group still fails the gate.
+#[expect(
+    unused_imports,
+    reason = "resolves intra-doc links in this module's `# Errors` sections"
+)]
+use crate::error::Error;
 
 /// Type-erased CPU storage. One variant per supported dtype that has
 /// a native Rust type; other dtypes live in raw-byte storage later.

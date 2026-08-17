@@ -5,7 +5,14 @@ use std::sync::Arc;
 use hipcore::{BytePod, Device};
 
 use crate::dtype::DType;
-use crate::error::{DTypeMismatchSnafu, Error, Result, ShapeMismatchSnafu};
+use crate::error::{DTypeMismatchSnafu, Result, ShapeMismatchSnafu};
+// WHY imported without a code reference: see `storage.rs` -- the `# Errors`
+// sections link to `Error` variants by intra-doc path.
+#[expect(
+    unused_imports,
+    reason = "resolves intra-doc links in this module's `# Errors` sections"
+)]
+use crate::error::Error;
 use crate::layout::Layout;
 use crate::shape::Shape;
 use crate::storage::{CpuStorage, HipStorage, Storage};
