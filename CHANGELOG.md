@@ -24,6 +24,18 @@ All notable changes to logismos are recorded here.
 - Kernel result defaults: explicit handling in cfg-gated branches
 - Matmul CPU helper visibility: narrowed to `pub(crate)`
 
+## [1.0.8](https://github.com/forkwright/logismos/compare/v1.0.7...v1.0.8) (2026-08-17)
+
+
+### Bug Fixes
+
+* **hipcore:** protect destination buffer in copy_from_host_async ([#110](https://github.com/forkwright/logismos/issues/110)) ([a6ed8c5](https://github.com/forkwright/logismos/commit/a6ed8c5edd6594566d028337b59e74102f0fa54e))
+
+
+### Documentation
+
+* **gate-attestation:** document hipcore's ROCm build requirement and CI fallback ([#78](https://github.com/forkwright/logismos/issues/78)) ([43abb58](https://github.com/forkwright/logismos/commit/43abb589ebeaa1e9400d78f9b1dd0f85fcfc01ef)), closes [#14](https://github.com/forkwright/logismos/issues/14)
+
 ## [1.0.7](https://github.com/forkwright/logismos/compare/v1.0.6...v1.0.7) (2026-08-16)
 
 
