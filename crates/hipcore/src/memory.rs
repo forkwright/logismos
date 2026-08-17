@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use std::io::{self, Write};
 
 use crate::device::Device;
-use crate::error::{Error, Result, check, hipError_t_code};
+use crate::error::{Error, InternalSnafu, OutOfMemorySnafu, Result, check, hipError_t_code};
 use crate::ffi;
 use crate::pod::BytePod;
 use crate::stream::Stream;
@@ -49,9 +49,12 @@ impl<T: BytePod> DeviceBuffer<T> {
     /// - [`Error::Runtime`] for any other HIP failure.
     pub fn alloc(device: &Device, len: usize) -> Result<Self> {
         device.make_current()?;
-        let bytes = len
-            .checked_mul(core::mem::size_of::<T>())
-            .ok_or_else(|| Error::Internal("allocation size overflow".into()))?;
+        let bytes = len.checked_mul(core::mem::size_of::<T>()).ok_or_else(|| {
+            InternalSnafu {
+                message: "allocation size overflow",
+            }
+            .build()
+        })?;
         let mut ptr: *mut c_void = core::ptr::null_mut();
         // SAFETY: FFI call; `&mut ptr` valid. HIP returns either a
         // non-null pointer with status success, or null with a failure
@@ -60,16 +63,21 @@ impl<T: BytePod> DeviceBuffer<T> {
         if status != ffi::hipError_t::hipSuccess {
             let free = device.memory_budget().map(|b| b.free).unwrap_or(0);
             return Err(if status == ffi::hipError_t::hipErrorOutOfMemory {
-                Error::OutOfMemory {
+                OutOfMemorySnafu {
                     requested: bytes,
                     free,
                 }
+                .build()
             } else {
                 Error::runtime(hipError_t_code(status), "hipMalloc")
             });
         }
-        let nn = NonNull::new(ptr.cast::<T>())
-            .ok_or_else(|| Error::Internal("hipMalloc returned success with null ptr".into()))?;
+        let nn = NonNull::new(ptr.cast::<T>()).ok_or_else(|| {
+            InternalSnafu {
+                message: "hipMalloc returned success with null ptr",
+            }
+            .build()
+        })?;
         Ok(Self {
             ptr: nn,
             len,
@@ -127,11 +135,14 @@ impl<T: BytePod> DeviceBuffer<T> {
     /// - [`Error::Runtime`] on HIP failure.
     pub(crate) fn copy_from_host(&mut self, data: &[T]) -> Result<()> {
         if data.len() != self.len {
-            return Err(Error::Internal(format!(
-                "copy_from_host length mismatch: buffer {} vs slice {}",
-                self.len,
-                data.len()
-            )));
+            return InternalSnafu {
+                message: format!(
+                    "copy_from_host length mismatch: buffer {} vs slice {}",
+                    self.len,
+                    data.len()
+                ),
+            }
+            .fail();
         }
         self.device.make_current()?;
         // SAFETY: destination pointer is owned and sized; source slice is valid.
@@ -177,11 +188,14 @@ impl<T: BytePod> DeviceBuffer<T> {
     /// - [`Error::Runtime`] on HIP failure.
     pub fn copy_to_host(&self, dst: &mut [T]) -> Result<()> {
         if dst.len() != self.len {
-            return Err(Error::Internal(format!(
-                "copy_to_host length mismatch: buffer {} vs slice {}",
-                self.len,
-                dst.len()
-            )));
+            return InternalSnafu {
+                message: format!(
+                    "copy_to_host length mismatch: buffer {} vs slice {}",
+                    self.len,
+                    dst.len()
+                ),
+            }
+            .fail();
         }
         self.device.make_current()?;
         // SAFETY: destination slice is valid; source pointer owned.
@@ -224,11 +238,14 @@ impl<T: BytePod> DeviceBuffer<T> {
         stream: &'s Stream,
     ) -> Result<PendingCopy<'s, T>> {
         if data.len() != self.len {
-            return Err(Error::Internal(format!(
-                "copy_from_host_async length mismatch: buffer {} vs slice {}",
-                self.len,
-                data.len()
-            )));
+            return InternalSnafu {
+                message: format!(
+                    "copy_from_host_async length mismatch: buffer {} vs slice {}",
+                    self.len,
+                    data.len()
+                ),
+            }
+            .fail();
         }
         self.device.make_current()?;
         // SAFETY: destination pointer is owned and sized. `data` is

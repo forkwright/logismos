@@ -1,15 +1,30 @@
 //! Error type for `transformers`.
 
+use snafu::Snafu;
+
 /// Transformer-block errors.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
     /// A shape contract was violated at block construction or forward.
-    #[error("shape: {0}")]
-    Shape(String),
+    #[snafu(display("shape: {message}"))]
+    Shape {
+        /// Free-form description.
+        message: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// Downstream kernel failure (unused in Phase 3; reserved for Phase 6).
-    #[error("kernel: {0}")]
-    Kernel(String),
+    #[snafu(display("kernel: {message}"))]
+    Kernel {
+        /// Free-form description.
+        message: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }
 
 /// Crate-local result alias.

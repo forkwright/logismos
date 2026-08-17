@@ -10,7 +10,7 @@ use loader::safetensors::Reader;
 use logismos_core::{EmbeddingError, EmbeddingModel, EncodeOpts, Prompt};
 use tokenize::Tokenizer;
 
-use crate::error::{Error, Result};
+use crate::error::{IoSnafu, Result, UnsupportedDimSnafu};
 
 /// Matryoshka output dimensionality for Stella.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,9 +149,12 @@ impl StellaModel {
             1024
         } else {
             // Fall back to the first loaded head.
-            *supported
-                .first()
-                .ok_or_else(|| Error::Io("no heads loaded".into()))?
+            *supported.first().ok_or_else(|| {
+                IoSnafu {
+                    message: "no heads loaded",
+                }
+                .build()
+            })?
         };
 
         // Prompt metadata is optional for the checkpoint: an absent
@@ -172,7 +175,12 @@ impl StellaModel {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(n_physical)
             .build()
-            .map_err(|e| Error::Io(format!("rayon pool: {e}")))?;
+            .map_err(|e| {
+                IoSnafu {
+                    message: format!("rayon pool: {e}"),
+                }
+                .build()
+            })?;
 
         Ok(Self {
             cfg,
@@ -206,7 +214,10 @@ impl StellaModel {
     ///
     /// Propagates encoder / shape failures.
     pub(crate) fn encode_raw(&self, ids: &[u32], mask: &[u8], dim: usize) -> Result<Vec<f32>> {
-        let head = self.heads.get(&dim).ok_or(Error::UnsupportedDim(dim))?;
+        let head = self
+            .heads
+            .get(&dim)
+            .ok_or_else(|| UnsupportedDimSnafu { dim }.build())?;
 
         // Forward through the encoder: [seq, hidden]
         let hidden_states = self.encoder.forward(ids, mask)?;
@@ -357,12 +368,15 @@ fn load_dense_head(root: &Path, dim: StellaDim, hidden: usize) -> Result<DenseHe
     let w_view = reader.get("linear.weight")?;
     let b_view = reader.get("linear.bias")?;
     if w_view.dtype != taxis::DType::F32 || b_view.dtype != taxis::DType::F32 {
-        return Err(Error::Io(format!(
-            "dense head {}: expected F32, got weight={:?}, bias={:?}",
-            dim.folder(),
-            w_view.dtype,
-            b_view.dtype
-        )));
+        return IoSnafu {
+            message: format!(
+                "dense head {}: expected F32, got weight={:?}, bias={:?}",
+                dim.folder(),
+                w_view.dtype,
+                b_view.dtype
+            ),
+        }
+        .fail();
     }
     validate_head_shapes(dim.folder(), &w_view.shape, &b_view.shape, dim, hidden)?;
     let weight = bytes_to_f32(w_view.bytes);
@@ -394,15 +408,21 @@ fn validate_head_shapes(
 ) -> Result<()> {
     let expected_w = [dim.width(), hidden];
     if w_shape != expected_w.as_slice() {
-        return Err(Error::Io(format!(
-            "dense head {label}: expected weight shape {expected_w:?}, got {w_shape:?}"
-        )));
+        return IoSnafu {
+            message: format!(
+                "dense head {label}: expected weight shape {expected_w:?}, got {w_shape:?}"
+            ),
+        }
+        .fail();
     }
     let expected_b = [dim.width()];
     if b_shape != expected_b.as_slice() {
-        return Err(Error::Io(format!(
-            "dense head {label}: expected bias shape {expected_b:?}, got {b_shape:?}"
-        )));
+        return IoSnafu {
+            message: format!(
+                "dense head {label}: expected bias shape {expected_b:?}, got {b_shape:?}"
+            ),
+        }
+        .fail();
     }
     Ok(())
 }

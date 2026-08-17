@@ -10,7 +10,7 @@
 
 use kernels::cpu_f32;
 
-use crate::error::{Error, Result};
+use crate::error::{Result, ShapeSnafu};
 use crate::rope::RopeTable;
 
 // ---------------------------------------------------------------------------
@@ -140,30 +140,39 @@ impl GeGluMlp {
     pub fn new(hidden: usize, intermediate: usize, weights: GeGluMlpWeights) -> Result<Self> {
         let wi_expected = 2 * intermediate * hidden;
         if weights.wi.len() != wi_expected {
-            return Err(Error::Shape(format!(
-                "Wi: expected {wi_expected} elements, got {}",
-                weights.wi.len()
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "Wi: expected {wi_expected} elements, got {}",
+                    weights.wi.len()
+                ),
+            }
+            .fail();
         }
         if weights.wo.len() != hidden * intermediate {
-            return Err(Error::Shape(format!(
-                "Wo: expected {} elements, got {}",
-                hidden * intermediate,
-                weights.wo.len()
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "Wo: expected {} elements, got {}",
+                    hidden * intermediate,
+                    weights.wo.len()
+                ),
+            }
+            .fail();
         }
         if !weights.bi.is_empty() && weights.bi.len() != 2 * intermediate {
-            return Err(Error::Shape(format!(
-                "Wi bias: expected {} or 0, got {}",
-                2 * intermediate,
-                weights.bi.len()
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "Wi bias: expected {} or 0, got {}",
+                    2 * intermediate,
+                    weights.bi.len()
+                ),
+            }
+            .fail();
         }
         if !weights.bo.is_empty() && weights.bo.len() != hidden {
-            return Err(Error::Shape(format!(
-                "Wo bias: expected {hidden} or 0, got {}",
-                weights.bo.len()
-            )));
+            return ShapeSnafu {
+                message: format!("Wo bias: expected {hidden} or 0, got {}", weights.bo.len()),
+            }
+            .fail();
         }
         Ok(Self {
             hidden,
@@ -179,11 +188,14 @@ impl GeGluMlp {
     /// [`Error::Shape`] when `x.len()` is not a multiple of `hidden`.
     pub fn forward(&self, x: &[f32]) -> Result<Vec<f32>> {
         if !x.len().is_multiple_of(self.hidden) {
-            return Err(Error::Shape(format!(
-                "geglu.forward: x.len()={} not multiple of hidden={}",
-                x.len(),
-                self.hidden
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "geglu.forward: x.len()={} not multiple of hidden={}",
+                    x.len(),
+                    self.hidden
+                ),
+            }
+            .fail();
         }
         let seq = x.len() / self.hidden;
         // wi_out = x @ Wi^T -> [seq, 2*intermediate]
@@ -290,30 +302,31 @@ impl ModernBertAttention {
         let h = cfg.hidden;
         let w3h = 3 * h;
         if weights.wqkv.len() != w3h * h {
-            return Err(Error::Shape(format!(
-                "Wqkv: expected {}, got {}",
-                w3h * h,
-                weights.wqkv.len()
-            )));
+            return ShapeSnafu {
+                message: format!("Wqkv: expected {}, got {}", w3h * h, weights.wqkv.len()),
+            }
+            .fail();
         }
         if cfg.attention_bias && weights.bqkv.len() != w3h {
-            return Err(Error::Shape(format!(
-                "bqkv: expected {w3h}, got {}",
-                weights.bqkv.len()
-            )));
+            return ShapeSnafu {
+                message: format!("bqkv: expected {w3h}, got {}", weights.bqkv.len()),
+            }
+            .fail();
         }
         if weights.wo.len() != h * h {
-            return Err(Error::Shape(format!(
-                "Wo: expected {}, got {}",
-                h * h,
-                weights.wo.len()
-            )));
+            return ShapeSnafu {
+                message: format!("Wo: expected {}, got {}", h * h, weights.wo.len()),
+            }
+            .fail();
         }
         if cfg.n_heads == 0 || h != cfg.n_heads * cfg.head_dim {
-            return Err(Error::Shape(format!(
-                "hidden={h} != n_heads={} * head_dim={}",
-                cfg.n_heads, cfg.head_dim
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "hidden={h} != n_heads={} * head_dim={}",
+                    cfg.n_heads, cfg.head_dim
+                ),
+            }
+            .fail();
         }
         Ok(Self { cfg, weights })
     }
@@ -338,12 +351,15 @@ impl ModernBertAttention {
     ) -> Result<Vec<f32>> {
         let seq = positions.len();
         if x.len() != seq * self.cfg.hidden {
-            return Err(Error::Shape(format!(
-                "attention.forward: x.len()={} != seq*hidden={}*{}",
-                x.len(),
-                seq,
-                self.cfg.hidden
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "attention.forward: x.len()={} != seq*hidden={}*{}",
+                    x.len(),
+                    seq,
+                    self.cfg.hidden
+                ),
+            }
+            .fail();
         }
         let h = self.cfg.hidden;
         let n_h = self.cfg.n_heads;

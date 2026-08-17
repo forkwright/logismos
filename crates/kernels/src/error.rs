@@ -1,23 +1,32 @@
 //! `kernels` error surface.
 
+use snafu::Snafu;
+
 /// Result alias.
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Errors surfaced by the kernel launchers and CPU references.
-#[derive(thiserror::Error, Debug)]
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
     /// Propagated HIP failure.
-    #[error(transparent)]
-    Hip(#[from] hipcore::Error),
+    #[snafu(transparent)]
+    Hip {
+        /// Source HIP error.
+        source: hipcore::Error,
+    },
 
     /// Propagated tensor failure.
-    #[error(transparent)]
-    Taxis(#[from] taxis::Error),
+    #[snafu(transparent)]
+    Taxis {
+        /// Source tensor error.
+        source: taxis::Error,
+    },
 
     /// Kernel launch failed — HIP reported a non-success status after
     /// kernel submission.
-    #[error("kernel {kernel}: launch failed: {kind:?} (code {code})")]
+    #[snafu(display("kernel {kernel}: launch failed: {kind:?} (code {code})"))]
     Launch {
         /// Symbolic kernel name.
         kernel: &'static str,
@@ -26,23 +35,32 @@ pub enum Error {
         kind: hipcore::ErrorKind,
         /// Raw HIP error code.
         code: u32,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 
     /// Tensor shape is not supported by this kernel.
-    #[error("kernel {kernel}: unsupported shape: {msg}")]
+    #[snafu(display("kernel {kernel}: unsupported shape: {msg}"))]
     UnsupportedShape {
         /// Symbolic kernel name.
         kernel: &'static str,
         /// Description.
         msg: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 
     /// Build was produced without the HIP kernel archive (e.g. `hipcc`
     /// was absent). CPU references still work; GPU paths return this.
-    #[error("kernel {kernel}: no-GPU build (set HIPCC or install ROCm to enable)")]
+    #[snafu(display("kernel {kernel}: no-GPU build (set HIPCC or install ROCm to enable)"))]
     NoGpuBuild {
         /// Symbolic kernel name.
         kernel: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 }
 
@@ -58,11 +76,12 @@ mod tests {
         // derived from the same code via `hipcore::ErrorKind::from_raw`
         // (the mapping this finding says already existed) and its
         // `Display` now names the failure instead of just the number.
-        let err = Error::Launch {
+        let err = LaunchSnafu {
             kernel: "matmul_naive_fp16",
             kind: hipcore::ErrorKind::from_raw(2), // hipErrorOutOfMemory
-            code: 2,
-        };
+            code: 2u32,
+        }
+        .build();
         assert_eq!(
             hipcore::ErrorKind::from_raw(2),
             hipcore::ErrorKind::OutOfMemory

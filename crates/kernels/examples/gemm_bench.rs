@@ -33,19 +33,20 @@ use hipcore::{Device, DeviceBuffer, Event, Stream};
 use kernels::matmul::{Variant, launch_matmul_fp16};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use snafu::Snafu;
 
 const PEAK_TFLOPS: f64 = 123.0;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Snafu)]
 enum BenchError {
-    #[error(transparent)]
-    Hip(#[from] hipcore::Error),
-    #[error(transparent)]
-    Kernel(#[from] kernels::Error),
-    #[error(transparent)]
-    Int(#[from] TryFromIntError),
-    #[error(transparent)]
-    Io(#[from] io::Error),
+    #[snafu(transparent)]
+    Hip { source: hipcore::Error },
+    #[snafu(transparent)]
+    Kernel { source: kernels::Error },
+    #[snafu(transparent)]
+    Int { source: TryFromIntError },
+    #[snafu(transparent)]
+    Io { source: io::Error },
 }
 
 fn random_f16(n: usize, seed: u64) -> Vec<f16> {

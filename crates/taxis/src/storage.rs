@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hipcore::{BytePod, Device, DeviceBuffer};
 
 use crate::dtype::DType;
-use crate::error::{Error, Result};
+use crate::error::{DTypeMismatchSnafu, Error, MsgSnafu, Result};
 
 /// Type-erased CPU storage. One variant per supported dtype that has
 /// a native Rust type; other dtypes live in raw-byte storage later.
@@ -67,11 +67,12 @@ impl CpuStorage {
     pub fn as_slice_f32(&self) -> Result<&[f32]> {
         match self {
             Self::F32(v) => Ok(v),
-            _ => Err(Error::DTypeMismatch {
+            _ => DTypeMismatchSnafu {
                 op: "as_slice_f32",
                 expected: DType::F32,
                 got: self.dtype(),
-            }),
+            }
+            .fail(),
         }
     }
 
@@ -83,11 +84,12 @@ impl CpuStorage {
     pub fn as_slice_f16(&self) -> Result<&[half::f16]> {
         match self {
             Self::F16(v) => Ok(v),
-            _ => Err(Error::DTypeMismatch {
+            _ => DTypeMismatchSnafu {
                 op: "as_slice_f16",
                 expected: DType::F16,
                 got: self.dtype(),
-            }),
+            }
+            .fail(),
         }
     }
 
@@ -99,11 +101,12 @@ impl CpuStorage {
     pub fn as_slice_bf16(&self) -> Result<&[half::bf16]> {
         match self {
             Self::BF16(v) => Ok(v),
-            _ => Err(Error::DTypeMismatch {
+            _ => DTypeMismatchSnafu {
                 op: "as_slice_bf16",
                 expected: DType::BF16,
                 got: self.dtype(),
-            }),
+            }
+            .fail(),
         }
     }
 }
@@ -201,14 +204,20 @@ impl HipStorage {
         let elem_size = core::mem::size_of::<T>();
         match dtype.size_in_bytes_exact() {
             Some(expected) if expected == elem_size => Ok(()),
-            Some(expected) => Err(Error::Msg(format!(
-                "from_host dtype/element-size mismatch: dtype {dtype:?} is {expected}B/elem, \
-                 but T is {elem_size}B (elem_count and byte_len would disagree with dtype)"
-            ))),
-            None => Err(Error::Msg(format!(
-                "from_host: dtype {dtype:?} is sub-byte-packed and cannot be represented by \
-                 a T: BytePod slice"
-            ))),
+            Some(expected) => MsgSnafu {
+                message: format!(
+                    "from_host dtype/element-size mismatch: dtype {dtype:?} is {expected}B/elem, \
+                     but T is {elem_size}B (elem_count and byte_len would disagree with dtype)"
+                ),
+            }
+            .fail(),
+            None => MsgSnafu {
+                message: format!(
+                    "from_host: dtype {dtype:?} is sub-byte-packed and cannot be represented by \
+                     a T: BytePod slice"
+                ),
+            }
+            .fail(),
         }
     }
 
@@ -284,19 +293,23 @@ impl HipStorage {
     /// [`Error::Hip`] on memcpy failure.
     pub(crate) fn to_host<T: BytePod>(&self, dtype_check: DType) -> Result<Vec<T>> {
         if self.dtype != dtype_check {
-            return Err(Error::DTypeMismatch {
+            return DTypeMismatchSnafu {
                 op: "HipStorage::to_host",
                 expected: dtype_check,
                 got: self.dtype,
-            });
+            }
+            .fail();
         }
         if core::mem::size_of::<T>() * self.elem_count != self.byte_len() {
-            return Err(Error::Msg(format!(
-                "to_host size mismatch: T={}B × {}elems != {}B",
-                core::mem::size_of::<T>(),
-                self.elem_count,
-                self.byte_len()
-            )));
+            return MsgSnafu {
+                message: format!(
+                    "to_host size mismatch: T={}B × {}elems != {}B",
+                    core::mem::size_of::<T>(),
+                    self.elem_count,
+                    self.byte_len()
+                ),
+            }
+            .fail();
         }
         let mut out: Vec<T> = Vec::with_capacity(self.elem_count);
         // SAFETY: `T: BytePod` means a byte-write followed by `set_len`
@@ -382,7 +395,7 @@ mod tests {
         // metadata a dtype-dispatched kernel would misread.
         assert!(matches!(
             HipStorage::validate_dtype_matches::<f32>(DType::F16),
-            Err(Error::Msg(_))
+            Err(Error::Msg { .. })
         ));
     }
 
@@ -392,7 +405,7 @@ mod tests {
         // regardless of `T`; `size_in_bytes_exact()` is `None` for I4.
         assert!(matches!(
             HipStorage::validate_dtype_matches::<u8>(DType::I4),
-            Err(Error::Msg(_))
+            Err(Error::Msg { .. })
         ));
     }
 }

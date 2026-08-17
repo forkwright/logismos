@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hipcore::{BytePod, Device};
 
 use crate::dtype::DType;
-use crate::error::{Error, Result};
+use crate::error::{DTypeMismatchSnafu, Error, Result, ShapeMismatchSnafu};
 use crate::layout::Layout;
 use crate::shape::Shape;
 use crate::storage::{CpuStorage, HipStorage, Storage};
@@ -54,13 +54,14 @@ impl Tensor {
     pub fn try_from_cpu(storage: CpuStorage, shape: Shape) -> Result<Self> {
         let elem_count = shape.elem_count();
         if storage.len() != elem_count {
-            return Err(Error::ShapeMismatch {
+            return ShapeMismatchSnafu {
                 op: "try_from_cpu",
                 msg: format!(
                     "storage.len()={} != shape.elem_count()={elem_count}",
                     storage.len()
                 ),
-            });
+            }
+            .fail();
         }
         Ok(Self::from_cpu(storage, shape))
     }
@@ -100,14 +101,15 @@ impl Tensor {
         dtype: DType,
     ) -> Result<Self> {
         if data.len() != shape.elem_count() {
-            return Err(Error::ShapeMismatch {
+            return ShapeMismatchSnafu {
                 op: "from_host_typed",
                 msg: format!(
                     "data.len()={} != shape.elem_count()={}",
                     data.len(),
                     shape.elem_count()
                 ),
-            });
+            }
+            .fail();
         }
         let storage = HipStorage::from_host(device, dtype, data)?;
         let layout = Layout::contiguous(shape);
@@ -221,11 +223,12 @@ impl Tensor {
         match self.inner.storage.as_ref() {
             Storage::Hip(h) => h.to_host::<f32>(DType::F32),
             Storage::Cpu(CpuStorage::F32(v)) => Ok(v.clone()),
-            Storage::Cpu(_) => Err(Error::DTypeMismatch {
+            Storage::Cpu(_) => DTypeMismatchSnafu {
                 op: "to_host_f32",
                 expected: DType::F32,
                 got: self.inner.dtype,
-            }),
+            }
+            .fail(),
         }
     }
 
@@ -238,11 +241,12 @@ impl Tensor {
         match self.inner.storage.as_ref() {
             Storage::Hip(h) => h.to_host::<half::f16>(DType::F16),
             Storage::Cpu(CpuStorage::F16(v)) => Ok(v.clone()),
-            Storage::Cpu(_) => Err(Error::DTypeMismatch {
+            Storage::Cpu(_) => DTypeMismatchSnafu {
                 op: "to_host_f16",
                 expected: DType::F16,
                 got: self.inner.dtype,
-            }),
+            }
+            .fail(),
         }
     }
 
@@ -255,11 +259,12 @@ impl Tensor {
         match self.inner.storage.as_ref() {
             Storage::Hip(h) => h.to_host::<half::bf16>(DType::BF16),
             Storage::Cpu(CpuStorage::BF16(v)) => Ok(v.clone()),
-            Storage::Cpu(_) => Err(Error::DTypeMismatch {
+            Storage::Cpu(_) => DTypeMismatchSnafu {
                 op: "to_host_bf16",
                 expected: DType::BF16,
                 got: self.inner.dtype,
-            }),
+            }
+            .fail(),
         }
     }
 }

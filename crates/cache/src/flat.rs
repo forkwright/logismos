@@ -26,7 +26,10 @@ use std::borrow::Cow;
 use taxis::{CpuStorage, DType, Shape, Tensor};
 
 use crate::KvCache;
-use crate::error::{Error, Result};
+use crate::error::{
+    DTypeMismatchSnafu, Error, LayerOutOfRangeSnafu, LenOverflowSnafu, MsgSnafu,
+    ReadBeyondWrittenSnafu, Result, ShapeMismatchSnafu, UnsupportedStorageSnafu,
+};
 
 /// Shape + dtype invariants of a cache.
 #[derive(Debug, Clone, Copy)]
@@ -114,52 +117,60 @@ impl FlatKvCache {
     /// tensor with shape `[n_tokens, row_elems]`.
     fn tensor_as_bytes<'t>(&self, t: &'t Tensor) -> Result<TensorBytes<'t>> {
         if t.dtype() != self.layout.dtype {
-            return Err(Error::DTypeMismatch {
+            return DTypeMismatchSnafu {
                 cache: self.layout.dtype,
                 supplied: t.dtype(),
-            });
+            }
+            .fail();
         }
         let dims = t.dims();
         let (n_tokens, row_elems) = match dims {
             [n, e] => (*n, *e),
             other => {
-                return Err(Error::ShapeMismatch {
+                return ShapeMismatchSnafu {
                     msg: format!("expected rank-2 [n_tokens, kv_heads*head_dim], got {other:?}"),
-                });
+                }
+                .fail();
             }
         };
         if row_elems != self.layout.row_elems() {
-            return Err(Error::ShapeMismatch {
+            return ShapeMismatchSnafu {
                 msg: format!(
                     "row_elems {} != cache row_elems {}",
                     row_elems,
                     self.layout.row_elems()
                 ),
-            });
+            }
+            .fail();
         }
-        let storage = t.cpu_storage().ok_or_else(|| Error::UnsupportedStorage {
-            msg: "Phase-2 FlatKvCache only accepts CPU-backed tensors".into(),
+        let storage = t.cpu_storage().ok_or_else(|| {
+            UnsupportedStorageSnafu {
+                msg: "Phase-2 FlatKvCache only accepts CPU-backed tensors",
+            }
+            .build()
         })?;
         let bytes = cpu_storage_bytes(storage)?;
         let expected = self.layout.dtype.byte_count(n_tokens * row_elems);
         if bytes.len() != expected {
-            return Err(Error::ShapeMismatch {
+            return ShapeMismatchSnafu {
                 msg: format!(
                     "tensor byte length {} != expected {expected} (n_tokens={n_tokens}, \
                      row_elems={row_elems})",
                     bytes.len()
                 ),
-            });
+            }
+            .fail();
         }
         Ok(TensorBytes { n_tokens, bytes })
     }
 
     fn check_layer(&self, layer_idx: usize) -> Result<()> {
         if layer_idx >= self.layout.num_layers {
-            return Err(Error::LayerOutOfRange {
+            return LayerOutOfRangeSnafu {
                 layer_idx,
                 num_layers: self.layout.num_layers,
-            });
+            }
+            .fail();
         }
         Ok(())
     }
@@ -177,53 +188,59 @@ impl KvCache for FlatKvCache {
             bytes: v_bytes,
         } = self.tensor_as_bytes(v)?;
         if n_k != n_v {
-            return Err(Error::ShapeMismatch {
+            return ShapeMismatchSnafu {
                 msg: format!("k n_tokens={n_k} != v n_tokens={n_v}"),
-            });
+            }
+            .fail();
         }
-        let current = self.lens.get(layer_idx).copied().ok_or({
-            Error::LayerOutOfRange {
+        let current = self.lens.get(layer_idx).copied().ok_or_else(|| {
+            LayerOutOfRangeSnafu {
                 layer_idx,
                 num_layers: self.layout.num_layers,
             }
+            .build()
         })?;
         if current + n_k > self.layout.max_seq_len {
-            return Err(Error::LenOverflow {
+            return LenOverflowSnafu {
                 layer_idx,
                 current,
                 n_new: n_k,
                 max_seq_len: self.layout.max_seq_len,
-            });
+            }
+            .fail();
         }
         let row_bytes = self.layout.row_bytes();
         let off = current * row_bytes;
         let end = off + n_k * row_bytes;
-        let shape_err = || Error::ShapeMismatch {
-            msg: format!(
-                "layer {layer_idx} buffer overflow (off={off}, end={end}, \
-                 buf_bytes={})",
-                self.layout.buffer_bytes()
-            ),
+        let shape_err = || {
+            ShapeMismatchSnafu {
+                msg: format!(
+                    "layer {layer_idx} buffer overflow (off={off}, end={end}, \
+                     buf_bytes={})",
+                    self.layout.buffer_bytes()
+                ),
+            }
+            .build()
         };
         let num_layers = self.layout.num_layers;
-        let k_buf = self
-            .k_buffers
-            .get_mut(layer_idx)
-            .ok_or(Error::LayerOutOfRange {
+        let k_buf = self.k_buffers.get_mut(layer_idx).ok_or_else(|| {
+            LayerOutOfRangeSnafu {
                 layer_idx,
                 num_layers,
-            })?;
+            }
+            .build()
+        })?;
         k_buf
             .get_mut(off..end)
             .ok_or_else(shape_err)?
             .copy_from_slice(&k_bytes);
-        let v_buf = self
-            .v_buffers
-            .get_mut(layer_idx)
-            .ok_or(Error::LayerOutOfRange {
+        let v_buf = self.v_buffers.get_mut(layer_idx).ok_or_else(|| {
+            LayerOutOfRangeSnafu {
                 layer_idx,
                 num_layers,
-            })?;
+            }
+            .build()
+        })?;
         v_buf
             .get_mut(off..end)
             .ok_or_else(shape_err)?
@@ -236,29 +253,37 @@ impl KvCache for FlatKvCache {
 
     fn get(&self, layer_idx: usize, len: usize) -> Result<(Tensor, Tensor)> {
         self.check_layer(layer_idx)?;
-        let current = self.lens.get(layer_idx).copied().ok_or({
-            Error::LayerOutOfRange {
+        let current = self.lens.get(layer_idx).copied().ok_or_else(|| {
+            LayerOutOfRangeSnafu {
                 layer_idx,
                 num_layers: self.layout.num_layers,
             }
+            .build()
         })?;
         if len > current {
-            return Err(Error::ReadBeyondWritten {
+            return ReadBeyondWrittenSnafu {
                 layer_idx,
                 requested: len,
                 current,
-            });
+            }
+            .fail();
         }
         let row_bytes = self.layout.row_bytes();
         let end = len * row_bytes;
-        let layer_err = || Error::LayerOutOfRange {
-            layer_idx,
-            num_layers: self.layout.num_layers,
+        let layer_err = || {
+            LayerOutOfRangeSnafu {
+                layer_idx,
+                num_layers: self.layout.num_layers,
+            }
+            .build()
         };
-        let read_err = || Error::ReadBeyondWritten {
-            layer_idx,
-            requested: len,
-            current,
+        let read_err = || {
+            ReadBeyondWrittenSnafu {
+                layer_idx,
+                requested: len,
+                current,
+            }
+            .build()
         };
         let k_slice = self
             .k_buffers
@@ -332,9 +357,10 @@ fn cpu_storage_bytes(s: &CpuStorage) -> Result<Cow<'_, [u8]>> {
         CpuStorage::I32(v) => Ok(le_bytes_of(v, i32::to_le_bytes)),
         CpuStorage::I8(v) => Ok(le_bytes_of(v, i8::to_le_bytes)),
         CpuStorage::U8(v) => Ok(Cow::Borrowed(v.as_slice())),
-        _ => Err(Error::UnsupportedStorage {
-            msg: "unsupported future CpuStorage variant".into(),
-        }),
+        _ => UnsupportedStorageSnafu {
+            msg: "unsupported future CpuStorage variant",
+        }
+        .fail(),
     }
 }
 
@@ -348,9 +374,10 @@ fn cpu_tensor_from_bytes(dtype: DType, bytes: &[u8], shape: Shape) -> Result<Ten
         DType::I8 => CpuStorage::I8(bytes_to_i8(bytes)),
         DType::U8 => CpuStorage::U8(bytes.to_vec()),
         other => {
-            return Err(Error::Msg(format!(
-                "dtype {other:?} not supported by Phase-2 FlatKvCache"
-            )));
+            return MsgSnafu {
+                message: format!("dtype {other:?} not supported by Phase-2 FlatKvCache"),
+            }
+            .fail();
         }
     };
     Ok(Tensor::from_cpu(storage, shape))
@@ -365,12 +392,13 @@ fn cpu_tensor_from_bytes(dtype: DType, bytes: &[u8], shape: Shape) -> Result<Ten
 /// error.
 fn check_decoded_len(produced: usize, expected: usize, byte_len: usize) -> Result<()> {
     if produced != expected {
-        return Err(Error::ShapeMismatch {
+        return ShapeMismatchSnafu {
             msg: format!(
                 "decoded {produced} elements from {byte_len} bytes, expected {expected} \
                  (dtype width does not evenly divide the supplied bytes)"
             ),
-        });
+        }
+        .fail();
     }
     Ok(())
 }

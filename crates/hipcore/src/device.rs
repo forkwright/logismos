@@ -3,7 +3,7 @@
 use std::ffi::c_int;
 use std::sync::Arc;
 
-use crate::error::{Error, Result, check};
+use crate::error::{InternalSnafu, NoSuchDeviceSnafu, Result, check};
 use crate::ffi;
 
 /// Device ordinal. Stable across runs; `0` is the first reported device.
@@ -104,7 +104,7 @@ impl Device {
             "hipGetDeviceCount",
         )?;
         if ordinal < 0 || ordinal >= count {
-            return Err(Error::NoSuchDevice { ordinal, count });
+            return NoSuchDeviceSnafu { ordinal, count }.fail();
         }
         // SAFETY: ordinal is bounds-checked above.
         check(unsafe { ffi::hipSetDevice(ordinal) }, "hipSetDevice")?;
@@ -253,9 +253,10 @@ where
     <u32 as TryFrom<T>>::Error: std::fmt::Display,
 {
     u32::try_from(value).map_err(|err| {
-        Error::Internal(format!(
-            "HIP device property `{field}` is outside the u32 range: {err}"
-        ))
+        InternalSnafu {
+            message: format!("HIP device property `{field}` is outside the u32 range: {err}"),
+        }
+        .build()
     })
 }
 

@@ -34,6 +34,8 @@
 
 use std::fmt;
 
+use snafu::Snafu;
+
 /// Prompt templates that sentence-transformer checkpoints ship with.
 ///
 /// Different retrieval setups benefit from different prompt prefixes; the
@@ -67,35 +69,67 @@ pub struct EncodeOpts {
 }
 
 /// Error type for embedding models.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum EmbeddingError {
     /// Input produced more tokens than the model's configured limit.
-    #[error("input exceeds max_tokens: got {got}, limit {limit}")]
+    #[snafu(display("input exceeds max_tokens: got {got}, limit {limit}"))]
     InputTooLong {
         /// Token count produced by tokenisation.
         got: usize,
         /// Configured maximum.
         limit: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
     /// Caller asked for a dim the model does not support.
-    #[error("unsupported dim {0}")]
-    UnsupportedDim(usize),
+    #[snafu(display("unsupported dim {dim}"))]
+    UnsupportedDim {
+        /// The unsupported dimension requested.
+        dim: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// Tokenisation failed.
-    #[error("tokenize: {0}")]
-    Tokenize(String),
+    #[snafu(display("tokenize: {message}"))]
+    Tokenize {
+        /// Free-form description.
+        message: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// Compute / kernel failure.
-    #[error("compute: {0}")]
-    Compute(String),
+    #[snafu(display("compute: {message}"))]
+    Compute {
+        /// Free-form description.
+        message: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// IO / weight-loading failure.
-    #[error("io: {0}")]
-    Io(String),
+    #[snafu(display("io: {message}"))]
+    Io {
+        /// Free-form description.
+        message: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// Caller supplied a [`Prompt`] variant this model build does not
     /// recognise. Reachable because `Prompt` is `#[non_exhaustive]`: a
     /// caller compiled against a newer `core` than the model may pass a
     /// variant added after this model was built.
-    #[error("unsupported prompt variant")]
-    UnsupportedPrompt,
+    #[snafu(display("unsupported prompt variant"))]
+    UnsupportedPrompt {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }
 
 /// Contract every embedding model implements.
@@ -158,10 +192,10 @@ mod tests {
         fn encode(&self, text: &str, opts: &EncodeOpts) -> Result<Vec<f32>, EmbeddingError> {
             let dim = opts.dim.unwrap_or(self.dim);
             if !self.supported_dims().contains(&dim) {
-                return Err(EmbeddingError::UnsupportedDim(dim));
+                return UnsupportedDimSnafu { dim }.fail();
             }
             if text == "fail" {
-                return Err(EmbeddingError::Compute("boom".into()));
+                return ComputeSnafu { message: "boom" }.fail();
             }
             Ok(vec![1.0; dim])
         }
@@ -187,10 +221,11 @@ mod tests {
 
     #[test]
     fn embedding_error_input_too_long_display() {
-        let err = EmbeddingError::InputTooLong {
-            got: 100,
-            limit: 50,
-        };
+        let err = InputTooLongSnafu {
+            got: 100_usize,
+            limit: 50_usize,
+        }
+        .build();
         let msg = err.to_string();
         assert!(msg.contains("input exceeds max_tokens"));
         assert!(msg.contains("got 100"));
@@ -199,13 +234,13 @@ mod tests {
 
     #[test]
     fn embedding_error_unsupported_dim_display() {
-        let err = EmbeddingError::UnsupportedDim(7);
+        let err = UnsupportedDimSnafu { dim: 7_usize }.build();
         assert_eq!(err.to_string(), "unsupported dim 7");
     }
 
     #[test]
     fn embedding_error_unsupported_prompt_display() {
-        let err = EmbeddingError::UnsupportedPrompt;
+        let err = UnsupportedPromptSnafu.build();
         assert_eq!(err.to_string(), "unsupported prompt variant");
     }
 

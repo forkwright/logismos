@@ -1,27 +1,54 @@
 //! Error type for `encoders`.
 
+use snafu::Snafu;
+
 /// Encoder crate errors.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
     /// Structural violation (shapes, layer count, etc.).
-    #[error("shape: {0}")]
-    Shape(String),
+    #[snafu(display("shape: {message}"))]
+    Shape {
+        /// Free-form description.
+        message: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// A weight name referenced in the Stella map was not found in the
     /// archive, or an archive tensor was not consumed.
-    #[error("weight layout: {0}")]
-    Layout(String),
+    #[snafu(display("weight layout: {message}"))]
+    Layout {
+        /// Free-form description.
+        message: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// Downstream loader error.
-    #[error("loader: {0}")]
-    Loader(#[from] loader::Error),
+    #[snafu(transparent)]
+    Loader {
+        /// Source loader error.
+        source: loader::Error,
+    },
     /// Downstream transformer-block error.
-    #[error("transformers: {0}")]
-    Transformers(String),
+    #[snafu(display("transformers: {message}"))]
+    Transformers {
+        /// Stringified downstream error.
+        message: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }
 
 impl From<transformers::Error> for Error {
     fn from(e: transformers::Error) -> Self {
-        Self::Transformers(e.to_string())
+        TransformersSnafu {
+            message: e.to_string(),
+        }
+        .build()
     }
 }
 

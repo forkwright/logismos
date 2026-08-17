@@ -63,23 +63,25 @@ pub fn rope_apply_fp16_ref(
 ) -> crate::error::Result<()> {
     let expected_qk_len = batch * seq * heads * head_dim;
     if qk.len() != expected_qk_len {
-        return Err(crate::error::Error::UnsupportedShape {
+        return crate::error::UnsupportedShapeSnafu {
             kernel: "rope_apply_fp16_ref",
             msg: format!(
                 "qk.len()={} != batch*seq*heads*head_dim={expected_qk_len}",
                 qk.len()
             ),
-        });
+        }
+        .fail();
     }
     let expected_table_len = seq * head_dim;
     if cos_sin.len() != expected_table_len {
-        return Err(crate::error::Error::UnsupportedShape {
+        return crate::error::UnsupportedShapeSnafu {
             kernel: "rope_apply_fp16_ref",
             msg: format!(
                 "cos_sin.len()={} != seq*head_dim={expected_table_len}",
                 cos_sin.len()
             ),
-        });
+        }
+        .fail();
     }
     debug_assert!(head_dim.is_multiple_of(2));
     let pairs = head_dim / 2;

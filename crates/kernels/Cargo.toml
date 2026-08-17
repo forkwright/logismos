@@ -15,8 +15,8 @@ half.workspace = true
 hipcore.workspace = true
 matrixmultiply = { workspace = true }
 num-traits.workspace = true
+snafu.workspace = true
 taxis.workspace = true
-thiserror.workspace = true
 
 [build-dependencies]
 

@@ -65,11 +65,17 @@ fn put_then_get_round_trip_f16() -> Result<()> {
     c.put(0, &k, &v)?;
     let (k_out, v_out) = c.get(0, 1)?;
     let Some(CpuStorage::F16(k_host)) = k_out.cpu_storage() else {
-        return Err(Error::Msg("expected F16 storage".into()));
+        return MsgSnafu {
+            message: "expected F16 storage",
+        }
+        .fail();
     };
     assert_eq!(k_host, &vec![val; layout.row_elems()]);
     let Some(CpuStorage::F16(v_host)) = v_out.cpu_storage() else {
-        return Err(Error::Msg("expected F16 storage".into()));
+        return MsgSnafu {
+            message: "expected F16 storage",
+        }
+        .fail();
     };
     assert_eq!(v_host, &vec![val; layout.row_elems()]);
     Ok(())
@@ -92,11 +98,17 @@ fn put_then_get_round_trip_bf16() -> Result<()> {
     c.put(0, &k, &v)?;
     let (k_out, v_out) = c.get(0, 1)?;
     let Some(CpuStorage::BF16(k_host)) = k_out.cpu_storage() else {
-        return Err(Error::Msg("expected BF16 storage".into()));
+        return MsgSnafu {
+            message: "expected BF16 storage",
+        }
+        .fail();
     };
     assert_eq!(k_host, &vec![val; layout.row_elems()]);
     let Some(CpuStorage::BF16(v_host)) = v_out.cpu_storage() else {
-        return Err(Error::Msg("expected BF16 storage".into()));
+        return MsgSnafu {
+            message: "expected BF16 storage",
+        }
+        .fail();
     };
     assert_eq!(v_host, &vec![val; layout.row_elems()]);
     Ok(())
@@ -122,11 +134,17 @@ fn put_then_get_round_trip_i32() -> Result<()> {
     c.put(0, &k, &v)?;
     let (k_out, v_out) = c.get(0, 1)?;
     let Some(CpuStorage::I32(k_host)) = k_out.cpu_storage() else {
-        return Err(Error::Msg("expected I32 storage".into()));
+        return MsgSnafu {
+            message: "expected I32 storage",
+        }
+        .fail();
     };
     assert_eq!(k_host, &row_k);
     let Some(CpuStorage::I32(v_host)) = v_out.cpu_storage() else {
-        return Err(Error::Msg("expected I32 storage".into()));
+        return MsgSnafu {
+            message: "expected I32 storage",
+        }
+        .fail();
     };
     assert_eq!(v_host, &row_v);
     Ok(())
@@ -156,11 +174,17 @@ fn put_then_get_round_trip_i8() -> Result<()> {
     c.put(0, &k, &v)?;
     let (k_out, v_out) = c.get(0, 1)?;
     let Some(CpuStorage::I8(k_host)) = k_out.cpu_storage() else {
-        return Err(Error::Msg("expected I8 storage".into()));
+        return MsgSnafu {
+            message: "expected I8 storage",
+        }
+        .fail();
     };
     assert_eq!(k_host, &row_k);
     let Some(CpuStorage::I8(v_host)) = v_out.cpu_storage() else {
-        return Err(Error::Msg("expected I8 storage".into()));
+        return MsgSnafu {
+            message: "expected I8 storage",
+        }
+        .fail();
     };
     assert_eq!(v_host, &row_v);
     Ok(())
@@ -186,11 +210,17 @@ fn put_then_get_round_trip_u8() -> Result<()> {
     c.put(0, &k, &v)?;
     let (k_out, v_out) = c.get(0, 1)?;
     let Some(CpuStorage::U8(k_host)) = k_out.cpu_storage() else {
-        return Err(Error::Msg("expected U8 storage".into()));
+        return MsgSnafu {
+            message: "expected U8 storage",
+        }
+        .fail();
     };
     assert_eq!(k_host, &row_k);
     let Some(CpuStorage::U8(v_host)) = v_out.cpu_storage() else {
-        return Err(Error::Msg("expected U8 storage".into()));
+        return MsgSnafu {
+            message: "expected U8 storage",
+        }
+        .fail();
     };
     assert_eq!(v_host, &row_v);
     Ok(())

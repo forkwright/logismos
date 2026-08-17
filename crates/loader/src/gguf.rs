@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, GgufSnafu, Result, TensorNotFoundSnafu};
 use crate::{TensorView, WeightProvider, check_mmap_not_truncated};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
@@ -92,10 +92,11 @@ impl GgmlType {
             20 => Self::F64,
             30 => Self::BF16,
             other => {
-                return Err(Error::Gguf {
+                return GgufSnafu {
                     offset: 0,
                     msg: format!("unknown ggml type id {other}"),
-                });
+                }
+                .fail();
             }
         })
     }
@@ -122,13 +123,14 @@ impl GgmlType {
             Self::I32 => taxis::DType::I32,
             Self::I8 => taxis::DType::I8,
             other => {
-                return Err(Error::Gguf {
+                return GgufSnafu {
                     offset: 0,
                     msg: format!(
                         "ggml type {other:?} not decodable in Phase 2 \
                          (K-quant / block dtypes land with quant kernels in Phase 6)"
                     ),
-                });
+                }
+                .fail();
             }
         })
     }
@@ -209,10 +211,11 @@ impl Reader {
         cur.check_magic()?;
         let version = cur.read_u32()?;
         if version != GGUF_V3 {
-            return Err(Error::Gguf {
+            return GgufSnafu {
                 offset: cur.pos,
                 msg: format!("unsupported GGUF version {version} (target: v{GGUF_V3})"),
-            });
+            }
+            .fail();
         }
         let tensor_count = cur.read_u64()?;
         let metadata_count = cur.read_u64()?;
@@ -240,9 +243,12 @@ impl Reader {
         // its own growth, and `cur.read_string()`/`cur.read_u32()` below
         // already bounds-check against the mmap, so a claimed count that
         // outruns the real file fails fast with `Error::Gguf` instead.
-        usize::try_from(tensor_count).map_err(|_| Error::Gguf {
-            offset: cur.pos,
-            msg: format!("tensor count {tensor_count} exceeds usize::MAX"),
+        usize::try_from(tensor_count).map_err(|_| {
+            GgufSnafu {
+                offset: cur.pos,
+                msg: format!("tensor count {tensor_count} exceeds usize::MAX"),
+            }
+            .build()
         })?;
         let mut tensors = Vec::new();
         let mut tensor_by_name = HashMap::new();
@@ -259,9 +265,12 @@ impl Reader {
             let ggml_type_id = cur.read_u32()?;
             let ggml_type = GgmlType::from_u32(ggml_type_id)?;
             let data_offset = cur.read_u64()?;
-            let idx_usize = usize::try_from(i).map_err(|_| Error::Gguf {
-                offset: cur.pos,
-                msg: format!("tensor index {i} exceeds usize::MAX"),
+            let idx_usize = usize::try_from(i).map_err(|_| {
+                GgufSnafu {
+                    offset: cur.pos,
+                    msg: format!("tensor index {i} exceeds usize::MAX"),
+                }
+                .build()
             })?;
             reject_duplicate_tensor_name(&tensor_by_name, &name, cur.pos)?;
             tensor_by_name.insert(name.clone(), idx_usize);
@@ -318,19 +327,21 @@ impl Reader {
 impl Reader {
     /// Look up a tensor descriptor by name.
     fn descriptor_by_name(&self, name: &str) -> Result<&TensorDescriptor> {
-        let idx = self
-            .tensor_by_name
-            .get(name)
-            .copied()
-            .ok_or_else(|| Error::TensorNotFound {
+        let idx = self.tensor_by_name.get(name).copied().ok_or_else(|| {
+            TensorNotFoundSnafu {
                 name: name.to_string(),
-            })?;
-        self.tensors.get(idx).ok_or_else(|| Error::Gguf {
-            offset: 0,
-            msg: format!(
-                "internal: tensor index {idx} out of range (len={})",
-                self.tensors.len()
-            ),
+            }
+            .build()
+        })?;
+        self.tensors.get(idx).ok_or_else(|| {
+            GgufSnafu {
+                offset: 0,
+                msg: format!(
+                    "internal: tensor index {idx} out of range (len={})",
+                    self.tensors.len()
+                ),
+            }
+            .build()
         })
     }
 
@@ -347,27 +358,36 @@ impl Reader {
         // turns that silent wraparound into a returned `Err`.
         let mut elem_count_u64: u64 = 1;
         for &d in &desc.dims {
-            elem_count_u64 = elem_count_u64.checked_mul(d).ok_or_else(|| Error::Gguf {
-                offset: 0,
-                msg: format!(
-                    "tensor `{}` dims product overflows u64: {:?}",
-                    desc.name, desc.dims
-                ),
+            elem_count_u64 = elem_count_u64.checked_mul(d).ok_or_else(|| {
+                GgufSnafu {
+                    offset: 0,
+                    msg: format!(
+                        "tensor `{}` dims product overflows u64: {:?}",
+                        desc.name, desc.dims
+                    ),
+                }
+                .build()
             })?;
         }
-        let elem_count = usize::try_from(elem_count_u64).map_err(|_| Error::Gguf {
-            offset: 0,
-            msg: format!(
-                "tensor `{}` element count {elem_count_u64} exceeds usize::MAX",
-                desc.name
-            ),
+        let elem_count = usize::try_from(elem_count_u64).map_err(|_| {
+            GgufSnafu {
+                offset: 0,
+                msg: format!(
+                    "tensor `{}` element count {elem_count_u64} exceeds usize::MAX",
+                    desc.name
+                ),
+            }
+            .build()
         })?;
-        let bits = desc.ggml_type.size_in_bits().ok_or_else(|| Error::Gguf {
-            offset: 0,
-            msg: format!(
-                "tensor `{}` uses block-quant dtype {:?}; block decoding is Phase 6",
-                desc.name, desc.ggml_type
-            ),
+        let bits = desc.ggml_type.size_in_bits().ok_or_else(|| {
+            GgufSnafu {
+                offset: 0,
+                msg: format!(
+                    "tensor `{}` uses block-quant dtype {:?}; block decoding is Phase 6",
+                    desc.name, desc.ggml_type
+                ),
+            }
+            .build()
         })?;
         // WHY(forkwright/logismos#56): `saturating_mul` clamped to
         // `usize::MAX` on overflow instead of erroring, which turns a
@@ -376,20 +396,25 @@ impl Reader {
         // wrong one). `checked_mul` reports the overflow itself.
         let byte_count = bits
             .checked_mul(elem_count)
-            .ok_or_else(|| Error::Gguf {
+            .ok_or_else(|| {
+                GgufSnafu {
                 offset: 0,
                 msg: format!(
                     "tensor `{}` byte count overflows usize: {bits} bits * {elem_count} elements",
                     desc.name
                 ),
+            }.build()
             })?
             .div_ceil(8);
-        let byte_count_u64 = u64::try_from(byte_count).map_err(|_| Error::Gguf {
-            offset: 0,
-            msg: format!(
-                "tensor `{}` byte count {byte_count} exceeds u64::MAX",
-                desc.name
-            ),
+        let byte_count_u64 = u64::try_from(byte_count).map_err(|_| {
+            GgufSnafu {
+                offset: 0,
+                msg: format!(
+                    "tensor `{}` byte count {byte_count} exceeds u64::MAX",
+                    desc.name
+                ),
+            }
+            .build()
         })?;
 
         // WHY(forkwright/logismos#56): both additions are on untrusted
@@ -398,43 +423,54 @@ impl Reader {
         // wrap silently in a release build, which can land `start`/`end`
         // on an arbitrary in-bounds-looking mmap offset instead of
         // failing loudly. `checked_add` turns the wrap into `Err`.
-        let start = self
-            .data_region_start
-            .checked_add(desc.data_offset)
-            .ok_or_else(|| Error::Gguf {
+        let start =
+            self.data_region_start
+                .checked_add(desc.data_offset)
+                .ok_or_else(|| {
+                    GgufSnafu {
                 offset: 0,
                 msg: format!(
                     "tensor `{}` start offset overflows u64: region_start={} + data_offset={}",
                     desc.name, self.data_region_start, desc.data_offset
                 ),
-            })?;
-        let end = start.checked_add(byte_count_u64).ok_or_else(|| Error::Gguf {
+            }.build()
+                })?;
+        let end = start.checked_add(byte_count_u64).ok_or_else(|| {
+            GgufSnafu {
             offset: start,
             msg: format!(
                 "tensor `{}` end offset overflows u64: start={start} + byte_count={byte_count_u64}",
                 desc.name
             ),
+        }.build()
         })?;
-        let start_usize = usize::try_from(start).map_err(|_| Error::Gguf {
-            offset: start,
-            msg: format!(
-                "tensor `{}` start offset {start} exceeds usize::MAX",
-                desc.name
-            ),
+        let start_usize = usize::try_from(start).map_err(|_| {
+            GgufSnafu {
+                offset: start,
+                msg: format!(
+                    "tensor `{}` start offset {start} exceeds usize::MAX",
+                    desc.name
+                ),
+            }
+            .build()
         })?;
-        let end_usize = usize::try_from(end).map_err(|_| Error::Gguf {
-            offset: start,
-            msg: format!("tensor `{}` end offset {end} exceeds usize::MAX", desc.name),
+        let end_usize = usize::try_from(end).map_err(|_| {
+            GgufSnafu {
+                offset: start,
+                msg: format!("tensor `{}` end offset {end} exceeds usize::MAX", desc.name),
+            }
+            .build()
         })?;
         if end_usize > self.mmap.len() {
-            return Err(Error::Gguf {
+            return GgufSnafu {
                 offset: start,
                 msg: format!(
                     "tensor `{}` data out of file bounds: [{start}..{end}] vs file len {}",
                     desc.name,
                     self.mmap.len()
                 ),
-            });
+            }
+            .fail();
         }
         Ok((start_usize, end_usize))
     }
@@ -446,10 +482,8 @@ impl WeightProvider for Reader {
         let desc = self.descriptor_by_name(name)?;
         let dtype = desc.ggml_type.to_taxis_dtype()?;
         let (start_usize, end_usize) = self.byte_range_for(desc)?;
-        let bytes = self
-            .mmap
-            .get(start_usize..end_usize)
-            .ok_or_else(|| Error::Gguf {
+        let bytes = self.mmap.get(start_usize..end_usize).ok_or_else(|| {
+            GgufSnafu {
                 // u64::try_from on a freshly-`usize::try_from`'d value on any
                 // 64-bit target is infallible; fall back to 0 on the
                 // pathological 128-bit-usize case rather than propagating.
@@ -458,15 +492,20 @@ impl WeightProvider for Reader {
                     "tensor `{}` data slice [{start_usize}..{end_usize}] out of mmap",
                     desc.name
                 ),
-            })?;
+            }
+            .build()
+        })?;
 
         let shape = desc
             .dims
             .iter()
             .map(|&d| {
-                usize::try_from(d).map_err(|_| Error::Gguf {
-                    offset: 0,
-                    msg: format!("tensor `{}` dim {d} exceeds usize::MAX", desc.name),
+                usize::try_from(d).map_err(|_| {
+                    GgufSnafu {
+                        offset: 0,
+                        msg: format!("tensor `{}` dim {d} exceeds usize::MAX", desc.name),
+                    }
+                    .build()
                 })
             })
             .collect::<Result<Vec<usize>>>()?;
@@ -509,10 +548,11 @@ fn reject_duplicate_metadata_key(
     offset: u64,
 ) -> Result<()> {
     if metadata.contains_key(key) {
-        return Err(Error::Gguf {
+        return GgufSnafu {
             offset,
             msg: format!("duplicate metadata key `{key}`"),
-        });
+        }
+        .fail();
     }
     Ok(())
 }
@@ -524,10 +564,11 @@ fn reject_duplicate_tensor_name(
     offset: u64,
 ) -> Result<()> {
     if tensor_by_name.contains_key(name) {
-        return Err(Error::Gguf {
+        return GgufSnafu {
             offset,
             msg: format!("duplicate tensor name `{name}`"),
-        });
+        }
+        .fail();
     }
     Ok(())
 }
@@ -542,10 +583,11 @@ fn reject_duplicate_tensor_name(
 /// a zero-byte tensor downstream.
 fn reject_zero_length_dimension(name: &str, dims: &[u64], offset: u64) -> Result<()> {
     if dims.contains(&0) {
-        return Err(Error::Gguf {
+        return GgufSnafu {
             offset,
             msg: format!("tensor `{name}` has a zero-length dimension: {dims:?}"),
-        });
+        }
+        .fail();
     }
     Ok(())
 }
@@ -565,39 +607,55 @@ impl<'a> Cursor<'a> {
         let magic = self.read_n(4)?;
         if magic != GGUF_MAGIC {
             let prefix = magic.get(..magic.len().min(4)).unwrap_or(magic);
-            return Err(Error::Gguf {
+            return GgufSnafu {
                 offset: 0,
                 msg: format!("bad magic: expected {GGUF_MAGIC:?}, got {prefix:?}"),
-            });
+            }
+            .fail();
         }
         Ok(())
     }
 
     fn read_n(&mut self, n: usize) -> Result<&'a [u8]> {
-        let pos_usize = usize::try_from(self.pos).map_err(|_| Error::Gguf {
-            offset: self.pos,
-            msg: format!("cursor pos {} exceeds usize::MAX", self.pos),
+        let pos_usize = usize::try_from(self.pos).map_err(|_| {
+            GgufSnafu {
+                offset: self.pos,
+                msg: format!("cursor pos {} exceeds usize::MAX", self.pos),
+            }
+            .build()
         })?;
-        let end = pos_usize.checked_add(n).ok_or_else(|| Error::Gguf {
-            offset: self.pos,
-            msg: format!("out-of-bounds read of {n}B at {}", self.pos),
+        let end = pos_usize.checked_add(n).ok_or_else(|| {
+            GgufSnafu {
+                offset: self.pos,
+                msg: format!("out-of-bounds read of {n}B at {}", self.pos),
+            }
+            .build()
         })?;
-        let out = self.mmap.get(pos_usize..end).ok_or_else(|| Error::Gguf {
-            offset: self.pos,
-            msg: format!("out-of-bounds read of {n}B at {}", self.pos),
+        let out = self.mmap.get(pos_usize..end).ok_or_else(|| {
+            GgufSnafu {
+                offset: self.pos,
+                msg: format!("out-of-bounds read of {n}B at {}", self.pos),
+            }
+            .build()
         })?;
-        self.pos = u64::try_from(end).map_err(|_| Error::Gguf {
-            offset: self.pos,
-            msg: format!("cursor end {end} exceeds u64::MAX"),
+        self.pos = u64::try_from(end).map_err(|_| {
+            GgufSnafu {
+                offset: self.pos,
+                msg: format!("cursor end {end} exceeds u64::MAX"),
+            }
+            .build()
         })?;
         Ok(out)
     }
 
     fn read_u8(&mut self) -> Result<u8> {
         let b = self.read_n(1)?;
-        let first = b.first().copied().ok_or_else(|| Error::Gguf {
-            offset: self.pos,
-            msg: "short read of u8".into(),
+        let first = b.first().copied().ok_or_else(|| {
+            GgufSnafu {
+                offset: self.pos,
+                msg: "short read of u8".into(),
+            }
+            .build()
         })?;
         Ok(first)
     }
@@ -645,10 +703,11 @@ impl<'a> Cursor<'a> {
         let slice = self.read_n(N)?;
         let mut out = [0u8; N];
         if slice.len() != N {
-            return Err(Error::Gguf {
+            return GgufSnafu {
                 offset: self.pos,
                 msg: format!("short read of {N}B"),
-            });
+            }
+            .fail();
         }
         out.copy_from_slice(slice);
         Ok(out)
@@ -656,16 +715,22 @@ impl<'a> Cursor<'a> {
 
     fn read_string(&mut self) -> Result<String> {
         let len = self.read_u64()?;
-        let len_usize = usize::try_from(len).map_err(|_| Error::Gguf {
-            offset: self.pos,
-            msg: format!("gguf string length {len} exceeds usize::MAX"),
+        let len_usize = usize::try_from(len).map_err(|_| {
+            GgufSnafu {
+                offset: self.pos,
+                msg: format!("gguf string length {len} exceeds usize::MAX"),
+            }
+            .build()
         })?;
         let bytes = self.read_n(len_usize)?;
         std::str::from_utf8(bytes)
             .map(ToString::to_string)
-            .map_err(|e| Error::Gguf {
-                offset: self.pos - len,
-                msg: format!("invalid utf-8 in gguf string: {e}"),
+            .map_err(|e| {
+                GgufSnafu {
+                    offset: self.pos - len,
+                    msg: format!("invalid utf-8 in gguf string: {e}"),
+                }
+                .build()
             })
     }
 
@@ -695,10 +760,11 @@ impl<'a> Cursor<'a> {
                 // ~65,000 levels, enough to overflow the thread stack
                 // (an unrecoverable process crash, not a catchable panic).
                 if inner_type == 9 {
-                    return Err(Error::Gguf {
+                    return GgufSnafu {
                         offset: self.pos,
                         msg: "gguf spec forbids arrays-of-arrays (inner_type=9)".into(),
-                    });
+                    }
+                    .fail();
                 }
                 let n = self.read_u64()?;
                 // WHY(forkwright/logismos#34): no pre-allocation from an
@@ -717,10 +783,11 @@ impl<'a> Cursor<'a> {
             11 => MetaValue::I64(self.read_i64()?),
             12 => MetaValue::F64(self.read_f64()?),
             other => {
-                return Err(Error::Gguf {
+                return GgufSnafu {
                     offset: self.pos,
                     msg: format!("unknown metadata type id {other}"),
-                });
+                }
+                .fail();
             }
         })
     }

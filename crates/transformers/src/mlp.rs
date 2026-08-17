@@ -6,7 +6,7 @@
 
 use kernels::cpu_f32;
 
-use crate::error::{Error, Result};
+use crate::error::{Result, ShapeSnafu};
 
 /// SwiGLU weights, HF layout `[out, in]`.
 #[derive(Debug, Clone)]
@@ -38,25 +38,34 @@ impl SwiGluMlp {
     /// [`Error::Shape`] on weight-size / config disagreement.
     pub fn new(hidden: usize, intermediate: usize, weights: SwiGluMlpWeights) -> Result<Self> {
         if weights.w_gate.len() != intermediate * hidden {
-            return Err(Error::Shape(format!(
-                "w_gate: expected {}, got {}",
-                intermediate * hidden,
-                weights.w_gate.len()
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "w_gate: expected {}, got {}",
+                    intermediate * hidden,
+                    weights.w_gate.len()
+                ),
+            }
+            .fail();
         }
         if weights.w_up.len() != intermediate * hidden {
-            return Err(Error::Shape(format!(
-                "w_up: expected {}, got {}",
-                intermediate * hidden,
-                weights.w_up.len()
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "w_up: expected {}, got {}",
+                    intermediate * hidden,
+                    weights.w_up.len()
+                ),
+            }
+            .fail();
         }
         if weights.w_down.len() != hidden * intermediate {
-            return Err(Error::Shape(format!(
-                "w_down: expected {}, got {}",
-                hidden * intermediate,
-                weights.w_down.len()
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "w_down: expected {}, got {}",
+                    hidden * intermediate,
+                    weights.w_down.len()
+                ),
+            }
+            .fail();
         }
         Ok(Self {
             hidden,
@@ -72,11 +81,14 @@ impl SwiGluMlp {
     /// [`Error::Shape`] when `x` is not a multiple of `hidden`.
     pub fn forward(&self, x: &[f32]) -> Result<Vec<f32>> {
         if !x.len().is_multiple_of(self.hidden) {
-            return Err(Error::Shape(format!(
-                "mlp.forward: x.len()={} not multiple of hidden={}",
-                x.len(),
-                self.hidden
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "mlp.forward: x.len()={} not multiple of hidden={}",
+                    x.len(),
+                    self.hidden
+                ),
+            }
+            .fail();
         }
         let seq = x.len() / self.hidden;
         // gate = x @ w_gate^T   -> [seq, intermediate]

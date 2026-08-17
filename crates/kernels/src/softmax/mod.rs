@@ -11,7 +11,7 @@ use std::ffi::c_void;
 
 use hipcore::Stream;
 
-use crate::error::{Error, Result};
+use crate::error::{LaunchSnafu, NoGpuBuildSnafu, Result};
 
 #[cfg_attr(
     logismos_no_gpu_kernels,
@@ -49,7 +49,7 @@ pub unsafe fn launch_softmax_fp16(
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (x, y, m, n, stream);
-        Err(Error::NoGpuBuild { kernel: "softmax" })
+        NoGpuBuildSnafu { kernel: "softmax" }.fail()
     }
 
     #[cfg(not(logismos_no_gpu_kernels))]
@@ -60,11 +60,12 @@ pub unsafe fn launch_softmax_fp16(
         if code == 0 {
             Ok(())
         } else {
-            Err(Error::Launch {
+            LaunchSnafu {
                 kernel: "softmax_fp16",
                 kind: hipcore::ErrorKind::from_raw(code),
                 code,
-            })
+            }
+            .fail()
         }
     }
 }

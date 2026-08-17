@@ -98,10 +98,11 @@ fn array_metadata_type_parses_elements() -> Result<()> {
     let mut cur = Cursor::new(&buf);
     let value = cur.read_meta_value_typed(9)?;
     let MetaValue::Array(items) = value else {
-        return Err(Error::Gguf {
+        return GgufSnafu {
             offset: 0,
             msg: "expected MetaValue::Array".into(),
-        });
+        }
+        .fail();
     };
     assert_eq!(items.len(), 3);
     assert!(matches!(items[0], MetaValue::U32(10)));
@@ -155,10 +156,11 @@ fn array_metadata_round_trips_through_reader_open() -> Result<()> {
 
     let r = Reader::open(&path)?;
     let Some(MetaValue::Array(items)) = r.metadata().get("arr_key") else {
-        return Err(Error::Gguf {
+        return GgufSnafu {
             offset: 0,
             msg: "expected metadata()[\"arr_key\"] to be MetaValue::Array".into(),
-        });
+        }
+        .fail();
     };
     assert_eq!(items.len(), 3);
     assert!(matches!(items[0], MetaValue::U32(1)));
@@ -264,10 +266,11 @@ fn byte_range_for_rejects_byte_count_overflow() -> Result<()> {
     // logged PASS). Asserting the message distinguishes them: only the
     // checked_mul path says "overflows usize".
     let Err(Error::Gguf { msg, .. }) = &result else {
-        return Err(Error::Gguf {
+        return GgufSnafu {
             offset: 0,
             msg: format!("expected Error::Gguf, got {result:?}"),
-        });
+        }
+        .fail();
     };
     assert!(
         msg.contains("overflows usize"),

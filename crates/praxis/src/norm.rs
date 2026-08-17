@@ -5,12 +5,15 @@ use std::ffi::c_void;
 use taxis::{DType, Tensor};
 
 use crate::device_dispatch::{DevicePlacement, classify_placement};
-use crate::error::{Error, Result};
+use crate::error::{InvalidSnafu, Result};
 
 fn dim_i32(value: usize, name: &'static str) -> Result<i32> {
-    i32::try_from(value).map_err(|_| Error::Invalid {
-        op: "rms_norm",
-        msg: format!("{name} dimension exceeds i32: {value}"),
+    i32::try_from(value).map_err(|_| {
+        InvalidSnafu {
+            op: "rms_norm",
+            msg: format!("{name} dimension exceeds i32: {value}"),
+        }
+        .build()
     })
 }
 
@@ -24,46 +27,53 @@ fn dim_i32(value: usize, name: &'static str) -> Result<i32> {
 /// See [`Error::Invalid`] and propagated kernel errors.
 pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     if x.dtype() != DType::F16 || weight.dtype() != DType::F16 {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "rms_norm",
             msg: "F16 only in Phase 1".into(),
-        });
+        }
+        .fail();
     }
     if x.dims().len() != 2 {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "rms_norm",
             msg: format!("expected (M, N); got {:?}", x.dims()),
-        });
+        }
+        .fail();
     }
     let x_dims = x.dims();
     let (Some(&m), Some(&n)) = (x_dims.first(), x_dims.get(1)) else {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "rms_norm",
             msg: "input rank changed during validation".into(),
-        });
+        }
+        .fail();
     };
     let weight_dims = weight.dims();
     if weight_dims.len() != 1 || weight_dims.first().copied() != Some(n) {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "rms_norm",
             msg: format!("weight shape {:?} != [{}]", weight.dims(), n),
-        });
+        }
+        .fail();
     }
 
     let placement = classify_placement(x.hip_storage().is_some(), weight.hip_storage().is_some());
     match placement {
         DevicePlacement::BothHip => {
             let (Some(x_hip), Some(w_hip)) = (x.hip_storage(), weight.hip_storage()) else {
-                return Err(Error::Invalid {
+                return InvalidSnafu {
                     op: "rms_norm",
                     msg: "device-pair classification invariant violated: BothHip without two HIP operands".into(),
-                });
+                }.fail();
             };
             let device = x_hip.device();
             let out = Tensor::zeros_hip(device, DType::F16, x.shape().clone())?;
-            let out_hip = out.hip_storage().ok_or_else(|| Error::Invalid {
-                op: "rms_norm",
-                msg: "zeros_hip did not return HIP".into(),
+            let out_hip = out.hip_storage().ok_or_else(|| {
+                InvalidSnafu {
+                    op: "rms_norm",
+                    msg: "zeros_hip did not return HIP".into(),
+                }
+                .build()
             })?;
             crate::stream_pool::POOL.with_stream(device, |stream| {
                 // SAFETY: device pointers valid; sizes verified above.
@@ -103,10 +113,11 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
         // caller bug (typically a weight upload that never reached the
         // device) and must fail loudly (CLAUDE.md:77, AGENTS.md:29 — no
         // silent CPU fallbacks).
-        DevicePlacement::Mixed => Err(Error::Invalid {
+        DevicePlacement::Mixed => InvalidSnafu {
             op: "rms_norm",
             msg: "x and weight must be on the same device".into(),
-        }),
+        }
+        .fail(),
     }
 }
 

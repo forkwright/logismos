@@ -16,7 +16,7 @@ use std::ffi::c_void;
 
 use hipcore::Stream;
 
-use crate::error::{Error, Result};
+use crate::error::{LaunchSnafu, NoGpuBuildSnafu, Result};
 
 #[cfg_attr(
     logismos_no_gpu_kernels,
@@ -59,7 +59,7 @@ pub unsafe fn launch_rms_norm_fp16(
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (x, w, y, m, n, eps, stream);
-        Err(Error::NoGpuBuild { kernel: "rms_norm" })
+        NoGpuBuildSnafu { kernel: "rms_norm" }.fail()
     }
 
     #[cfg(not(logismos_no_gpu_kernels))]
@@ -71,11 +71,12 @@ pub unsafe fn launch_rms_norm_fp16(
         if code == 0 {
             Ok(())
         } else {
-            Err(Error::Launch {
+            LaunchSnafu {
                 kernel: "rms_norm_fp16",
                 kind: hipcore::ErrorKind::from_raw(code),
                 code,
-            })
+            }
+            .fail()
         }
     }
 }
