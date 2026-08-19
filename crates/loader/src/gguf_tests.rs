@@ -1,6 +1,11 @@
 //! `gguf.rs` tests, `#[path]`-included as a sibling file per `RUST/file-too-long`.
 
 use super::*;
+// WHY not via `use super::*`: the parent's `Error` import is declared
+// `#[expect(unused_imports)]` for intra-doc links; resolving these
+// assertions through this dedicated import keeps that expectation
+// fulfilled in test builds.
+use crate::error::Error;
 
 /// Build a minimal v3 GGUF file in memory with:
 /// - magic + version
@@ -99,8 +104,8 @@ fn array_metadata_type_parses_elements() -> Result<()> {
     let value = cur.read_meta_value_typed(9)?;
     let MetaValue::Array(items) = value else {
         return GgufSnafu {
-            offset: 0,
-            msg: "expected MetaValue::Array".into(),
+            offset: 0u64,
+            msg: "expected MetaValue::Array".to_string(),
         }
         .fail();
     };
@@ -157,8 +162,8 @@ fn array_metadata_round_trips_through_reader_open() -> Result<()> {
     let r = Reader::open(&path)?;
     let Some(MetaValue::Array(items)) = r.metadata().get("arr_key") else {
         return GgufSnafu {
-            offset: 0,
-            msg: "expected metadata()[\"arr_key\"] to be MetaValue::Array".into(),
+            offset: 0u64,
+            msg: "expected metadata()[\"arr_key\"] to be MetaValue::Array".to_string(),
         }
         .fail();
     };
@@ -267,7 +272,7 @@ fn byte_range_for_rejects_byte_count_overflow() -> Result<()> {
     // checked_mul path says "overflows usize".
     let Err(Error::Gguf { msg, .. }) = &result else {
         return GgufSnafu {
-            offset: 0,
+            offset: 0u64,
             msg: format!("expected Error::Gguf, got {result:?}"),
         }
         .fail();

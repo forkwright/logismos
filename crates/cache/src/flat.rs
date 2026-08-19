@@ -27,8 +27,8 @@ use taxis::{CpuStorage, DType, Shape, Tensor};
 
 use crate::KvCache;
 use crate::error::{
-    DTypeMismatchSnafu, Error, LayerOutOfRangeSnafu, LenOverflowSnafu, MsgSnafu,
-    ReadBeyondWrittenSnafu, Result, ShapeMismatchSnafu, UnsupportedStorageSnafu,
+    DTypeMismatchSnafu, LayerOutOfRangeSnafu, LenOverflowSnafu, MsgSnafu, ReadBeyondWrittenSnafu,
+    Result, ShapeMismatchSnafu, UnsupportedStorageSnafu,
 };
 
 /// Shape + dtype invariants of a cache.

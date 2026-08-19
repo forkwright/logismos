@@ -31,7 +31,16 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
-use crate::error::{Error, GgufSnafu, Result, TensorNotFoundSnafu};
+use crate::error::{GgufSnafu, Result, TensorNotFoundSnafu};
+// WHY imported without a code reference: the `# Errors` sections below link to
+// `Error` variants by intra-doc path, which rustdoc resolves only against items
+// in scope. Split from the group above so the expectation covers this import
+// alone -- a later genuinely-unused import in the group still fails the gate.
+#[expect(
+    unused_imports,
+    reason = "resolves intra-doc links in this module's `# Errors` sections"
+)]
+use crate::error::Error;
 use crate::{TensorView, WeightProvider, check_mmap_not_truncated};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
@@ -93,7 +102,7 @@ impl GgmlType {
             30 => Self::BF16,
             other => {
                 return GgufSnafu {
-                    offset: 0,
+                    offset: 0u64,
                     msg: format!("unknown ggml type id {other}"),
                 }
                 .fail();
@@ -124,7 +133,7 @@ impl GgmlType {
             Self::I8 => taxis::DType::I8,
             other => {
                 return GgufSnafu {
-                    offset: 0,
+                    offset: 0u64,
                     msg: format!(
                         "ggml type {other:?} not decodable in Phase 2 \
                          (K-quant / block dtypes land with quant kernels in Phase 6)"
@@ -335,7 +344,7 @@ impl Reader {
         })?;
         self.tensors.get(idx).ok_or_else(|| {
             GgufSnafu {
-                offset: 0,
+                offset: 0u64,
                 msg: format!(
                     "internal: tensor index {idx} out of range (len={})",
                     self.tensors.len()
@@ -347,6 +356,12 @@ impl Reader {
 
     /// Compute a tensor's `[start, end)` byte range inside the mmap'd file
     /// and convert both ends to `usize`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "length is six eager snafu context constructions plus the documented \
+                  overflow rationale; splitting the validation chain is a refactor \
+                  beyond the snafu-migration compile fix"
+    )]
     fn byte_range_for(&self, desc: &TensorDescriptor) -> Result<(usize, usize)> {
         // WHY(forkwright/logismos#36): `Iterator::product()` on `u64`
         // uses ordinary wrapping multiplication in a release build — a
@@ -360,7 +375,7 @@ impl Reader {
         for &d in &desc.dims {
             elem_count_u64 = elem_count_u64.checked_mul(d).ok_or_else(|| {
                 GgufSnafu {
-                    offset: 0,
+                    offset: 0u64,
                     msg: format!(
                         "tensor `{}` dims product overflows u64: {:?}",
                         desc.name, desc.dims
@@ -371,7 +386,7 @@ impl Reader {
         }
         let elem_count = usize::try_from(elem_count_u64).map_err(|_| {
             GgufSnafu {
-                offset: 0,
+                offset: 0u64,
                 msg: format!(
                     "tensor `{}` element count {elem_count_u64} exceeds usize::MAX",
                     desc.name
@@ -381,7 +396,7 @@ impl Reader {
         })?;
         let bits = desc.ggml_type.size_in_bits().ok_or_else(|| {
             GgufSnafu {
-                offset: 0,
+                offset: 0u64,
                 msg: format!(
                     "tensor `{}` uses block-quant dtype {:?}; block decoding is Phase 6",
                     desc.name, desc.ggml_type
@@ -398,7 +413,7 @@ impl Reader {
             .checked_mul(elem_count)
             .ok_or_else(|| {
                 GgufSnafu {
-                offset: 0,
+                offset: 0u64,
                 msg: format!(
                     "tensor `{}` byte count overflows usize: {bits} bits * {elem_count} elements",
                     desc.name
@@ -408,7 +423,7 @@ impl Reader {
             .div_ceil(8);
         let byte_count_u64 = u64::try_from(byte_count).map_err(|_| {
             GgufSnafu {
-                offset: 0,
+                offset: 0u64,
                 msg: format!(
                     "tensor `{}` byte count {byte_count} exceeds u64::MAX",
                     desc.name
@@ -428,7 +443,7 @@ impl Reader {
                 .checked_add(desc.data_offset)
                 .ok_or_else(|| {
                     GgufSnafu {
-                offset: 0,
+                offset: 0u64,
                 msg: format!(
                     "tensor `{}` start offset overflows u64: region_start={} + data_offset={}",
                     desc.name, self.data_region_start, desc.data_offset
@@ -502,7 +517,7 @@ impl WeightProvider for Reader {
             .map(|&d| {
                 usize::try_from(d).map_err(|_| {
                     GgufSnafu {
-                        offset: 0,
+                        offset: 0u64,
                         msg: format!("tensor `{}` dim {d} exceeds usize::MAX", desc.name),
                     }
                     .build()
@@ -608,7 +623,7 @@ impl<'a> Cursor<'a> {
         if magic != GGUF_MAGIC {
             let prefix = magic.get(..magic.len().min(4)).unwrap_or(magic);
             return GgufSnafu {
-                offset: 0,
+                offset: 0u64,
                 msg: format!("bad magic: expected {GGUF_MAGIC:?}, got {prefix:?}"),
             }
             .fail();
@@ -653,7 +668,7 @@ impl<'a> Cursor<'a> {
         let first = b.first().copied().ok_or_else(|| {
             GgufSnafu {
                 offset: self.pos,
-                msg: "short read of u8".into(),
+                msg: "short read of u8".to_string(),
             }
             .build()
         })?;
@@ -762,7 +777,7 @@ impl<'a> Cursor<'a> {
                 if inner_type == 9 {
                     return GgufSnafu {
                         offset: self.pos,
-                        msg: "gguf spec forbids arrays-of-arrays (inner_type=9)".into(),
+                        msg: "gguf spec forbids arrays-of-arrays (inner_type=9)".to_string(),
                     }
                     .fail();
                 }

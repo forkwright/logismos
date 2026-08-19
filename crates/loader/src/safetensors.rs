@@ -22,7 +22,16 @@ use memmap2::Mmap;
 use safetensors::SafeTensors;
 use safetensors::tensor::Dtype as UpstreamDtype;
 
-use crate::error::{Error, MsgSnafu, Result, SafetensorsSnafu, TensorNotFoundSnafu};
+use crate::error::{MsgSnafu, Result, SafetensorsSnafu, TensorNotFoundSnafu};
+// WHY imported without a code reference: the `# Errors` sections below link to
+// `Error` variants by intra-doc path, which rustdoc resolves only against items
+// in scope. Split from the group above so the expectation covers this import
+// alone -- a later genuinely-unused import in the group still fails the gate.
+#[expect(
+    unused_imports,
+    reason = "resolves intra-doc links in this module's `# Errors` sections"
+)]
+use crate::error::Error;
 use crate::{TensorView, WeightProvider, check_mmap_not_truncated};
 
 /// The header's first 8 bytes are a little-endian `u64` declaring the
@@ -214,6 +223,11 @@ pub(crate) mod tests {
     use safetensors::tensor::TensorView as UpstreamView;
 
     use super::*;
+    // WHY not via `use super::*`: the parent's `Error` import is declared
+    // `#[expect(unused_imports)]` for intra-doc links; resolving these
+    // assertions through this dedicated import keeps that expectation
+    // fulfilled in test builds.
+    use crate::error::Error;
 
     /// `pub(crate)` so `lib.rs`'s `Archive::open` dispatch test can
     /// reuse it rather than duplicating a fixture builder.

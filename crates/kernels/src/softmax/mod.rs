@@ -11,7 +11,12 @@ use std::ffi::c_void;
 
 use hipcore::Stream;
 
-use crate::error::{LaunchSnafu, NoGpuBuildSnafu, Result};
+use crate::error::{NoGpuBuildSnafu, Result};
+// WHY cfg-gated: only the `not(logismos_no_gpu_kernels)` launcher body builds
+// launch errors, so an unconditional import fails `-D warnings` on hipcc-less
+// (CPU-only) builds.
+#[cfg(not(logismos_no_gpu_kernels))]
+use crate::error::LaunchSnafu;
 
 #[cfg_attr(
     logismos_no_gpu_kernels,

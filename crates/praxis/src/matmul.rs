@@ -53,7 +53,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if !a.is_contiguous() || !b.is_contiguous() {
         return InvalidSnafu {
             op: "matmul",
-            msg: "inputs must be contiguous in Phase 1".into(),
+            msg: "inputs must be contiguous in Phase 1".to_string(),
         }
         .fail();
     }
@@ -62,14 +62,14 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let (Some(&m), Some(&ka)) = (a_dims.first(), a_dims.get(1)) else {
         return InvalidSnafu {
             op: "matmul",
-            msg: "A rank changed during validation".into(),
+            msg: "A rank changed during validation".to_string(),
         }
         .fail();
     };
     let (Some(&kb), Some(&n)) = (b_dims.first(), b_dims.get(1)) else {
         return InvalidSnafu {
             op: "matmul",
-            msg: "B rank changed during validation".into(),
+            msg: "B rank changed during validation".to_string(),
         }
         .fail();
     };
@@ -91,14 +91,14 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             let (Some(a_hip), Some(b_hip)) = (a.hip_storage(), b.hip_storage()) else {
                 return InvalidSnafu {
                     op: "matmul",
-                    msg: "device-pair classification invariant violated: BothHip without two HIP operands".into(),
+                    msg: "device-pair classification invariant violated: BothHip without two HIP operands".to_string(),
                 }.fail();
             };
             let device = a_hip.device();
             if device.ordinal() != b_hip.device().ordinal() {
                 return InvalidSnafu {
                     op: "matmul",
-                    msg: "A and B must live on the same device".into(),
+                    msg: "A and B must live on the same device".to_string(),
                 }
                 .fail();
             }
@@ -106,7 +106,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             let out_hip = out.hip_storage().ok_or_else(|| {
                 InvalidSnafu {
                     op: "matmul",
-                    msg: "zeros_hip did not return a HIP tensor".into(),
+                    msg: "zeros_hip did not return a HIP tensor".to_string(),
                 }
                 .build()
             })?;
@@ -161,7 +161,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         // — no silent CPU fallbacks).
         DevicePlacement::Mixed => InvalidSnafu {
             op: "matmul",
-            msg: "A and B must both be on CPU or both on the same HIP device".into(),
+            msg: "A and B must both be on CPU or both on the same HIP device".to_string(),
         }
         .fail(),
     }

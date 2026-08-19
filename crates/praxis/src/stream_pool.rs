@@ -53,7 +53,7 @@ impl StreamPool {
             // to avoid.
             return InvalidSnafu {
                 op: "pooled_stream",
-                msg: "stream pool slot unexpectedly empty after population".into(),
+                msg: "stream pool slot unexpectedly empty after population".to_string(),
             }
             .fail();
         };

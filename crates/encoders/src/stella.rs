@@ -16,7 +16,16 @@ use transformers::{
     SwiGluMlpWeights, rms_norm_f32,
 };
 
-use crate::error::{Error, LayoutSnafu, Result, ShapeSnafu};
+use crate::error::{LayoutSnafu, Result, ShapeSnafu};
+// WHY imported without a code reference: the `# Errors` sections below link to
+// `Error` variants by intra-doc path, which rustdoc resolves only against items
+// in scope. Split from the group above so the expectation covers this import
+// alone -- a later genuinely-unused import in the group still fails the gate.
+#[expect(
+    unused_imports,
+    reason = "resolves intra-doc links in this module's `# Errors` sections"
+)]
+use crate::error::Error;
 
 /// Tensors [`load_layer`] reads per transformer layer, feeding the
 /// checkpoint-completeness guard in [`StellaWeights::load`]:
@@ -399,6 +408,11 @@ mod tests {
     use safetensors::tensor::{Dtype as UpstreamDtype, TensorView as UpstreamView};
 
     use super::*;
+    // WHY not via `use super::*`: the parent's `Error` import is declared
+    // `#[expect(unused_imports)]` for intra-doc links; resolving these
+    // assertions through this dedicated import keeps that expectation
+    // fulfilled in test builds.
+    use crate::error::Error;
 
     /// Tiny Stella-shaped config: same field structure as
     /// [`StellaConfig::stella_1_5b`], scaled down so the fixture below

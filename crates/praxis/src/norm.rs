@@ -29,7 +29,7 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     if x.dtype() != DType::F16 || weight.dtype() != DType::F16 {
         return InvalidSnafu {
             op: "rms_norm",
-            msg: "F16 only in Phase 1".into(),
+            msg: "F16 only in Phase 1".to_string(),
         }
         .fail();
     }
@@ -44,7 +44,7 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     let (Some(&m), Some(&n)) = (x_dims.first(), x_dims.get(1)) else {
         return InvalidSnafu {
             op: "rms_norm",
-            msg: "input rank changed during validation".into(),
+            msg: "input rank changed during validation".to_string(),
         }
         .fail();
     };
@@ -63,7 +63,7 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
             let (Some(x_hip), Some(w_hip)) = (x.hip_storage(), weight.hip_storage()) else {
                 return InvalidSnafu {
                     op: "rms_norm",
-                    msg: "device-pair classification invariant violated: BothHip without two HIP operands".into(),
+                    msg: "device-pair classification invariant violated: BothHip without two HIP operands".to_string(),
                 }.fail();
             };
             let device = x_hip.device();
@@ -71,7 +71,7 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
             let out_hip = out.hip_storage().ok_or_else(|| {
                 InvalidSnafu {
                     op: "rms_norm",
-                    msg: "zeros_hip did not return HIP".into(),
+                    msg: "zeros_hip did not return HIP".to_string(),
                 }
                 .build()
             })?;
@@ -115,7 +115,7 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
         // silent CPU fallbacks).
         DevicePlacement::Mixed => InvalidSnafu {
             op: "rms_norm",
-            msg: "x and weight must be on the same device".into(),
+            msg: "x and weight must be on the same device".to_string(),
         }
         .fail(),
     }

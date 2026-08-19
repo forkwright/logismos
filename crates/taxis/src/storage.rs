@@ -383,6 +383,11 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // WHY not via `use super::*`: the parent's `Error` import is declared
+    // `#[expect(unused_imports)]` for intra-doc links; resolving these
+    // assertions through this dedicated import keeps that expectation
+    // fulfilled in test builds.
+    use crate::error::Error;
 
     // WHY: pure host-side arithmetic (dtype byte-size vs `size_of::<T>()`) —
     // no `Device`/HIP runtime involved, so these run without ROCm/GPU

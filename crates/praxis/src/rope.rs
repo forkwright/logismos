@@ -6,7 +6,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 use hipcore::{Device, DeviceBuffer};
 use taxis::{DType, Tensor};
 
-use crate::error::{Error, InvalidSnafu, Result};
+use crate::error::{InvalidSnafu, Result};
+// WHY imported without a code reference: the `# Errors` sections below link to
+// `Error` variants by intra-doc path, which rustdoc resolves only against items
+// in scope. Split from the group above so the expectation covers this import
+// alone -- a later genuinely-unused import in the group still fails the gate.
+#[expect(
+    unused_imports,
+    reason = "resolves intra-doc links in this module's `# Errors` sections"
+)]
+use crate::error::Error;
 
 fn dim_i32(value: usize, name: &'static str) -> Result<i32> {
     i32::try_from(value).map_err(|_| {
@@ -94,7 +103,7 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
     if qk.dtype() != DType::F16 {
         return InvalidSnafu {
             op: "rope_apply",
-            msg: "F16 only in Phase 1".into(),
+            msg: "F16 only in Phase 1".to_string(),
         }
         .fail();
     }
@@ -114,7 +123,7 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
     ) else {
         return InvalidSnafu {
             op: "rope_apply",
-            msg: "input rank changed during validation".into(),
+            msg: "input rank changed during validation".to_string(),
         }
         .fail();
     };
@@ -226,6 +235,11 @@ mod tests {
     use taxis::{CpuStorage, Shape};
 
     use super::*;
+    // WHY not via `use super::*`: the parent's `Error` import is declared
+    // `#[expect(unused_imports)]` for intra-doc links; resolving these
+    // assertions through this dedicated import keeps that expectation
+    // fulfilled in test builds.
+    use crate::error::Error;
 
     #[test]
     fn rope_apply_rejects_odd_head_dim() {

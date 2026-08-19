@@ -376,7 +376,7 @@ impl ModernBertEncoder {
         let seq = token_ids.len();
         if seq == 0 {
             return ShapeSnafu {
-                message: "encoder.forward: empty input".into(),
+                message: "encoder.forward: empty input".to_string(),
             }
             .fail();
         }

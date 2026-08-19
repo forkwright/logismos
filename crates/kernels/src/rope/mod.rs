@@ -18,7 +18,21 @@ use std::ffi::c_void;
 
 use hipcore::Stream;
 
-use crate::error::{Error, LaunchSnafu, NoGpuBuildSnafu, Result, UnsupportedShapeSnafu};
+use crate::error::{NoGpuBuildSnafu, Result, UnsupportedShapeSnafu};
+// WHY cfg-gated: only the `not(logismos_no_gpu_kernels)` launcher body builds
+// launch errors, so an unconditional import fails `-D warnings` on hipcc-less
+// (CPU-only) builds.
+#[cfg(not(logismos_no_gpu_kernels))]
+use crate::error::LaunchSnafu;
+// WHY imported without a code reference: the `# Errors` sections below link to
+// `Error` variants by intra-doc path, which rustdoc resolves only against items
+// in scope. Split from the group above so the expectation covers this import
+// alone -- a later genuinely-unused import in the group still fails the gate.
+#[expect(
+    unused_imports,
+    reason = "resolves intra-doc links in this module's `# Errors` sections"
+)]
+use crate::error::Error;
 
 #[cfg_attr(
     logismos_no_gpu_kernels,
@@ -178,6 +192,11 @@ mod tests {
     #![expect(clippy::expect_used, reason = "test assertions use expect() directly")]
 
     use super::*;
+    // WHY not via `use super::*`: the parent's `Error` import is declared
+    // `#[expect(unused_imports)]` for intra-doc links; resolving these
+    // assertions through this dedicated import keeps that expectation
+    // fulfilled in test builds.
+    use crate::error::Error;
 
     // WHY host-side only: `check_rope_shape` is pure `i32`/`i64`
     // arithmetic with no device access, so it needs neither `hipcc` (HIP

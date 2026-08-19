@@ -1,4 +1,8 @@
 use super::*;
+// WHY not via `use super::*`: `flat.rs` no longer imports `Error` (nothing
+// outside these tests references it), so the assertions below import it
+// directly.
+use crate::error::Error;
 
 fn layout_small() -> CacheLayout {
     CacheLayout {

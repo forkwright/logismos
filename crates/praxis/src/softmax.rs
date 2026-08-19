@@ -26,7 +26,7 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
     if x.dtype() != DType::F16 {
         return InvalidSnafu {
             op: "softmax",
-            msg: "F16 only in Phase 1".into(),
+            msg: "F16 only in Phase 1".to_string(),
         }
         .fail();
     }
@@ -41,7 +41,7 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
     let (Some(&m), Some(&n)) = (x_dims.first(), x_dims.get(1)) else {
         return InvalidSnafu {
             op: "softmax",
-            msg: "input rank changed during validation".into(),
+            msg: "input rank changed during validation".to_string(),
         }
         .fail();
     };
@@ -52,7 +52,7 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
         let out_hip = out.hip_storage().ok_or_else(|| {
             InvalidSnafu {
                 op: "softmax",
-                msg: "zeros_hip did not return HIP".into(),
+                msg: "zeros_hip did not return HIP".to_string(),
             }
             .build()
         })?;
