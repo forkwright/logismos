@@ -308,11 +308,20 @@ impl EmbeddingModel for StellaModel {
         let ids: Vec<u32> = self
             .tokenizer
             .encode(&text_with_prompt, true)
-            .map_err(|e| CoreTokenizeSnafu { message: e.to_string() }.build())?;
+            .map_err(|e| {
+                CoreTokenizeSnafu {
+                    message: e.to_string(),
+                }
+                .build()
+            })?;
         check_token_limit(ids.len(), max_tokens)?;
         let mask = vec![1u8; ids.len()];
-        self.encode_raw(&ids, &mask, dim)
-            .map_err(|e| CoreComputeSnafu { message: e.to_string() }.build())
+        self.encode_raw(&ids, &mask, dim).map_err(|e| {
+            CoreComputeSnafu {
+                message: e.to_string(),
+            }
+            .build()
+        })
     }
 }
 
