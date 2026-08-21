@@ -24,6 +24,9 @@ snafu = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# WHY dev-only: stella_throughput.rs derives its own BenchError with thiserror. The crate's
+# sources use snafu; both belong, for different targets.
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
