@@ -24,6 +24,13 @@ All notable changes to logismos are recorded here.
 - Kernel result defaults: explicit handling in cfg-gated branches
 - Matmul CPU helper visibility: narrowed to `pub(crate)`
 
+## [1.0.9](https://github.com/forkwright/logismos/compare/v1.0.8...v1.0.9) (2026-08-21)
+
+
+### Refactoring
+
+* **errors:** migrate eleven crates from thiserror to snafu ([#111](https://github.com/forkwright/logismos/issues/111)) ([3131e13](https://github.com/forkwright/logismos/commit/3131e138d8b410e1f22d3475b7fdf9d592907094))
+
 ## [1.0.8](https://github.com/forkwright/logismos/compare/v1.0.7...v1.0.8) (2026-08-17)
 
 
