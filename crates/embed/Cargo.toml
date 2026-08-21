@@ -20,7 +20,7 @@ loader = { workspace = true }
 rayon = { workspace = true }
 taxis = { workspace = true }
 tokenize = { workspace = true }
-thiserror = { workspace = true }
+snafu = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

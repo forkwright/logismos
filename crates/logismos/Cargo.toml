@@ -37,7 +37,6 @@ embed = { path = "../embed" }
 # when Stella isn't on disk, so it needs the upstream writer.
 safetensors = { workspace = true }
 kernels = { workspace = true }
-thiserror = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]
