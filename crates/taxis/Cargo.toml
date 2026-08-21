@@ -11,7 +11,7 @@ publish = false
 half.workspace = true
 hipcore.workspace = true
 smallvec.workspace = true
-thiserror.workspace = true
+snafu.workspace = true
 
 [lints]
 workspace = true

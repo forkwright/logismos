@@ -4,12 +4,15 @@ use std::ffi::c_void;
 
 use taxis::{DType, Tensor};
 
-use crate::error::{Error, Result};
+use crate::error::{InvalidSnafu, Result};
 
 fn dim_i32(value: usize, name: &'static str) -> Result<i32> {
-    i32::try_from(value).map_err(|_| Error::Invalid {
-        op: "softmax",
-        msg: format!("{name} dimension exceeds i32: {value}"),
+    i32::try_from(value).map_err(|_| {
+        InvalidSnafu {
+            op: "softmax",
+            msg: format!("{name} dimension exceeds i32: {value}"),
+        }
+        .build()
     })
 }
 
@@ -21,31 +24,37 @@ fn dim_i32(value: usize, name: &'static str) -> Result<i32> {
 /// See [`Error::Invalid`] and propagated kernel errors.
 pub fn softmax(x: &Tensor) -> Result<Tensor> {
     if x.dtype() != DType::F16 {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "softmax",
-            msg: "F16 only in Phase 1".into(),
-        });
+            msg: "F16 only in Phase 1".to_string(),
+        }
+        .fail();
     }
     if x.dims().len() != 2 {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "softmax",
             msg: format!("expected 2-D; got {:?}", x.dims()),
-        });
+        }
+        .fail();
     }
     let x_dims = x.dims();
     let (Some(&m), Some(&n)) = (x_dims.first(), x_dims.get(1)) else {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "softmax",
-            msg: "input rank changed during validation".into(),
-        });
+            msg: "input rank changed during validation".to_string(),
+        }
+        .fail();
     };
 
     if let Some(x_hip) = x.hip_storage() {
         let device = x_hip.device();
         let out = Tensor::zeros_hip(device, DType::F16, x.shape().clone())?;
-        let out_hip = out.hip_storage().ok_or_else(|| Error::Invalid {
-            op: "softmax",
-            msg: "zeros_hip did not return HIP".into(),
+        let out_hip = out.hip_storage().ok_or_else(|| {
+            InvalidSnafu {
+                op: "softmax",
+                msg: "zeros_hip did not return HIP".to_string(),
+            }
+            .build()
         })?;
         crate::stream_pool::POOL.with_stream(device, |stream| {
             // SAFETY: device pointers valid; sizes verified above. `out`

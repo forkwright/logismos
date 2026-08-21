@@ -1,30 +1,45 @@
 //! `praxis` error surface — lifts the underlying crates.
 
+use snafu::Snafu;
+
 /// Result alias.
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Errors surfaced by `praxis` free functions.
-#[derive(thiserror::Error, Debug)]
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
     /// Propagated HIP error.
-    #[error(transparent)]
-    Hip(#[from] hipcore::Error),
+    #[snafu(transparent)]
+    Hip {
+        /// Source HIP error.
+        source: hipcore::Error,
+    },
 
     /// Propagated tensor error.
-    #[error(transparent)]
-    Taxis(#[from] taxis::Error),
+    #[snafu(transparent)]
+    Taxis {
+        /// Source tensor error.
+        source: taxis::Error,
+    },
 
     /// Propagated kernel error.
-    #[error(transparent)]
-    Kernel(#[from] kernels::Error),
+    #[snafu(transparent)]
+    Kernel {
+        /// Source kernel error.
+        source: kernels::Error,
+    },
 
     /// Invalid shape / dtype combination for the requested op.
-    #[error("praxis {op}: {msg}")]
+    #[snafu(display("praxis {op}: {msg}"))]
     Invalid {
         /// Op name.
         op: &'static str,
         /// Description.
         msg: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 }

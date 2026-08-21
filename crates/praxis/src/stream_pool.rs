@@ -6,7 +6,7 @@ use std::sync::{Mutex, PoisonError};
 
 use hipcore::{Device, Stream};
 
-use crate::error::{Error, Result};
+use crate::error::{InvalidSnafu, Result};
 
 /// Pooled stream, keyed by device ordinal.
 ///
@@ -51,10 +51,11 @@ impl StreamPool {
             // because a defensive branch is not the place to introduce
             // the one `unwrap`-shaped failure mode this module exists
             // to avoid.
-            return Err(Error::Invalid {
+            return InvalidSnafu {
                 op: "pooled_stream",
-                msg: "stream pool slot unexpectedly empty after population".into(),
-            });
+                msg: "stream pool slot unexpectedly empty after population".to_string(),
+            }
+            .fail();
         };
         f(stream)
     }

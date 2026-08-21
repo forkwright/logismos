@@ -16,7 +16,7 @@
 use kernels::cpu_f32;
 use num_traits::ToPrimitive;
 
-use crate::error::{Error, Result};
+use crate::error::{Result, ShapeSnafu};
 use crate::rope::RopeTable;
 
 /// Attention config shared between Qwen2 and Stella.
@@ -86,16 +86,22 @@ impl QwenAttention {
         check_shape("bv", weights.bv.len(), kvw)?;
         check_shape("wo", weights.wo.len(), h * h)?;
         if !cfg.n_heads.is_multiple_of(cfg.n_kv_heads) {
-            return Err(Error::Shape(format!(
-                "attention: n_heads {} not a multiple of n_kv_heads {}",
-                cfg.n_heads, cfg.n_kv_heads
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "attention: n_heads {} not a multiple of n_kv_heads {}",
+                    cfg.n_heads, cfg.n_kv_heads
+                ),
+            }
+            .fail();
         }
         if cfg.head_dim * cfg.n_heads != cfg.hidden {
-            return Err(Error::Shape(format!(
-                "attention: head_dim({}) * n_heads({}) != hidden({})",
-                cfg.head_dim, cfg.n_heads, cfg.hidden
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "attention: head_dim({}) * n_heads({}) != hidden({})",
+                    cfg.head_dim, cfg.n_heads, cfg.hidden
+                ),
+            }
+            .fail();
         }
         Ok(Self { cfg, weights })
     }
@@ -123,31 +129,43 @@ impl QwenAttention {
         let groups = n_h / n_kv;
 
         if !x.len().is_multiple_of(hidden) {
-            return Err(Error::Shape(format!(
-                "attention.forward: x.len()={} not multiple of hidden={}",
-                x.len(),
-                hidden
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "attention.forward: x.len()={} not multiple of hidden={}",
+                    x.len(),
+                    hidden
+                ),
+            }
+            .fail();
         }
         let seq = x.len() / hidden;
         if mask.len() != seq {
-            return Err(Error::Shape(format!(
-                "attention.forward: mask.len()={} != seq={}",
-                mask.len(),
-                seq
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "attention.forward: mask.len()={} != seq={}",
+                    mask.len(),
+                    seq
+                ),
+            }
+            .fail();
         }
         if seq > rope.max_seq {
-            return Err(Error::Shape(format!(
-                "attention.forward: seq {} > rope.max_seq {}",
-                seq, rope.max_seq
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "attention.forward: seq {} > rope.max_seq {}",
+                    seq, rope.max_seq
+                ),
+            }
+            .fail();
         }
         if rope.head_dim != d {
-            return Err(Error::Shape(format!(
-                "attention.forward: rope.head_dim {} != cfg.head_dim {}",
-                rope.head_dim, d
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "attention.forward: rope.head_dim {} != cfg.head_dim {}",
+                    rope.head_dim, d
+                ),
+            }
+            .fail();
         }
 
         // ---- Q/K/V projections -------------------------------------------
@@ -229,13 +247,18 @@ impl QwenAttention {
         let mut col_mask = vec![1u8; seq * seq];
         for i in 0..seq {
             for j in 0..seq {
-                let slot = col_mask
-                    .get_mut(i * seq + j)
-                    .ok_or_else(|| Error::Shape("attention column mask slot".to_string()))?;
-                *slot = mask
-                    .get(j)
-                    .copied()
-                    .ok_or_else(|| Error::Shape("attention mask column".to_string()))?;
+                let slot = col_mask.get_mut(i * seq + j).ok_or_else(|| {
+                    ShapeSnafu {
+                        message: "attention column mask slot".to_string(),
+                    }
+                    .build()
+                })?;
+                *slot = mask.get(j).copied().ok_or_else(|| {
+                    ShapeSnafu {
+                        message: "attention mask column".to_string(),
+                    }
+                    .build()
+                })?;
             }
         }
         // Apply per head; kernels::mask_additive_in_place expects scores
@@ -285,9 +308,10 @@ fn check_shape(name: &'static str, got: usize, expected: usize) -> Result<()> {
     if got == expected {
         Ok(())
     } else {
-        Err(Error::Shape(format!(
-            "{name}: expected {expected} elements, got {got}"
-        )))
+        ShapeSnafu {
+            message: format!("{name}: expected {expected} elements, got {got}"),
+        }
+        .fail()
     }
 }
 
@@ -367,10 +391,13 @@ fn checked_slice<'a>(
     context: &'static str,
 ) -> Result<&'a [f32]> {
     x.get(start..end).ok_or_else(|| {
-        Error::Shape(format!(
-            "{context}: range {start}..{end} exceeds slice length {}",
-            x.len()
-        ))
+        ShapeSnafu {
+            message: format!(
+                "{context}: range {start}..{end} exceeds slice length {}",
+                x.len()
+            ),
+        }
+        .build()
     })
 }
 
@@ -383,9 +410,10 @@ fn checked_slice_mut<'a>(
 ) -> Result<&'a mut [f32]> {
     let len = x.len();
     x.get_mut(start..end).ok_or_else(|| {
-        Error::Shape(format!(
-            "{context}: range {start}..{end} exceeds slice length {len}"
-        ))
+        ShapeSnafu {
+            message: format!("{context}: range {start}..{end} exceeds slice length {len}"),
+        }
+        .build()
     })
 }
 

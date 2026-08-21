@@ -1,37 +1,67 @@
 //! Error type for `embed`.
 
+use snafu::Snafu;
+
 /// Embed crate errors.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
     /// Model directory lookup failed.
-    #[error("io: {0}")]
-    Io(String),
+    #[snafu(display("io: {message}"))]
+    Io {
+        /// Free-form description.
+        message: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// Encoder crate bubbled an error.
-    #[error("encoders: {0}")]
-    Encoders(#[from] encoders::Error),
+    #[snafu(transparent)]
+    Encoders {
+        /// Source encoder error.
+        source: encoders::Error,
+    },
     /// Loader crate bubbled an error.
-    #[error("loader: {0}")]
-    Loader(#[from] loader::Error),
+    #[snafu(transparent)]
+    Loader {
+        /// Source loader error.
+        source: loader::Error,
+    },
     /// Tokenizer crate bubbled an error.
-    #[error("tokenize: {0}")]
-    Tokenize(#[from] tokenize::Error),
+    #[snafu(transparent)]
+    Tokenize {
+        /// Source tokenizer error.
+        source: tokenize::Error,
+    },
     /// Caller asked for a dim the model does not support.
-    #[error("unsupported dim {0}")]
-    UnsupportedDim(usize),
+    #[snafu(display("unsupported dim {dim}"))]
+    UnsupportedDim {
+        /// The unsupported dimension requested.
+        dim: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// Input token length exceeds configured max.
-    #[error("input too long: got {got}, limit {limit}")]
+    #[snafu(display("input too long: got {got}, limit {limit}"))]
     InputTooLong {
         /// Actual token count.
         got: usize,
         /// Configured maximum.
         limit: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 }
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Self::Io(e.to_string())
+        IoSnafu {
+            message: e.to_string(),
+        }
+        .build()
     }
 }
 

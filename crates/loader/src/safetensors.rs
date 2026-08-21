@@ -22,7 +22,16 @@ use memmap2::Mmap;
 use safetensors::SafeTensors;
 use safetensors::tensor::Dtype as UpstreamDtype;
 
-use crate::error::{Error, Result};
+use crate::error::{MsgSnafu, Result, SafetensorsSnafu, TensorNotFoundSnafu};
+// WHY imported without a code reference: the `# Errors` sections below link to
+// `Error` variants by intra-doc path, which rustdoc resolves only against items
+// in scope. Split from the group above so the expectation covers this import
+// alone -- a later genuinely-unused import in the group still fails the gate.
+#[expect(
+    unused_imports,
+    reason = "resolves intra-doc links in this module's `# Errors` sections"
+)]
+use crate::error::Error;
 use crate::{TensorView, WeightProvider, check_mmap_not_truncated};
 
 /// The header's first 8 bytes are a little-endian `u64` declaring the
@@ -86,7 +95,10 @@ impl Reader {
         // pair directly — no pointer arithmetic required.
         let (header_size, metadata) = SafeTensors::read_metadata(&mmap)?;
         let data_region_start = header_size.checked_add(HEADER_LEN_PREFIX).ok_or_else(|| {
-            Error::Safetensors("safetensors header + size prefix overflows usize".into())
+            SafetensorsSnafu {
+                message: "safetensors header + size prefix overflows usize",
+            }
+            .build()
         })?;
 
         // `offset_keys()` orders names by on-disk tensor offset, which
@@ -95,17 +107,24 @@ impl Reader {
         let mut index = HashMap::with_capacity(ordering.len());
         for name in &ordering {
             let info = metadata.info(name).ok_or_else(|| {
-                Error::Safetensors(format!(
-                    "tensor `{name}` in offset_keys but missing from metadata"
-                ))
+                SafetensorsSnafu {
+                    message: format!("tensor `{name}` in offset_keys but missing from metadata"),
+                }
+                .build()
             })?;
             let dtype = map_dtype(info.dtype, name)?;
             let (rel_start, rel_end) = info.data_offsets;
             let start = data_region_start.checked_add(rel_start).ok_or_else(|| {
-                Error::Safetensors(format!("tensor `{name}` start offset overflows usize"))
+                SafetensorsSnafu {
+                    message: format!("tensor `{name}` start offset overflows usize"),
+                }
+                .build()
             })?;
             let end = data_region_start.checked_add(rel_end).ok_or_else(|| {
-                Error::Safetensors(format!("tensor `{name}` end offset overflows usize"))
+                SafetensorsSnafu {
+                    message: format!("tensor `{name}` end offset overflows usize"),
+                }
+                .build()
             })?;
             index.insert(
                 name.clone(),
@@ -144,18 +163,21 @@ impl WeightProvider for Reader {
         // `get_key_value` ties the returned name to the `String` owned
         // by `self.index` (== `&self`-bound) in one lookup, rather than
         // a second linear scan through `ordering` to recover it.
-        let (stored_name, entry) =
-            self.index
-                .get_key_value(name)
-                .ok_or_else(|| Error::TensorNotFound {
-                    name: name.to_string(),
-                })?;
+        let (stored_name, entry) = self.index.get_key_value(name).ok_or_else(|| {
+            TensorNotFoundSnafu {
+                name: name.to_string(),
+            }
+            .build()
+        })?;
         let bytes = self.mmap.get(entry.start..entry.end).ok_or_else(|| {
-            Error::Safetensors(format!(
-                "tensor `{name}` byte range [{start}..{end}] out of mmap bounds",
-                start = entry.start,
-                end = entry.end,
-            ))
+            SafetensorsSnafu {
+                message: format!(
+                    "tensor `{name}` byte range [{start}..{end}] out of mmap bounds",
+                    start = entry.start,
+                    end = entry.end,
+                ),
+            }
+            .build()
         })?;
         Ok(TensorView {
             name: stored_name,
@@ -185,9 +207,10 @@ fn map_dtype(d: UpstreamDtype, name: &str) -> Result<taxis::DType> {
         UpstreamDtype::F8_E4M3 => taxis::DType::F8E4M3,
         UpstreamDtype::F8_E5M2 => taxis::DType::F8E5M2,
         other => {
-            return Err(Error::Msg(format!(
-                "tensor `{name}` uses unmapped safetensors dtype {other:?}"
-            )));
+            return MsgSnafu {
+                message: format!("tensor `{name}` uses unmapped safetensors dtype {other:?}"),
+            }
+            .fail();
         }
     })
 }
@@ -200,6 +223,11 @@ pub(crate) mod tests {
     use safetensors::tensor::TensorView as UpstreamView;
 
     use super::*;
+    // WHY not via `use super::*`: the parent's `Error` import is declared
+    // `#[expect(unused_imports)]` for intra-doc links; resolving these
+    // assertions through this dedicated import keeps that expectation
+    // fulfilled in test builds.
+    use crate::error::Error;
 
     /// `pub(crate)` so `lib.rs`'s `Archive::open` dispatch test can
     /// reuse it rather than duplicating a fixture builder.
@@ -214,15 +242,27 @@ pub(crate) mod tests {
             .iter()
             .flat_map(|f| f.to_le_bytes())
             .collect();
-        let tv_a = UpstreamView::new(UpstreamDtype::F32, vec![2, 2], &a)
-            .map_err(|e| Error::Msg(format!("tv_a: {e}")))?;
-        let tv_b = UpstreamView::new(UpstreamDtype::F32, vec![2], &b)
-            .map_err(|e| Error::Msg(format!("tv_b: {e}")))?;
+        let tv_a = UpstreamView::new(UpstreamDtype::F32, vec![2, 2], &a).map_err(|e| {
+            MsgSnafu {
+                message: format!("tv_a: {e}"),
+            }
+            .build()
+        })?;
+        let tv_b = UpstreamView::new(UpstreamDtype::F32, vec![2], &b).map_err(|e| {
+            MsgSnafu {
+                message: format!("tv_b: {e}"),
+            }
+            .build()
+        })?;
         let mut tensors: StdMap<String, UpstreamView<'_>> = StdMap::new();
         tensors.insert("a".into(), tv_a);
         tensors.insert("b".into(), tv_b);
-        serialize_to_file(&tensors, None, path)
-            .map_err(|e| Error::Msg(format!("serialize_to_file: {e}")))?;
+        serialize_to_file(&tensors, None, path).map_err(|e| {
+            MsgSnafu {
+                message: format!("serialize_to_file: {e}"),
+            }
+            .build()
+        })?;
         Ok(())
     }
 
@@ -269,7 +309,10 @@ pub(crate) mod tests {
         let tensor = tv_a.to_tensor_cpu()?;
         assert_eq!(tensor.dims(), &[2, 2]);
         let Some(taxis::CpuStorage::F32(v)) = tensor.cpu_storage() else {
-            return Err(Error::Msg("expected F32 CPU storage".into()));
+            return MsgSnafu {
+                message: "expected F32 CPU storage",
+            }
+            .fail();
         };
         assert_eq!(v.as_slice(), &[1.0_f32, 2.0, 3.0, 4.0][..]);
         let _ = std::fs::remove_file(&tmp);

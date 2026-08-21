@@ -10,7 +10,21 @@ use std::ffi::c_void;
 
 use hipcore::Stream;
 
-use crate::error::{Error, Result};
+use crate::error::{NoGpuBuildSnafu, Result, UnsupportedShapeSnafu};
+// WHY cfg-gated: only the `not(logismos_no_gpu_kernels)` launcher body builds
+// launch errors, so an unconditional import fails `-D warnings` on hipcc-less
+// (CPU-only) builds.
+#[cfg(not(logismos_no_gpu_kernels))]
+use crate::error::LaunchSnafu;
+// WHY imported without a code reference: the `# Errors` sections below link to
+// `Error` variants by intra-doc path, which rustdoc resolves only against items
+// in scope. Split from the group above so the expectation covers this import
+// alone -- a later genuinely-unused import in the group still fails the gate.
+#[expect(
+    unused_imports,
+    reason = "resolves intra-doc links in this module's `# Errors` sections"
+)]
+use crate::error::Error;
 
 #[cfg_attr(
     logismos_no_gpu_kernels,
@@ -75,10 +89,11 @@ pub enum Variant {
 fn check_matmul_shape(m: i32, n: i32, k: i32) -> Result<()> {
     for (value, name) in [(m, "M"), (n, "N"), (k, "K")] {
         if value <= 0 {
-            return Err(Error::UnsupportedShape {
+            return UnsupportedShapeSnafu {
                 kernel: "matmul_fp16",
                 msg: format!("{name} must be positive, got {value}"),
-            });
+            }
+            .fail();
         }
     }
     // INVARIANT: all three operands are positive `i32` here, so each
@@ -88,13 +103,14 @@ fn check_matmul_shape(m: i32, n: i32, k: i32) -> Result<()> {
     for (label, product) in [("M*K", m64 * k64), ("K*N", k64 * n64), ("M*N", m64 * n64)] {
         if product > i64::from(i32::MAX) {
             let max = i32::MAX;
-            return Err(Error::UnsupportedShape {
+            return UnsupportedShapeSnafu {
                 kernel: "matmul_fp16",
                 msg: format!(
                     "{label} = {product} exceeds i32::MAX ({max}); matmul_naive.hip's \
                      element-index products cannot address this shape"
                 ),
-            });
+            }
+            .fail();
         }
     }
     Ok(())
@@ -136,7 +152,7 @@ pub unsafe fn launch_matmul_fp16(
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (variant, a, b, d, m, n, k, stream);
-        Err(Error::NoGpuBuild { kernel: "matmul" })
+        NoGpuBuildSnafu { kernel: "matmul" }.fail()
     }
 
     #[cfg(not(logismos_no_gpu_kernels))]
@@ -156,14 +172,15 @@ pub unsafe fn launch_matmul_fp16(
         if code == 0 {
             Ok(())
         } else {
-            Err(Error::Launch {
+            LaunchSnafu {
                 kernel: match variant {
                     Variant::Naive => "matmul_naive_fp16",
                     Variant::Wmma => "matmul_wmma_fp16",
                 },
                 kind: hipcore::ErrorKind::from_raw(code),
                 code,
-            })
+            }
+            .fail()
         }
     }
 }
@@ -173,6 +190,11 @@ mod tests {
     #![expect(clippy::expect_used, reason = "test assertions use expect() directly")]
 
     use super::*;
+    // WHY not via `use super::*`: the parent's `Error` import is declared
+    // `#[expect(unused_imports)]` for intra-doc links; resolving these
+    // assertions through this dedicated import keeps that expectation
+    // fulfilled in test builds.
+    use crate::error::Error;
 
     // WHY host-side only: `check_matmul_shape` is pure `i32`/`i64`
     // arithmetic with no device access, so it needs neither `hipcc` (HIP
@@ -199,7 +221,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Error::UnsupportedShape { kernel: "matmul_fp16", msg }
+                Error::UnsupportedShape { kernel: "matmul_fp16", msg, .. }
                     if msg.contains("2147549184") && msg.contains("i32::MAX")
             ),
             "expected UnsupportedShape citing the overflowing product, got {err:?}"

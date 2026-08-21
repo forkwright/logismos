@@ -5,12 +5,15 @@ use std::ffi::c_void;
 use taxis::{DType, Shape, Tensor};
 
 use crate::device_dispatch::{DevicePlacement, classify_placement};
-use crate::error::{Error, Result};
+use crate::error::{InvalidSnafu, Result};
 
 fn dim_i32(value: usize, name: &'static str) -> Result<i32> {
-    i32::try_from(value).map_err(|_| Error::Invalid {
-        op: "matmul",
-        msg: format!("{name} dimension exceeds i32: {value}"),
+    i32::try_from(value).map_err(|_| {
+        InvalidSnafu {
+            op: "matmul",
+            msg: format!("{name} dimension exceeds i32: {value}"),
+        }
+        .build()
     })
 }
 
@@ -26,50 +29,56 @@ fn dim_i32(value: usize, name: &'static str) -> Result<i32> {
 /// launch failure.
 pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if a.dtype() != DType::F16 || b.dtype() != DType::F16 {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "matmul",
             msg: format!(
                 "Phase 1 supports F16 inputs; got A={:?}, B={:?}",
                 a.dtype(),
                 b.dtype()
             ),
-        });
+        }
+        .fail();
     }
     if a.dims().len() != 2 || b.dims().len() != 2 {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "matmul",
             msg: format!(
                 "Phase 1 requires 2-D inputs; got A shape {:?}, B shape {:?}",
                 a.dims(),
                 b.dims()
             ),
-        });
+        }
+        .fail();
     }
     if !a.is_contiguous() || !b.is_contiguous() {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "matmul",
-            msg: "inputs must be contiguous in Phase 1".into(),
-        });
+            msg: "inputs must be contiguous in Phase 1".to_string(),
+        }
+        .fail();
     }
     let a_dims = a.dims();
     let b_dims = b.dims();
     let (Some(&m), Some(&ka)) = (a_dims.first(), a_dims.get(1)) else {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "matmul",
-            msg: "A rank changed during validation".into(),
-        });
+            msg: "A rank changed during validation".to_string(),
+        }
+        .fail();
     };
     let (Some(&kb), Some(&n)) = (b_dims.first(), b_dims.get(1)) else {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "matmul",
-            msg: "B rank changed during validation".into(),
-        });
+            msg: "B rank changed during validation".to_string(),
+        }
+        .fail();
     };
     if ka != kb {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "matmul",
             msg: format!("inner dims mismatch: A={ka}, B={kb}"),
-        });
+        }
+        .fail();
     }
 
     // Phase 1 dispatch: if inputs are on HIP, use the WMMA kernel for
@@ -80,22 +89,26 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     match placement {
         DevicePlacement::BothHip => {
             let (Some(a_hip), Some(b_hip)) = (a.hip_storage(), b.hip_storage()) else {
-                return Err(Error::Invalid {
+                return InvalidSnafu {
                     op: "matmul",
-                    msg: "device-pair classification invariant violated: BothHip without two HIP operands".into(),
-                });
+                    msg: "device-pair classification invariant violated: BothHip without two HIP operands".to_string(),
+                }.fail();
             };
             let device = a_hip.device();
             if device.ordinal() != b_hip.device().ordinal() {
-                return Err(Error::Invalid {
+                return InvalidSnafu {
                     op: "matmul",
-                    msg: "A and B must live on the same device".into(),
-                });
+                    msg: "A and B must live on the same device".to_string(),
+                }
+                .fail();
             }
             let out = Tensor::zeros_hip(device, DType::F16, Shape::new(&[m, n]))?;
-            let out_hip = out.hip_storage().ok_or_else(|| Error::Invalid {
-                op: "matmul",
-                msg: "zeros_hip did not return a HIP tensor".into(),
+            let out_hip = out.hip_storage().ok_or_else(|| {
+                InvalidSnafu {
+                    op: "matmul",
+                    msg: "zeros_hip did not return a HIP tensor".to_string(),
+                }
+                .build()
             })?;
             let variant = if m % 16 == 0 && n % 16 == 0 && ka % 16 == 0 {
                 kernels::matmul::Variant::Wmma
@@ -146,10 +159,11 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         // or both on the same HIP device; mismatched placement is a
         // caller bug and must fail loudly (CLAUDE.md:77, AGENTS.md:29
         // — no silent CPU fallbacks).
-        DevicePlacement::Mixed => Err(Error::Invalid {
+        DevicePlacement::Mixed => InvalidSnafu {
             op: "matmul",
-            msg: "A and B must both be on CPU or both on the same HIP device".into(),
-        }),
+            msg: "A and B must both be on CPU or both on the same HIP device".to_string(),
+        }
+        .fail(),
     }
 }
 

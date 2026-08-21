@@ -6,12 +6,24 @@ use std::sync::{Arc, Mutex, PoisonError};
 use hipcore::{Device, DeviceBuffer};
 use taxis::{DType, Tensor};
 
-use crate::error::{Error, Result};
+use crate::error::{InvalidSnafu, Result};
+// WHY imported without a code reference: the `# Errors` sections below link to
+// `Error` variants by intra-doc path, which rustdoc resolves only against items
+// in scope. Split from the group above so the expectation covers this import
+// alone -- a later genuinely-unused import in the group still fails the gate.
+#[expect(
+    unused_imports,
+    reason = "resolves intra-doc links in this module's `# Errors` sections"
+)]
+use crate::error::Error;
 
 fn dim_i32(value: usize, name: &'static str) -> Result<i32> {
-    i32::try_from(value).map_err(|_| Error::Invalid {
-        op: "rope_apply",
-        msg: format!("{name} dimension exceeds i32: {value}"),
+    i32::try_from(value).map_err(|_| {
+        InvalidSnafu {
+            op: "rope_apply",
+            msg: format!("{name} dimension exceeds i32: {value}"),
+        }
+        .build()
     })
 }
 
@@ -89,16 +101,18 @@ impl CosSinTable {
 /// See [`Error::Invalid`] and propagated kernel errors.
 pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
     if qk.dtype() != DType::F16 {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "rope_apply",
-            msg: "F16 only in Phase 1".into(),
-        });
+            msg: "F16 only in Phase 1".to_string(),
+        }
+        .fail();
     }
     if qk.dims().len() != 4 {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "rope_apply",
             msg: format!("expected (B, S, H, D); got {:?}", qk.dims()),
-        });
+        }
+        .fail();
     }
     let qk_dims = qk.dims();
     let (Some(&batch), Some(&seq), Some(&heads), Some(&head_dim)) = (
@@ -107,19 +121,21 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
         qk_dims.get(2),
         qk_dims.get(3),
     ) else {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "rope_apply",
-            msg: "input rank changed during validation".into(),
-        });
+            msg: "input rank changed during validation".to_string(),
+        }
+        .fail();
     };
     if head_dim != table.head_dim || seq > table.seq {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "rope_apply",
             msg: format!(
                 "table shape ({}x{}) incompatible with tensor seq={seq}, head_dim={head_dim}",
                 table.seq, table.head_dim
             ),
-        });
+        }
+        .fail();
     }
     // WHY: the pair-rotation kernel and its CPU reference both index
     // `2 * pair_idx` / `2 * pair_idx + 1` off `head_dim / 2`. An odd
@@ -127,10 +143,11 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
     // element instead of rotating it — reject it here rather than
     // letting a malformed checkpoint produce quietly wrong encoding.
     if !head_dim.is_multiple_of(2) {
-        return Err(Error::Invalid {
+        return InvalidSnafu {
             op: "rope_apply",
             msg: format!("head_dim must be even, got {head_dim}"),
-        });
+        }
+        .fail();
     }
 
     match qk.hip_storage() {
@@ -140,9 +157,12 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
             // "in-place" at the kernel level, but the `Tensor` layer
             // preserves immutability).
             let out = clone_hip_tensor(qk, device)?;
-            let out_hip = out.hip_storage().ok_or_else(|| Error::Invalid {
-                op: "rope_apply",
-                msg: "clone did not return HIP".into(),
+            let out_hip = out.hip_storage().ok_or_else(|| {
+                InvalidSnafu {
+                    op: "rope_apply",
+                    msg: "clone did not return HIP",
+                }
+                .build()
             })?;
 
             let cs_dev = table.device_buffer(device)?;
@@ -199,10 +219,11 @@ fn clone_hip_tensor(t: &Tensor, device: &Device) -> Result<Tensor> {
             let host = t.to_host_f32()?;
             Ok(Tensor::from_host_f32(device, &host, t.shape().clone())?)
         }
-        other => Err(Error::Invalid {
+        other => InvalidSnafu {
             op: "clone_hip_tensor",
             msg: format!("unsupported dtype {other:?}"),
-        }),
+        }
+        .fail(),
     }
 }
 
@@ -214,6 +235,11 @@ mod tests {
     use taxis::{CpuStorage, Shape};
 
     use super::*;
+    // WHY not via `use super::*`: the parent's `Error` import is declared
+    // `#[expect(unused_imports)]` for intra-doc links; resolving these
+    // assertions through this dedicated import keeps that expectation
+    // fulfilled in test builds.
+    use crate::error::Error;
 
     #[test]
     fn rope_apply_rejects_odd_head_dim() {
@@ -236,7 +262,7 @@ mod tests {
         let err = rope_apply(&qk, &table).expect_err("odd head_dim must be rejected");
 
         assert!(
-            matches!(&err, Error::Invalid { op: "rope_apply", msg } if msg.contains("even")),
+            matches!(&err, Error::Invalid { op: "rope_apply", msg, .. } if msg.contains("even")),
             "expected an even-head_dim Invalid error, got {err:?}"
         );
     }

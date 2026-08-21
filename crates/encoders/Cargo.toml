@@ -12,7 +12,7 @@ kernels = { workspace = true }
 loader = { workspace = true }
 taxis = { workspace = true }
 transformers = { path = "../transformers" }
-thiserror = { workspace = true }
+snafu = { workspace = true }
 
 [dev-dependencies]
 safetensors = { workspace = true }

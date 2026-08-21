@@ -51,6 +51,9 @@ pub mod provider;
 pub mod safetensors;
 
 pub use crate::error::{Error, Result};
+use crate::error::{
+    MmapStaleSnafu, MsgSnafu, ShapeMismatchSnafu, UnknownFormatSnafu, UnsupportedDTypeSnafu,
+};
 pub use crate::mapping::NameMap;
 pub use crate::provider::WeightProvider;
 
@@ -85,13 +88,14 @@ impl<'a> TensorView<'a> {
         let elem_count = shape.elem_count();
         let expected_bytes = self.dtype.byte_count(elem_count);
         if self.bytes.len() != expected_bytes {
-            return Err(Error::ShapeMismatch {
+            return ShapeMismatchSnafu {
                 name: self.name.to_string(),
                 dtype: self.dtype,
                 elem_count,
                 expected_bytes,
                 actual_bytes: self.bytes.len(),
-            });
+            }
+            .fail();
         }
 
         let storage = match self.dtype {
@@ -102,10 +106,11 @@ impl<'a> TensorView<'a> {
             taxis::DType::I8 => CpuStorage::I8(read_i8_le(self.bytes)),
             taxis::DType::U8 => CpuStorage::U8(self.bytes.to_vec()),
             other => {
-                return Err(Error::UnsupportedDType {
+                return UnsupportedDTypeSnafu {
                     name: self.name.to_string(),
                     dtype: other,
-                });
+                }
+                .fail();
             }
         };
 
@@ -199,9 +204,10 @@ impl Archive {
         match ext.as_deref() {
             Some("safetensors") => Ok(Self::Safetensors(crate::safetensors::Reader::open(path)?)),
             Some("gguf") => Ok(Self::Gguf(crate::gguf::Reader::open(path)?)),
-            _ => Err(Error::UnknownFormat {
+            _ => UnknownFormatSnafu {
                 path: path.to_path_buf(),
-            }),
+            }
+            .fail(),
         }
     }
 }
@@ -222,14 +228,19 @@ impl Archive {
 /// file's current length disagrees with `expected_len`.
 pub(crate) fn check_mmap_not_truncated(path: &std::path::Path, expected_len: usize) -> Result<()> {
     let actual_len = std::fs::metadata(path)?.len();
-    let expected_len = u64::try_from(expected_len)
-        .map_err(|_| Error::Msg(format!("mmap length {expected_len} exceeds u64::MAX")))?;
+    let expected_len = u64::try_from(expected_len).map_err(|_| {
+        MsgSnafu {
+            message: format!("mmap length {expected_len} exceeds u64::MAX"),
+        }
+        .build()
+    })?;
     if actual_len != expected_len {
-        return Err(Error::MmapStale {
+        return MmapStaleSnafu {
             path: path.to_path_buf(),
             expected_len,
             actual_len,
-        });
+        }
+        .fail();
     }
     Ok(())
 }
@@ -300,7 +311,10 @@ mod tests {
         assert_eq!(tensor.dtype(), taxis::DType::F16);
         assert_eq!(tensor.dims(), &[3]);
         let Some(taxis::CpuStorage::F16(v)) = tensor.cpu_storage() else {
-            return Err(Error::Msg("expected F16 CPU storage".into()));
+            return MsgSnafu {
+                message: "expected F16 CPU storage",
+            }
+            .fail();
         };
         assert_eq!(v.as_slice(), &vals[..]);
         Ok(())
@@ -324,7 +338,10 @@ mod tests {
         assert_eq!(tensor.dtype(), taxis::DType::BF16);
         assert_eq!(tensor.dims(), &[3]);
         let Some(taxis::CpuStorage::BF16(v)) = tensor.cpu_storage() else {
-            return Err(Error::Msg("expected BF16 CPU storage".into()));
+            return MsgSnafu {
+                message: "expected BF16 CPU storage",
+            }
+            .fail();
         };
         assert_eq!(v.as_slice(), &vals[..]);
         Ok(())
@@ -347,7 +364,10 @@ mod tests {
         assert_eq!(tensor.dtype(), taxis::DType::I8);
         assert_eq!(tensor.dims(), &[3]);
         let Some(taxis::CpuStorage::I8(v)) = tensor.cpu_storage() else {
-            return Err(Error::Msg("expected I8 CPU storage".into()));
+            return MsgSnafu {
+                message: "expected I8 CPU storage",
+            }
+            .fail();
         };
         assert_eq!(v.as_slice(), &vals[..]);
         Ok(())
@@ -369,7 +389,10 @@ mod tests {
         assert_eq!(tensor.dtype(), taxis::DType::I32);
         assert_eq!(tensor.dims(), &[3]);
         let Some(taxis::CpuStorage::I32(v)) = tensor.cpu_storage() else {
-            return Err(Error::Msg("expected I32 CPU storage".into()));
+            return MsgSnafu {
+                message: "expected I32 CPU storage",
+            }
+            .fail();
         };
         assert_eq!(v.as_slice(), &vals[..]);
         Ok(())
@@ -390,7 +413,10 @@ mod tests {
         assert_eq!(tensor.dtype(), taxis::DType::U8);
         assert_eq!(tensor.dims(), &[3]);
         let Some(taxis::CpuStorage::U8(v)) = tensor.cpu_storage() else {
-            return Err(Error::Msg("expected U8 CPU storage".into()));
+            return MsgSnafu {
+                message: "expected U8 CPU storage",
+            }
+            .fail();
         };
         assert_eq!(v.as_slice(), &vals[..]);
         Ok(())

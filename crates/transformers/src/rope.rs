@@ -13,7 +13,7 @@
 
 use kernels::cpu_f32::build_rope_table_f32;
 
-use crate::error::{Error, Result};
+use crate::error::{Result, ShapeSnafu};
 
 /// Precomputed rotary-position-embedding table.
 #[derive(Debug, Clone)]
@@ -56,24 +56,33 @@ impl RopeTable {
         let mut sin_rows = Vec::with_capacity(positions.len() * half);
         for &pos in positions {
             if pos >= self.max_seq {
-                return Err(Error::Shape(format!(
-                    "RopeTable::gather: position {pos} >= max_seq {}",
-                    self.max_seq
-                )));
+                return ShapeSnafu {
+                    message: format!(
+                        "RopeTable::gather: position {pos} >= max_seq {}",
+                        self.max_seq
+                    ),
+                }
+                .fail();
             }
             let start = pos * half;
             let end = start + half;
             let cos_row = self.cos.get(start..end).ok_or_else(|| {
-                Error::Shape(format!(
-                    "RopeTable::gather: cos range {start}..{end} exceeds table length {}",
-                    self.cos.len()
-                ))
+                ShapeSnafu {
+                    message: format!(
+                        "RopeTable::gather: cos range {start}..{end} exceeds table length {}",
+                        self.cos.len()
+                    ),
+                }
+                .build()
             })?;
             let sin_row = self.sin.get(start..end).ok_or_else(|| {
-                Error::Shape(format!(
-                    "RopeTable::gather: sin range {start}..{end} exceeds table length {}",
-                    self.sin.len()
-                ))
+                ShapeSnafu {
+                    message: format!(
+                        "RopeTable::gather: sin range {start}..{end} exceeds table length {}",
+                        self.sin.len()
+                    ),
+                }
+                .build()
             })?;
             cos_rows.extend_from_slice(cos_row);
             sin_rows.extend_from_slice(sin_row);

@@ -10,7 +10,7 @@ links = "amdhip64"
 
 [dependencies]
 half.workspace = true
-thiserror.workspace = true
+snafu.workspace = true
 
 [build-dependencies]
 bindgen.workspace = true

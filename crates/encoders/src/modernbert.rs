@@ -17,7 +17,7 @@ use transformers::{
 };
 pub use transformers::{GeGluMlpWeights, ModernBertAttentionWeights};
 
-use crate::error::{Error, Result};
+use crate::error::{LayoutSnafu, Result, ShapeSnafu};
 
 /// Encoder-side configuration extracted from a ModernBERT checkpoint config.
 ///
@@ -231,16 +231,19 @@ fn load_layer(
 fn read_f32(reader: &Reader, name: &str, expected_shape: &[usize]) -> Result<Vec<f32>> {
     let view = reader.get(name)?;
     if view.dtype != taxis::DType::F32 {
-        return Err(Error::Layout(format!(
-            "{name}: expected F32, got {:?}",
-            view.dtype
-        )));
+        return LayoutSnafu {
+            message: format!("{name}: expected F32, got {:?}", view.dtype),
+        }
+        .fail();
     }
     if view.shape != expected_shape {
-        return Err(Error::Layout(format!(
-            "{name}: expected shape {:?}, got {:?}",
-            expected_shape, view.shape
-        )));
+        return LayoutSnafu {
+            message: format!(
+                "{name}: expected shape {:?}, got {:?}",
+                expected_shape, view.shape
+            ),
+        }
+        .fail();
     }
     let mut out = Vec::with_capacity(view.bytes.len() / 4);
     for chunk in view.bytes.chunks_exact(4) {
@@ -286,19 +289,23 @@ impl ModernBertEncoder {
         let h = cfg.hidden_size;
         let n_heads = cfg.num_attention_heads;
         if n_heads == 0 || !h.is_multiple_of(n_heads) {
-            return Err(Error::Shape(format!(
-                "hidden_size {h} not divisible by num_attention_heads {n_heads}"
-            )));
+            return ShapeSnafu {
+                message: format!("hidden_size {h} not divisible by num_attention_heads {n_heads}"),
+            }
+            .fail();
         }
         let head_dim = h / n_heads;
         let global_every = cfg.global_attn_every_n_layers;
 
         if weights.layers.len() != cfg.num_hidden_layers {
-            return Err(Error::Shape(format!(
-                "weights.layers.len()={} != num_hidden_layers={}",
-                weights.layers.len(),
-                cfg.num_hidden_layers
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "weights.layers.len()={} != num_hidden_layers={}",
+                    weights.layers.len(),
+                    cfg.num_hidden_layers
+                ),
+            }
+            .fail();
         }
 
         let rope_local =
@@ -319,12 +326,20 @@ impl ModernBertEncoder {
                 is_global,
                 attention_bias: cfg.attention_bias,
             };
-            let attn = ModernBertAttention::new(acfg, lw.attn.clone())
-                .map_err(|e| Error::Shape(e.to_string()))?;
+            let attn = ModernBertAttention::new(acfg, lw.attn.clone()).map_err(|e| {
+                ShapeSnafu {
+                    message: e.to_string(),
+                }
+                .build()
+            })?;
             attn_blocks.push(attn);
 
-            let mlp = GeGluMlp::new(h, cfg.intermediate_size, lw.mlp.clone())
-                .map_err(|e| Error::Shape(e.to_string()))?;
+            let mlp = GeGluMlp::new(h, cfg.intermediate_size, lw.mlp.clone()).map_err(|e| {
+                ShapeSnafu {
+                    message: e.to_string(),
+                }
+                .build()
+            })?;
             mlp_blocks.push(mlp);
         }
 
@@ -360,14 +375,16 @@ impl ModernBertEncoder {
     pub fn forward(&self, token_ids: &[u32], mask: &[u8]) -> Result<Vec<f32>> {
         let seq = token_ids.len();
         if seq == 0 {
-            return Err(Error::Shape("encoder.forward: empty input".into()));
+            return ShapeSnafu {
+                message: "encoder.forward: empty input".to_string(),
+            }
+            .fail();
         }
         if mask.len() != seq {
-            return Err(Error::Shape(format!(
-                "encoder.forward: mask.len()={} != seq={}",
-                mask.len(),
-                seq
-            )));
+            return ShapeSnafu {
+                message: format!("encoder.forward: mask.len()={} != seq={}", mask.len(), seq),
+            }
+            .fail();
         }
         let h = self.cfg.hidden_size;
         let global_every = self.cfg.global_attn_every_n_layers;
@@ -418,7 +435,12 @@ impl ModernBertEncoder {
             let rope = if is_global { rope_global } else { rope_local };
             let attn_out = attn_block
                 .forward(&normed_attn, rope, &positions, mask)
-                .map_err(|e| Error::Shape(e.to_string()))?;
+                .map_err(|e| {
+                    ShapeSnafu {
+                        message: e.to_string(),
+                    }
+                    .build()
+                })?;
             for (xv, av) in hidden.iter_mut().zip(attn_out.iter()) {
                 *xv += av;
             }
@@ -432,9 +454,12 @@ impl ModernBertEncoder {
                 h,
                 norm_eps,
             );
-            let mlp_out = mlp_block
-                .forward(&normed_mlp)
-                .map_err(|e| Error::Shape(e.to_string()))?;
+            let mlp_out = mlp_block.forward(&normed_mlp).map_err(|e| {
+                ShapeSnafu {
+                    message: e.to_string(),
+                }
+                .build()
+            })?;
             for (xv, mv) in hidden.iter_mut().zip(mlp_out.iter()) {
                 *xv += mv;
             }

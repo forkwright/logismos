@@ -16,7 +16,16 @@ use transformers::{
     SwiGluMlpWeights, rms_norm_f32,
 };
 
-use crate::error::{Error, Result};
+use crate::error::{LayoutSnafu, Result, ShapeSnafu};
+// WHY imported without a code reference: the `# Errors` sections below link to
+// `Error` variants by intra-doc path, which rustdoc resolves only against items
+// in scope. Split from the group above so the expectation covers this import
+// alone -- a later genuinely-unused import in the group still fails the gate.
+#[expect(
+    unused_imports,
+    reason = "resolves intra-doc links in this module's `# Errors` sections"
+)]
+use crate::error::Error;
 
 /// Tensors [`load_layer`] reads per transformer layer, feeding the
 /// checkpoint-completeness guard in [`StellaWeights::load`]:
@@ -126,10 +135,13 @@ impl StellaWeights {
         // individual name lookup downstream.
         let have: Vec<String> = reader.names();
         if have.len() != total_expected {
-            return Err(Error::Layout(format!(
-                "expected {total_expected} tensors in stella archive, got {}",
-                have.len()
-            )));
+            return LayoutSnafu {
+                message: format!(
+                    "expected {total_expected} tensors in stella archive, got {}",
+                    have.len()
+                ),
+            }
+            .fail();
         }
 
         let tok_embed = read_f32(
@@ -265,18 +277,21 @@ impl StellaEncoder {
     /// [`Error::Shape`] on mismatched input lengths.
     pub fn forward(&self, ids: &[u32], mask: &[u8]) -> Result<Vec<f32>> {
         if ids.len() != mask.len() {
-            return Err(Error::Shape(format!(
-                "forward: ids.len()={} != mask.len()={}",
-                ids.len(),
-                mask.len()
-            )));
+            return ShapeSnafu {
+                message: format!(
+                    "forward: ids.len()={} != mask.len()={}",
+                    ids.len(),
+                    mask.len()
+                ),
+            }
+            .fail();
         }
         let seq = ids.len();
         if seq > self.cfg.max_pos {
-            return Err(Error::Shape(format!(
-                "forward: seq {} > max_pos {}",
-                seq, self.cfg.max_pos
-            )));
+            return ShapeSnafu {
+                message: format!("forward: seq {} > max_pos {}", seq, self.cfg.max_pos),
+            }
+            .fail();
         }
 
         // 1. Embedding lookup.
@@ -361,16 +376,19 @@ fn layer_weight(r: &Reader, i: usize, suffix: &str, expected_shape: &[usize]) ->
 fn read_f32(r: &Reader, name: &str, expected_shape: &[usize]) -> Result<Vec<f32>> {
     let view = r.get(name)?;
     if view.dtype != taxis::DType::F32 {
-        return Err(Error::Layout(format!(
-            "{name}: expected F32, got {:?}",
-            view.dtype
-        )));
+        return LayoutSnafu {
+            message: format!("{name}: expected F32, got {:?}", view.dtype),
+        }
+        .fail();
     }
     if view.shape != expected_shape {
-        return Err(Error::Layout(format!(
-            "{name}: expected shape {:?}, got {:?}",
-            expected_shape, view.shape
-        )));
+        return LayoutSnafu {
+            message: format!(
+                "{name}: expected shape {:?}, got {:?}",
+                expected_shape, view.shape
+            ),
+        }
+        .fail();
     }
     let mut out = Vec::with_capacity(view.bytes.len() / 4);
     for chunk in view.bytes.chunks_exact(4) {
@@ -390,6 +408,11 @@ mod tests {
     use safetensors::tensor::{Dtype as UpstreamDtype, TensorView as UpstreamView};
 
     use super::*;
+    // WHY not via `use super::*`: the parent's `Error` import is declared
+    // `#[expect(unused_imports)]` for intra-doc links; resolving these
+    // assertions through this dedicated import keeps that expectation
+    // fulfilled in test builds.
+    use crate::error::Error;
 
     /// Tiny Stella-shaped config: same field structure as
     /// [`StellaConfig::stella_1_5b`], scaled down so the fixture below
@@ -517,7 +540,7 @@ mod tests {
         let result = StellaWeights::load(&path, &cfg);
         let _ = std::fs::remove_file(&path);
         assert!(
-            matches!(&result, Err(Error::Layout(_))),
+            matches!(&result, Err(Error::Layout { .. })),
             "a checkpoint short of the expected tensor count must be rejected by the count guard as a layout error, got {result:?}"
         );
         Ok(())
@@ -537,7 +560,7 @@ mod tests {
         let result = StellaWeights::load(&path, &cfg);
         let _ = std::fs::remove_file(&path);
         assert!(
-            matches!(&result, Err(Error::Layout(_))),
+            matches!(&result, Err(Error::Layout { .. })),
             "a checkpoint with an unconsumed extra tensor must be rejected as a layout error, got {result:?}"
         );
         Ok(())

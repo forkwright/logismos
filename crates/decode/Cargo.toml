@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 taxis = { workspace = true }
-thiserror = { workspace = true }
+snafu = { workspace = true }
 rand = { workspace = true }
 
 [lints]

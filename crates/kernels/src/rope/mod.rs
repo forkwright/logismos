@@ -18,7 +18,21 @@ use std::ffi::c_void;
 
 use hipcore::Stream;
 
-use crate::error::{Error, Result};
+use crate::error::{NoGpuBuildSnafu, Result, UnsupportedShapeSnafu};
+// WHY cfg-gated: only the `not(logismos_no_gpu_kernels)` launcher body builds
+// launch errors, so an unconditional import fails `-D warnings` on hipcc-less
+// (CPU-only) builds.
+#[cfg(not(logismos_no_gpu_kernels))]
+use crate::error::LaunchSnafu;
+// WHY imported without a code reference: the `# Errors` sections below link to
+// `Error` variants by intra-doc path, which rustdoc resolves only against items
+// in scope. Split from the group above so the expectation covers this import
+// alone -- a later genuinely-unused import in the group still fails the gate.
+#[expect(
+    unused_imports,
+    reason = "resolves intra-doc links in this module's `# Errors` sections"
+)]
+use crate::error::Error;
 
 #[cfg_attr(
     logismos_no_gpu_kernels,
@@ -70,10 +84,11 @@ fn check_rope_shape(batch: i32, seq: i32, heads: i32, head_dim: i32) -> Result<(
         (head_dim, "head_dim"),
     ] {
         if value <= 0 {
-            return Err(Error::UnsupportedShape {
+            return UnsupportedShapeSnafu {
                 kernel: "rope_fp16",
                 msg: format!("{name} must be positive, got {value}"),
-            });
+            }
+            .fail();
         }
     }
     // INVARIANT: all four operands are positive `i32` here, but their
@@ -92,24 +107,26 @@ fn check_rope_shape(batch: i32, seq: i32, heads: i32, head_dim: i32) -> Result<(
         .into_iter()
         .try_fold(1i64, |acc, value| acc.checked_mul(i64::from(value)));
     let Some(total) = total else {
-        return Err(Error::UnsupportedShape {
+        return UnsupportedShapeSnafu {
             kernel: "rope_fp16",
             msg: format!(
                 "batch*seq*heads*head_dim overflows i64 (batch={batch}, seq={seq}, \
                  heads={heads}, head_dim={head_dim}); rope.hip's composite base \
                  index cannot address this shape"
             ),
-        });
+        }
+        .fail();
     };
     if total > i64::from(i32::MAX) {
         let max = i32::MAX;
-        return Err(Error::UnsupportedShape {
+        return UnsupportedShapeSnafu {
             kernel: "rope_fp16",
             msg: format!(
                 "batch*seq*heads*head_dim = {total} exceeds i32::MAX ({max}); \
                  rope.hip's composite base index cannot address this shape"
             ),
-        });
+        }
+        .fail();
     }
     Ok(())
 }
@@ -140,7 +157,7 @@ pub unsafe fn launch_rope_fp16_in_place(
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (qk, cos_sin, batch, seq, heads, head_dim, stream);
-        Err(Error::NoGpuBuild { kernel: "rope" })
+        NoGpuBuildSnafu { kernel: "rope" }.fail()
     }
 
     #[cfg(not(logismos_no_gpu_kernels))]
@@ -160,11 +177,12 @@ pub unsafe fn launch_rope_fp16_in_place(
         if code == 0 {
             Ok(())
         } else {
-            Err(Error::Launch {
+            LaunchSnafu {
                 kernel: "rope_fp16",
                 kind: hipcore::ErrorKind::from_raw(code),
                 code,
-            })
+            }
+            .fail()
         }
     }
 }
@@ -174,6 +192,11 @@ mod tests {
     #![expect(clippy::expect_used, reason = "test assertions use expect() directly")]
 
     use super::*;
+    // WHY not via `use super::*`: the parent's `Error` import is declared
+    // `#[expect(unused_imports)]` for intra-doc links; resolving these
+    // assertions through this dedicated import keeps that expectation
+    // fulfilled in test builds.
+    use crate::error::Error;
 
     // WHY host-side only: `check_rope_shape` is pure `i32`/`i64`
     // arithmetic with no device access, so it needs neither `hipcc` (HIP
@@ -200,7 +223,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Error::UnsupportedShape { kernel: "rope_fp16", msg }
+                Error::UnsupportedShape { kernel: "rope_fp16", msg, .. }
                     if msg.contains("2147500032") && msg.contains("i32::MAX")
             ),
             "expected UnsupportedShape citing the overflowing product, got {err:?}"
@@ -222,7 +245,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Error::UnsupportedShape { kernel: "rope_fp16", msg }
+                Error::UnsupportedShape { kernel: "rope_fp16", msg, .. }
                     if msg.contains("overflows i64")
             ),
             "expected UnsupportedShape citing the i64 overflow, got {err:?}"

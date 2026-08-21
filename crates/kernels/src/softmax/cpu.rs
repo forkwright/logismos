@@ -14,10 +14,11 @@ use half::f16;
 pub fn softmax_fp16_ref(x: &[f16], m: usize, n: usize) -> crate::error::Result<Vec<f16>> {
     let expected_len = m * n;
     if x.len() != expected_len {
-        return Err(crate::error::Error::UnsupportedShape {
+        return crate::error::UnsupportedShapeSnafu {
             kernel: "softmax_fp16_ref",
             msg: format!("x.len()={} != m*n={expected_len}", x.len()),
-        });
+        }
+        .fail();
     }
     let mut y = vec![f16::from_f32(0.0); m * n];
     for row in 0..m {

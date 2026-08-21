@@ -6,17 +6,20 @@
 
 use std::ffi::c_int;
 
+use snafu::Snafu;
+
 use crate::ffi;
 
 /// Result alias used throughout `hipcore`.
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Every failure surface `hipcore` can emit.
-#[derive(thiserror::Error, Debug)]
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
     /// A HIP runtime call returned a non-success status.
-    #[error("HIP runtime error: {kind:?} ({code}) in `{op}`")]
+    #[snafu(display("HIP runtime error: {kind:?} ({code}) in `{op}`"))]
     Runtime {
         /// Classified error kind.
         kind: ErrorKind,
@@ -24,48 +27,69 @@ pub enum Error {
         code: u32,
         /// Static operation name.
         op: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 
     /// Device ordinal out of range.
-    #[error("device {ordinal} not found (host reports {count} devices)")]
+    #[snafu(display("device {ordinal} not found (host reports {count} devices)"))]
     NoSuchDevice {
         /// Requested ordinal.
         ordinal: c_int,
         /// Devices reported by `hipGetDeviceCount`.
         count: c_int,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 
     /// Allocation failed because device memory is exhausted.
-    #[error("out of device memory: requested {requested} bytes, {free} bytes free")]
+    #[snafu(display("out of device memory: requested {requested} bytes, {free} bytes free"))]
     OutOfMemory {
         /// Allocation size in bytes.
         requested: usize,
         /// Free VRAM at the time of the failed call.
         free: u64,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 
     /// Kernel launch failed; wraps the underlying HIP error.
-    #[error("kernel launch failed: {kernel}: {source}")]
+    #[snafu(display("kernel launch failed: {kernel}: {source}"))]
     LaunchFailure {
         /// Kernel symbol name.
         kernel: &'static str,
         /// Source HIP error.
         source: Box<Error>,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 
     /// Detected ISA does not match the expected gfx1100 target.
     ///
     /// Non-fatal at construction time (a logismos consumer may choose
     /// to continue on another ISA), but surfaced so callers can decide.
-    #[error("unsupported ISA `{isa}`, expected `gfx1100`")]
+    #[snafu(display("unsupported ISA `{isa}`, expected `gfx1100`"))]
     UnsupportedIsa {
         /// ISA reported by `hipGetDeviceProperties`.
         isa: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 
     /// Something went wrong inside the safe wrapper rather than HIP.
-    #[error("internal hipcore error: {0}")]
-    Internal(String),
+    #[snafu(display("internal hipcore error: {message}"))]
+    Internal {
+        /// Free-form description.
+        message: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }
 
 /// Classified HIP error kind.
@@ -180,11 +204,12 @@ impl Error {
     /// Build a [`Error::Runtime`] from a raw HIP status code.
     #[must_use]
     pub(crate) fn runtime(code: u32, op: &'static str) -> Self {
-        Self::Runtime {
+        RuntimeSnafu {
             kind: ErrorKind::from_raw(code),
             code,
             op,
         }
+        .build()
     }
 }
 

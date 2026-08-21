@@ -7,10 +7,15 @@ use encoders::{StellaConfig, StellaEncoder};
 use kernels::cpu_f32;
 use loader::WeightProvider;
 use loader::safetensors::Reader;
-use logismos_core::{EmbeddingError, EmbeddingModel, EncodeOpts, Prompt};
+use logismos_core::{
+    ComputeSnafu as CoreComputeSnafu, EmbeddingError, EmbeddingModel, EncodeOpts,
+    InputTooLongSnafu as CoreInputTooLongSnafu, Prompt, TokenizeSnafu as CoreTokenizeSnafu,
+    UnsupportedDimSnafu as CoreUnsupportedDimSnafu,
+    UnsupportedPromptSnafu as CoreUnsupportedPromptSnafu,
+};
 use tokenize::Tokenizer;
 
-use crate::error::{Error, Result};
+use crate::error::{IoSnafu, Result, UnsupportedDimSnafu};
 
 /// Matryoshka output dimensionality for Stella.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,9 +154,12 @@ impl StellaModel {
             1024
         } else {
             // Fall back to the first loaded head.
-            *supported
-                .first()
-                .ok_or_else(|| Error::Io("no heads loaded".into()))?
+            *supported.first().ok_or_else(|| {
+                IoSnafu {
+                    message: "no heads loaded",
+                }
+                .build()
+            })?
         };
 
         // Prompt metadata is optional for the checkpoint: an absent
@@ -172,7 +180,12 @@ impl StellaModel {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(n_physical)
             .build()
-            .map_err(|e| Error::Io(format!("rayon pool: {e}")))?;
+            .map_err(|e| {
+                IoSnafu {
+                    message: format!("rayon pool: {e}"),
+                }
+                .build()
+            })?;
 
         Ok(Self {
             cfg,
@@ -206,7 +219,10 @@ impl StellaModel {
     ///
     /// Propagates encoder / shape failures.
     pub(crate) fn encode_raw(&self, ids: &[u32], mask: &[u8], dim: usize) -> Result<Vec<f32>> {
-        let head = self.heads.get(&dim).ok_or(Error::UnsupportedDim(dim))?;
+        let head = self
+            .heads
+            .get(&dim)
+            .ok_or_else(|| UnsupportedDimSnafu { dim }.build())?;
 
         // Forward through the encoder: [seq, hidden]
         let hidden_states = self.encoder.forward(ids, mask)?;
@@ -284,7 +300,7 @@ impl EmbeddingModel for StellaModel {
     ) -> std::result::Result<Vec<f32>, EmbeddingError> {
         let dim = opts.dim.unwrap_or(self.default_dim);
         if !self.supported.contains(&dim) {
-            return Err(EmbeddingError::UnsupportedDim(dim));
+            return CoreUnsupportedDimSnafu { dim }.fail();
         }
         let max_tokens = opts.max_tokens.unwrap_or(self.max_tokens);
         let text_with_prompt = apply_prompt(&self.prompts, opts.prompt.as_ref(), text)?;
@@ -292,11 +308,20 @@ impl EmbeddingModel for StellaModel {
         let ids: Vec<u32> = self
             .tokenizer
             .encode(&text_with_prompt, true)
-            .map_err(|e| EmbeddingError::Tokenize(e.to_string()))?;
+            .map_err(|e| {
+                CoreTokenizeSnafu {
+                    message: e.to_string(),
+                }
+                .build()
+            })?;
         check_token_limit(ids.len(), max_tokens)?;
         let mask = vec![1u8; ids.len()];
-        self.encode_raw(&ids, &mask, dim)
-            .map_err(|e| EmbeddingError::Compute(e.to_string()))
+        self.encode_raw(&ids, &mask, dim).map_err(|e| {
+            CoreComputeSnafu {
+                message: e.to_string(),
+            }
+            .build()
+        })
     }
 }
 
@@ -327,7 +352,7 @@ fn apply_prompt(
             .get("s2p_query")
             .map_or_else(|| text.to_string(), |p| format!("{p}{text}")),
         Some(Prompt::Custom(s)) => format!("{s}{text}"),
-        Some(_) => return Err(EmbeddingError::UnsupportedPrompt),
+        Some(_) => return Err(CoreUnsupportedPromptSnafu.build()),
     })
 }
 
@@ -342,10 +367,11 @@ fn check_token_limit(
     max_tokens: usize,
 ) -> std::result::Result<(), EmbeddingError> {
     if token_count > max_tokens {
-        Err(EmbeddingError::InputTooLong {
+        CoreInputTooLongSnafu {
             got: token_count,
             limit: max_tokens,
-        })
+        }
+        .fail()
     } else {
         Ok(())
     }
@@ -357,12 +383,15 @@ fn load_dense_head(root: &Path, dim: StellaDim, hidden: usize) -> Result<DenseHe
     let w_view = reader.get("linear.weight")?;
     let b_view = reader.get("linear.bias")?;
     if w_view.dtype != taxis::DType::F32 || b_view.dtype != taxis::DType::F32 {
-        return Err(Error::Io(format!(
-            "dense head {}: expected F32, got weight={:?}, bias={:?}",
-            dim.folder(),
-            w_view.dtype,
-            b_view.dtype
-        )));
+        return IoSnafu {
+            message: format!(
+                "dense head {}: expected F32, got weight={:?}, bias={:?}",
+                dim.folder(),
+                w_view.dtype,
+                b_view.dtype
+            ),
+        }
+        .fail();
     }
     validate_head_shapes(dim.folder(), &w_view.shape, &b_view.shape, dim, hidden)?;
     let weight = bytes_to_f32(w_view.bytes);
@@ -394,15 +423,21 @@ fn validate_head_shapes(
 ) -> Result<()> {
     let expected_w = [dim.width(), hidden];
     if w_shape != expected_w.as_slice() {
-        return Err(Error::Io(format!(
-            "dense head {label}: expected weight shape {expected_w:?}, got {w_shape:?}"
-        )));
+        return IoSnafu {
+            message: format!(
+                "dense head {label}: expected weight shape {expected_w:?}, got {w_shape:?}"
+            ),
+        }
+        .fail();
     }
     let expected_b = [dim.width()];
     if b_shape != expected_b.as_slice() {
-        return Err(Error::Io(format!(
-            "dense head {label}: expected bias shape {expected_b:?}, got {b_shape:?}"
-        )));
+        return IoSnafu {
+            message: format!(
+                "dense head {label}: expected bias shape {expected_b:?}, got {b_shape:?}"
+            ),
+        }
+        .fail();
     }
     Ok(())
 }
@@ -674,7 +709,11 @@ mod tests {
         let err = check_token_limit(5, 4).expect_err("over-limit must error");
         assert!(matches!(
             err,
-            EmbeddingError::InputTooLong { got: 5, limit: 4 }
+            EmbeddingError::InputTooLong {
+                got: 5,
+                limit: 4,
+                ..
+            }
         ));
     }
 
