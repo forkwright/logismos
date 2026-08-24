@@ -57,3 +57,17 @@ jobs:
         run: cargo install cargo-audit --locked --version ^0.22
       - name: cargo audit
         run: cargo audit --deny unmaintained --deny unsound --deny yanked
+
+  # WHY the reusable workflow rather than the scanner action: the action's own
+  # description recommends it, and warns the action's behaviour may change in a
+  # minor patch update. This repo can use it now that Cargo.lock is committed --
+  # the scan-args reference a lockfile that must exist on disk after checkout.
+  osv-scanner:
+    name: osv scanner
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    with:
+      scan-args: '--config=osv-scanner.toml --lockfile=Cargo.lock'

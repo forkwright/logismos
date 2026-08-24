@@ -8,4 +8,8 @@
 ignore = [
     # paste unmaintained — transitive via tokenizers/spm_precompiled
     "RUSTSEC-2024-0436",
+    # name collision — `cache` here is this workspace's crates/cache path dependency, not the abandoned crates.io crate
+    "RUSTSEC-2020-0128",
+    # name collision — `cache` here is this workspace's crates/cache path dependency, not the abandoned crates.io crate
+    "RUSTSEC-2021-0006",
 ]

@@ -3,7 +3,13 @@
 **/*.rs.bk
 
 # Cargo
-Cargo.lock
+#
+# WHY Cargo.lock IS committed here: it was ignored by inheritance rather than by
+# decision -- the line arrived in the initial public snapshot with no stated
+# reason, while every other Rust workspace in the fleet commits its lockfile.
+# Committing it makes `--locked` builds reproducible and gives the OSV scanner
+# something to scan; without it that job finds no lockfile and fails on every
+# run rather than reporting anything.
 
 # Editor / OS cruft
 .DS_Store
