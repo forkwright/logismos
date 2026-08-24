@@ -1,0 +1,27 @@
+version: 2
+
+updates:
+  # WARNING: every lockfile needs a row here. Nothing fails when one is missing --
+  # a graph watched by no entry simply never updates, which is invisible until an
+  # advisory lands in it. thumos lost nine releases of fuzz/Cargo.lock that way.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      patch-updates:
+        update-types: [patch]
+      minor-updates:
+        update-types: [minor]
+    reviewers:
+      - forkwright
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        update-types: [minor, patch]
