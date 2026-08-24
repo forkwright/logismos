@@ -37,7 +37,7 @@ num-traits = "0.2"
 # safetensors: upstream reader for the HF safetensors format
 # (approved in the Phase-0 dossier as a sovereignty cut; the format
 # itself is our API, no reason to reinvent header parsing).
-safetensors = "0.7"
+safetensors = "0.8"
 # tokenizers: HF tokenizer.json runtime. Approved as a sovereignty
 # cut in Phase-0 dossier 02 §tokenize. `default-features = false` strips
 # the HTTP hub client, progressbar, and C++ esaxx dep; we keep only the
