@@ -12,6 +12,23 @@ all-features = false
 id = "RUSTSEC-2024-0436"
 reason = "paste unmaintained — transitive via tokenizers/spm_precompiled"
 
+# RUSTSEC-2020-0128 and RUSTSEC-2021-0006 are NAME COLLISIONS, not findings. Both
+# advisories concern an abandoned crates.io crate called `cache`. The `cache 1.0.9`
+# in this lockfile is THIS workspace's own crate at crates/cache -- its lockfile
+# entry carries no `source` and no `checksum`, which is what a path dependency
+# looks like and what a registry crate never looks like.
+#
+# Scanners that match on name alone cannot tell the two apart. aletheia's
+# .cargo/audit.toml already carries the same pair with the same reasoning, so this
+# is a known class rather than a new judgement.
+[[advisories.ignore]]
+id = "RUSTSEC-2020-0128"
+reason = "name collision — `cache` here is this workspace's crates/cache path dependency, not the abandoned crates.io crate"
+
+[[advisories.ignore]]
+id = "RUSTSEC-2021-0006"
+reason = "name collision — `cache` here is this workspace's crates/cache path dependency, not the abandoned crates.io crate"
+
 [licenses]
 allow = [
     "MIT",

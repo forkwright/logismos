@@ -5,3 +5,11 @@
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0436"
 reason = "paste unmaintained — transitive via tokenizers/spm_precompiled"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2020-0128"
+reason = "name collision — `cache` here is this workspace's crates/cache path dependency, not the abandoned crates.io crate"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2021-0006"
+reason = "name collision — `cache` here is this workspace's crates/cache path dependency, not the abandoned crates.io crate"
