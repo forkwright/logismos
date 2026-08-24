@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use hipcore::{BytePod, Device};
+use hipcore::Device;
 
-use crate::dtype::DType;
+use crate::dtype::{DType, DTyped};
 use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::shape::Shape;
@@ -44,7 +44,7 @@ impl Tensor {
     /// [`Error::ShapeMismatch`] when `data.len() != shape.elem_count()`.
     /// [`Error::Hip`] on device allocation or copy failure.
     pub fn from_host_f32(device: &Device, data: &[f32], shape: Shape) -> Result<Self> {
-        Self::from_host_typed(device, data, shape, DType::F32)
+        Self::from_host_typed(device, data, shape)
     }
 
     /// Construct a HIP tensor from a host slice of `half::f16`.
@@ -53,7 +53,7 @@ impl Tensor {
     ///
     /// See [`Self::from_host_f32`].
     pub fn from_host_f16(device: &Device, data: &[half::f16], shape: Shape) -> Result<Self> {
-        Self::from_host_typed(device, data, shape, DType::F16)
+        Self::from_host_typed(device, data, shape)
     }
 
     /// Construct a HIP tensor from a host slice of `half::bf16`.
@@ -62,15 +62,13 @@ impl Tensor {
     ///
     /// See [`Self::from_host_f32`].
     pub fn from_host_bf16(device: &Device, data: &[half::bf16], shape: Shape) -> Result<Self> {
-        Self::from_host_typed(device, data, shape, DType::BF16)
+        Self::from_host_typed(device, data, shape)
     }
 
-    fn from_host_typed<T: BytePod>(
-        device: &Device,
-        data: &[T],
-        shape: Shape,
-        dtype: DType,
-    ) -> Result<Self> {
+    /// `dtype` is derived from `T::DTYPE` ([`DTyped`]), never accepted
+    /// as a free parameter — a caller cannot request a `T`/dtype pair
+    /// that disagrees, because there is no second value to disagree.
+    fn from_host_typed<T: DTyped>(device: &Device, data: &[T], shape: Shape) -> Result<Self> {
         if data.len() != shape.elem_count() {
             return Err(Error::ShapeMismatch {
                 op: "from_host_typed",
@@ -81,27 +79,24 @@ impl Tensor {
                 ),
             });
         }
-        let storage = HipStorage::from_host(device, dtype, data)?;
+        let storage = HipStorage::from_host(device, data)?;
         let layout = Layout::contiguous(shape);
         Ok(Self {
             inner: Arc::new(TensorInner {
-                dtype,
+                dtype: T::DTYPE,
                 storage: Arc::new(Storage::Hip(storage)),
                 layout,
             }),
         })
     }
 
-    /// Allocate a HIP tensor of the given shape + dtype, uninitialised.
+    /// Allocate a HIP tensor of the given shape + dtype, zero-filled.
     ///
     /// # Errors
     ///
-    /// [`Error::Hip`] on allocation failure.
+    /// [`Error::Hip`] on allocation or zero-fill failure.
     pub fn zeros_hip(device: &Device, dtype: DType, shape: Shape) -> Result<Self> {
         let elem = shape.elem_count();
-        // Caller may want genuinely zeroed memory; `hipMalloc` does
-        // not zero. Phase-1 kernels always overwrite their outputs,
-        // so this allocation stays uninitialised by design.
         let storage = HipStorage::alloc(device, dtype, elem)?;
         let layout = Layout::contiguous(shape);
         Ok(Self {

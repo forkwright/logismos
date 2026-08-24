@@ -37,7 +37,7 @@ pub mod shape;
 pub mod storage;
 pub mod tensor;
 
-pub use crate::dtype::DType;
+pub use crate::dtype::{DType, DTyped};
 pub use crate::error::{Error, Result};
 pub use crate::layout::Layout;
 pub use crate::shape::Shape;

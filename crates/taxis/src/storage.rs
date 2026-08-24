@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hipcore::{BytePod, Device, DeviceBuffer};
 
-use crate::dtype::DType;
+use crate::dtype::{DType, DTyped};
 use crate::error::{Error, Result};
 
 /// Type-erased CPU storage. One variant per supported dtype that has
@@ -138,10 +138,15 @@ impl HipStorage {
     ///
     /// # Errors
     ///
-    /// [`Error::Hip`] on allocation failure.
+    /// [`Error::Hip`] on allocation or zero-fill failure.
     pub fn alloc(device: &Device, dtype: DType, elem_count: usize) -> Result<Self> {
         let bytes = dtype.byte_count(elem_count);
-        let buffer = DeviceBuffer::<u8>::alloc(device, bytes)?;
+        let mut buffer = DeviceBuffer::<u8>::alloc(device, bytes)?;
+        // WHY: `hipMalloc` never zeroes memory; without this, any
+        // caller trusting this fn's "zeroed" contract (or a Phase-1
+        // kernel that does not overwrite every output element) would
+        // observe residual bytes from a prior allocation.
+        buffer.zero_fill()?;
         Ok(Self {
             buffer: Arc::new(buffer),
             dtype,
@@ -152,20 +157,25 @@ impl HipStorage {
 
     /// Copy a typed host slice to a freshly allocated HIP storage.
     ///
+    /// The stored `dtype` is derived from `T::DTYPE`
+    /// ([`DTyped`]) rather than accepted as a separate
+    /// parameter, so the declared dtype cannot disagree with the byte
+    /// layout of `data`.
+    ///
     /// # Errors
     ///
     /// [`Error::Hip`] on allocation or memcpy failure.
-    pub fn from_host<T: BytePod>(device: &Device, dtype: DType, data: &[T]) -> Result<Self> {
-        // SAFETY: `T: BytePod` guarantees every bit pattern is valid
-        // and the type is `Copy`. Transmuting the slice to a byte
-        // view is defined.
+    pub fn from_host<T: DTyped>(device: &Device, data: &[T]) -> Result<Self> {
+        // SAFETY: `T: BytePod` (via `DTyped`'s supertrait) guarantees
+        // every bit pattern is valid and the type is `Copy`.
+        // Transmuting the slice to a byte view is defined.
         let bytes: &[u8] = unsafe {
             core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), core::mem::size_of_val(data))
         };
         let buffer = DeviceBuffer::<u8>::from_host(device, bytes)?;
         Ok(Self {
             buffer: Arc::new(buffer),
-            dtype,
+            dtype: T::DTYPE,
             elem_count: data.len(),
             device: device.clone(),
         })

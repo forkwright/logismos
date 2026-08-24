@@ -205,6 +205,28 @@ impl<T: BytePod> DeviceBuffer<T> {
             "hipMemcpyAsync(HtoD)",
         )
     }
+
+    /// Zero every byte of the allocation via `hipMemset`.
+    ///
+    /// `hipMalloc` never zeroes device memory on its own — a fresh
+    /// allocation can carry residual bytes from whatever this VRAM
+    /// region held before. Call this whenever a caller-facing "zeroed"
+    /// contract depends on it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Runtime`] on HIP failure.
+    pub fn zero_fill(&mut self) -> Result<()> {
+        self.device.make_current()?;
+        let byte_len = self.byte_len();
+        // SAFETY: `self.ptr` is a live device allocation owned by this
+        // `DeviceBuffer`, sized `byte_len` bytes; `hipMemset` writes
+        // exactly that many bytes starting at the pointer.
+        check(
+            unsafe { ffi::hipMemset(self.ptr.as_ptr().cast::<c_void>(), 0, byte_len) },
+            "hipMemset",
+        )
+    }
 }
 
 impl<T: BytePod> Drop for DeviceBuffer<T> {
