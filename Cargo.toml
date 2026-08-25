@@ -29,7 +29,7 @@ multiple_crate_versions = "allow"
 half = "2.4"
 smallvec = { version = "1.13", features = ["union"] }
 thiserror = "2"
-snafu = "0.8"
+snafu = "0.9"
 bindgen = "0.71"
 num-traits = "0.2"
 
