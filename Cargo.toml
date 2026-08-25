@@ -42,7 +42,7 @@ safetensors = "0.8"
 # cut in Phase-0 dossier 02 §tokenize. `default-features = false` strips
 # the HTTP hub client, progressbar, and C++ esaxx dep; we keep only the
 # onig regex engine (required by BPE pre-tokenizers).
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 # memmap2: read-only mmap for bulk-tensor files. No alternatives in the
 # Rust ecosystem; used only inside loader's safetensors path.
 memmap2 = "0.9"
