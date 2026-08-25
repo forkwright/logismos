@@ -30,7 +30,7 @@ half = "2.4"
 smallvec = { version = "1.13", features = ["union"] }
 thiserror = "2"
 snafu = "0.9"
-bindgen = "0.71"
+bindgen = "0.72"
 num-traits = "0.2"
 
 # Tier-2 infrastructure deps (Phase 2).
