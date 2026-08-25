@@ -42,7 +42,7 @@ fn parity_check(gpu: &[f16], cpu: &[f16], tol: f32) {
 fn random_f16(n: usize, seed: u64) -> Vec<f16> {
     let mut r = SmallRng::seed_from_u64(seed);
     (0..n)
-        .map(|_| f16::from_f32(r.gen_range(-1.0..1.0)))
+        .map(|_| f16::from_f32(r.random_range(-1.0..1.0)))
         .collect()
 }
 

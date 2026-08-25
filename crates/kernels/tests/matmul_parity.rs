@@ -76,7 +76,7 @@ fn run_gpu_matmul(
 fn random_f16_matrix(rows: usize, cols: usize, seed: u64) -> Vec<f16> {
     let mut rng = SmallRng::seed_from_u64(seed);
     (0..rows * cols)
-        .map(|_| f16::from_f32(rng.gen_range(-1.0..1.0)))
+        .map(|_| f16::from_f32(rng.random_range(-1.0..1.0)))
         .collect()
 }
 

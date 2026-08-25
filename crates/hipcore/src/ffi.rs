@@ -17,7 +17,6 @@
     clippy::all,
     clippy::missing_safety_doc,
     missing_docs,
-    unsafe_op_in_unsafe_fn,
     reason = "bindgen emits raw HIP symbols that are wrapped by safe hipcore APIs"
 )]
 

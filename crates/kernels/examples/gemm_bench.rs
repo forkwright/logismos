@@ -52,7 +52,7 @@ enum BenchError {
 fn random_f16(n: usize, seed: u64) -> Vec<f16> {
     let mut r = SmallRng::seed_from_u64(seed);
     (0..n)
-        .map(|_| f16::from_f32(r.gen_range(-0.5..0.5)))
+        .map(|_| f16::from_f32(r.random_range(-0.5..0.5)))
         .collect()
 }
 

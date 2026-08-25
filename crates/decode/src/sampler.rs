@@ -46,7 +46,7 @@ impl<R: Rng + Send> Sampler for MultinomialSampler<R> {
         for e in &mut exps {
             *e /= sum;
         }
-        let mut u: f32 = self.rng.gen_range(0.0f32..1.0f32);
+        let mut u: f32 = self.rng.random_range(0.0f32..1.0f32);
         for (i, &p) in exps.iter().enumerate() {
             if u < p {
                 return u32::try_from(i).unwrap_or(u32::MAX);
