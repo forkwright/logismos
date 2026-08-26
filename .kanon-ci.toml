@@ -23,7 +23,22 @@
 # the stage (matching harmonia's) once the baseline is clean.
 
 [pipeline]
-stages = ["cargo fmt", "cargo check", "cargo clippy", "cargo nextest"]
+stages = [
+    "runtime scope",
+    "kanon root SSOT",
+    "cargo fmt",
+    "cargo check",
+    "cargo clippy",
+    "cargo nextest",
+]
+
+[stages."runtime scope"]
+cmd = "python3 scripts/check_runtime_scope.py"
+timeout_secs = 60
+
+[stages."kanon root SSOT"]
+cmd = "bash scripts/check-kanon-root-ssot.sh"
+timeout_secs = 60
 
 [stages."cargo fmt"]
 cmd = "cargo fmt --all -- --check"

@@ -24,12 +24,13 @@
 # WHY rust_toolchain left empty: rust-toolchain.toml is the one place that pins the
 # channel — auto-detect applies (fleet convention), so this workflow never restates it.
 #
-# WHY fmt_cmd carries a second command (kanon#3459/#3478/#3484/#3488): the
-# hybrid-gate reusable workflow has no free-form "extra check" input, so the
-# SSOT guard (scripts/check-kanon-root-ssot.sh — fails if any file other than
-# CLAUDE.md restates the kanon-checkout-root resolution mechanism) rides the
-# fmt stage, which is cheap and unrelated in content so a guard failure there
-# reads unambiguously as the guard, not a formatting regression.
+# WHY fmt_cmd carries two repository guards (kanon#3459/#3478/#3484/#3488,
+# forkwright/logismos#131): the hybrid-gate reusable workflow has no free-form
+# "extra check" input. `check_runtime_scope.py` validates the declared scope's
+# concrete workspace and license invariants with locked metadata; it does not
+# infer semantics from tokens. `check-kanon-root-ssot.sh` fails if any file
+# other than CLAUDE.md restates the kanon-checkout-root resolution mechanism.
+# Both ride the cheap fmt stage, and each emits a distinct failure message.
 #
 # WHY needs_fleet_repo_token false: no `git = "https://github.com/forkwright/..."`
 # dependency anywhere in the workspace (grepped directly).
@@ -103,7 +104,7 @@ jobs:
   gate:
     uses: forkwright/.github/.github/workflows/hybrid-gate.yml@main
     with:
-      fmt_cmd: "cargo fmt --all -- --check && bash scripts/check-kanon-root-ssot.sh"
+      fmt_cmd: "python3 scripts/check_runtime_scope.py && cargo fmt --all -- --check && bash scripts/check-kanon-root-ssot.sh"
       check_cmd: "cargo check --workspace --all-targets"
       clippy_cmd: "cargo clippy --workspace --all-targets -- -D warnings"
       nextest_cmd: "cargo nextest run --workspace --no-fail-fast && cargo nextest run --release -p kernels --no-fail-fast"
@@ -112,5 +113,7 @@ jobs:
       needs_fleet_repo_token: false
       rust_cache_key: "gate-attestation"
       ai_attribution_check: true
-      docs_only_exemption: true
+      # WHY: root documentation directs future scope and checkout-root work;
+      # docs-only changes must still run both structural guards and full CI.
+      docs_only_exemption: false
     secrets: inherit

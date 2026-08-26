@@ -16,9 +16,16 @@ written from the device upward.
 
 ## Scope
 
-- In: tensor ops on HIP. Transformer inference. Stella 1.5B end-to-end. The
- `EmbeddingModel` contract mnemosyne consumes.
-- Out: training. Non-AMD GPUs. Runtime graph optimization. Multi-GPU.
+- In: loading, quantization, inference, and serving on the owned HIP runtime. This includes
+  transformer inference, Stella 1.5B end-to-end, and the `EmbeddingModel` contract consumed by
+  downstream systems.
+- Out: general model formation, training authority, and model release. Non-AMD GPUs. Runtime graph
+  optimization. Multi-GPU.
+
+[`contracts/runtime-scope.toml`](contracts/runtime-scope.toml) records this product boundary.
+Bounded adaptation remains absent unless a named consumer contract supplies an output owner,
+retention and revocation policy, and rollback. The repository guard validates those declared
+requirements and concrete workspace/license invariants; semantic scope remains a review decision.
 
 ## Build configuration
 
@@ -57,6 +64,12 @@ ships the two headers `hipcore`'s wrapper includes, plus
 still gets a real `cargo check`/`clippy`/`nextest` pass across the
 whole workspace, `hipcore` included. On a non-ROCm host, push without
 a trailer and let that CI path attest the change.
+
+Before formatting, the public workflow runs two cheap repository guards. The runtime-scope guard
+self-tests positive and negative cases, requires locked Cargo metadata, rejects retired
+path/package/lock identities, and derives license coherence from Cargo metadata plus the checked
+`LICENSE` bytes. The kanon-root SSOT guard rejects duplicate checkout-root instructions outside
+`CLAUDE.md`. Neither guard claims to infer arbitrary program semantics.
 
 What it does not prove: the GH-hosted runner has no AMD GPU. This path
 proves the workspace compiles and links against real HIP headers/ABI —

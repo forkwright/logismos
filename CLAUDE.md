@@ -1,5 +1,5 @@
 <!--
-scope: logismos repo conventions (Rust+HIP inference runtime, ~27 peer crates, W7900 primary target)
+scope: logismos repo conventions (Rust+HIP inference runtime, W7900 primary target)
 defers_to: kanon standards at kanon's crates/basanos/standards/ (checkout-root resolution below)
 tightens: no-external-ML-framework rule, HIP FFI as lowest acceptable layer, per-kernel CPU-reference-test policy
 -->
@@ -17,13 +17,10 @@ per machine. This repo holds code plus repo-local agent docs (`CLAUDE.md`, `AGEN
 
 ## What logismos is
 
-A Rust-native local inference platform. Workspace of ~25 peer
-crates across 6 tiers (foundation, infrastructure, model families,
-training, serving, API). HIP + hipBLASLt foundation, W7900 (gfx1100)
-primary target. Every neural workload in the ecosystem - embedding,
-rerank, classification, NER, extraction, decoder LLMs (incl. MoE),
-speculative decoding, voice (STT + TTS), image-model backend ops,
-training - runs through logismos.
+A Rust-native local inference platform on a HIP + hipBLASLt foundation, with W7900 (gfx1100) as
+the primary target. Logismos owns loading, quantization, inference, and serving. Model formation,
+general training, behavioral evaluation, and model release belong to the named producer; Logismos
+owns runtime parity, correctness, compatibility, resource, and serving evidence.
 
 Consumers pick the minimum subset of crates they need. `core` exposes
 the stable trait surface. Implementations live in dedicated crates.
@@ -57,17 +54,10 @@ hermeneus - not kanon-X or aletheia-X). Where a role corresponds to
 an existing ecosystem-Greek name, logismos inherits that name and its
 original home eventually consolidates onto ours.
 
-Current crates (see kanon's `projects/logismos/vision.md` for the role table):
-
-Greek (earned by role): `hermeneus`, `ekphrasis`, `ichneutes`,
-`melete`, `taxis`, `praxis`.
-
-English mechanical: `hipcore`, `kernels`, `loader`, `tokenize`,
-`quant`, `cache`, `sample`, `grammar`, `sched`, `transformers`,
-`encoders`, `decoders`, `embed`, `rerank`, `tts`, `diffusion`,
-`autograd`, `optim`, `data`, `mcp`, `bin`, `core`.
-
-Top-level facade: `logismos`.
+The current crate inventory is derived from Cargo workspace metadata. Do not maintain a second
+hand-written list here. See kanon's `projects/logismos/vision.md` for the role model, and run
+`python3 scripts/check_runtime_scope.py` to verify its concrete structural guardrails. The check
+does not replace semantic review of new behavior.
 
 New Greek names must pass kanon's `projects/logismos/gnomon.md`'s
 L1-L4 gate. No haste to invent decoration.
@@ -87,6 +77,9 @@ L1-L4 gate. No haste to invent decoration.
  torch, burn, tract, ort, llama.cpp, vLLM). FFI to ROCm is the lowest
  acceptable layer.
 - **Do not** add backends speculatively.
+- **Do not** create general training or model-release authority. Bounded adaptation may enter only
+  through a named consumer contract that defines its persistent output owner, retention and
+  revocation, and rollback; execution authority does not imply release authority.
 - **Do not** push to a third-party upstream remote. `origin`
  (`forkwright/logismos`, public) takes normal pushes, gated by
  `gate-attestation`.
@@ -113,8 +106,6 @@ CI's `full-gate-build`, which installs real ROCm headers on the
 GH-hosted runner and genuinely compiles the workspace — see README's
 Build configuration section for exactly what that check does and does
 not verify.
-
-When `kanon lint` runs from this repo, zero open violations.
 
 ## Working with AI assistants
 

@@ -1,6 +1,6 @@
 # llms.txt - Logismos AI navigation index
 
-> Rust-native GPU inference runtime for AMD W7900 (gfx1100). ~27 peer crates.
+> Rust-native GPU inference runtime for AMD W7900 (gfx1100).
 > HIP + hipBLASLt. Public on GitHub: forkwright/logismos.
 
 ## LLM corpus
@@ -15,6 +15,7 @@ Structured reference data for AI agents is in `_llm/`:
 - [AGENTS.md](AGENTS.md): Cross-tool bootstrap guide
 - [README.md](README.md): Project overview and layout
 - [ARCHITECTURE.md](ARCHITECTURE.md): Crate topology and dependency model
+- [contracts/runtime-scope.toml](contracts/runtime-scope.toml): declared load/quantize/infer/serve boundary and structural guardrails
 - [CHANGELOG.md](CHANGELOG.md): Release history
 
 ## Planning (in kanon)
@@ -28,13 +29,13 @@ See [CLAUDE.md](CLAUDE.md) for how to resolve the kanon checkout root on this bo
 
 ## Key crates
 
-- `crates/core/` - stable public traits (`EmbeddingModel`, `Reranker`)
+- `crates/core/` - current stable public model trait (`EmbeddingModel`)
 - `crates/hipcore/` - HIP FFI surface, device/stream/memory
 - `crates/kernels/` - HIP + CPU reference kernels
 - `crates/transformers/` - transformer building blocks (attention, norms)
 - `crates/encoders/` - encoder model impls (Stella, ModernBERT)
 - `crates/embed/` - embedding pipeline
-- `crates/rerank/` - cross-encoder reranker (GteReranker, ModernBERT CPU)
+- `crates/rerank/` - `Reranker` trait and cross-encoder implementations (GteReranker, ModernBERT CPU)
 - `crates/quant/` - quantization schemes (TurboQuant 3-bit)
 - `crates/loader/` - safetensors + GGUF v3 reader
 - `crates/tokenize/` - tokenizer facade

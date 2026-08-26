@@ -1,0 +1,31 @@
+schema = 1
+
+# NOTE: this file records the product boundary.
+# WHY: CI can enforce concrete structural guardrails, while semantic compliance still requires
+# review.
+
+[scope]
+owner = "logismos"
+capabilities = ["load", "quantize", "infer", "serve"]
+excluded_authority = [
+    "general-model-formation",
+    "general-training",
+    "model-release",
+]
+
+retired_packages = ["autograd", "optim", "data", "melete"]
+retired_paths = [
+    "crates/autograd",
+    "crates/optim",
+    "crates/data",
+    "crates/melete",
+]
+
+[bounded_adaptation]
+default = "absent"
+admission = "named-consumer-contract"
+requirements = [
+    "persistent-output-owner",
+    "retention-and-revocation",
+    "rollback",
+]

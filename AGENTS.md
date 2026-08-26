@@ -1,5 +1,5 @@
 ---
-scope: logismos repo conventions (Rust+HIP inference runtime, ~27 peer crates, W7900 primary target)
+scope: logismos repo conventions (Rust+HIP inference runtime, W7900 primary target)
 defers_to: kanon standards at kanon's crates/basanos/standards/ (see CLAUDE.md for how to resolve the kanon checkout root on this box)
 tightens: no-external-ML-framework rule, HIP FFI as lowest acceptable layer, per-kernel CPU-reference-test policy
 ---
@@ -29,7 +29,7 @@ Use `CARGO_TARGET_DIR=/data/target` from `<workspace>/logismos`. Leave `CARGO_TA
 - **No silent CPU fallbacks.** GPU unavailable means precise error, never silent degradation.
 - **Visibility:** `pub(crate)` default. Use `pub` only on cross-crate API.
 - **Test data:** synthetic identities (alice, bob, acme.corp). Never use real names, emails, or hosts.
-- **Hosted at forkwright/logismos.** Changes land via gated pushes; the gate runs before every push.
+- **Hosted at forkwright/logismos.** Changes land through the required public CI gate.
 
 ## Where to add things
 
@@ -42,15 +42,21 @@ Use `CARGO_TARGET_DIR=/data/target` from `<workspace>/logismos`. Leave `CARGO_TA
 | Encoder model | `crates/encoders/` |
 | Decoder model | `crates/decoders/` |
 | Embedding model wiring | `crates/embed/` |
-| Reranker | `crates/rerank/` |
+| Reranker contract + implementations | `crates/rerank/` |
 | TTS pipeline component | `crates/tts/` |
 | Speculative-decoding scheduler | `crates/sched/` |
-| Public stable trait | `crates/core/` (every consumer reads through this) |
+| Embedding-model public trait (`EmbeddingModel`) | `crates/core/` |
 | Provider adapter (HTTP/MCP) | `crates/hermeneus/` |
 | STT pipeline | `crates/ekphrasis/` |
 | Tokenizer | `crates/tokenize/` |
 
 Crate architecture + dependency direction lives in kanon's `projects/logismos/vision.md` (role table) and `projects/logismos/STATE.md` (current state).
+
+Logismos owns load, quantize, infer, and serve. It does not own general model formation, training,
+or model release. [`contracts/runtime-scope.toml`](contracts/runtime-scope.toml) records that
+boundary. Its guard checks the declared fields plus retired path/package/lock absence and license
+coherence; it does not infer future code semantics. Do not recreate retired marker crates to imply
+future authority.
 
 ## Standards
 
@@ -60,11 +66,13 @@ Universal engineering policy lives in kanon at `crates/basanos/standards/`. Read
 
 - **Always:** stay within the declared blast radius. Verify behavioral changes with the relevant CPU reference test or hipBLASLt comparison.
 - **Ask first:** changes to the public stable trait surface in `core` (downstream consumers depend), `hipcore` FFI shape, or kernel numerics tolerance defaults.
-- **Never:** push to third-party upstream remotes. Never add ML-framework dependencies. Never introduce silent CPU fallback paths. Never bypass the `core` trait surface from a consumer crate.
+- **Never:** push to third-party upstream remotes. Never add ML-framework dependencies. Never introduce silent CPU fallback paths. Never bypass a capability's public contract to couple a consumer to implementation internals: embedding consumers use `core::EmbeddingModel`, while reranking consumers use `rerank::Reranker`.
 
-## Gate trailer
+## Verification
 
-Run `kanon gate --stamp` before pushing, then prefix every commit body with `Gate-Passed: kanon 0.1.0` once the stamp succeeds. Kanon holds trailer authority until logismos has its own dispatched CI.
+On a non-ROCm host, do not claim a local full-gate stamp. Run the non-build scope guard when
+applicable, push without a trailer, and let the required public `gate / gate` workflow compile the
+workspace with its documented HIP headers. GPU behavior still requires the real-hardware gate.
 
 <!-- kanon:auto-start -->
 <!--
