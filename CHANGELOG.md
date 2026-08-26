@@ -24,6 +24,20 @@ All notable changes to logismos are recorded here.
 - Kernel result defaults: explicit handling in cfg-gated branches
 - Matmul CPU helper visibility: narrowed to `pub(crate)`
 
+## [1.0.10](https://github.com/forkwright/logismos/compare/v1.0.9...v1.0.10) (2026-08-26)
+
+
+### Bug Fixes
+
+* **ci:** name the sha's real version on every action pin ([#132](https://github.com/forkwright/logismos/issues/132)) ([84d0fbe](https://github.com/forkwright/logismos/commit/84d0fbe990237dbdea6f46fe8c2a203d4e95e1e1))
+* **deps:** regenerate Cargo.lock for bindgen 0.72 and rand 0.9 ([#139](https://github.com/forkwright/logismos/issues/139)) ([51bd2c1](https://github.com/forkwright/logismos/commit/51bd2c119a19040699d3631c5fd107cbd10d22de))
+* **license:** converge remaining metadata on Noncommercial, not Shield ([#138](https://github.com/forkwright/logismos/issues/138)) ([d32ab01](https://github.com/forkwright/logismos/commit/d32ab01574d55e3322f390680d2eb5d085f1ab49))
+
+
+### Refactoring
+
+* **scope:** retire training marker crates ([#137](https://github.com/forkwright/logismos/issues/137)) ([dbcb9aa](https://github.com/forkwright/logismos/commit/dbcb9aaba0d2975dcc89fc4bfd9e33091f42e1e4)), closes [#131](https://github.com/forkwright/logismos/issues/131)
+
 ## [1.0.9](https://github.com/forkwright/logismos/compare/v1.0.8...v1.0.9) (2026-08-21)
 
 
