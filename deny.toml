@@ -45,8 +45,10 @@ allow = [
     "Unicode-3.0",
     "MPL-2.0",
     "CDLA-Permissive-2.0",
-    # Logismos itself is PolyForm Shield 1.0.0 (source-available, non-compete).
-    # See .kanon-license-fingerprint.toml for the repo-local canonical digest.
+    # WHY: fleet posture rendering can emit any of the three fleet LicenseRefs.
+    # Logismos itself is PolyForm Noncommercial 1.0.0 (see .kanon-license-fingerprint.toml
+    # for the repo-local canonical digest); Shield stays allowed for any dependency
+    # in the graph still carrying the prior fleet posture.
     "LicenseRef-PolyForm-Shield-1.0.0",
     "LicenseRef-PolyForm-Noncommercial-1.0.0",
     "LicenseRef-Proprietary",

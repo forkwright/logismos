@@ -1,7 +1,7 @@
 # Canonical license fingerprint metadata for MANIFEST/license-spdx-match.
 #
-# SPDX: LicenseRef-PolyForm-Shield-1.0.0
+# SPDX: LicenseRef-PolyForm-Noncommercial-1.0.0
 # Fleet-shared: kanon, logismos, and private downstream consumers.
 
 [sha256]
-LICENSE = "98171cc730f48b140b86bda9eea6305d82398d210ba4b6c79f61422862d5110a"
+LICENSE = "60cd10e4f7e2e2f98514f157b34e0ebf62d4a7828324b255656e1fb093dcdb0a"

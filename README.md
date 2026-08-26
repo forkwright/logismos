@@ -86,7 +86,7 @@ Repo-local:
 
 ## License
 
-PolyForm Shield 1.0.0 with AI-training prohibition. See [LICENSE](LICENSE).
+PolyForm Noncommercial 1.0.0. See [LICENSE](LICENSE).
 
 <!-- kanon:auto-start -->
 ## Repository Metadata
