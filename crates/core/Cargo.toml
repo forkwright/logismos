@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Public trait surface: EmbeddingModel, Reranker, DecoderModel, SpeechRecognizer, etc."
+description = "Current stable public model trait surface, centered on EmbeddingModel."
 publish = false
 
 [lib]

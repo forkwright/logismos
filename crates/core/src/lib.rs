@@ -1,27 +1,13 @@
 //! # core
 //!
-//! Public trait surface for the logismos platform. Every consumer
-//! that does not need crate-specific types depends on `core` only,
-//! plus whichever concrete implementation it chooses at the trait
-//! boundary.
+//! Public embedding-model contract for the logismos platform.
 //!
-//! ## Phase 3 status
-//!
-//! [`EmbeddingModel`] is finalised in Phase 3 and used by
-//! `embed::StellaModel`. Other traits (Reranker, Classifier,
-//! DecoderModel, SpeechRecognizer, etc.) land with their respective
-//! phases per the roadmap.
-//!
-//! ## Traits (forward-looking)
-//!
-//! - `EmbeddingModel` — text → vector (**finalised, Phase 3**)
-//! - `Reranker` — (query, document) → score (Phase 5)
-//! - `Classifier` — input → labels (+ scores) (Phase 5)
-//! - `Extractor` — input → structured value (Phase 5)
-//! - `DecoderModel` — prompt → token stream (Phase 6)
-//! - `SpeechRecognizer` — audio → text (Phase 8)
-//! - `SpeechSynthesizer` — text → audio (Phase 9)
-//! - `DiffusionModel` — latent → denoised latent (Phase 11)
+//! [`EmbeddingModel`] is the stable embedding trait used by concrete models such
+//! as `embed::StellaModel`. Contracts that require capability-specific types
+//! stay with their owning crate: `rerank`, for example, owns its `Reranker`
+//! trait and implementations. Consumers depend on the public contract exported
+//! by the capability they use; this crate is not a universal gateway for
+//! unrelated model APIs.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
