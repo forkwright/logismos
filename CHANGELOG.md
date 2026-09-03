@@ -24,6 +24,13 @@ All notable changes to logismos are recorded here.
 - Kernel result defaults: explicit handling in cfg-gated branches
 - Matmul CPU helper visibility: narrowed to `pub(crate)`
 
+## [1.0.11](https://github.com/forkwright/logismos/compare/v1.0.10...v1.0.11) (2026-09-03)
+
+
+### Documentation
+
+* Phase 4 unblocked — menos (W7900) returned to service ([#148](https://github.com/forkwright/logismos/issues/148)) ([3812fba](https://github.com/forkwright/logismos/commit/3812fbabc66c4f49b24e9f338048560ef9aed138))
+
 ## [1.0.10](https://github.com/forkwright/logismos/compare/v1.0.9...v1.0.10) (2026-08-26)
 
 
