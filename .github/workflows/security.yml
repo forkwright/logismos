@@ -64,7 +64,7 @@ jobs:
   # the scan-args reference a lockfile that must exist on disk after checkout.
   osv-scanner:
     name: osv scanner
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67
     permissions:
       actions: read
       contents: read
