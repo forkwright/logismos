@@ -98,6 +98,7 @@ jobs:
           toolchain: ${{ steps.rust_toolchain.outputs.channel }}
           components: ${{ steps.rust_toolchain.outputs.components }}
       - name: Prepare non-root boundary account
+        shell: bash
         run: |
           set -euo pipefail
           useradd --create-home --user-group --shell /bin/bash gpu-ci
@@ -118,6 +119,7 @@ jobs:
           chown -R gpu-ci:gpu-ci -- "$ci_home/.cargo" "$ci_home/.rustup" \
             "$GITHUB_WORKSPACE/target"
       - name: Provision locked Rust sources without executing workspace code
+        shell: bash
         env:
           PINNED_TOOLCHAIN: ${{ steps.rust_toolchain.outputs.channel }}
         run: |
@@ -149,6 +151,7 @@ jobs:
               /home/gpu-ci/.cargo/bin/cargo fetch --locked \
                 --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
       - name: Compile and inspect HIP code objects without a GPU
+        shell: bash
         run: |
           set -euo pipefail
           {
