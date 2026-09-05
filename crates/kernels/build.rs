@@ -74,15 +74,33 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
+    compile_sources(&hipcc, &out_dir, &hip_sources, &cpp_sources)?;
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=logismos_kernels");
+    // The HIP device runtime lives in the `amdhip64` shared object
+    // already pulled in by hipcore; we rely on that.
+    // hipcc links stdc++; re-export for the final binary.
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+
+    Ok(())
+}
+
+fn compile_sources(
+    hipcc: &str,
+    out_dir: &Path,
+    hip_sources: &[PathBuf],
+    cpp_sources: &[PathBuf],
+) -> Result<(), String> {
     let mut obj_files = Vec::with_capacity(hip_sources.len() + cpp_sources.len());
 
-    for src in hip_sources.iter().chain(cpp_sources.iter()) {
+    for src in hip_sources.iter().chain(cpp_sources) {
         let obj = out_dir.join(format!(
             "{}.o",
             src.file_name().and_then(|s| s.to_str()).unwrap_or("anon")
         ));
         // kanon:ignore RUST/no-direct-process-command -- invoking hipcc is the build script's purpose
-        let status = match Command::new(&hipcc)
+        let status = match Command::new(hipcc)
             .args([
                 &format!("--offload-arch={HIP_TARGET}"),
                 "-O3",
@@ -111,7 +129,6 @@ fn main() -> Result<(), String> {
         obj_files.push(obj);
     }
 
-    // Bundle all objects into a static archive.
     let archive = out_dir.join("liblogismos_kernels.a");
     remove_stale_archive(&archive);
     let ar = env::var("AR").unwrap_or_else(|_| "ar".to_string());
@@ -127,13 +144,6 @@ fn main() -> Result<(), String> {
     if !status.success() {
         return Err(format!("ar failed (status {status:?})"));
     }
-
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=logismos_kernels");
-    // The HIP device runtime lives in the `amdhip64` shared object
-    // already pulled in by hipcore; we rely on that.
-    // hipcc links stdc++; re-export for the final binary.
-    println!("cargo:rustc-link-lib=dylib=stdc++");
 
     Ok(())
 }
