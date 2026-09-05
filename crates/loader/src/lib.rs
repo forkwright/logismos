@@ -2,19 +2,23 @@
 //!
 //! Weight loaders for the logismos platform.
 //!
-//! Two input formats are supported:
+//! GGUF v3 metadata inspection is always available. The default `tensor`
+//! feature additionally enables these tensor archive adapters:
 //!
-//! - **safetensors** — via the upstream [`safetensors`] crate wrapped
-//!   in [`crate::safetensors::Reader`].
-//! - **GGUF** — via our own v3 reader in [`gguf::Reader`] (metadata +
+//! - **safetensors** — via the upstream `safetensors` crate wrapped
+//!   in the `safetensors::Reader` adapter.
+//! - **GGUF** — via our own v3 `gguf::Reader` (metadata +
 //!   a tensor index; fp16/bf16/f32 tensor bytes only — K-quant blocks
 //!   are Phase-6 work per the PLAN).
 //!
-//! Both formats expose a common [`WeightProvider`] trait and resolve
-//! through an [`Archive`] enum so consumers can write format-agnostic
-//! code. A small [`mapping::NameMap`] utility translates model-family
-//! HF names onto logismos-internal keys; tables live in each model's
-//! module under `decoders` / `encoders` / `embed`.
+//! With `tensor`, both formats expose a common `WeightProvider` trait and
+//! resolve through an `Archive` enum so consumers can write format-agnostic
+//! code. In the minimal `cargo build -p bin` graph, `bin` disables that feature
+//! and consequently does not depend on `taxis` or HIP. Workspace-wide feature
+//! unification can still enable `loader/tensor` when another selected package
+//! requests it. A small [`mapping::NameMap`] utility translates model-family
+//! HF names onto logismos-internal keys; tables live in each model's module
+//! under `decoders` / `encoders` / `embed`.
 //!
 //! Phase 2 scope:
 //! - Read metadata + tensor bytes.
@@ -47,20 +51,25 @@
 pub mod error;
 pub mod gguf;
 pub mod mapping;
+#[cfg(feature = "tensor")]
 pub mod provider;
+#[cfg(feature = "tensor")]
 pub mod safetensors;
 
 pub use crate::error::{Error, Result};
+#[cfg(feature = "tensor")]
 use crate::error::{
     MmapStaleSnafu, MsgSnafu, ShapeMismatchSnafu, UnknownFormatSnafu, UnsupportedDTypeSnafu,
 };
 pub use crate::mapping::NameMap;
+#[cfg(feature = "tensor")]
 pub use crate::provider::WeightProvider;
 
 /// Read-only view of a single tensor inside an archive.
 ///
 /// Views borrow from their archive and do not own memory. Callers copy
 /// into a `taxis::Tensor` with [`TensorView::to_tensor_cpu`].
+#[cfg(feature = "tensor")]
 #[derive(Debug, Clone)]
 pub struct TensorView<'a> {
     /// Logical name (verbatim from the archive; no normalisation).
@@ -73,6 +82,7 @@ pub struct TensorView<'a> {
     pub bytes: &'a [u8],
 }
 
+#[cfg(feature = "tensor")]
 impl<'a> TensorView<'a> {
     /// Copy this view into a newly allocated CPU `taxis::Tensor`.
     ///
@@ -118,6 +128,7 @@ impl<'a> TensorView<'a> {
     }
 }
 
+#[cfg(feature = "tensor")]
 fn read_i8_le(bytes: &[u8]) -> Vec<i8> {
     bytes
         .chunks_exact(1)
@@ -129,6 +140,7 @@ fn read_i8_le(bytes: &[u8]) -> Vec<i8> {
         .collect()
 }
 
+#[cfg(feature = "tensor")]
 fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
@@ -140,6 +152,7 @@ fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+#[cfg(feature = "tensor")]
 fn read_i32_le(bytes: &[u8]) -> Vec<i32> {
     bytes
         .chunks_exact(4)
@@ -151,6 +164,7 @@ fn read_i32_le(bytes: &[u8]) -> Vec<i32> {
         .collect()
 }
 
+#[cfg(feature = "tensor")]
 fn read_f16_le(bytes: &[u8]) -> Vec<half::f16> {
     bytes
         .chunks_exact(2)
@@ -162,6 +176,7 @@ fn read_f16_le(bytes: &[u8]) -> Vec<half::f16> {
         .collect()
 }
 
+#[cfg(feature = "tensor")]
 fn read_bf16_le(bytes: &[u8]) -> Vec<half::bf16> {
     bytes
         .chunks_exact(2)
@@ -174,6 +189,7 @@ fn read_bf16_le(bytes: &[u8]) -> Vec<half::bf16> {
 }
 
 /// Sum type over the supported archive formats.
+#[cfg(feature = "tensor")]
 #[non_exhaustive]
 pub enum Archive {
     /// A safetensors archive (upstream reader).
@@ -182,6 +198,7 @@ pub enum Archive {
     Gguf(crate::gguf::Reader),
 }
 
+#[cfg(feature = "tensor")]
 impl Archive {
     /// Open an archive by format auto-detection: `.safetensors` → safetensors,
     /// `.gguf` → GGUF (case-insensitively), everything else returns
@@ -216,16 +233,18 @@ impl Archive {
 /// `expected_len` (the mmap's length at open time).
 ///
 /// Best-effort: this check and the slice read that follows it are not
-/// atomic, so it closes the common non-adversarial case — a weights
+/// atomic, so it closes the common non-adversarial case — a safetensors
 /// file re-saved or truncated by something else while a `Reader` still
 /// has it mapped — rather than a fully adversarial race. See the
-/// SAFETY comments on `gguf::Reader::open` / `safetensors::Reader::open`
-/// for what this does and doesn't guarantee.
+/// SAFETY comment on `safetensors::Reader::open` for what this does and
+/// doesn't guarantee. GGUF inspection instead checks its retained file
+/// handle, so replacement of the original path cannot switch identities.
 ///
 /// # Errors
 ///
 /// [`Error::Io`] if the re-stat fails; [`Error::MmapStale`] if the
 /// file's current length disagrees with `expected_len`.
+#[cfg(feature = "tensor")]
 pub(crate) fn check_mmap_not_truncated(path: &std::path::Path, expected_len: usize) -> Result<()> {
     let actual_len = std::fs::metadata(path)?.len();
     let expected_len = u64::try_from(expected_len).map_err(|_| {
@@ -245,6 +264,7 @@ pub(crate) fn check_mmap_not_truncated(path: &std::path::Path, expected_len: usi
     Ok(())
 }
 
+#[cfg(feature = "tensor")]
 impl WeightProvider for Archive {
     fn get(&self, name: &str) -> Result<TensorView<'_>> {
         match self {
@@ -266,7 +286,7 @@ impl WeightProvider for Archive {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tensor"))]
 mod tests {
     use super::*;
 

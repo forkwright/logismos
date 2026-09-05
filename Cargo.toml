@@ -27,6 +27,7 @@ multiple_crate_versions = "allow"
 [workspace.dependencies]
 # Tier-1 foundation deps (Phase 1).
 half = "2.4"
+isa = { path = "crates/isa" }
 smallvec = { version = "1.13", features = ["union"] }
 thiserror = "2"
 snafu = "0.9"
@@ -54,9 +55,9 @@ rayon = "1.10"
 # it. `threading` enables internal multi-thread tiling via std::thread.
 matrixmultiply = "0.3"
 
-# Test-only tier-1 deps.
+# Sampling and test-only tier-1 deps.
 approx = "0.5"
-rand = { version = "0.9", features = ["small_rng"] }
+rand = { version = "0.10", default-features = false }
 # tempfile: fleet-canonical test-fixture temp dirs (RUST.md "Test fixtures:
 # tempfile over /tmp/<hardcoded>", D-057) -- parallel-scope-safe, RAII cleanup.
 tempfile = "3"
@@ -65,6 +66,9 @@ tempfile = "3"
 # transitively; made explicit for workspace members).
 serde = "1.0"
 serde_json = "1.0"
+# sha2: RustCrypto's maintained SHA-256 implementation. Artifact inspection
+# streams whole-file bytes; no handwritten digest implementation is acceptable.
+sha2 = { version = "0.11.0", default-features = false }
 
 # Internal crate cross-refs.
 hipcore = { path = "crates/hipcore" }
@@ -79,3 +83,4 @@ core = { path = "crates/core" }
 transformers = { path = "crates/transformers" }
 encoders = { path = "crates/encoders" }
 embed = { path = "crates/embed" }
+placement = { path = "crates/placement" }

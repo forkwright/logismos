@@ -43,7 +43,6 @@
 
 pub mod cpu_f32;
 pub mod error;
-pub mod gated_delta_rule;
 pub mod gdn;
 pub mod matmul;
 pub mod rms_norm;
@@ -51,4 +50,4 @@ pub mod rope;
 pub mod softmax;
 
 pub use crate::error::{Error, Result};
-pub use crate::gdn::{GdnConfig, chunk_gated_delta_rule_fwd, fused_recurrent_gated_delta_rule_fwd};
+pub use crate::gdn::{GdnError, GdnResult, RecurrentInput, RecurrentOutput, recurrent_fwd};

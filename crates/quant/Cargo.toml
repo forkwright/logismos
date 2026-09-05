@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Phase 0 scaffold - not implemented. Intended for quantisation schemes and dtype conversions."
+description = "CPU TurboQuant layout, codebook, transform and packing contracts; GPU parity remains pending."
 publish = false
 
 [dependencies]

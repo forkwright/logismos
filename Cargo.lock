@@ -9,7 +9,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
 dependencies = [
  "cfg-if",
- "getrandom 0.3.4",
+ "getrandom",
  "once_cell",
  "serde",
  "version_check",
@@ -54,7 +54,14 @@ checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
 name = "bin"
-version = "1.0.10"
+version = "1.0.11"
+dependencies = [
+ "loader",
+ "placement",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "bindgen"
@@ -83,8 +90,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "block-buffer"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "cache"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "half",
  "snafu",
@@ -153,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "core"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "snafu",
 ]
@@ -190,10 +206,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
-name = "daachorse"
-version = "1.0.1"
+name = "cpufeatures"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f55d7153ba3b507595872a3874803f07a8a81d1e888abed8e5db7da0597d6e2"
+checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "crypto-common"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
+name = "daachorse"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5614204febbc33cc07a2806aa6440b904ac012b68eecc37f4493ea4a76455a3d"
 
 [[package]]
 name = "darling"
@@ -241,16 +275,16 @@ dependencies = [
 
 [[package]]
 name = "decode"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
- "rand",
+ "rand 0.10.2",
  "snafu",
  "taxis",
 ]
 
 [[package]]
 name = "decoders"
-version = "1.0.10"
+version = "1.0.11"
 
 [[package]]
 name = "derive_builder"
@@ -285,7 +319,17 @@ dependencies = [
 
 [[package]]
 name = "diffusion"
-version = "1.0.10"
+version = "1.0.11"
+
+[[package]]
+name = "digest"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
+dependencies = [
+ "block-buffer",
+ "crypto-common",
+]
 
 [[package]]
 name = "either"
@@ -295,11 +339,11 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "ekphrasis"
-version = "1.0.10"
+version = "1.0.11"
 
 [[package]]
 name = "embed"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "core",
  "encoders",
@@ -314,8 +358,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "emulation"
+version = "1.0.11"
+dependencies = [
+ "isa",
+ "snafu",
+ "tempfile",
+]
+
+[[package]]
 name = "encoders"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "kernels",
  "loader",
@@ -379,19 +432,8 @@ checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
  "libc",
- "r-efi 5.3.0",
+ "r-efi",
  "wasip2",
-]
-
-[[package]]
-name = "getrandom"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
-dependencies = [
- "cfg-if",
- "libc",
- "r-efi 6.0.0",
 ]
 
 [[package]]
@@ -432,27 +474,37 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermeneus"
-version = "1.0.10"
+version = "1.0.11"
 
 [[package]]
 name = "hipcore"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "bindgen",
  "half",
+ "isa",
  "snafu",
  "tempfile",
 ]
 
 [[package]]
 name = "ichneutes"
-version = "1.0.10"
+version = "1.0.11"
 
 [[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
+
+[[package]]
+name = "hybrid-array"
+version = "0.4.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
+dependencies = [
+ "typenum",
+]
 
 [[package]]
 name = "itertools"
@@ -479,15 +531,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "isa"
+version = "1.0.11"
+dependencies = [
+ "snafu",
+]
+
+[[package]]
 name = "kernels"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "approx",
  "half",
  "hipcore",
  "matrixmultiply",
  "num-traits",
- "rand",
+ "rand 0.10.2",
  "snafu",
  "taxis",
 ]
@@ -516,11 +575,12 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "loader"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "half",
  "memmap2",
  "safetensors",
+ "sha2",
  "snafu",
  "taxis",
 ]
@@ -533,7 +593,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "logismos"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "cache",
  "core",
@@ -685,6 +745,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "placement"
+version = "1.0.11"
+dependencies = [
+ "isa",
+ "serde",
+ "serde_json",
+ "snafu",
+]
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -695,14 +765,14 @@ dependencies = [
 
 [[package]]
 name = "praxis"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "approx",
  "half",
  "hipcore",
  "kernels",
  "num-traits",
- "rand",
+ "rand 0.10.2",
  "snafu",
  "taxis",
 ]
@@ -728,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "quant"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "half",
 ]
@@ -749,19 +819,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
-name = "r-efi"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
-
-[[package]]
 name = "rand"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
 dependencies = [
  "rand_chacha",
- "rand_core",
+ "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+dependencies = [
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -771,7 +844,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
- "rand_core",
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -780,8 +853,14 @@ version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom",
 ]
+
+[[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rawpointer"
@@ -851,7 +930,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rerank"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "encoders",
  "kernels",
@@ -907,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "sched"
-version = "1.0.10"
+version = "1.0.11"
 
 [[package]]
 name = "serde"
@@ -953,6 +1032,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -966,9 +1056,9 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "smallvec"
-version = "1.15.2"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 
 [[package]]
 name = "snafu"
@@ -1039,7 +1129,7 @@ dependencies = [
 
 [[package]]
 name = "taxis"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "half",
  "hipcore",
@@ -1054,7 +1144,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom",
  "once_cell",
  "rustix",
  "windows-sys",
@@ -1082,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "tokenize"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "thiserror",
  "tokenizers",
@@ -1090,9 +1180,9 @@ dependencies = [
 
 [[package]]
 name = "tokenizers"
-version = "0.23.1"
+version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44e5bea67576e04b6ff8564c5d9e09c2ef0cf476502245f2f120e497769d3112"
+checksum = "7afbf6e88718afcc138bad01d6ccc3051dbbc3b2ce9793d8b8a3aeb610969cfc"
 dependencies = [
  "ahash",
  "compact_str",
@@ -1100,14 +1190,14 @@ dependencies = [
  "dary_heap",
  "derive_builder",
  "esaxx-rs",
- "getrandom 0.3.4",
+ "getrandom",
  "itertools 0.14.0",
  "log",
  "macro_rules_attribute",
  "monostate",
  "onig",
  "paste",
- "rand",
+ "rand 0.9.5",
  "rayon",
  "rayon-cond",
  "regex",
@@ -1123,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "transformers"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "approx",
  "kernels",
@@ -1133,7 +1223,13 @@ dependencies = [
 
 [[package]]
 name = "tts"
-version = "1.0.10"
+version = "1.0.11"
+
+[[package]]
+name = "typenum"
+version = "1.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "unicode-ident"

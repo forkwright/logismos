@@ -1,0 +1,18 @@
+[package]
+name = "emulation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded CPU execution of a deliberately small gfx1100 wave32 instruction subset."
+publish = false
+
+[dependencies]
+isa.workspace = true
+snafu.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

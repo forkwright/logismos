@@ -10,6 +10,7 @@ links = "amdhip64"
 
 [dependencies]
 half.workspace = true
+isa.workspace = true
 snafu.workspace = true
 
 [build-dependencies]

@@ -1,7 +1,7 @@
 ---
-scope: logismos repo conventions (Rust+HIP inference runtime, W7900 primary target)
+scope: logismos repo conventions (Rust-native agent-aware inference, gfx1100 target)
 defers_to: kanon standards at kanon's crates/basanos/standards/ (see CLAUDE.md for how to resolve the kanon checkout root on this box)
-tightens: no-external-ML-framework rule, HIP FFI as lowest acceptable layer, per-kernel CPU-reference-test policy
+tightens: original inference implementations, explicit hardware-access boundary, per-kernel CPU-reference-test policy
 ---
 
 # AGENTS.md - Logismos
@@ -11,22 +11,32 @@ Cross-tool guide for AI coding agents (Claude Code, Kimi, Codex, Cursor, Copilot
 ## Build / Test / Lint
 
 ```bash
-cargo check -p <crate>                       # fast compile check
-cargo test  -p <crate>                       # single crate tests
-cargo clippy --workspace -- -D warnings      # lint (zero warnings under -D)
-cargo test  --workspace                      # full suite
+scripts/gpu-denied-runner.sh -- /bin/sh -ceu \
+  'LOGISMOS_HIP_BUILD=cpu-only cargo check -p <crate>'
+scripts/gpu-denied-runner.sh -- /bin/sh -ceu \
+  'LOGISMOS_HIP_BUILD=cpu-only cargo test --workspace --jobs 8'
+scripts/gpu-denied-runner.sh -- /bin/sh -ceu \
+  'LOGISMOS_HIP_BUILD=cpu-only cargo clippy --workspace --all-targets --jobs 8 -- -D warnings'
+scripts/hip-code-object-witness.sh           # compile/inspect only; denied wrapper is mandatory
 ```
 
-Use `CARGO_TARGET_DIR=/data/target` from `<workspace>/logismos`. Leave `CARGO_TARGET_DIR` unset inside `<workspace>/worktrees/logismos/<slug>/` so each worktree gets its own `<wt>/target`.
+The runner fixes the target directory to its worktree's `target/` and ignores
+ambient target/cache configuration. Delegated edits and validation use their
+own named worktree. Run one Cargo command at a time in each worktree; do not
+share `/data/target` across agent lanes. See
+[`docs/gpu-denied-runner.md`](docs/gpu-denied-runner.md) for prerequisites and
+the precise threat model. Ordinary compilation is not a hardware-test permit.
 
 ## Key patterns
 
-- **No external ML frameworks.** HIP-first stack. Do NOT add dependencies on `candle`, `torch`, `burn`, `onnx`, `llama.cpp`. HIP FFI via `hipcore` is the lowest acceptable layer.
+- **No external ML frameworks.** HIP-first stack. Do not add dependencies on `candle`, `torch`, `burn`, `onnx`, or `llama.cpp`. Upstream runtime and emulator code is Read-only prior art; implement original code. The approved experimental HSA/ROCr provider preserves `amdgpu` and stays behind the hardware-access boundary.
 - **Errors:** `snafu` with `.context()` and `Location` tracking. Agents must not call `unwrap()` in library code. Use `#[expect(lint, reason = "...")]` over `#[allow]`.
 - **Time:** `jiff`. The fleet bans `chrono`.
 - **Crate naming:** standalone single-word names (no `logismos-X` prefixes). Greek when the role earns it; English mechanical otherwise. See `CLAUDE.md` § "Crate naming rule".
 - **Per-kernel CPU reference test.** Every GPU kernel has a CPU-side reference. Default tolerance is 1e-3 unless justified inline.
 - **No silent CPU fallbacks.** GPU unavailable means precise error, never silent degradation.
+- **Device-independent planning.** Capability checks target gfx1100, not a device name, ordinal, or fixed VRAM size. The W7900-only configuration remains supported; an absent optional XTX does not block it.
+- **Agent-safe iteration.** Tests and compiler work use an OS-enforced GPU-denied runner. Hardware qualification is a separate operator-coordinated lane; do not probe devices, run GPU tests, change modes, or evict services as routine validation.
 - **Visibility:** `pub(crate)` default. Use `pub` only on cross-crate API.
 - **Test data:** synthetic identities (alice, bob, acme.corp). Never use real names, emails, or hosts.
 - **Hosted at forkwright/logismos.** Changes land through the required public CI gate.
@@ -37,7 +47,7 @@ Use `CARGO_TARGET_DIR=/data/target` from `<workspace>/logismos`. Leave `CARGO_TA
 |------|----------|
 | New HIP kernel | `crates/kernels/src/<family>/` + `crates/hipcore` for FFI surface |
 | Quantization scheme | `crates/quant/` |
-| Sampler / decode policy | `crates/sample/` or `crates/decode/` |
+| Sampler / decode policy | `crates/decode/` |
 | New transformer family | `crates/transformers/src/<family>/` |
 | Encoder model | `crates/encoders/` |
 | Decoder model | `crates/decoders/` |
@@ -60,11 +70,11 @@ future authority.
 
 ## Standards
 
-Universal engineering policy lives in kanon at `crates/basanos/standards/`. Read `STANDARDS.md` § Philosophy before writing code. Check `RUST.md` for language-specific rules. Logismos tightens kanon's universal rules with the no-external-ML-framework, per-kernel-CPU-test, and HIP-FFI-floor policies above.
+Universal engineering policy lives in kanon at `crates/basanos/standards/`. Read `STANDARDS.md` § Philosophy before writing code. Check `RUST.md` for language-specific rules. Logismos tightens kanon's universal rules with the original-implementation, per-kernel-CPU-test, and explicit hardware-boundary policies above.
 
 ## Boundaries
 
-- **Always:** stay within the declared blast radius. Verify behavioral changes with the relevant CPU reference test or hipBLASLt comparison.
+- **Always:** stay within the declared blast radius. Verify behavior with independent CPU references and the declared proof lane; compilation, emulation, and hardware qualification are different evidence.
 - **Ask first:** changes to the public stable trait surface in `core` (downstream consumers depend), `hipcore` FFI shape, or kernel numerics tolerance defaults.
 - **Never:** push to third-party upstream remotes. Never add ML-framework dependencies. Never introduce silent CPU fallback paths. Never bypass a capability's public contract to couple a consumer to implementation internals: embedding consumers use `core::EmbeddingModel`, while reranking consumers use `rerank::Reranker`.
 
@@ -79,7 +89,7 @@ workspace with its documented HIP headers. GPU behavior still requires the real-
 scope: logismos repo cross-tool agent guide (Claude Code, Kimi, Codex, Cursor, Windsurf, Copilot)
 generated_by: kanon docs sync
 defers_to: CLAUDE.md for Claude Code-specific behavior; ~/menos-ops/CLAUDE.md for machine + service topology
-tightens: workflow/AGENTS-mcp-tools.md catalog routing; crates/basanos/standards/AGENT-DOCS.md authoring rules
+tightens: repo-local MCP routing conventions; repo-local authoring conventions
 -->
 
 # logismos
@@ -99,8 +109,7 @@ build, test, and lint commands from this repository root.
 - `kanon docs sync --check --repo logismos` - verify derived bootstrap docs
 - `kanon docs sync --apply --repo logismos` - regenerate derived bootstrap docs
 
-For agent-native operations, prefer the `mcp__kanon__*` tool family. See
-[workflow/AGENTS-mcp-tools.md](workflow/AGENTS-mcp-tools.md) for routing and fallback rules.
+For agent-native operations, prefer the `mcp__kanon__*` tool family. The canonical MCP routing catalog is not vendored in this repo; consult the kanon toolkit's `workflow/AGENTS-mcp-tools.md` for routing and fallback rules.
 
 ## Standards
 

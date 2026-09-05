@@ -16,7 +16,7 @@ use half::f16;
 use hipcore::{Device, DeviceBuffer, Stream};
 use kernels::matmul::{Variant, cpu, launch_matmul_fp16};
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 fn have_gpu() -> bool {
     matches!(hipcore::device::device_count(), Ok(c) if c > 0)

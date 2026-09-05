@@ -1,6 +1,6 @@
 //! Samplers. Given a (possibly processed) logits slice, emit a token id.
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use crate::sampler_trait::Sampler;
 
@@ -14,9 +14,11 @@ impl Sampler for GreedySampler {
     }
 }
 
-/// Multinomial sampler. Draws from softmax(logits). RNG is owned by
-/// the caller and supplied at construction so reproducible streams
-/// stay trivial (seed a `StdRng`, pass it in).
+/// Multinomial sampler. Draws from softmax(logits).
+///
+/// The caller owns and supplies the RNG, so paired tests can reproduce a
+/// stream with the same seed. `SmallRng` is non-portable across rand releases;
+/// golden fixtures must use fixed input draws instead of its sampled output.
 pub struct MultinomialSampler<R: Rng + Send> {
     rng: R,
 }

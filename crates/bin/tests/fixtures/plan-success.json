@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "devices": [{"id":"GPU-0001","gfx_isa":"gfx1100","total_bytes":25769803776,"reserved_bytes":0,"availability":"available"}],
+  "artifacts": [{"artifact_id":"embedding","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],
+  "workloads": [{"profile_id":"search","artifact_id":"embedding","memory_estimate":{"weights_bytes":1073741824,"kv_cache_bytes":0,"workspace_bytes":0,"headroom_bytes":0},"placement":{"kind":"requested_device","device_id":"GPU-0001"}}],
+  "commitments": []
+}

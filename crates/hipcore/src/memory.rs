@@ -249,7 +249,8 @@ impl<T: BytePod> DeviceBuffer<T> {
     ///
     /// # Errors
     ///
-    /// As [`Self::copy_from_host`].
+    /// As [`Self::copy_from_host`], plus [`Error::DeviceMismatch`] when
+    /// `stream` belongs to a different device than this allocation.
     pub fn copy_from_host_async(self, data: Vec<T>, stream: &Stream) -> Result<PendingCopy<'_, T>> {
         if data.len() != self.len {
             return InternalSnafu {
@@ -261,7 +262,9 @@ impl<T: BytePod> DeviceBuffer<T> {
             }
             .fail();
         }
-        self.device.make_current()?;
+        self.device
+            .ensure_same_device(stream.device(), "hipMemcpyAsync(HtoD)")?;
+        stream.make_current()?;
         // SAFETY: destination pointer is owned and sized. `self` and
         // `data` are both moved into the `PendingCopy` this returns on
         // success, which keeps the destination allocation and the

@@ -2,25 +2,38 @@
 
 *λογισμός - reckoning, calculation. The step-by-step numerical mode of reasoning.*
 
-GPU inference stack for transformer embedding models, built ground-up on
-HIP + hipBLASLt, targeting AMD gfx1100 (W7900).
+An agent-aware operating environment for local AI compute: a Rust-native inference stack
+targeting AMD gfx1100, with owned HIP/WMMA kernels and progressively owned execution policy.
 
-**Status:** Phases 0-3 complete - Stella 1.5B v5 runs end-to-end on CPU with golden-fixture parity. Phase 4 (GPU cutover) is next: the W7900 host is back in service, and GPU paths remain unverified until the Phase 4 gate runs on it.
+**Status:** HIP primitives, kernels, and Stella CPU end-to-end golden-fixture parity exist.
+Native decoder serving, agent-aware placement, instruction emulation, and the experimental
+below-HIP provider are under development, not qualified capabilities. The W7900 is available;
+the RX 7900 XTX is a planned second device and requires its own qualification.
 
 ## Why
 
-Kanon's knowledge substrate (mnemosyne) needs a GPU-accelerated embedder. Candle
-has no ROCm backend. AMD deprecated ONNX Runtime's ROCm support. Rolling our own
-keeps the hardware boundary owned in-repo. One transformer family, one GPU family,
-written from the device upward.
+Aletheia knows what work needs doing; Logismos owns how inference uses the resources granted
+to it. The intended loop connects workload intent, admission, model and state residency,
+kernels, and measured execution costs. Ordinary clients retain an inference API; agent-aware
+clients can supply richer intent without becoming GPU administrators.
+
+Arche/Tropos and systemd retain host modes and process-lifecycle enforcement. Logismos does not
+take over gaming, display ownership, firmware, or the fleet's development-work scheduler.
 
 ## Scope
 
-- In: loading, quantization, inference, and serving on the owned HIP runtime. This includes
-  transformer inference, Stella 1.5B end-to-end, and the `EmbeddingModel` contract consumed by
-  downstream systems.
-- Out: general model formation, training authority, and model release. Non-AMD GPUs. Runtime graph
-  optimization. Multi-GPU.
+- In: loading, quantization, inference, and serving; typed model profiles, resource planning,
+  admission, residency, and device-local execution. gfx1100 is the architecture target, not a
+  synonym for one SKU or a 48-GB minimum. A single supported device is a normal configuration.
+- First serving target: Qwen3.8 hybrid text execution plus Qwen3 embedding and reranking
+  continuity, qualified against exact artifacts. Independent multi-device services are planned;
+  two devices do not form one allocation pool.
+- Out: general model formation, training authority, and model release. Automatic fleet cutover,
+  direct PCI takeover, firmware changes, and unqualified hardware/performance claims.
+
+Upstream projects are reference corpora for original implementations, including the planned
+bounded gfx1100 functional emulator. HIP remains the production substrate; an original
+HSA/ROCr provider is an explicitly scoped experiment, not a production backend claim.
 
 [`contracts/runtime-scope.toml`](contracts/runtime-scope.toml) records this product boundary.
 Bounded adaptation remains absent unless a named consumer contract supplies an output owner,
@@ -29,28 +42,25 @@ requirements and concrete workspace/license invariants; semantic scope remains a
 
 ## Build configuration
 
-`crates/kernels/build.rs` compiles HIP kernel sources via `hipcc`. When
-`hipcc` is absent from `PATH` this falls back automatically to a
-CPU-only, `logismos_no_gpu_kernels`-cfg'd build (this is the normal
-path on a GH-hosted CI runner and any box without ROCm).
+`crates/kernels/build.rs` compiles HIP sources with `hipcc` for the target in
+`contracts/gpu-target.txt`. The default and `LOGISMOS_HIP_BUILD=required`
+both fail if the compiler is missing or compilation fails. CPU-only iteration
+requires `LOGISMOS_HIP_BUILD=cpu-only`; the retired `LOGISMOS_SKIP_HIP_BUILD`
+variable is an error. A CPU-only build has no GPU kernels, and HIP-backed ops
+return `Error::NoGpuBuild` instead of running on-device.
 
-On a box that *has* ROCm installed but where a HIP kernel compile needs
-to be skipped anyway - bisecting a `hipcc` regression, working around a
-broken local ROCm install, or a fast CPU-only iteration loop - set
-`LOGISMOS_SKIP_HIP_BUILD` to force the same CPU-only fallback the
-`hipcc`-absent path takes:
+Build mode is not an isolation boundary. Agent-led checks run through the
+[GPU-denied runner](docs/gpu-denied-runner.md), which denies device access even
+to dependencies and build scripts. For example:
 
+```bash
+scripts/gpu-denied-runner.sh -- /bin/sh -ceu \
+  'LOGISMOS_HIP_BUILD=cpu-only cargo test --locked -p placement -p bin'
 ```
-LOGISMOS_SKIP_HIP_BUILD=1 cargo build
-```
-
-Cost: the resulting build has no GPU kernels - `kernels` compiles
-against its CPU reference path only, and any HIP-backed op returns
-`Error::NoGpuBuild` at runtime instead of running on-device.
 
 `crates/hipcore/build.rs` is different: it resolves the HIP runtime
-header and links `amdhip64` unconditionally, with no `LOGISMOS_SKIP_HIP_BUILD`
-equivalent. `cargo check --workspace` therefore fails at `hipcore` on
+header and links `amdhip64` unconditionally, even in CPU-only kernel mode.
+`cargo check --workspace` therefore fails at `hipcore` on
 any box without ROCm headers installed — including a fresh developer
 machine. That failure is expected, not a defect
 (forkwright/logismos#14); do not look for a local workaround.
@@ -75,8 +85,10 @@ What it does not prove: the GH-hosted runner has no AMD GPU. This path
 proves the workspace compiles and links against real HIP headers/ABI —
 it never executes a HIP kernel. A change touching `.hip` sources, or
 `hipcore`/`kernels` FFI surface, still needs verification on real
-hardware (the forge-primary gate on menos, ROCm 6.4, per
-`.kanon-ci.toml`) before anyone can trust it at runtime.
+hardware in a separately reserved operator qualification window before anyone
+can trust it at runtime. Compiling real HIP code inside the GPU-denied runner
+can catch compiler and code-object defects without allocating on a device;
+neither that check nor functional emulation establishes hardware performance.
 
 ## Layout
 
@@ -112,7 +124,7 @@ PolyForm Noncommercial 1.0.0. See [LICENSE](LICENSE).
 - Kanon prefix: `lo`
 - Config source: `workflow/kanon.toml [projects.logismos]`
 - Planning state: `projects/logismos/STATE.md`
-- Last state update: `2026-08-03`
+- Last state update: `2026-09-05`
 
 Run `kanon docs sync --check --repo logismos` to verify this generated
 section and `kanon docs sync --apply --repo logismos` to refresh it.

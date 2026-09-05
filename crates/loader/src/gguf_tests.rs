@@ -1,6 +1,7 @@
 //! `gguf.rs` tests, `#[path]`-included as a sibling file per `RUST/file-too-long`.
 
 use super::*;
+use std::sync::{Arc, Barrier};
 // WHY not via `use super::*`: the parent's `Error` import is declared
 // `#[expect(unused_imports)]` for intra-doc links; resolving these
 // assertions through this dedicated import keeps that expectation
@@ -43,7 +44,7 @@ pub(crate) fn fixture_bytes() -> Vec<u8> {
     buf.extend_from_slice(&0u32.to_le_bytes()); // ggml_type F32
     buf.extend_from_slice(&0u64.to_le_bytes()); // data offset
     // align to 32
-    let pad = align_up(buf.len() as u64, 32) as usize - buf.len();
+    let pad = (32 - buf.len() % 32) % 32;
     buf.extend(std::iter::repeat_n(0u8, pad));
     // payload: [1.0, 2.0, 3.0] as f32 LE
     for v in [1.0_f32, 2.0, 3.0] {
@@ -52,15 +53,32 @@ pub(crate) fn fixture_bytes() -> Vec<u8> {
     buf
 }
 
-#[test]
-fn align_up_rounds_correctly() {
-    assert_eq!(align_up(0, 32), 0);
-    assert_eq!(align_up(1, 32), 32);
-    assert_eq!(align_up(32, 32), 32);
-    assert_eq!(align_up(33, 32), 64);
+fn sha256_text(inspection: &Inspection) -> Result<String> {
+    let ArtifactDigest::Sha256(digest) = inspection.digest else {
+        return GgufSnafu {
+            offset: 0u64,
+            msg: "whole-file inspection did not return SHA-256".to_string(),
+        }
+        .fail();
+    };
+    Ok(digest.to_string())
+}
+
+fn expected_sha256_text(bytes: &[u8]) -> String {
+    Sha256Digest(Sha256::digest(bytes).into()).to_string()
 }
 
 #[test]
+fn align_up_rounds_correctly() -> Result<()> {
+    assert_eq!(align_up(0, 32)?, 0);
+    assert_eq!(align_up(1, 32)?, 32);
+    assert_eq!(align_up(32, 32)?, 32);
+    assert_eq!(align_up(33, 32)?, 64);
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "tensor")]
 fn reads_fixture_bytes() -> Result<()> {
     let dir = tempdir_for_test();
     let path = dir.join("fixture.gguf");
@@ -85,6 +103,164 @@ fn reads_fixture_bytes() -> Result<()> {
         .flat_map(|f| f.to_le_bytes())
         .collect();
     assert_eq!(tv.bytes, expected.as_slice());
+    let inspection = r.inspect()?;
+    assert_eq!(inspection.tensors.len(), 1);
+    assert_eq!(inspection.tensors[0].name, "one");
+    assert_eq!(inspection.tensors[0].ggml_type, GgmlType::F32);
+    assert_eq!(inspection.tensors[0].byte_len, 12);
+    Ok(())
+}
+
+#[test]
+fn whole_file_inspection_returns_known_observed_sha256() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("fixture-with-misleading-suffix.bin");
+    let bytes = fixture_bytes();
+    std::fs::write(&path, &bytes)?;
+
+    let inspection = inspect_gguf_with_sha256(&path)?;
+    let expected_file_len = u64::try_from(bytes.len()).map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: "fixture length exceeds u64::MAX".to_string(),
+        }
+        .build()
+    })?;
+    assert_eq!(inspection.file_len, expected_file_len);
+    assert_eq!(
+        sha256_text(&inspection)?,
+        "623d94e17734e71bc68433a1f9121ae9b59f4aabc33fdf74f7b5cc62b61c3980",
+        "the digest covers complete fixture bytes, not GGUF metadata only"
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_whole_file_inspections_use_independent_retained_handles() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("concurrent-sha256.gguf");
+    std::fs::write(&path, fixture_bytes())?;
+    let path = Arc::new(path);
+    let barrier = Arc::new(Barrier::new(3));
+
+    let (first, second) = std::thread::scope(|scope| {
+        let first_path = Arc::clone(&path);
+        let first_barrier = Arc::clone(&barrier);
+        let first = scope.spawn(move || {
+            first_barrier.wait();
+            inspect_gguf_with_sha256(&first_path).and_then(|inspection| sha256_text(&inspection))
+        });
+        let second_path = Arc::clone(&path);
+        let second_barrier = Arc::clone(&barrier);
+        let second = scope.spawn(move || {
+            second_barrier.wait();
+            inspect_gguf_with_sha256(&second_path).and_then(|inspection| sha256_text(&inspection))
+        });
+        barrier.wait();
+        (first.join(), second.join())
+    });
+    let first = first.map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: "first concurrent SHA-256 worker panicked".to_string(),
+        }
+        .build()
+    })??;
+    let second = second.map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: "second concurrent SHA-256 worker panicked".to_string(),
+        }
+        .build()
+    })??;
+    let expected = "623d94e17734e71bc68433a1f9121ae9b59f4aabc33fdf74f7b5cc62b61c3980";
+    assert_eq!(first, expected);
+    assert_eq!(second, expected);
+    Ok(())
+}
+
+#[test]
+fn whole_file_hash_retains_opened_file_identity_after_path_replacement() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("replaceable.gguf");
+    let original = fixture_bytes();
+    std::fs::write(&path, &original)?;
+    let file = File::open(&path)?;
+
+    let moved_original = dir.join("original-renamed-away.gguf");
+    std::fs::rename(&path, &moved_original)?;
+    std::fs::write(&path, vec![0u8; original.len()])?;
+
+    let inspection = inspect_open_file_with_sha256(&file, &path)?;
+    let digest = sha256_text(&inspection)?;
+    assert_eq!(
+        digest,
+        "623d94e17734e71bc68433a1f9121ae9b59f4aabc33fdf74f7b5cc62b61c3980"
+    );
+    Ok(())
+}
+
+#[test]
+fn receipt_hash_matches_owned_prefix_and_tail_observed_after_same_length_rewrite() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("interphase-rewrite.gguf");
+    let mut original = fixture_bytes();
+    original.extend(std::iter::repeat_n(0xa5u8, 256));
+    std::fs::write(&path, &original)?;
+    let file = File::open(&path)?;
+
+    // The fixture's parsed header ends at byte 114. This deliberately splits
+    // inside alignment padding so the exact owned header observation is fixed
+    // before the simulated concurrent writer replaces the remaining bytes.
+    let prefix_len = 120u64;
+    let observation = observe_prefix(&file, &path, prefix_len)?;
+    let mut replacement = original.clone();
+    let split = usize::try_from(prefix_len).map_err(|_| {
+        GgufSnafu {
+            offset: prefix_len,
+            msg: "test prefix length exceeds usize::MAX".to_string(),
+        }
+        .build()
+    })?;
+    replacement[split..].fill(0x5a);
+    std::fs::write(&path, &replacement)?;
+
+    let inspection = finish_observation(&file, &path, observation)?;
+    let mut observed = original[..split].to_vec();
+    observed.extend_from_slice(&replacement[split..]);
+    assert_eq!(sha256_text(&inspection)?, expected_sha256_text(&observed));
+    let observed_len = u64::try_from(observed.len()).map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: "test observation length exceeds u64::MAX".to_string(),
+        }
+        .build()
+    })?;
+    assert_eq!(inspection.file_len, observed_len);
+    assert_eq!(inspection.tensors.len(), 1);
+    assert_eq!(inspection.tensors[0].name, "one");
+    Ok(())
+}
+
+#[test]
+fn receipt_rejects_truncation_between_prefix_and_tail_observation() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("interphase-truncation.gguf");
+    let mut bytes = fixture_bytes();
+    bytes.extend(std::iter::repeat_n(0u8, 256));
+    std::fs::write(&path, bytes)?;
+    let file = File::open(&path)?;
+    let prefix_len = 120u64;
+    let observation = observe_prefix(&file, &path, prefix_len)?;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)?
+        .set_len(prefix_len)?;
+    assert!(matches!(
+        finish_observation(&file, &path, observation),
+        Err(Error::MmapStale { .. })
+    ));
     Ok(())
 }
 
@@ -189,6 +365,18 @@ fn nested_array_inner_type_is_rejected() {
 }
 
 #[test]
+fn metadata_arrays_have_a_cumulative_element_limit() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&0u32.to_le_bytes()); // inner_type = U8
+    buf.extend_from_slice(&1u64.to_le_bytes()); // n = 1
+    let mut cur = Cursor::new(&buf);
+    cur.total_metadata_array_elements = MAX_TOTAL_METADATA_ARRAY_ELEMENTS;
+
+    let result = cur.read_meta_value_typed(9);
+    assert!(matches!(result, Err(Error::Gguf { .. })));
+}
+
+#[test]
 fn huge_tensor_count_returns_err_not_abort() -> Result<()> {
     // WHY(forkwright/logismos#34): before the fix this pre-allocated
     // `Vec::with_capacity(tensor_count_usize)` for an untrusted,
@@ -212,6 +400,7 @@ fn huge_tensor_count_returns_err_not_abort() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "tensor")]
 fn dims_product_overflow_is_rejected_not_wrapped_to_zero() -> Result<()> {
     // WHY(forkwright/logismos#36): `desc.dims.iter().product()` used
     // ordinary wrapping multiplication in a release build. A dims
@@ -237,6 +426,7 @@ fn dims_product_overflow_is_rejected_not_wrapped_to_zero() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "tensor")]
 fn byte_range_for_rejects_byte_count_overflow() -> Result<()> {
     // WHY(forkwright/logismos#56): distinct from the dims-product
     // overflow above — this exercises the *new* `checked_mul` on
@@ -252,7 +442,7 @@ fn byte_range_for_rejects_byte_count_overflow() -> Result<()> {
         // A single dim of `u64::MAX` doesn't overflow the
         // dims-product loop (1 * u64::MAX doesn't overflow), so it
         // reaches the byte-count multiply as `elem_count =
-        // usize::MAX`, which `32 bits * usize::MAX` then overflows.
+        // u64::MAX`, which `32 bits * u64::MAX` then overflows.
         dims: vec![u64::MAX],
         ggml_type: GgmlType::F32,
         data_offset: 0,
@@ -278,13 +468,14 @@ fn byte_range_for_rejects_byte_count_overflow() -> Result<()> {
         .fail();
     };
     assert!(
-        msg.contains("overflows usize"),
-        "expected the checked_mul overflow message, got: {msg}"
+        msg.contains("byte count overflows"),
+        "expected the checked-multiply overflow message, got: {msg}"
     );
     Ok(())
 }
 
 #[test]
+#[cfg(feature = "tensor")]
 fn byte_range_for_rejects_out_of_bounds_data() -> Result<()> {
     // WHY(forkwright/logismos#56): `byte_range_for`'s
     // `end_usize > mmap.len()` branch had no test — every existing
@@ -417,6 +608,7 @@ fn rejects_duplicate_tensor_name() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "tensor")]
 fn get_rejects_after_external_truncation() -> Result<()> {
     // WHY(forkwright/logismos#60): the mmap SAFETY comment states
     // the backing file must not be mutated while the mapping is
@@ -431,6 +623,308 @@ fn get_rejects_after_external_truncation() -> Result<()> {
 
     let result = r.get("one");
     assert!(matches!(result, Err(Error::MmapStale { .. })));
+    Ok(())
+}
+
+#[test]
+fn inspection_reports_exact_tensor_types_and_serialized_extents() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("hybrid-profile.gguf");
+    std::fs::write(&path, hybrid_profile_fixture_bytes()?)?;
+
+    let profile = Reader::open(&path)?.inspect()?;
+    assert_eq!(profile.digest, ArtifactDigest::NotComputed);
+    assert_eq!(profile.model.architecture.as_deref(), Some("qwen3"));
+    assert_eq!(profile.model.name.as_deref(), Some("synthetic-hybrid"));
+    assert_eq!(profile.model.file_type, Some(12));
+    assert_eq!(profile.model.quantization_version, Some(2));
+    assert_eq!(profile.tensors.len(), 2);
+    assert_eq!(profile.tensors[0].ggml_type, GgmlType::F16);
+    assert_eq!(profile.tensors[0].logical_elements, 2);
+    assert_eq!(profile.tensors[0].byte_len, 4);
+    assert_eq!(profile.tensors[1].ggml_type, GgmlType::Q4K);
+    assert_eq!(profile.tensors[1].logical_elements, 256);
+    assert_eq!(profile.tensors[1].byte_len, 144);
+    assert_eq!(profile.type_census.len(), 2);
+    assert_eq!(profile.type_census[0].ggml_type, GgmlType::F16);
+    assert_eq!(profile.type_census[1].ggml_type, GgmlType::Q4K);
+    Ok(())
+}
+
+#[test]
+fn inspection_rejects_stale_mmap_after_external_truncation() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("stale-profile.gguf");
+    std::fs::write(&path, hybrid_profile_fixture_bytes()?)?;
+    let reader = Reader::open(&path)?;
+    std::fs::write(&path, b"short")?;
+
+    assert!(matches!(reader.inspect(), Err(Error::MmapStale { .. })));
+    Ok(())
+}
+
+#[test]
+fn owned_prefix_receipt_rejects_malformed_truncated_and_oversize_headers() -> Result<()> {
+    let dir = tempdir_for_test();
+    let malformed = dir.join("receipt-bad-magic.gguf");
+    std::fs::write(&malformed, b"NOPE-this-is-not-gguf")?;
+    assert!(matches!(
+        inspect_gguf_with_sha256(&malformed),
+        Err(Error::Gguf { .. })
+    ));
+
+    let truncated = dir.join("receipt-truncated-header.gguf");
+    std::fs::write(&truncated, GGUF_MAGIC)?;
+    assert!(matches!(
+        inspect_gguf_with_sha256(&truncated),
+        Err(Error::Gguf { .. })
+    ));
+
+    let oversize = dir.join("receipt-oversize-count.gguf");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(GGUF_MAGIC);
+    bytes.extend_from_slice(&GGUF_V3.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&(MAX_METADATA_COUNT + 1).to_le_bytes());
+    std::fs::write(&oversize, bytes)?;
+    assert!(matches!(
+        inspect_gguf_with_sha256(&oversize),
+        Err(Error::Gguf { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn header_parse_uses_full_file_length_for_large_alignment_extents() -> Result<()> {
+    let alignment = 1u32 << 31;
+    let mut header = Vec::new();
+    header.extend_from_slice(GGUF_MAGIC);
+    header.extend_from_slice(&GGUF_V3.to_le_bytes());
+    header.extend_from_slice(&1u64.to_le_bytes());
+    header.extend_from_slice(&1u64.to_le_bytes());
+    append_u32_metadata(&mut header, "general.alignment", alignment)?;
+    append_tensor_descriptor(&mut header, "far-away", &[1], 0, 0)?;
+
+    let parsed = Reader::parse(&header)?;
+    assert_eq!(parsed.data_region_start, u64::from(alignment));
+    let full_file_len = u64::from(alignment).checked_add(4).ok_or_else(|| {
+        GgufSnafu {
+            offset: u64::from(alignment),
+            msg: "test file length overflows u64".to_string(),
+        }
+        .build()
+    })?;
+    parsed.validate_tensor_extents(full_file_len)?;
+    let inspection = parsed.inspection(full_file_len, ArtifactDigest::NotComputed)?;
+    assert_eq!(inspection.tensors[0].file_offset, u64::from(alignment));
+    assert!(full_file_len > maximum_header_snapshot_bytes()?);
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_unknown_ggml_type_before_profile_creation() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("unknown-ggml-type.gguf");
+    std::fs::write(&path, one_tensor_fixture(999, &[1], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_unsupported_iq_ggml_type_before_profile_creation() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("unsupported-iq-ggml-type.gguf");
+    // GGML_TYPE_IQ2_XXS = 16. It must not be mistaken for I8.
+    std::fs::write(&path, one_tensor_fixture(16, &[1], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_metadata_count_above_inspection_limit() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("too-many-metadata-entries.gguf");
+    let mut buf = Vec::new();
+    buf.extend_from_slice(GGUF_MAGIC);
+    buf.extend_from_slice(&GGUF_V3.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    buf.extend_from_slice(&(MAX_METADATA_COUNT + 1).to_le_bytes());
+    std::fs::write(&path, buf)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_rank_above_ggml_limit() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("too-many-tensor-dimensions.gguf");
+    std::fs::write(&path, one_tensor_fixture(0, &[1, 1, 1, 1, 1], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_quantized_tensor_with_partial_block() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("partial-quant-block.gguf");
+    std::fs::write(&path, one_tensor_fixture(12, &[1], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_truncated_tensor_payload_during_open() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("truncated-tensor-payload.gguf");
+    std::fs::write(&path, one_tensor_fixture(0, &[1], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_descriptor_extent_overflow_during_open() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("extent-overflow.gguf");
+    std::fs::write(&path, one_tensor_fixture(0, &[u64::MAX], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_overlapping_tensor_extents_during_open() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("overlapping-extents.gguf");
+    let mut buf = Vec::new();
+    buf.extend_from_slice(GGUF_MAGIC);
+    buf.extend_from_slice(&GGUF_V3.to_le_bytes());
+    buf.extend_from_slice(&2u64.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    append_tensor_descriptor(&mut buf, "first", &[1], 0, 0)?;
+    append_tensor_descriptor(&mut buf, "second", &[1], 0, 0)?;
+    pad_to_data_region(&mut buf)?;
+    buf.extend_from_slice(&0f32.to_le_bytes());
+    std::fs::write(&path, buf)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+fn hybrid_profile_fixture_bytes() -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(GGUF_MAGIC);
+    buf.extend_from_slice(&GGUF_V3.to_le_bytes());
+    buf.extend_from_slice(&2u64.to_le_bytes());
+    buf.extend_from_slice(&4u64.to_le_bytes());
+    append_string_metadata(&mut buf, "general.architecture", "qwen3")?;
+    append_string_metadata(&mut buf, "general.name", "synthetic-hybrid")?;
+    append_u32_metadata(&mut buf, "general.file_type", 12)?;
+    append_u32_metadata(&mut buf, "general.quantization_version", 2)?;
+    append_tensor_descriptor(&mut buf, "blk.0.attn_q.weight", &[2], 1, 0)?;
+    append_tensor_descriptor(&mut buf, "blk.0.gdn_a.weight", &[256], 12, 32)?;
+    pad_to_data_region(&mut buf)?;
+    buf.extend_from_slice(&[0u8; 4]);
+    buf.extend_from_slice(&[0u8; 28]);
+    buf.extend_from_slice(&[0u8; 144]);
+    Ok(buf)
+}
+
+fn one_tensor_fixture(
+    ggml_type: u32,
+    dims: &[u64],
+    data_offset: u64,
+    payload_len: usize,
+) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(GGUF_MAGIC);
+    buf.extend_from_slice(&GGUF_V3.to_le_bytes());
+    buf.extend_from_slice(&1u64.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    append_tensor_descriptor(&mut buf, "tensor", dims, ggml_type, data_offset)?;
+    pad_to_data_region(&mut buf)?;
+    buf.extend(std::iter::repeat_n(0u8, payload_len));
+    Ok(buf)
+}
+
+fn append_string_metadata(buf: &mut Vec<u8>, key: &str, value: &str) -> Result<()> {
+    append_string(buf, key)?;
+    buf.extend_from_slice(&8u32.to_le_bytes());
+    append_string(buf, value)
+}
+
+fn append_u32_metadata(buf: &mut Vec<u8>, key: &str, value: u32) -> Result<()> {
+    append_string(buf, key)?;
+    buf.extend_from_slice(&4u32.to_le_bytes());
+    buf.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn append_tensor_descriptor(
+    buf: &mut Vec<u8>,
+    name: &str,
+    dims: &[u64],
+    ggml_type: u32,
+    data_offset: u64,
+) -> Result<()> {
+    append_string(buf, name)?;
+    let dimension_count = u32::try_from(dims.len()).map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: format!(
+                "test tensor dimension count {} exceeds u32::MAX",
+                dims.len()
+            ),
+        }
+        .build()
+    })?;
+    buf.extend_from_slice(&dimension_count.to_le_bytes());
+    for dim in dims {
+        buf.extend_from_slice(&dim.to_le_bytes());
+    }
+    buf.extend_from_slice(&ggml_type.to_le_bytes());
+    buf.extend_from_slice(&data_offset.to_le_bytes());
+    Ok(())
+}
+
+fn append_string(buf: &mut Vec<u8>, value: &str) -> Result<()> {
+    let len = u64::try_from(value.len()).map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: format!("test string length {} exceeds u64::MAX", value.len()),
+        }
+        .build()
+    })?;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn pad_to_data_region(buf: &mut Vec<u8>) -> Result<()> {
+    let header_len = u64::try_from(buf.len()).map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: format!("test GGUF header length {} exceeds u64::MAX", buf.len()),
+        }
+        .build()
+    })?;
+    let data_start = align_up(header_len, DEFAULT_ALIGNMENT)?;
+    let padding = usize::try_from(data_start - header_len).map_err(|_| {
+        GgufSnafu {
+            offset: header_len,
+            msg: format!(
+                "test GGUF padding {} exceeds usize::MAX",
+                data_start - header_len
+            ),
+        }
+        .build()
+    })?;
+    buf.extend(std::iter::repeat_n(0u8, padding));
     Ok(())
 }
 

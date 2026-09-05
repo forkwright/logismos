@@ -16,7 +16,7 @@ Pipeline (matches the Stella + sentence-transformers default for dim=1024):
 Outputs at `phases/03-stella/golden/`:
     - tokens.jsonl — per-sentence {text, ids, attention_mask}
     - embeddings_dim1024.safetensors — [N, 1024] float32, row i <=> input line i
-    - PROVENANCE.md — versions, hash, notes
+    - PROVENANCE.json — versions, hash, notes
 """
 
 from __future__ import annotations
