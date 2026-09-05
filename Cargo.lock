@@ -55,6 +55,10 @@ checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 [[package]]
 name = "bin"
 version = "1.0.11"
+dependencies = [
+ "placement",
+ "serde_json",
+]
 
 [[package]]
 name = "bindgen"
@@ -672,6 +676,15 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "placement"
+version = "1.0.11"
+dependencies = [
+ "serde",
+ "serde_json",
+ "snafu",
+]
 
 [[package]]
 name = "ppv-lite86"

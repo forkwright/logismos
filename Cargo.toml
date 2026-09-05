@@ -79,3 +79,4 @@ core = { path = "crates/core" }
 transformers = { path = "crates/transformers" }
 encoders = { path = "crates/encoders" }
 embed = { path = "crates/embed" }
+placement = { path = "crates/placement" }
