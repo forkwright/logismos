@@ -104,6 +104,15 @@ does not execute a HIP kernel or prove hardware behavior. Real GPU execution
 is a separate hardware lane and is never enabled by this runner or its default
 CI job.
 
+Run `scripts/hip-code-object-witness.sh` for the required-HIP lane. This public
+entry point always enters the denied runner, then compiles the in-tree HIP
+sources and inspects the archive's offload bundles and exact target metadata.
+It rejects missing objects and malformed or wrong-architecture metadata.
+`target/hip-code-object-witness/receipt.txt` records the observed compiler,
+resource directory, archive membership and code-object count. The receipt
+describes that invocation; it is neither a hardware result nor evidence that
+another toolchain or revision passed.
+
 ## Threat-model limits
 
 The boundary contains the requested command and its descendants as an

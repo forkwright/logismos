@@ -11,13 +11,21 @@ Cross-tool guide for AI coding agents (Claude Code, Kimi, Codex, Cursor, Copilot
 ## Build / Test / Lint
 
 ```bash
-cargo check -p <crate>                       # fast compile check
-cargo test  -p <crate>                       # single crate tests
-cargo clippy --workspace -- -D warnings      # lint (zero warnings under -D)
-cargo test  --workspace                      # full suite
+scripts/gpu-denied-runner.sh -- /bin/sh -ceu \
+  'LOGISMOS_HIP_BUILD=cpu-only cargo check -p <crate>'
+scripts/gpu-denied-runner.sh -- /bin/sh -ceu \
+  'LOGISMOS_HIP_BUILD=cpu-only cargo test --workspace --jobs 8'
+scripts/gpu-denied-runner.sh -- /bin/sh -ceu \
+  'LOGISMOS_HIP_BUILD=cpu-only cargo clippy --workspace --all-targets --jobs 8 -- -D warnings'
+scripts/hip-code-object-witness.sh           # compile/inspect only; denied wrapper is mandatory
 ```
 
-Use `CARGO_TARGET_DIR=/data/target` from `<workspace>/logismos`. Leave `CARGO_TARGET_DIR` unset inside `<workspace>/worktrees/logismos/<slug>/` so each worktree gets its own `<wt>/target`.
+The runner fixes the target directory to its worktree's `target/` and ignores
+ambient target/cache configuration. Delegated edits and validation use their
+own named worktree. Run one Cargo command at a time in each worktree; do not
+share `/data/target` across agent lanes. See
+[`docs/gpu-denied-runner.md`](docs/gpu-denied-runner.md) for prerequisites and
+the precise threat model. Ordinary compilation is not a hardware-test permit.
 
 ## Key patterns
 
