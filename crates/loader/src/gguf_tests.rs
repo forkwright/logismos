@@ -43,7 +43,7 @@ pub(crate) fn fixture_bytes() -> Vec<u8> {
     buf.extend_from_slice(&0u32.to_le_bytes()); // ggml_type F32
     buf.extend_from_slice(&0u64.to_le_bytes()); // data offset
     // align to 32
-    let pad = align_up(buf.len() as u64, 32) as usize - buf.len();
+    let pad = (32 - buf.len() % 32) % 32;
     buf.extend(std::iter::repeat_n(0u8, pad));
     // payload: [1.0, 2.0, 3.0] as f32 LE
     for v in [1.0_f32, 2.0, 3.0] {
@@ -53,11 +53,12 @@ pub(crate) fn fixture_bytes() -> Vec<u8> {
 }
 
 #[test]
-fn align_up_rounds_correctly() {
-    assert_eq!(align_up(0, 32), 0);
-    assert_eq!(align_up(1, 32), 32);
-    assert_eq!(align_up(32, 32), 32);
-    assert_eq!(align_up(33, 32), 64);
+fn align_up_rounds_correctly() -> Result<()> {
+    assert_eq!(align_up(0, 32)?, 0);
+    assert_eq!(align_up(1, 32)?, 32);
+    assert_eq!(align_up(32, 32)?, 32);
+    assert_eq!(align_up(33, 32)?, 64);
+    Ok(())
 }
 
 #[test]
@@ -85,6 +86,11 @@ fn reads_fixture_bytes() -> Result<()> {
         .flat_map(|f| f.to_le_bytes())
         .collect();
     assert_eq!(tv.bytes, expected.as_slice());
+    let inspection = r.inspect()?;
+    assert_eq!(inspection.tensors.len(), 1);
+    assert_eq!(inspection.tensors[0].name, "one");
+    assert_eq!(inspection.tensors[0].ggml_type, GgmlType::F32);
+    assert_eq!(inspection.tensors[0].byte_len, 12);
     Ok(())
 }
 
@@ -252,7 +258,7 @@ fn byte_range_for_rejects_byte_count_overflow() -> Result<()> {
         // A single dim of `u64::MAX` doesn't overflow the
         // dims-product loop (1 * u64::MAX doesn't overflow), so it
         // reaches the byte-count multiply as `elem_count =
-        // usize::MAX`, which `32 bits * usize::MAX` then overflows.
+        // u64::MAX`, which `32 bits * u64::MAX` then overflows.
         dims: vec![u64::MAX],
         ggml_type: GgmlType::F32,
         data_offset: 0,
@@ -278,8 +284,8 @@ fn byte_range_for_rejects_byte_count_overflow() -> Result<()> {
         .fail();
     };
     assert!(
-        msg.contains("overflows usize"),
-        "expected the checked_mul overflow message, got: {msg}"
+        msg.contains("byte count overflows"),
+        "expected the checked-multiply overflow message, got: {msg}"
     );
     Ok(())
 }
@@ -431,6 +437,239 @@ fn get_rejects_after_external_truncation() -> Result<()> {
 
     let result = r.get("one");
     assert!(matches!(result, Err(Error::MmapStale { .. })));
+    Ok(())
+}
+
+#[test]
+fn inspection_reports_exact_tensor_types_and_serialized_extents() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("hybrid-profile.gguf");
+    std::fs::write(&path, hybrid_profile_fixture_bytes()?)?;
+
+    let profile = Reader::open(&path)?.inspect()?;
+    assert_eq!(profile.digest, ArtifactDigest::Unverified);
+    assert_eq!(profile.model.architecture.as_deref(), Some("qwen3"));
+    assert_eq!(profile.model.name.as_deref(), Some("synthetic-hybrid"));
+    assert_eq!(profile.model.file_type, Some(12));
+    assert_eq!(profile.model.quantization_version, Some(2));
+    assert_eq!(profile.tensors.len(), 2);
+    assert_eq!(profile.tensors[0].ggml_type, GgmlType::F16);
+    assert_eq!(profile.tensors[0].logical_elements, 2);
+    assert_eq!(profile.tensors[0].byte_len, 4);
+    assert_eq!(profile.tensors[1].ggml_type, GgmlType::Q4K);
+    assert_eq!(profile.tensors[1].logical_elements, 256);
+    assert_eq!(profile.tensors[1].byte_len, 144);
+    assert_eq!(profile.type_census.len(), 2);
+    assert_eq!(profile.type_census[0].ggml_type, GgmlType::F16);
+    assert_eq!(profile.type_census[1].ggml_type, GgmlType::Q4K);
+    Ok(())
+}
+
+#[test]
+fn inspection_rejects_stale_mmap_after_external_truncation() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("stale-profile.gguf");
+    std::fs::write(&path, hybrid_profile_fixture_bytes()?)?;
+    let reader = Reader::open(&path)?;
+    std::fs::write(&path, b"short")?;
+
+    assert!(matches!(reader.inspect(), Err(Error::MmapStale { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_unknown_ggml_type_before_profile_creation() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("unknown-ggml-type.gguf");
+    std::fs::write(&path, one_tensor_fixture(999, &[1], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_metadata_count_above_inspection_limit() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("too-many-metadata-entries.gguf");
+    let mut buf = Vec::new();
+    buf.extend_from_slice(GGUF_MAGIC);
+    buf.extend_from_slice(&GGUF_V3.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    buf.extend_from_slice(&(MAX_METADATA_COUNT + 1).to_le_bytes());
+    std::fs::write(&path, buf)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_rank_above_ggml_limit() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("too-many-tensor-dimensions.gguf");
+    std::fs::write(&path, one_tensor_fixture(0, &[1, 1, 1, 1, 1], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_quantized_tensor_with_partial_block() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("partial-quant-block.gguf");
+    std::fs::write(&path, one_tensor_fixture(12, &[1], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_truncated_tensor_payload_during_open() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("truncated-tensor-payload.gguf");
+    std::fs::write(&path, one_tensor_fixture(0, &[1], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_descriptor_extent_overflow_during_open() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("extent-overflow.gguf");
+    std::fs::write(&path, one_tensor_fixture(0, &[u64::MAX], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_overlapping_tensor_extents_during_open() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("overlapping-extents.gguf");
+    let mut buf = Vec::new();
+    buf.extend_from_slice(GGUF_MAGIC);
+    buf.extend_from_slice(&GGUF_V3.to_le_bytes());
+    buf.extend_from_slice(&2u64.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    append_tensor_descriptor(&mut buf, "first", &[1], 0, 0)?;
+    append_tensor_descriptor(&mut buf, "second", &[1], 0, 0)?;
+    pad_to_data_region(&mut buf)?;
+    buf.extend_from_slice(&0f32.to_le_bytes());
+    std::fs::write(&path, buf)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+fn hybrid_profile_fixture_bytes() -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(GGUF_MAGIC);
+    buf.extend_from_slice(&GGUF_V3.to_le_bytes());
+    buf.extend_from_slice(&2u64.to_le_bytes());
+    buf.extend_from_slice(&4u64.to_le_bytes());
+    append_string_metadata(&mut buf, "general.architecture", "qwen3")?;
+    append_string_metadata(&mut buf, "general.name", "synthetic-hybrid")?;
+    append_u32_metadata(&mut buf, "general.file_type", 12)?;
+    append_u32_metadata(&mut buf, "general.quantization_version", 2)?;
+    append_tensor_descriptor(&mut buf, "blk.0.attn_q.weight", &[2], 1, 0)?;
+    append_tensor_descriptor(&mut buf, "blk.0.gdn_a.weight", &[256], 12, 32)?;
+    pad_to_data_region(&mut buf)?;
+    buf.extend_from_slice(&[0u8; 4]);
+    buf.extend_from_slice(&[0u8; 28]);
+    buf.extend_from_slice(&[0u8; 144]);
+    Ok(buf)
+}
+
+fn one_tensor_fixture(
+    ggml_type: u32,
+    dims: &[u64],
+    data_offset: u64,
+    payload_len: usize,
+) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(GGUF_MAGIC);
+    buf.extend_from_slice(&GGUF_V3.to_le_bytes());
+    buf.extend_from_slice(&1u64.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    append_tensor_descriptor(&mut buf, "tensor", dims, ggml_type, data_offset)?;
+    pad_to_data_region(&mut buf)?;
+    buf.extend(std::iter::repeat_n(0u8, payload_len));
+    Ok(buf)
+}
+
+fn append_string_metadata(buf: &mut Vec<u8>, key: &str, value: &str) -> Result<()> {
+    append_string(buf, key)?;
+    buf.extend_from_slice(&8u32.to_le_bytes());
+    append_string(buf, value)
+}
+
+fn append_u32_metadata(buf: &mut Vec<u8>, key: &str, value: u32) -> Result<()> {
+    append_string(buf, key)?;
+    buf.extend_from_slice(&4u32.to_le_bytes());
+    buf.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn append_tensor_descriptor(
+    buf: &mut Vec<u8>,
+    name: &str,
+    dims: &[u64],
+    ggml_type: u32,
+    data_offset: u64,
+) -> Result<()> {
+    append_string(buf, name)?;
+    let dimension_count = u32::try_from(dims.len()).map_err(|_| {
+        GgufSnafu {
+            offset: 0,
+            msg: format!(
+                "test tensor dimension count {} exceeds u32::MAX",
+                dims.len()
+            ),
+        }
+        .build()
+    })?;
+    buf.extend_from_slice(&dimension_count.to_le_bytes());
+    for dim in dims {
+        buf.extend_from_slice(&dim.to_le_bytes());
+    }
+    buf.extend_from_slice(&ggml_type.to_le_bytes());
+    buf.extend_from_slice(&data_offset.to_le_bytes());
+    Ok(())
+}
+
+fn append_string(buf: &mut Vec<u8>, value: &str) -> Result<()> {
+    let len = u64::try_from(value.len()).map_err(|_| {
+        GgufSnafu {
+            offset: 0,
+            msg: format!("test string length {} exceeds u64::MAX", value.len()),
+        }
+        .build()
+    })?;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn pad_to_data_region(buf: &mut Vec<u8>) -> Result<()> {
+    let header_len = u64::try_from(buf.len()).map_err(|_| {
+        GgufSnafu {
+            offset: 0,
+            msg: format!("test GGUF header length {} exceeds u64::MAX", buf.len()),
+        }
+        .build()
+    })?;
+    let data_start = align_up(header_len, DEFAULT_ALIGNMENT)?;
+    let padding = usize::try_from(data_start - header_len).map_err(|_| {
+        GgufSnafu {
+            offset: header_len,
+            msg: format!(
+                "test GGUF padding {} exceeds usize::MAX",
+                data_start - header_len
+            ),
+        }
+        .build()
+    })?;
+    buf.extend(std::iter::repeat_n(0u8, padding));
     Ok(())
 }
 
