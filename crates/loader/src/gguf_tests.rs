@@ -195,6 +195,18 @@ fn nested_array_inner_type_is_rejected() {
 }
 
 #[test]
+fn metadata_arrays_have_a_cumulative_element_limit() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&0u32.to_le_bytes()); // inner_type = U8
+    buf.extend_from_slice(&1u64.to_le_bytes()); // n = 1
+    let mut cur = Cursor::new(&buf);
+    cur.total_metadata_array_elements = MAX_TOTAL_METADATA_ARRAY_ELEMENTS;
+
+    let result = cur.read_meta_value_typed(9);
+    assert!(matches!(result, Err(Error::Gguf { .. })));
+}
+
+#[test]
 fn huge_tensor_count_returns_err_not_abort() -> Result<()> {
     // WHY(forkwright/logismos#34): before the fix this pre-allocated
     // `Vec::with_capacity(tensor_count_usize)` for an untrusted,
@@ -620,7 +632,7 @@ fn append_tensor_descriptor(
     append_string(buf, name)?;
     let dimension_count = u32::try_from(dims.len()).map_err(|_| {
         GgufSnafu {
-            offset: 0,
+            offset: 0u64,
             msg: format!(
                 "test tensor dimension count {} exceeds u32::MAX",
                 dims.len()
@@ -640,7 +652,7 @@ fn append_tensor_descriptor(
 fn append_string(buf: &mut Vec<u8>, value: &str) -> Result<()> {
     let len = u64::try_from(value.len()).map_err(|_| {
         GgufSnafu {
-            offset: 0,
+            offset: 0u64,
             msg: format!("test string length {} exceeds u64::MAX", value.len()),
         }
         .build()
@@ -653,7 +665,7 @@ fn append_string(buf: &mut Vec<u8>, value: &str) -> Result<()> {
 fn pad_to_data_region(buf: &mut Vec<u8>) -> Result<()> {
     let header_len = u64::try_from(buf.len()).map_err(|_| {
         GgufSnafu {
-            offset: 0,
+            offset: 0u64,
             msg: format!("test GGUF header length {} exceeds u64::MAX", buf.len()),
         }
         .build()

@@ -49,6 +49,7 @@ const DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_TENSOR_COUNT: u64 = 100_000;
 const MAX_METADATA_COUNT: u64 = 100_000;
 const MAX_METADATA_ARRAY_ELEMENTS: u64 = 262_144;
+const MAX_TOTAL_METADATA_ARRAY_ELEMENTS: u64 = 1_000_000;
 const MAX_STRING_BYTES: u64 = 1 << 20;
 const MAX_TOTAL_STRING_BYTES: u64 = 64 << 20;
 const MAX_TENSOR_DIMS: u32 = 4;
@@ -278,7 +279,10 @@ pub struct GgmlTypeCensus {
 ///
 /// The profile identifies exact descriptor types and on-disk extents. It does
 /// not decode tensor payloads, reserve device memory, classify execution
-/// support, or establish a cryptographic artifact identity.
+/// support, or establish a cryptographic artifact identity. Its facts derive
+/// from the original mmap and require the caller not to mutate the backing
+/// artifact while it is open; a size re-check catches truncation, not a
+/// same-length content replacement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Inspection {
@@ -508,7 +512,7 @@ impl Reader {
         Ok(Inspection {
             file_len: u64::try_from(self.mmap.len()).map_err(|_| {
                 GgufSnafu {
-                    offset: 0,
+                    offset: 0u64,
                     msg: format!("GGUF file length {} exceeds u64::MAX", self.mmap.len()),
                 }
                 .build()
@@ -929,6 +933,7 @@ struct Cursor<'a> {
     mmap: &'a [u8],
     pos: u64,
     total_string_bytes: u64,
+    total_metadata_array_elements: u64,
 }
 
 impl<'a> Cursor<'a> {
@@ -937,6 +942,7 @@ impl<'a> Cursor<'a> {
             mmap,
             pos: 0,
             total_string_bytes: 0,
+            total_metadata_array_elements: 0,
         }
     }
 
@@ -1155,6 +1161,25 @@ impl<'a> Cursor<'a> {
                     }
                     .fail();
                 }
+                let total_metadata_array_elements = self
+                    .total_metadata_array_elements
+                    .checked_add(n)
+                    .ok_or_else(|| {
+                        GgufSnafu {
+                            offset: self.pos,
+                            msg: "GGUF cumulative metadata array elements overflow u64".to_string(),
+                        }
+                        .build()
+                    })?;
+                if total_metadata_array_elements > MAX_TOTAL_METADATA_ARRAY_ELEMENTS {
+                    return GgufSnafu {
+                        offset: self.pos,
+                        msg: format!(
+                            "GGUF cumulative metadata array elements {total_metadata_array_elements} exceed limit {MAX_TOTAL_METADATA_ARRAY_ELEMENTS}"
+                        ),
+                    }
+                    .fail();
+                }
                 // WHY(forkwright/logismos#34): no pre-allocation from an
                 // untrusted length — see the tensor_count/n_dims WHY
                 // above in `Reader::open`. `Vec::push` amortises growth,
@@ -1165,6 +1190,7 @@ impl<'a> Cursor<'a> {
                 for _ in 0..n {
                     out.push(self.read_meta_value_typed(inner_type)?);
                 }
+                self.total_metadata_array_elements = total_metadata_array_elements;
                 MetaValue::Array(out)
             }
             10 => MetaValue::U64(self.read_u64()?),
