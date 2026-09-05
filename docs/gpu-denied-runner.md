@@ -49,10 +49,13 @@ target is fixed to the worktree's `target/`.
 Before Bubblewrap starts, the supervisor enumerates `/proc/self/fd` and closes
 every inherited descriptor above standard I/O. This does not depend on the
 soft descriptor limit. Standard input, output, and error accept only pipes,
-`/dev/null`, or regular files inside the worktree. Sockets, unlinked or
-multiply-linked regular files, block devices, pseudo-terminals, and all other
-character devices fail closed. Standard output and error remain deliberate
-byte-egress channels to the invoking process.
+`/dev/null`, or regular files inside the worktree. Sockets, unlinked regular
+files, block devices, pseudo-terminals, and all other character devices fail
+closed. Source-tree hard links also fail closed. Target hard links are allowed
+only when an inode census proves that every link is contained in the writable
+target; this preserves ordinary Cargo artifact reuse without permitting a
+writable alias to a file elsewhere on the host. Standard output and error
+remain deliberate byte-egress channels to the invoking process.
 
 The witness uses synthetic inherited descriptors, startup hooks, symlink and
 hard-link targets, Unix and TCP listeners, and a pseudo-terminal. It never

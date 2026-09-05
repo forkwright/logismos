@@ -10,6 +10,7 @@ fi
 ROOT=$(builtin cd -- "$SCRIPT_DIR/.." && builtin pwd -P)
 RUNNER="$ROOT/scripts/gpu-denied-runner.sh"
 FIXTURE_DIR=$(/usr/bin/mktemp -d)
+LINK_FIXTURE_DIR=$(/usr/bin/mktemp -d "${ROOT%/*}/gpu-denied-hardlink.XXXXXX")
 CLEANUP_DONE=
 
 cleanup() {
@@ -18,8 +19,11 @@ cleanup() {
     fi
     CLEANUP_DONE=1
     /usr/bin/rm -f -- "$ROOT/target/gpu-denied-escape-link"
-    /usr/bin/rm -f -- "$ROOT/target/gpu-denied-hardlink" "$ROOT/gpu-denied-hardlink-source"
+    /usr/bin/rm -f -- \
+        "$ROOT/target/gpu-denied-hardlink-a" \
+        "$ROOT/target/gpu-denied-hardlink-b"
     /usr/bin/rm -rf -- "$FIXTURE_DIR"
+    /usr/bin/rm -rf -- "$LINK_FIXTURE_DIR"
 }
 
 interrupt() {
@@ -146,7 +150,7 @@ if [[ -e "$TRAP_MARKER" ]]; then
     exit 1
 fi
 
-/usr/bin/python3 - "$RUNNER" "$ROOT" "$FIXTURE_DIR" <<'PYTHON'
+/usr/bin/python3 - "$RUNNER" "$ROOT" "$FIXTURE_DIR" "$LINK_FIXTURE_DIR" <<'PYTHON'
 import os
 import pty
 import resource
@@ -159,6 +163,7 @@ from pathlib import Path
 runner = Path(sys.argv[1])
 root = Path(sys.argv[2])
 fixture = Path(sys.argv[3])
+link_fixture = Path(sys.argv[4])
 
 
 def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
@@ -245,14 +250,31 @@ finally:
 if unlinked_result.returncode != 69 or b'unsupported host endpoint' not in unlinked_result.stderr:
     raise AssertionError('unlinked regular standard input was not rejected')
 
-hardlink_source = root / 'gpu-denied-hardlink-source'
-hardlink_target = root / 'target/gpu-denied-hardlink'
-hardlink_source.unlink(missing_ok=True)
-hardlink_target.unlink(missing_ok=True)
+hardlink_a = root / 'target/gpu-denied-hardlink-a'
+hardlink_b = root / 'target/gpu-denied-hardlink-b'
+hardlink_a.unlink(missing_ok=True)
+hardlink_b.unlink(missing_ok=True)
+hardlink_a.write_text('synthetic target data', encoding='utf-8')
+hardlink_b.hardlink_to(hardlink_a)
+try:
+    internal_hardlink_result = run(
+        [str(runner), '--', '/usr/bin/true'],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+finally:
+    hardlink_b.unlink(missing_ok=True)
+    hardlink_a.unlink(missing_ok=True)
+if internal_hardlink_result.returncode != 0:
+    raise AssertionError(internal_hardlink_result.stderr.decode(errors='replace'))
+
+hardlink_source = link_fixture / 'gpu-denied-hardlink-source'
+hardlink_target = root / 'target/gpu-denied-hardlink-a'
 hardlink_source.write_text('synthetic host data', encoding='utf-8')
 hardlink_target.hardlink_to(hardlink_source)
 try:
-    hardlink_result = run(
+    escaping_hardlink_result = run(
         [str(runner), '--', '/usr/bin/true'],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -261,8 +283,11 @@ try:
 finally:
     hardlink_target.unlink(missing_ok=True)
     hardlink_source.unlink(missing_ok=True)
-if hardlink_result.returncode != 69 or b'multiply-linked' not in hardlink_result.stderr:
-    raise AssertionError('hard-linked host file was not rejected')
+if (
+    escaping_hardlink_result.returncode != 69
+    or b'hard link escapes' not in escaping_hardlink_result.stderr
+):
+    raise AssertionError('target hard link to a host file was not rejected')
 
 target_socket_path = root / 'target/gpu-denied-host-endpoint.sock'
 target_socket_path.unlink(missing_ok=True)

@@ -54,7 +54,13 @@ def _reject_nested_mounts(source: Path) -> None:
             raise BoundaryError('worktree contains a nested host mount')
 
 
-def _reject_special_files(source: Path, *, skip_top_level: frozenset[str] = frozenset()) -> None:
+def _reject_special_files(
+    source: Path,
+    *,
+    skip_top_level: frozenset[str] = frozenset(),
+    allow_contained_hardlinks: bool = False,
+) -> None:
+    hardlinks: dict[tuple[int, int], tuple[int, int, Path]] = {}
     for current, directories, files in os.walk(source, topdown=True, followlinks=False):
         current_path = Path(current)
         if current_path == source and skip_top_level:
@@ -62,13 +68,28 @@ def _reject_special_files(source: Path, *, skip_top_level: frozenset[str] = froz
         for name in (*directories, *files):
             path = current_path / name
             try:
-                file_type = stat.S_IFMT(path.lstat().st_mode)
+                metadata = path.lstat()
             except OSError as error:
                 raise BoundaryError(f'cannot inspect worktree mount source: {error}') from error
+            file_type = stat.S_IFMT(metadata.st_mode)
             if file_type in SPECIAL_FILE_TYPES:
                 raise BoundaryError(f'worktree contains a host endpoint: {path}')
-            if file_type == stat.S_IFREG and path.lstat().st_nlink != 1:
-                raise BoundaryError(f'worktree contains a multiply-linked regular file: {path}')
+            if file_type == stat.S_IFREG and metadata.st_nlink != 1:
+                if not allow_contained_hardlinks:
+                    raise BoundaryError(f'worktree contains a multiply-linked regular file: {path}')
+                key = (metadata.st_dev, metadata.st_ino)
+                observed, expected, first_path = hardlinks.get(
+                    key, (0, metadata.st_nlink, path)
+                )
+                if expected != metadata.st_nlink:
+                    raise BoundaryError(f'worktree hard-link count changed while scanning: {path}')
+                hardlinks[key] = (observed + 1, expected, first_path)
+
+    for observed, expected, path in hardlinks.values():
+        if observed != expected:
+            raise BoundaryError(
+                f'worktree target hard link escapes the writable target: {path}'
+            )
 
 
 def _local_account_home() -> Path | None:
@@ -192,7 +213,7 @@ def _prepare_worktree(root_argument: str) -> tuple[Path, Path]:
 
     _reject_nested_mounts(root)
     _reject_special_files(root, skip_top_level=frozenset({'target'}))
-    _reject_special_files(target)
+    _reject_special_files(target, allow_contained_hardlinks=True)
     return root, target
 
 
