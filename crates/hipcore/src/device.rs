@@ -234,8 +234,11 @@ impl DeviceProps {
         }
     }
 
-    fn from_raw(raw: &ffi::hipDeviceProp_t, pci_bus_id: PciBusId) -> Result<Self> {
-        let uuid_bytes = raw.uuid.bytes.map(|byte| byte as u8);
+    fn from_raw(
+        raw: &ffi::hipDeviceProp_t,
+        uuid: Option<DeviceUuid>,
+        pci_bus_id: PciBusId,
+    ) -> Result<Self> {
         Ok(Self {
             isa: cstr_from_array(&raw.gcnArchName),
             name: cstr_from_array(&raw.name),
@@ -245,7 +248,7 @@ impl DeviceProps {
             max_threads_per_block: device_prop_u32("maxThreadsPerBlock", raw.maxThreadsPerBlock)?,
             max_shared_mem_per_block: device_prop_u32("sharedMemPerBlock", raw.sharedMemPerBlock)?,
             clock_rate_khz: device_prop_u32("clockRate", raw.clockRate)?,
-            identity: DeviceIdentity::from_runtime(Some(DeviceUuid::new(uuid_bytes)), pci_bus_id),
+            identity: DeviceIdentity::from_runtime(uuid, pci_bus_id),
         })
     }
 }
@@ -486,11 +489,41 @@ fn query_device(ordinal: DeviceOrdinal) -> Result<DeviceInfo> {
         unsafe { ffi::hipGetDeviceProperties(&mut raw, ordinal) },
         "hipGetDeviceProperties",
     )?;
+    let uuid = query_device_uuid(ordinal)?;
     let pci_bus_id = query_pci_bus_id(ordinal)?;
     Ok(DeviceInfo {
         ordinal,
-        props: DeviceProps::from_raw(&raw, pci_bus_id)?,
+        props: DeviceProps::from_raw(&raw, uuid, pci_bus_id)?,
     })
+}
+
+/// Query a device UUID independently of the versioned property struct layout.
+///
+/// ROCm 5.7's `hipDeviceProp_t` has no `uuid` member, whereas newer headers
+/// add one. `hipDeviceGetUuid` is available in both runtime APIs, so it keeps
+/// device identity independent of that ABI detail. A runtime that explicitly
+/// reports the query unsupported retains its canonical PCI identity; all other
+/// HIP failures remain typed runtime errors.
+fn query_device_uuid(ordinal: DeviceOrdinal) -> Result<Option<DeviceUuid>> {
+    let mut raw = ffi::hipUUID::default();
+    // SAFETY: `raw` is valid writable UUID storage and `ordinal` was already
+    // checked against `hipGetDeviceCount` by `query_device`.
+    let status = unsafe { ffi::hipDeviceGetUuid(&mut raw, ordinal) };
+    uuid_from_query(status, raw)
+}
+
+fn uuid_from_query(status: ffi::hipError_t, raw: ffi::hipUUID) -> Result<Option<DeviceUuid>> {
+    match status {
+        ffi::hipError_t::hipSuccess => Ok(Some(DeviceUuid::new(raw.bytes.map(|byte| byte as u8)))),
+        ffi::hipError_t::hipErrorNotSupported => Ok(None),
+        other => {
+            check(other, "hipDeviceGetUuid")?;
+            InternalSnafu {
+                message: "hipDeviceGetUuid returned success after a non-success match".to_string(),
+            }
+            .fail()
+        }
+    }
 }
 
 fn query_pci_bus_id(ordinal: DeviceOrdinal) -> Result<PciBusId> {
@@ -720,6 +753,24 @@ mod tests {
             ),
             "missing UUID must select by PCI topology"
         );
+    }
+
+    #[test]
+    fn uuid_query_accepts_the_api_value_and_only_falls_back_when_unsupported() -> Result<()> {
+        let raw = ffi::hipUUID { bytes: [7; 16] };
+        assert_eq!(
+            uuid_from_query(ffi::hipError_t::hipSuccess, raw)?,
+            Some(DeviceUuid::new([7; 16]))
+        );
+        assert_eq!(
+            uuid_from_query(ffi::hipError_t::hipErrorNotSupported, raw)?,
+            None
+        );
+        assert!(matches!(
+            uuid_from_query(ffi::hipError_t::hipErrorInvalidValue, raw),
+            Err(crate::Error::Runtime { .. })
+        ));
+        Ok(())
     }
 
     #[test]
