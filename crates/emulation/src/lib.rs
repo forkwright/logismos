@@ -1008,7 +1008,7 @@ fn lane_binary(
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::expect_used,
     clippy::needless_range_loop,
     reason = "fixtures use expect to name invariants and explicit indices to state the AMD lane mapping"

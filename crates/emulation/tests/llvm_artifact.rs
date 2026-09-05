@@ -10,21 +10,29 @@ const LLVM_OBJDUMP: &str = "/usr/lib64/rocm/llvm/bin/llvm-objdump";
 const EXPECTED_ASSEMBLER: &str = "AOMP-18.0-12";
 const EXPECTED_SOURCE_ID: &str = "18.0-12-ce1873ac686bb90ddec72bb99889a4e80e2de382";
 
-#[test]
-#[ignore = "requires the explicitly pinned local AOMP llvm-mc/llvm-objdump witness"]
-#[allow(
+#[expect(
     clippy::expect_used,
-    reason = "the explicit witness test must name each unavailable external prerequisite"
+    reason = "the explicit witness names its unavailable assembler prerequisite"
 )]
-fn rebuilds_and_disassembles_gfx1100_copy_add_fixture() {
+fn assert_pinned_version() {
     let version = Command::new(LLVM_MC)
         .arg("--version")
         .output()
         .expect("ROCm LLVM assembler must be installed for this artifact witness");
     assert!(version.status.success(), "llvm-mc --version failed");
-    let version_text = String::from_utf8_lossy(&version.stdout);
-    assert!(version_text.contains(EXPECTED_ASSEMBLER));
-    assert!(version_text.contains(EXPECTED_SOURCE_ID));
+    let text = String::from_utf8_lossy(&version.stdout);
+    assert!(text.contains(EXPECTED_ASSEMBLER));
+    assert!(text.contains(EXPECTED_SOURCE_ID));
+}
+
+#[test]
+#[ignore = "requires the explicitly pinned local AOMP llvm-mc/llvm-objdump witness"]
+#[expect(
+    clippy::expect_used,
+    reason = "the explicit witness test must name each unavailable external prerequisite"
+)]
+fn rebuilds_and_disassembles_gfx1100_copy_add_fixture() {
+    assert_pinned_version();
 
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -87,11 +95,12 @@ fn rebuilds_and_disassembles_gfx1100_copy_add_fixture() {
 
 #[test]
 #[ignore = "requires the explicitly pinned local AOMP llvm-mc/llvm-objdump witness"]
-#[allow(
+#[expect(
     clippy::expect_used,
     reason = "the explicit witness names unavailable external prerequisites"
 )]
 fn rebuilds_disassembles_and_admits_gfx1100_wmma_fixture() {
+    assert_pinned_version();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wave32_wmma.s");
     let directory = tempfile::tempdir().expect("temporary artifact directory");
     let object = directory.path().join("wave32_wmma.o");
