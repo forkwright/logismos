@@ -117,8 +117,12 @@ jobs:
           PINNED_TOOLCHAIN: ${{ steps.rust_toolchain.outputs.channel }}
         run: |
           set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/target"
-          sudo chown --recursive 10001:10001 "$GITHUB_WORKSPACE/target"
+          if [[ -e "$GITHUB_WORKSPACE/target" || -L "$GITHUB_WORKSPACE/target" ]]; then
+            printf '%s\n' 'refusing preexisting HIP target directory' >&2
+            exit 69
+          fi
+          mkdir -- "$GITHUB_WORKSPACE/target"
+          sudo chown --no-dereference 10001:10001 -- "$GITHUB_WORKSPACE/target"
           source_owner=$(/usr/bin/stat --format '%u' "$GITHUB_WORKSPACE")
           if [[ "$source_owner" == 10001 ]]; then
             printf '%s\n' 'workspace source owner collides with the fixed gpu-ci account' >&2
