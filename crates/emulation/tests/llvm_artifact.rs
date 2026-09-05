@@ -84,3 +84,47 @@ fn rebuilds_and_disassembles_gfx1100_copy_add_fixture() {
         .expect("admitted text uses only the implemented instruction forms");
     assert_eq!(execution.coverage().end_program_count(), 1);
 }
+
+#[test]
+#[ignore = "requires the explicitly pinned local AOMP llvm-mc/llvm-objdump witness"]
+#[allow(
+    clippy::expect_used,
+    reason = "the explicit witness names unavailable external prerequisites"
+)]
+fn rebuilds_disassembles_and_admits_gfx1100_wmma_fixture() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wave32_wmma.s");
+    let directory = tempfile::tempdir().expect("temporary artifact directory");
+    let object = directory.path().join("wave32_wmma.o");
+    let assembly = Command::new(LLVM_MC)
+        .args([
+            "-triple=amdgcn-amd-amdhsa",
+            "-mcpu=gfx1100",
+            "-filetype=obj",
+            "-o",
+        ])
+        .arg(&object)
+        .arg(&fixture)
+        .output()
+        .expect("llvm-mc must start");
+    assert!(
+        assembly.status.success(),
+        "llvm-mc failed: {}",
+        String::from_utf8_lossy(&assembly.stderr)
+    );
+    let disassembly = Command::new(LLVM_OBJDUMP)
+        .arg("-d")
+        .arg(&object)
+        .output()
+        .expect("llvm-objdump must start");
+    assert!(disassembly.status.success());
+    let text = String::from_utf8_lossy(&disassembly.stdout);
+    assert!(text.contains("CC404018"));
+    assert!(text.contains("1C421100"));
+    assert!(text.contains("v_wmma_f32_16x16x16_f16 v[24:31], v[0:7], v[8:15], v[16:23]"));
+    let bytes = std::fs::read(&object).expect("object readable");
+    let admitted = inspect_relocatable_text(&bytes).expect("relocatable WMMA object admitted");
+    assert_eq!(
+        &admitted.text()[..8],
+        [0x18, 0x40, 0x40, 0xcc, 0x00, 0x11, 0x42, 0x1c]
+    );
+}

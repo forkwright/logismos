@@ -2,7 +2,7 @@
 //!
 //! This crate is a test aid, not an HSA loader, code-object validator, or GPU
 //! performance model. It accepts raw little-endian instruction words and rejects
-//! every encoding other than the four forms documented by [`SUPPORTED_INSTRUCTIONS`].
+//! every encoding other than the forms documented by [`SUPPORTED_INSTRUCTIONS`].
 //! Normal emulator tests use checked instruction bytes and require no AMD toolchain.
 //! The separately ignored `llvm_artifact` test rebuilds the pinned fixture when the
 //! local AOMP witness is deliberately requested.
@@ -34,10 +34,11 @@ pub fn gfx1100_target() -> &'static str {
 }
 
 /// Exact instruction forms accepted by this executor.
-pub const SUPPORTED_INSTRUCTIONS: [&str; 4] = [
+pub const SUPPORTED_INSTRUCTIONS: [&str; 5] = [
     "v_mov_b32_e32",
     "v_add_nc_u32_e32",
     "v_add_f32_e32",
+    "v_wmma_f32_16x16x16_f16 (exact-integer subset)",
     "s_endpgm",
 ];
 
@@ -187,6 +188,7 @@ pub struct InstructionCoverage {
     moves: usize,
     add_u32: usize,
     add_f32: usize,
+    wmma_f32: usize,
     end_program: usize,
     refusals: usize,
 }
@@ -208,6 +210,12 @@ impl InstructionCoverage {
     #[must_use]
     pub const fn add_f32_count(self) -> usize {
         self.add_f32
+    }
+
+    /// Returns the number of executed exact-integer WMMA words.
+    #[must_use]
+    pub const fn wmma_f32_count(self) -> usize {
+        self.wmma_f32
     }
 
     /// Returns the number of executed `s_endpgm` words.
@@ -657,6 +665,7 @@ fn apply_instruction(
             c,
         } => {
             apply_wmma_f32(registers, destination, a, b, c, pc, *coverage)?;
+            coverage.wmma_f32 = coverage.wmma_f32.saturating_add(1);
         }
         Instruction::EndProgram => {
             coverage.end_program = coverage.end_program.saturating_add(1);
@@ -1001,7 +1010,8 @@ fn lane_binary(
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    reason = "fixtures use expect to make a failed test assertion name its invariant"
+    clippy::needless_range_loop,
+    reason = "fixtures use expect to name invariants and explicit indices to state the AMD lane mapping"
 )]
 mod tests {
     use super::*;
@@ -1234,6 +1244,41 @@ mod tests {
                 assert_eq!(
                     d.registers()[24 + row / 2][(row % 2) * 16 + col],
                     encode_f32_integer(v)
+                );
+            }
+        }
+        let mut r = vec![[0; 32]; 32];
+        let mut a = [[0i32; 16]; 16];
+        let mut b = [[0i32; 16]; 16];
+        for row in 0..16 {
+            for k in 0..16 {
+                a[row][k] = i32::try_from((row + 2 * k) % 4).unwrap_or(0);
+                for lane in [row, row + 16] {
+                    put_half(&mut r, 0, lane, k, a[row][k]);
+                }
+            }
+        }
+        for k in 0..16 {
+            for col in 0..16 {
+                b[k][col] = i32::try_from((3 * k + col) % 4).unwrap_or(0);
+                for lane in [col, col + 16] {
+                    put_half(&mut r, 8, lane, k, b[k][col]);
+                }
+            }
+        }
+        let d = Wave32Program::new(WMMA.to_vec(), r, 2)
+            .expect("bounded")
+            .execute()
+            .expect("dense");
+        for row in 0..16 {
+            for col in 0..16 {
+                let mut expected = 0i32;
+                for k in 0..16 {
+                    expected += a[row][k] * b[k][col];
+                }
+                assert_eq!(
+                    d.registers()[24 + row / 2][(row % 2) * 16 + col],
+                    encode_f32_integer(expected)
                 );
             }
         }
