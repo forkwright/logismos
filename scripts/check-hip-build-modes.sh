@@ -12,6 +12,9 @@ RUNNER="$ROOT/scripts/gpu-denied-runner.sh"
 OUT="$ROOT/target/hip-build-mode-witness"
 
 {
+    # WHY: `$1`, `$2`, and the derived paths intentionally expand in the
+    # child `/bin/sh` inside the denied boundary, not in this wrapper.
+    # shellcheck disable=SC2016
     "$RUNNER" -- /bin/sh -ceu '
         root=$1
         out=$2

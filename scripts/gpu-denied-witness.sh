@@ -134,6 +134,9 @@ for name in bash bwrap dirname python3 setpriv; do
 done
 
 {
+    # WHY: these variables intentionally expand in the child `/bin/sh`, after
+    # the runner has cleared the hostile parent environment.
+    # shellcheck disable=SC2016
     PATH="$FIXTURE_DIR/bin" \
     HOME="$FIXTURE_DIR/home" \
     CARGO_HOME="$FIXTURE_DIR/home/.cargo" \
