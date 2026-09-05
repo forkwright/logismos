@@ -18,6 +18,8 @@ jobs:
           persist-credentials: false
       - name: Install boundary dependency
         run: sudo apt-get update && sudo apt-get install --yes bubblewrap shellcheck util-linux
+      - name: Admit unprivileged namespace bootstrap
+        run: bash scripts/ci-hosted-userns.sh
       - name: Resolve repository Rust toolchain
         id: rust_toolchain
         run: |
@@ -59,7 +61,8 @@ jobs:
       - name: Check boundary scripts
         run: |
           shellcheck scripts/gpu-denied-runner.sh scripts/gpu-denied-witness.sh \
-            scripts/check-hip-build-modes.sh
+            scripts/check-hip-build-modes.sh scripts/ci-hosted-userns.sh \
+            scripts/ci-hip-code-object.sh
           python3 - <<'PYTHON'
           from pathlib import Path
           source = Path('scripts/gpu-denied-exec.py').read_text(encoding='utf-8')
@@ -78,15 +81,12 @@ jobs:
     # GPU-denied boundary before invoking Cargo or hipcc.
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    container:
-      image: rocm/dev-ubuntu-24.04@sha256:31418ac10a3769a71eaef330c07280d1d999d7074621339b8f93c484c35f6078
-      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install GPU-denied boundary dependencies
-        run: apt-get update && apt-get install --yes --no-install-recommends bubblewrap python3 util-linux
+      - name: Admit unprivileged namespace bootstrap
+        run: bash scripts/ci-hosted-userns.sh
       - name: Resolve repository Rust toolchain
         id: rust_toolchain
         run: |
@@ -107,73 +107,18 @@ jobs:
               print(f'channel={channel}', file=output)
               print(f'components={",".join(components)}', file=output)
           PYTHON
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
-          components: ${{ steps.rust_toolchain.outputs.components }}
-      - name: Prepare non-root boundary account
-        shell: bash
-        run: |
-          set -euo pipefail
-          useradd --create-home --user-group --shell /bin/bash gpu-ci
-          ci_home=/home/gpu-ci
-          host_cargo_home=${CARGO_HOME:-$HOME/.cargo}
-          host_rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
-          test -d "$host_cargo_home/bin"
-          test -d "$host_rustup_home"
-          install -d -m 0755 -o gpu-ci -g gpu-ci \
-            "$ci_home/.cargo" "$ci_home/.rustup" "$GITHUB_WORKSPACE/target"
-          cp -a -- "$host_cargo_home/bin" "$ci_home/.cargo/bin"
-          for cache in registry git; do
-            if [[ -d "$host_cargo_home/$cache" ]]; then
-              cp -a -- "$host_cargo_home/$cache" "$ci_home/.cargo/$cache"
-            fi
-          done
-          cp -a -- "$host_rustup_home/." "$ci_home/.rustup/"
-          chown -R gpu-ci:gpu-ci -- "$ci_home/.cargo" "$ci_home/.rustup" \
-            "$GITHUB_WORKSPACE/target"
-      - name: Provision locked Rust sources without executing workspace code
+      - name: Compile and inspect HIP code objects without a GPU
         shell: bash
         env:
           PINNED_TOOLCHAIN: ${{ steps.rust_toolchain.outputs.channel }}
         run: |
           set -euo pipefail
-          python3 - "$GITHUB_WORKSPACE/Cargo.lock" <<'PYTHON'
-          import sys
-          import tomllib
-          from pathlib import Path
-
-          lock = tomllib.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
-          allowed = 'registry+https://github.com/rust-lang/crates.io-index'
-          unexpected = sorted({
-              package['source']
-              for package in lock.get('package', [])
-              if 'source' in package and package['source'] != allowed
-          })
-          if unexpected:
-              raise SystemExit(f'Cargo.lock contains non-crates.io sources: {unexpected}')
-          PYTHON
-          cd /tmp
-          /usr/bin/setpriv \
-            --reuid=gpu-ci --regid=gpu-ci --init-groups --no-new-privs \
-            --inh-caps=-all --ambient-caps=-all -- \
-            /usr/bin/env -i \
-              HOME=/home/gpu-ci USER=gpu-ci LOGNAME=gpu-ci \
-              PATH=/home/gpu-ci/.cargo/bin:/usr/bin:/bin \
-              CARGO_HOME=/home/gpu-ci/.cargo RUSTUP_HOME=/home/gpu-ci/.rustup \
-              RUSTUP_TOOLCHAIN="$PINNED_TOOLCHAIN" \
-              /home/gpu-ci/.cargo/bin/cargo fetch --locked \
-                --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
-      - name: Compile and inspect HIP code objects without a GPU
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            /usr/bin/setpriv \
-              --reuid=gpu-ci --regid=gpu-ci --init-groups --no-new-privs \
-              --inh-caps=-all --ambient-caps=-all -- \
-              /usr/bin/env -i \
-                HOME=/home/gpu-ci USER=gpu-ci LOGNAME=gpu-ci PATH=/usr/bin:/bin \
-                /usr/bin/bash --noprofile --norc \
-                  "$GITHUB_WORKSPACE/scripts/hip-code-object-witness.sh" </dev/null
-          } 2>&1 | /usr/bin/cat
+          mkdir -p "$GITHUB_WORKSPACE/target"
+          # The denied runner itself rebinds source read-only and only target writable.
+          docker run --rm \
+            --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --workdir /workspace \
+            --env PINNED_TOOLCHAIN \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace" \
+            rocm/dev-ubuntu-24.04@sha256:31418ac10a3769a71eaef330c07280d1d999d7074621339b8f93c484c35f6078 \
+            /usr/bin/bash --noprofile --norc /workspace/scripts/ci-hip-code-object.sh /workspace

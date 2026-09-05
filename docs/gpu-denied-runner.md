@@ -33,6 +33,13 @@ network remains isolated and loopback-down. A container seccomp profile or host
 policy that blocks this namespace creation is a hard prerequisite failure, not
 a reason to run the requested command outside the boundary.
 
+GitHub-hosted Ubuntu runners may require the CI-only
+`scripts/ci-hosted-userns.sh` admission helper before either boundary job. It
+is guarded to those ephemeral hosted runners, reads the exact AppArmor
+user-namespace sysctl, accepts only `0` or `1`, and verifies `0` before the
+boundary starts. It does not change the runner, grant the sandbox a capability,
+or apply to development hosts. A failed admission remains a hard failure.
+
 The pinned ROCm container job provisions a dedicated non-root account before
 entering the boundary. Its networked `cargo fetch` is a trusted provisioning
 step: it runs from `/tmp`, accepts only crates.io sources from the lockfile,
