@@ -10,7 +10,9 @@ use crate::error::{
 };
 use crate::ffi;
 
-const HIP_TARGET: &str = include_str!("../../../contracts/gpu-target.txt").trim();
+fn hip_target() -> &'static str {
+    include_str!("../../../contracts/gpu-target.txt").trim()
+}
 
 /// Device ordinal assigned by HIP for the current process visibility set.
 ///
@@ -349,7 +351,7 @@ impl Device {
 
     /// Return the transient HIP ordinal.
     #[must_use]
-    pub const fn ordinal(&self) -> DeviceOrdinal {
+    pub fn ordinal(&self) -> DeviceOrdinal {
         self.inner.ordinal
     }
 
@@ -457,9 +459,9 @@ fn query_device(ordinal: DeviceOrdinal) -> Result<DeviceInfo> {
 
 fn isa_matches_target(isa: &str) -> bool {
     let Some((architecture, suffixes)) = isa.split_once(':') else {
-        return isa == HIP_TARGET;
+        return isa == hip_target();
     };
-    architecture == HIP_TARGET && suffixes.split(':').all(valid_isa_feature)
+    architecture == hip_target() && suffixes.split(':').all(valid_isa_feature)
 }
 
 fn valid_isa_feature(feature: &str) -> bool {
@@ -516,7 +518,7 @@ pub fn device_count() -> Result<i32> {
 #[cfg(test)]
 fn test_props() -> DeviceProps {
     DeviceProps {
-        isa: HIP_TARGET.to_string(),
+        isa: hip_target().to_string(),
         name: String::new(),
         total_vram_bytes: 0,
         compute_units: 0,
@@ -543,7 +545,7 @@ mod tests {
         DeviceInfo {
             ordinal,
             props: DeviceProps {
-                isa: HIP_TARGET.to_string(),
+                isa: hip_target().to_string(),
                 name: "fixture".to_string(),
                 total_vram_bytes: vram_gib * GIB,
                 compute_units: 1,
@@ -559,11 +561,11 @@ mod tests {
     #[test]
     fn target_isa_accepts_valid_feature_suffixes() {
         assert!(
-            isa_matches_target(HIP_TARGET),
+            isa_matches_target(hip_target()),
             "bare target ISA must be accepted"
         );
         assert!(
-            isa_matches_target(&format!("{HIP_TARGET}:sramecc+:xnack-")),
+            isa_matches_target(&format!("{}:sramecc+:xnack-", hip_target())),
             "valid HIP feature suffixes must be accepted"
         );
     }
@@ -575,11 +577,11 @@ mod tests {
             "lookalike ISA must not match"
         );
         assert!(
-            !isa_matches_target(&format!("{HIP_TARGET}:xnack")),
+            !isa_matches_target(&format!("{}:xnack", hip_target())),
             "feature suffix must include its state"
         );
         assert!(
-            !isa_matches_target(&format!("{HIP_TARGET}::xnack+")),
+            !isa_matches_target(&format!("{}::xnack+", hip_target())),
             "empty feature suffix must not match"
         );
     }

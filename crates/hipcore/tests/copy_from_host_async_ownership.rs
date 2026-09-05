@@ -69,6 +69,7 @@ fn assert_fixture_rejects_reuse_after_move(fixture_file: &str, crate_name: &str)
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
         .arg("check")
+        .arg("--offline")
         .arg("--manifest-path")
         .arg(work.path().join("Cargo.toml"))
         .arg("--target-dir")
