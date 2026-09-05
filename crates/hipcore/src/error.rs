@@ -65,6 +65,30 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// Two resources passed to one HIP operation belong to different devices.
+    #[snafu(display("device mismatch in `{op}`: expected device {expected}, got device {actual}"))]
+    DeviceMismatch {
+        /// HIP operation or wrapper boundary that rejected the resources.
+        op: &'static str,
+        /// Ordinal of the resource that establishes the operation's device.
+        expected: c_int,
+        /// Ordinal of the incompatible resource.
+        actual: c_int,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A PCI bus identifier was not in canonical `dddd:bb:dd.f` form.
+    #[snafu(display("invalid PCI bus ID `{value}`; expected canonical `dddd:bb:dd.f` form"))]
+    InvalidPciBusId {
+        /// Rejected identifier.
+        value: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// Allocation failed because device memory is exhausted.
     #[snafu(display("out of device memory: requested {requested} bytes, {free} bytes free"))]
     OutOfMemory {

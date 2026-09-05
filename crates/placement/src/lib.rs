@@ -19,6 +19,29 @@ fn supported_gfx_isa() -> &'static str {
     include_str!("../../../contracts/gpu-target.txt").trim()
 }
 
+/// Match the same HIP ISA spelling accepted by `hipcore`: the configured
+/// architecture may be bare or followed by one or more `name+` / `name-`
+/// feature states. `placement` deliberately stays CPU-only and cannot depend
+/// on `hipcore` (whose build generates HIP bindings), so the shared target
+/// file remains the identity source while this small grammar is pinned here.
+fn gfx_isa_matches_target(isa: &str) -> bool {
+    let Some((architecture, suffixes)) = isa.split_once(':') else {
+        return isa == supported_gfx_isa();
+    };
+    architecture == supported_gfx_isa() && suffixes.split(':').all(valid_isa_feature)
+}
+
+fn valid_isa_feature(feature: &str) -> bool {
+    let Some((name, state)) = feature.split_at_checked(feature.len().saturating_sub(1)) else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        && matches!(state, "+" | "-")
+}
+
 /// Resource-plan input after schema validation.
 ///
 /// Construct this type by deserializing JSON. Its fields are intentionally
@@ -393,7 +416,7 @@ fn select_device(
                 });
             };
             let device = &devices[index];
-            if device.gfx_isa != supported_gfx_isa() {
+            if !gfx_isa_matches_target(&device.gfx_isa) {
                 return Err(PlacementRefusal::UnsupportedDevice {
                     device_id: device.id.clone(),
                     gfx_isa: device.gfx_isa.clone(),
@@ -419,7 +442,7 @@ fn select_device(
                     continue;
                 };
                 let device = &devices[index];
-                if device.gfx_isa == supported_gfx_isa()
+                if gfx_isa_matches_target(&device.gfx_isa)
                     && device.availability == Availability::Available
                     && remaining[index] >= required_bytes
                 {
@@ -725,6 +748,26 @@ mod contract_tests {
         format!(
             r#"{{"schema_version":1,"devices":{devices},"artifacts":{artifacts},"workloads":{workloads},"commitments":[]}}"#
         )
+    }
+
+    #[test]
+    fn gpu_boundary_pure_accepts_valid_hip_suffixes_and_rejects_malformed_lookalikes() {
+        assert!(gfx_isa_matches_target(supported_gfx_isa()));
+        assert!(gfx_isa_matches_target(&format!(
+            "{}:sramecc+:xnack-",
+            supported_gfx_isa()
+        )));
+        for invalid in [
+            format!("{}0", supported_gfx_isa()),
+            format!("{}:xnack", supported_gfx_isa()),
+            format!("{}::xnack+", supported_gfx_isa()),
+            format!("{}:XNACK+", supported_gfx_isa()),
+        ] {
+            assert!(
+                !gfx_isa_matches_target(&invalid),
+                "malformed ISA was accepted: {invalid}"
+            );
+        }
     }
 
     #[test]

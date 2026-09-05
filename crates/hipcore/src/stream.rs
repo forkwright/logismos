@@ -68,13 +68,27 @@ impl Stream {
         &self.device
     }
 
+    /// Make this stream's owning device current on the calling thread.
+    ///
+    /// Kernel launch adapters must call this immediately before passing
+    /// [`Self::raw`] to HIP. This is required even for an explicit stream and
+    /// is essential for a NULL stream, whose device is otherwise only the
+    /// calling thread's ambient current device.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Runtime`] on HIP failure.
+    pub fn make_current(&self) -> Result<()> {
+        self.device.make_current()
+    }
+
     /// Block the calling thread until all work on this stream completes.
     ///
     /// # Errors
     ///
     /// [`crate::Error::Runtime`] on HIP failure.
     pub fn synchronize(&self) -> Result<()> {
-        self.device.make_current()?;
+        self.make_current()?;
         // SAFETY: FFI call; handle is valid (null is accepted by HIP
         // to mean the default stream).
         check(
@@ -87,9 +101,12 @@ impl Stream {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Runtime`] on HIP failure.
+    /// [`crate::Error::DeviceMismatch`] if `event` belongs to another
+    /// device, or [`crate::Error::Runtime`] on HIP failure.
     pub fn record(&self, event: &Event) -> Result<()> {
-        self.device.make_current()?;
+        self.device
+            .ensure_same_device(&event.device, "hipEventRecord")?;
+        self.make_current()?;
         // SAFETY: FFI call; handles validated at construction.
         check(
             unsafe { ffi::hipEventRecord(event.handle, self.handle) },
@@ -176,6 +193,7 @@ impl Event {
     ///
     /// [`crate::Error::Runtime`] on HIP failure.
     pub fn synchronize(&self) -> Result<()> {
+        self.device.make_current()?;
         // SAFETY: FFI call; handle owned.
         check(
             unsafe { ffi::hipEventSynchronize(self.handle) },
@@ -187,9 +205,13 @@ impl Event {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Runtime`] on HIP failure (typical cause: the
-    /// events were not both recorded on the same stream).
+    /// [`crate::Error::DeviceMismatch`] if the events belong to different
+    /// devices, or [`crate::Error::Runtime`] on HIP failure.
     pub fn elapsed_ms(start: &Event, end: &Event) -> Result<f32> {
+        start
+            .device
+            .ensure_same_device(&end.device, "hipEventElapsedTime")?;
+        start.device.make_current()?;
         let mut ms: f32 = 0.0;
         // SAFETY: FFI call; handles owned, output pointer valid.
         check(
@@ -248,5 +270,60 @@ impl Drop for Event {
                 // Drop cannot surface secondary stderr failures.
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::expect_used,
+        reason = "test assertions use expect_err() directly"
+    )]
+
+    use super::*;
+
+    fn borrowed_event(device: &Device) -> Event {
+        Event {
+            handle: ptr::null_mut(),
+            device: device.clone(),
+            owns_handle: false,
+        }
+    }
+
+    #[test]
+    fn gpu_boundary_pure_record_rejects_cross_device_event_before_ffi() {
+        let stream = Stream::null(&Device::for_test(2));
+        let event = borrowed_event(&Device::for_test(7));
+
+        let error = stream
+            .record(&event)
+            .expect_err("cross-device event must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::DeviceMismatch {
+                op: "hipEventRecord",
+                expected: 2,
+                actual: 7,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gpu_boundary_pure_elapsed_time_rejects_cross_device_events_before_ffi() {
+        let start = borrowed_event(&Device::for_test(3));
+        let end = borrowed_event(&Device::for_test(8));
+
+        let error =
+            Event::elapsed_ms(&start, &end).expect_err("cross-device events must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::DeviceMismatch {
+                op: "hipEventElapsedTime",
+                expected: 3,
+                actual: 8,
+                ..
+            }
+        ));
     }
 }

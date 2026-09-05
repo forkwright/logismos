@@ -48,7 +48,8 @@ unsafe extern "C" {
 ///
 /// # Errors
 ///
-/// [`Error::NoGpuBuild`] or [`Error::Launch`] on kernel failure.
+/// [`Error::NoGpuBuild`] for CPU-only builds, [`Error::Hip`] if the stream's
+/// device cannot be made current, or [`Error::Launch`] on kernel failure.
 ///
 /// # Safety
 ///
@@ -71,6 +72,10 @@ pub unsafe fn launch_rms_norm_fp16(
 
     #[cfg(not(logismos_no_gpu_kernels))]
     {
+        // Restore the stream owner's thread-local context immediately before
+        // dispatch. In particular, a NULL stream otherwise means the ambient
+        // current device rather than the device retained by `Stream`.
+        stream.make_current()?;
         // SAFETY: FFI call; caller contract upheld per function doc.
         let code = unsafe {
             logismos_launch_rms_norm_fp16(x, w, y, m, n, eps, stream.raw().cast::<c_void>())

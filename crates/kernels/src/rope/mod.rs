@@ -139,7 +139,8 @@ fn check_rope_shape(batch: i32, seq: i32, heads: i32, head_dim: i32) -> Result<(
 ///
 /// [`Error::UnsupportedShape`] if the shape's composite index would
 /// overflow the kernel's 32-bit-derived arithmetic; [`Error::NoGpuBuild`]
-/// or [`Error::Launch`] otherwise.
+/// for CPU-only builds; [`Error::Hip`] if the stream's device cannot be made
+/// current; or [`Error::Launch`] otherwise.
 ///
 /// # Safety
 ///
@@ -164,6 +165,10 @@ pub unsafe fn launch_rope_fp16_in_place(
 
     #[cfg(not(logismos_no_gpu_kernels))]
     {
+        // Cache replacement and other resource drops may change HIP's
+        // thread-local current device. Restore the stream owner immediately
+        // before dispatch; a NULL stream has no other device association.
+        stream.make_current()?;
         // SAFETY: FFI call; caller upholds pointer validity.
         let code = unsafe {
             logismos_launch_rope_fp16(

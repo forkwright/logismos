@@ -5,8 +5,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::error::{
-    InternalSnafu, NoDeviceWithPciBusIdSnafu, NoDeviceWithUuidSnafu, NoSuchDeviceSnafu, Result,
-    UnsupportedIsaSnafu, check,
+    DeviceMismatchSnafu, InternalSnafu, InvalidPciBusIdSnafu, NoDeviceWithPciBusIdSnafu,
+    NoDeviceWithUuidSnafu, NoSuchDeviceSnafu, Result, UnsupportedIsaSnafu, check,
 };
 use crate::ffi;
 
@@ -28,16 +28,44 @@ pub(crate) type DeviceOrdinal = c_int;
 pub struct PciBusId(String);
 
 impl PciBusId {
-    /// Wrap an already-formatted PCI bus identifier.
-    #[must_use]
-    pub const fn new(id: String) -> Self {
-        Self(id)
+    /// Validate and normalize a PCI bus identifier.
+    ///
+    /// ASCII hexadecimal digits are normalized to lowercase. The PCI device
+    /// and function fields are additionally bounded to 5 and 3 bits,
+    /// respectively.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidPciBusId`] unless `id` has canonical
+    /// `dddd:bb:dd.f` field widths and values.
+    pub fn new(id: String) -> Result<Self> {
+        if valid_pci_bus_id(&id) {
+            Ok(Self(id.to_ascii_lowercase()))
+        } else {
+            InvalidPciBusIdSnafu { value: id }.fail()
+        }
     }
 
     /// Borrow the identifier as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl TryFrom<String> for PciBusId {
+    type Error = crate::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for PciBusId {
+    type Error = crate::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        Self::new(value.to_owned())
     }
 }
 
@@ -62,6 +90,10 @@ impl DeviceUuid {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
+    }
+
+    fn is_nil(&self) -> bool {
+        self.0 == [0; 16]
     }
 }
 
@@ -89,10 +121,11 @@ pub struct DeviceIdentity {
 }
 
 impl DeviceIdentity {
-    /// Construct a stable identity from HIP properties.
-    #[must_use]
-    pub const fn new(uuid: Option<DeviceUuid>, pci_bus_id: PciBusId) -> Self {
-        Self { uuid, pci_bus_id }
+    fn from_runtime(uuid: Option<DeviceUuid>, pci_bus_id: PciBusId) -> Self {
+        Self {
+            uuid: uuid.filter(|candidate| !candidate.is_nil()),
+            pci_bus_id,
+        }
     }
 
     /// Return the UUID when HIP reported a non-zero value.
@@ -201,15 +234,8 @@ impl DeviceProps {
         }
     }
 
-    fn from_raw(raw: &ffi::hipDeviceProp_t) -> Result<Self> {
-        let pci_domain = device_prop_u32("pciDomainID", raw.pciDomainID)?;
-        let pci_bus = device_prop_u32("pciBusID", raw.pciBusID)?;
-        let pci_device = device_prop_u32("pciDeviceID", raw.pciDeviceID)?;
-        let pci_bus_id =
-            PciBusId::new(format!("{pci_domain:04x}:{pci_bus:02x}:{pci_device:02x}.0"));
+    fn from_raw(raw: &ffi::hipDeviceProp_t, pci_bus_id: PciBusId) -> Result<Self> {
         let uuid_bytes = raw.uuid.bytes.map(|byte| byte as u8);
-        let uuid =
-            (!uuid_bytes.iter().all(|byte| *byte == 0)).then_some(DeviceUuid::new(uuid_bytes));
         Ok(Self {
             isa: cstr_from_array(&raw.gcnArchName),
             name: cstr_from_array(&raw.name),
@@ -219,7 +245,7 @@ impl DeviceProps {
             max_threads_per_block: device_prop_u32("maxThreadsPerBlock", raw.maxThreadsPerBlock)?,
             max_shared_mem_per_block: device_prop_u32("sharedMemPerBlock", raw.sharedMemPerBlock)?,
             clock_rate_khz: device_prop_u32("clockRate", raw.clockRate)?,
-            identity: DeviceIdentity::new(uuid, pci_bus_id),
+            identity: DeviceIdentity::from_runtime(Some(DeviceUuid::new(uuid_bytes)), pci_bus_id),
         })
     }
 }
@@ -341,9 +367,14 @@ impl Device {
     /// failure without querying or requiring a physical GPU.
     #[cfg(test)]
     pub(crate) fn invalid_for_test() -> Self {
+        Self::for_test(DeviceOrdinal::MAX)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(ordinal: DeviceOrdinal) -> Self {
         Self {
             inner: Arc::new(DeviceInner {
-                ordinal: DeviceOrdinal::MAX,
+                ordinal,
                 props: test_props(),
             }),
         }
@@ -378,6 +409,10 @@ impl Device {
             unsafe { ffi::hipSetDevice(self.inner.ordinal) },
             "hipSetDevice",
         )
+    }
+
+    pub(crate) fn ensure_same_device(&self, other: &Self, op: &'static str) -> Result<()> {
+        ensure_same_device_ordinals(self.ordinal(), other.ordinal(), op)
     }
 
     /// Snapshot free and total VRAM via `hipMemGetInfo`.
@@ -451,10 +486,75 @@ fn query_device(ordinal: DeviceOrdinal) -> Result<DeviceInfo> {
         unsafe { ffi::hipGetDeviceProperties(&mut raw, ordinal) },
         "hipGetDeviceProperties",
     )?;
+    let pci_bus_id = query_pci_bus_id(ordinal)?;
     Ok(DeviceInfo {
         ordinal,
-        props: DeviceProps::from_raw(&raw)?,
+        props: DeviceProps::from_raw(&raw, pci_bus_id)?,
     })
+}
+
+fn query_pci_bus_id(ordinal: DeviceOrdinal) -> Result<PciBusId> {
+    // `dddd:bb:dd.f` plus NUL needs 13 bytes. Keep spare capacity so a
+    // non-conforming runtime value is observed and rejected rather than
+    // silently truncated into something that happens to look canonical.
+    const BUFFER_BYTES: usize = 32;
+    let mut raw = [0_i8; BUFFER_BYTES];
+    let len = c_int::try_from(raw.len()).map_err(|error| {
+        InternalSnafu {
+            message: format!("PCI bus ID buffer length is outside the c_int range: {error}"),
+        }
+        .build()
+    })?;
+    // SAFETY: `raw` is writable for `len` bytes and `ordinal` was already
+    // checked against `hipGetDeviceCount` by `query_device`.
+    check(
+        unsafe { ffi::hipDeviceGetPCIBusId(raw.as_mut_ptr(), len, ordinal) },
+        "hipDeviceGetPCIBusId",
+    )?;
+    PciBusId::new(cstr_from_array(&raw))
+}
+
+fn valid_pci_bus_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if bytes.len() != 12
+        || bytes[4] != b':'
+        || bytes[7] != b':'
+        || bytes[10] != b'.'
+        || !bytes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !matches!(index, 4 | 7 | 10))
+            .all(|(_, byte)| byte.is_ascii_hexdigit())
+    {
+        return false;
+    }
+
+    let hex_value = |byte: u8| match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => u8::MAX,
+    };
+    let device = hex_value(bytes[8]) * 16 + hex_value(bytes[9]);
+    let function = hex_value(bytes[11]);
+    device <= 0x1f && function <= 0x07
+}
+
+fn ensure_same_device_ordinals(
+    expected: DeviceOrdinal,
+    actual: DeviceOrdinal,
+    op: &'static str,
+) -> Result<()> {
+    if expected == actual {
+        Ok(())
+    } else {
+        DeviceMismatchSnafu {
+            op,
+            expected,
+            actual,
+        }
+        .fail()
+    }
 }
 
 fn isa_matches_target(isa: &str) -> bool {
@@ -526,7 +626,7 @@ fn test_props() -> DeviceProps {
         max_threads_per_block: 0,
         max_shared_mem_per_block: 0,
         clock_rate_khz: 0,
-        identity: DeviceIdentity::new(None, PciBusId::new(String::new())),
+        identity: DeviceIdentity::from_runtime(None, PciBusId("0000:00:00.0".to_string())),
     }
 }
 
@@ -553,7 +653,11 @@ mod tests {
                 max_threads_per_block: 1,
                 max_shared_mem_per_block: 1,
                 clock_rate_khz: 1,
-                identity: DeviceIdentity::new(uuid, PciBusId::new(pci_bus_id.to_string())),
+                identity: DeviceIdentity::from_runtime(
+                    uuid,
+                    PciBusId::new(pci_bus_id.to_string())
+                        .expect("fixture PCI bus ID must be valid"),
+                ),
             },
         }
     }
@@ -610,7 +714,10 @@ mod tests {
         let device = fixture(3, None, "0000:03:00.0", 24);
         assert_eq!(
             device.identity().preferred_selector(),
-            DeviceSelector::PciBusId(PciBusId::new("0000:03:00.0".to_string())),
+            DeviceSelector::PciBusId(
+                PciBusId::new("0000:03:00.0".to_string())
+                    .expect("fixture PCI bus ID must be valid")
+            ),
             "missing UUID must select by PCI topology"
         );
     }
@@ -654,5 +761,54 @@ mod tests {
             ),
             "required UUID selection must report the UUID-specific missing-device error"
         );
+    }
+
+    #[test]
+    fn gpu_boundary_pure_pci_bus_id_validates_bounds_and_normalizes_case() {
+        let id = PciBusId::new("ABCD:EF:1F.7".to_string())
+            .expect("canonical uppercase PCI bus ID must be accepted");
+        assert_eq!(id.as_str(), "abcd:ef:1f.7");
+
+        for invalid in [
+            "0000:00:20.0",
+            "0000:00:00.8",
+            "000:00:00.0",
+            "0000:0g:00.0",
+            "0000:00:00.0 trailing",
+        ] {
+            assert!(
+                matches!(
+                    PciBusId::new(invalid.to_string()),
+                    Err(crate::Error::InvalidPciBusId { .. })
+                ),
+                "invalid PCI bus ID was accepted: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_boundary_pure_runtime_identity_discards_nil_uuid() {
+        let pci_bus_id =
+            PciBusId::new("0000:01:00.0".to_string()).expect("fixture PCI bus ID must be valid");
+        let identity = DeviceIdentity::from_runtime(Some(DeviceUuid::new([0; 16])), pci_bus_id);
+        assert_eq!(identity.uuid(), None);
+    }
+
+    #[test]
+    fn gpu_boundary_pure_resource_device_mismatch_is_typed_without_ffi() {
+        let expected = Device::for_test(2);
+        let actual = Device::for_test(7);
+        let error = expected
+            .ensure_same_device(&actual, "test operation")
+            .expect_err("different ordinals must fail");
+        assert!(matches!(
+            error,
+            crate::Error::DeviceMismatch {
+                op: "test operation",
+                expected: 2,
+                actual: 7,
+                ..
+            }
+        ));
     }
 }

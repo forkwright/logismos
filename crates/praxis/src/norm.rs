@@ -17,6 +17,20 @@ fn dim_i32(value: usize, name: &'static str) -> Result<i32> {
     })
 }
 
+fn require_same_device(x_ordinal: i32, weight_ordinal: i32) -> Result<()> {
+    if x_ordinal == weight_ordinal {
+        Ok(())
+    } else {
+        InvalidSnafu {
+            op: "rms_norm",
+            msg: format!(
+                "x and weight must live on the same device; got x={x_ordinal}, weight={weight_ordinal}"
+            ),
+        }
+        .fail()
+    }
+}
+
 /// `y = x / sqrt(mean(x .* x) + eps) .* weight`, per row.
 ///
 /// Phase 1 contract: `x` is 2-D `(M, N)`, fp16, contiguous; `weight`
@@ -67,6 +81,10 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
                 }.fail();
             };
             let device = x_hip.device();
+            // Reject before allocating an output or crossing any kernel FFI
+            // boundary. HIP pointers from a different ordinal are not made
+            // compatible by changing the calling thread's current device.
+            require_same_device(device.ordinal(), w_hip.device().ordinal())?;
             let out = Tensor::zeros_hip(device, DType::F16, x.shape().clone())?;
             let out_hip = out.hip_storage().ok_or_else(|| {
                 InvalidSnafu {
@@ -131,7 +149,7 @@ mod tests {
     use half::f16;
     use taxis::{CpuStorage, Shape, Tensor};
 
-    use super::rms_norm;
+    use super::{require_same_device, rms_norm};
 
     fn f16_tensor(values: &[f32], shape: &[usize]) -> Tensor {
         let data: Vec<f16> = values.iter().copied().map(f16::from_f32).collect();
@@ -161,5 +179,16 @@ mod tests {
         for (g, w) in got.iter().zip(want.iter()) {
             assert!((g - w).abs() < 1e-2, "got {got:?}, want {want:?}");
         }
+    }
+
+    #[test]
+    fn gpu_boundary_pure_cross_device_operands_are_rejected_before_gpu_work() {
+        let error =
+            require_same_device(2, 7).expect_err("different device ordinals must be rejected");
+        assert!(matches!(
+            &error,
+            crate::Error::Invalid { op: "rms_norm", msg, .. }
+                if msg.contains("x=2") && msg.contains("weight=7")
+        ));
     }
 }

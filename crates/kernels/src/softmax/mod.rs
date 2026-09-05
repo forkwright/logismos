@@ -41,7 +41,8 @@ unsafe extern "C" {
 ///
 /// # Errors
 ///
-/// [`Error::NoGpuBuild`] or [`Error::Launch`].
+/// [`Error::NoGpuBuild`] for CPU-only builds, [`Error::Hip`] if the stream's
+/// device cannot be made current, or [`Error::Launch`] on kernel failure.
 ///
 /// # Safety
 ///
@@ -61,6 +62,10 @@ pub unsafe fn launch_softmax_fp16(
 
     #[cfg(not(logismos_no_gpu_kernels))]
     {
+        // Restore the stream owner's thread-local context immediately before
+        // dispatch. This is required for NULL streams and protects explicit
+        // streams from ambient context changes caused by another resource's Drop.
+        stream.make_current()?;
         // SAFETY: FFI call; caller contract upheld.
         let code =
             unsafe { logismos_launch_softmax_fp16(x, y, m, n, stream.raw().cast::<c_void>()) };
