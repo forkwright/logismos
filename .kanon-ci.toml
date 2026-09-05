@@ -28,6 +28,7 @@
 stages = [
     "runtime scope",
     "kanon root SSOT",
+    "document contracts",
     "cargo fmt",
     "cargo check",
     "cargo clippy",
@@ -40,6 +41,10 @@ timeout_secs = 60
 
 [stages."kanon root SSOT"]
 cmd = "bash scripts/check-kanon-root-ssot.sh"
+timeout_secs = 60
+
+[stages."document contracts"]
+cmd = "python3 scripts/check_document_contracts.py"
 timeout_secs = 60
 
 [stages."cargo fmt"]
