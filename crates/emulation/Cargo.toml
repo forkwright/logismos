@@ -8,7 +8,7 @@ description = "Bounded CPU execution of a deliberately small gfx1100 wave32 inst
 publish = false
 
 [dependencies]
-gpu-target.workspace = true
+isa.workspace = true
 snafu.workspace = true
 
 [dev-dependencies]

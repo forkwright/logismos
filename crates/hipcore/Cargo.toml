@@ -9,8 +9,8 @@ publish = false
 links = "amdhip64"
 
 [dependencies]
-gpu-target.workspace = true
 half.workspace = true
+isa.workspace = true
 snafu.workspace = true
 
 [build-dependencies]

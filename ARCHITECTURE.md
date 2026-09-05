@@ -30,9 +30,9 @@ semantically respects that boundary.
 ## Dependency rules
 
 - Lower tiers never depend on higher tiers.
-- `core` and `gpu-target` have no Logismos-local dependencies. `gpu-target` is
+- `core` and `isa` have no Logismos-local dependencies. `isa` is
   pure parsing over the checked-in target token; it neither links nor probes HIP.
-- `hipcore`, `placement`, and `emulation` depend on `gpu-target` so architecture
+- `hipcore`, `placement`, and `emulation` depend on `isa` so target-architecture
   identity and suffix syntax have one implementation.
 - `placement` has no HIP/device-runtime dependency; `bin` consumes it without
   linking the device runtime for the `plan` command.

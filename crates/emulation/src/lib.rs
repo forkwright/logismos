@@ -30,7 +30,7 @@ pub const MAX_TEXT_BYTES: usize = 4096;
 /// stable constant operation on the fleet Rust toolchain.
 #[must_use]
 pub fn gfx1100_target() -> &'static str {
-    gpu_target::configured_target_token()
+    isa::configured_target_token()
 }
 
 /// Exact instruction forms accepted by this executor.
@@ -1113,7 +1113,7 @@ mod tests {
     #[test]
     fn reads_the_target_from_the_contract_single_source_of_truth() {
         assert_eq!(gfx1100_target(), "gfx1100");
-        let parsed = gpu_target::TargetIsa::parse(gfx1100_target())
+        let parsed = isa::TargetIsa::parse(gfx1100_target())
             .expect("configured target must satisfy the shared ISA grammar");
         assert_eq!(parsed.architecture(), "gfx1100");
     }

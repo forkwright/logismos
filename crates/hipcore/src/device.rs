@@ -219,7 +219,7 @@ impl DeviceProps {
     /// arbitrary feature state is supported by this build.
     #[must_use]
     pub fn matches_target_architecture(&self) -> bool {
-        gpu_target::matches_configured_architecture(&self.isa)
+        isa::matches_configured_architecture(&self.isa)
     }
 
     fn require_target(&self) -> Result<()> {
@@ -228,7 +228,7 @@ impl DeviceProps {
         } else {
             UnsupportedIsaSnafu {
                 isa: self.isa.clone(),
-                configured: gpu_target::configured_target_token(),
+                configured: isa::configured_target_token(),
             }
             .fail()
         }
@@ -639,7 +639,7 @@ pub fn device_count() -> Result<i32> {
 #[cfg(test)]
 fn test_props() -> DeviceProps {
     DeviceProps {
-        isa: gpu_target::configured_target_token().to_string(),
+        isa: isa::configured_target_token().to_string(),
         name: String::new(),
         total_vram_bytes: 0,
         compute_units: 0,
@@ -666,7 +666,7 @@ mod tests {
         DeviceInfo {
             ordinal,
             props: DeviceProps {
-                isa: gpu_target::configured_target_token().to_string(),
+                isa: isa::configured_target_token().to_string(),
                 name: "fixture".to_string(),
                 total_vram_bytes: vram_gib * GIB,
                 compute_units: 1,

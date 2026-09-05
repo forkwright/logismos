@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use gpu_target::matches_configured_architecture;
+use isa::matches_configured_architecture;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
@@ -735,7 +735,7 @@ mod contract_tests {
             plan_json(&plan_input(&devices, &artifacts, workloads))
         };
 
-        let target = gpu_target::configured_target_token();
+        let target = isa::configured_target_token();
         assert!(matches!(
             outcome_for(&format!("{target}:sramecc+:xnack-")),
             PlanOutcome::Plan { .. }
