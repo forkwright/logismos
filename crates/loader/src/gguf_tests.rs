@@ -95,6 +95,37 @@ fn reads_fixture_bytes() -> Result<()> {
 }
 
 #[test]
+fn whole_file_inspection_returns_known_observed_sha256() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("fixture-with-misleading-suffix.bin");
+    let bytes = fixture_bytes();
+    std::fs::write(&path, &bytes)?;
+
+    let inspection = inspect_gguf_with_sha256(&path)?;
+    let ArtifactDigest::Sha256(digest) = inspection.digest else {
+        return GgufSnafu {
+            offset: 0u64,
+            msg: "whole-file inspection did not return SHA-256".to_string(),
+        }
+        .fail();
+    };
+    let expected_file_len = u64::try_from(bytes.len()).map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: "fixture length exceeds u64::MAX".to_string(),
+        }
+        .build()
+    })?;
+    assert_eq!(inspection.file_len, expected_file_len);
+    assert_eq!(
+        digest.to_string(),
+        "623d94e17734e71bc68433a1f9121ae9b59f4aabc33fdf74f7b5cc62b61c3980",
+        "the digest covers complete fixture bytes, not GGUF metadata only"
+    );
+    Ok(())
+}
+
+#[test]
 fn array_metadata_type_parses_elements() -> Result<()> {
     // WHY(forkwright/logismos#37): the array branch (type id 9) of
     // `read_meta_value_typed` had no test coverage at all — this
@@ -486,6 +517,21 @@ fn inspection_rejects_stale_mmap_after_external_truncation() -> Result<()> {
     std::fs::write(&path, b"short")?;
 
     assert!(matches!(reader.inspect(), Err(Error::MmapStale { .. })));
+    Ok(())
+}
+
+#[test]
+fn whole_file_inspection_rejects_size_changing_concurrent_mutation() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("stale-whole-file-digest.gguf");
+    std::fs::write(&path, fixture_bytes())?;
+    let reader = Reader::open(&path)?;
+    std::fs::write(&path, b"short")?;
+
+    assert!(matches!(
+        reader.inspect_with_sha256(),
+        Err(Error::MmapStale { .. })
+    ));
     Ok(())
 }
 

@@ -26,10 +26,14 @@
 //! (GGUF v3; magic 0x46554747, little-endian throughout).
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memmap2::Mmap;
+use sha2::{Digest, Sha256};
 
 use crate::error::{GgufSnafu, Result, TensorNotFoundSnafu};
 // WHY imported without a code reference: the `# Errors` sections below link to
@@ -55,6 +59,8 @@ const MAX_TOTAL_STRING_BYTES: u64 = 64 << 20;
 const MAX_TENSOR_DIMS: u32 = 4;
 const MIN_METADATA_ENTRY_BYTES: u64 = 13;
 const MIN_TENSOR_DESCRIPTOR_BYTES: u64 = 24;
+const SHA256_DIGEST_BYTES: usize = 32;
+const SHA256_READ_BUFFER_BYTES: usize = 64 * 1024;
 
 /// ggml / GGUF dtype tag. Numeric ids match the spec verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -218,15 +224,39 @@ pub struct TensorDescriptor {
     pub data_offset: u64,
 }
 
-/// The inspection result has no cryptographic artifact identity.
+/// Exact SHA-256 digest bytes from a whole-file stream.
 ///
-/// SHA-256 verification is intentionally external to this bounded metadata
-/// reader; a path or mmap must not be presented as immutable identity.
+/// WHY: callers need a typed identity value, rather than a display-formatted
+/// string that could be confused with a different digest algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct Sha256Digest([u8; SHA256_DIGEST_BYTES]);
+
+impl Sha256Digest {
+    /// Borrow the canonical digest bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; SHA256_DIGEST_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Cryptographic artifact-identity state for an inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ArtifactDigest {
     /// The caller has not supplied separately verified digest evidence.
     Unverified,
+    /// SHA-256 streamed from the file opened by the GGUF reader.
+    Sha256(Sha256Digest),
 }
 
 /// Stable model-level metadata selected from the GGUF key/value table.
@@ -279,10 +309,9 @@ pub struct GgmlTypeCensus {
 ///
 /// The profile identifies exact descriptor types and on-disk extents. It does
 /// not decode tensor payloads, reserve device memory, classify execution
-/// support, or establish a cryptographic artifact identity. Its facts derive
-/// from the original mmap and require the caller not to mutate the backing
-/// artifact while it is open; a size re-check catches truncation, not a
-/// same-length content replacement.
+/// support, or establish source provenance. Its facts derive from the original
+/// mmap and require the caller not to mutate the backing artifact while it is
+/// open; size checks catch truncation, not a same-length content replacement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Inspection {
@@ -303,6 +332,7 @@ pub struct Inspection {
 /// Owning GGUF archive.
 pub struct Reader {
     path: PathBuf,
+    file: File,
     mmap: Arc<Mmap>,
     metadata: HashMap<String, MetaValue>,
     tensors: Vec<TensorDescriptor>,
@@ -412,6 +442,7 @@ impl Reader {
 
         let reader = Self {
             path: path.to_path_buf(),
+            file,
             mmap,
             metadata,
             tensors,
@@ -529,6 +560,60 @@ impl Reader {
             type_census,
         })
     }
+
+    /// Inspect the mapped artifact and stream its complete SHA-256 digest.
+    ///
+    /// The digest stream is cloned from the same file handle used to create
+    /// this reader's mmap. Length checks before and after hashing reject common
+    /// truncation/re-save races. They cannot detect a concurrent same-length
+    /// rewrite, so the returned digest is neither source provenance nor proof
+    /// of artifact immutability.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the opened file cannot be cloned, sought, or read;
+    /// [`Error::MmapStale`] if its length changes while it is inspected.
+    pub fn inspect_with_sha256(&self) -> Result<Inspection> {
+        let mut inspection = self.inspect()?;
+        inspection.digest = ArtifactDigest::Sha256(self.streamed_sha256()?);
+        Ok(inspection)
+    }
+
+    fn streamed_sha256(&self) -> Result<Sha256Digest> {
+        check_mmap_not_truncated(&self.path, self.mmap.len())?;
+        let mut digest_file = self.file.try_clone()?;
+        digest_file.seek(SeekFrom::Start(0))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; SHA256_READ_BUFFER_BYTES];
+        loop {
+            let bytes_read = digest_file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(buffer.get(..bytes_read).ok_or_else(|| {
+                GgufSnafu {
+                    offset: 0u64,
+                    msg: "SHA-256 read length exceeds its buffer".to_string(),
+                }
+                .build()
+            })?);
+        }
+        check_mmap_not_truncated(&self.path, self.mmap.len())?;
+        Ok(Sha256Digest(hasher.finalize().into()))
+    }
+}
+
+/// Open, bound-check, inspect, and whole-file hash a GGUF v3 artifact.
+///
+/// This is CPU-only metadata inspection. It does not load a model, initialize
+/// HIP, admit a workload, or claim that a digest proves source provenance.
+///
+/// # Errors
+///
+/// Propagates [`Reader::open`] parse and resource-limit errors plus
+/// [`Reader::inspect_with_sha256`] I/O and concurrent-size-change errors.
+pub fn inspect_gguf_with_sha256(path: &Path) -> Result<Inspection> {
+    Reader::open(path)?.inspect_with_sha256()
 }
 
 impl Reader {
