@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use emulation::elf::inspect_relocatable_text;
+
 const LLVM_MC: &str = "/usr/lib64/rocm/llvm/bin/llvm-mc";
 const LLVM_OBJDUMP: &str = "/usr/lib64/rocm/llvm/bin/llvm-objdump";
 const EXPECTED_ASSEMBLER: &str = "AOMP-18.0-12";
@@ -65,4 +67,20 @@ fn rebuilds_and_disassembles_gfx1100_copy_add_fixture() {
     assert!(text.contains("v_mov_b32_e32 v1, v0"));
     assert!(text.contains("v_add_nc_u32_e32 v2, v0, v1"));
     assert!(text.contains("s_endpgm"));
+
+    let object_bytes = std::fs::read(&object).expect("rebuilt object must be readable");
+    let relocatable = inspect_relocatable_text(&object_bytes)
+        .expect("LLVM relocatable fixture meets the inspect-only contract");
+    assert_eq!(
+        relocatable.text(),
+        [
+            0x00, 0x03, 0x02, 0x7e, 0x00, 0x03, 0x04, 0x4a, 0x00, 0x00, 0xb0, 0xbf,
+        ]
+    );
+    let execution = relocatable
+        .into_wave32_program(vec![[0; 32]; 3], 3)
+        .expect("admitted text meets raw dispatch bounds")
+        .execute()
+        .expect("admitted text uses only the implemented instruction forms");
+    assert_eq!(execution.coverage().end_program_count(), 1);
 }

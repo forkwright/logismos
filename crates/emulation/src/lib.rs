@@ -12,6 +12,9 @@
 
 use snafu::Snafu;
 
+/// Strict inspection of non-runnable AMDGPU relocatable text fixtures.
+pub mod elf;
+
 /// Number of lanes in the only supported wavefront shape.
 pub const WAVE32_LANES: usize = 32;
 
@@ -21,8 +24,14 @@ pub const MAX_VECTOR_REGISTERS: usize = 256;
 /// Maximum raw text size accepted by one program.
 pub const MAX_TEXT_BYTES: usize = 4096;
 
-/// Target accepted by the artifact witness and this decoder.
-pub const GFX1100_TARGET: &str = "gfx1100";
+/// Returns the single configured GPU target from `contracts/gpu-target.txt`.
+///
+/// This is a function because trimming the newline in the contract is not a
+/// stable constant operation on the fleet Rust toolchain.
+#[must_use]
+pub fn gfx1100_target() -> &'static str {
+    include_str!("../../../contracts/gpu-target.txt").trim()
+}
 
 /// Exact instruction forms accepted by this executor.
 pub const SUPPORTED_INSTRUCTIONS: [&str; 4] = [
@@ -89,15 +98,16 @@ impl Wave32Program {
 
     /// Executes the instruction stream from its supplied register state.
     ///
-    /// The f32 form performs host IEEE-754 `f32` addition on lane bit patterns.
-    /// It does not model hardware FP-mode registers, denormal behavior, status
-    /// flags, EXEC masking, or any source modifiers; instructions that would set
-    /// such state are unsupported encodings.
+    /// The f32 form admits only finite, normal inputs and a finite, normal host
+    /// result. It uses host IEEE-754 `f32` addition as a CPU oracle within that
+    /// narrow domain; it does not claim RDNA3 FP-mode, denormal, NaN, flag, or
+    /// exception behavior. EXEC masking and source modifiers are also unsupported.
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] for an unsupported encoding or operand, an unavailable
-    /// vector register, an exhausted budget, or text without `s_endpgm`.
+    /// Returns [`Error`] for an unsupported encoding, operand, or floating-point
+    /// class; an unavailable vector register; an exhausted budget; or text without
+    /// `s_endpgm`.
     pub fn execute(&self) -> Result<ExecutionReport> {
         let mut registers = self.initial_registers.clone();
         let mut coverage = InstructionCoverage::default();
@@ -267,6 +277,19 @@ pub enum Error {
         coverage: InstructionCoverage,
     },
 
+    /// Floating-point input or result was outside the executable host-oracle domain.
+    #[snafu(display("unsupported f32 {operand} class {bits:#010x} at byte {pc}"))]
+    UnsupportedF32Class {
+        /// Whether the rejected value was a source or result.
+        operand: &'static str,
+        /// IEEE-754 bit pattern.
+        bits: u32,
+        /// Byte offset of the instruction.
+        pc: usize,
+        /// Coverage up to and including this refusal.
+        coverage: InstructionCoverage,
+    },
+
     /// Decoded vector register was outside the supplied register file.
     #[snafu(display("vector register v{register} unavailable at byte {pc}"))]
     RegisterOutOfBounds {
@@ -295,6 +318,80 @@ pub enum Error {
         /// Coverage up to and including this refusal.
         coverage: InstructionCoverage,
     },
+
+    /// ELF object exceeded the bounded inspection input size.
+    #[snafu(display("ELF object is {actual} bytes; maximum is {maximum}"))]
+    ElfTooLarge {
+        /// Input object length.
+        actual: usize,
+        /// Largest supported object length.
+        maximum: usize,
+    },
+
+    /// ELF object was too short to read a required region.
+    #[snafu(display("ELF object is truncated while reading {context} at byte {offset}"))]
+    ElfTruncated {
+        /// Human-readable fixed parser context.
+        context: &'static str,
+        /// Required byte offset.
+        offset: usize,
+    },
+
+    /// ELF identification byte did not match the relocatable fixture contract.
+    #[snafu(display("unsupported ELF {field}: got {actual:#04x}, expected {expected:#04x}"))]
+    UnsupportedElfIdent {
+        /// ELF identification field name.
+        field: &'static str,
+        /// Observed byte.
+        actual: u8,
+        /// Required byte.
+        expected: u8,
+    },
+
+    /// ELF header field did not match the relocatable fixture contract.
+    #[snafu(display("unsupported ELF {field}: got {actual:#x}, expected {expected:#x}"))]
+    UnsupportedElfHeader {
+        /// ELF header field name.
+        field: &'static str,
+        /// Observed numeric value.
+        actual: u64,
+        /// Required numeric value.
+        expected: u64,
+    },
+
+    /// ELF contains program headers and is not an inspectable relocatable fixture.
+    #[snafu(display("ELF program-header count {count} is unsupported for a relocatable fixture"))]
+    ProgramHeadersUnsupported {
+        /// Observed program-header count.
+        count: u16,
+    },
+
+    /// ELF contains a relocation section, which this no-memory executor cannot apply.
+    #[snafu(display("ELF relocation section {section} is unsupported"))]
+    RelocationsUnsupported {
+        /// Relocation section name.
+        section: String,
+    },
+
+    /// ELF section is not part of the narrow relocatable-text fixture contract.
+    #[snafu(display("ELF section {section} (type {section_type:#x}) is unsupported"))]
+    UnsupportedElfSection {
+        /// Section name.
+        section: String,
+        /// ELF section type.
+        section_type: u32,
+    },
+
+    /// ELF fixture had no unique executable `.text` section.
+    #[snafu(display("ELF relocatable fixture is missing executable .text"))]
+    MissingExecutableText,
+
+    /// ELF `.text` was malformed for raw wave32 instruction dispatch.
+    #[snafu(display("ELF .text is unsupported: {reason}"))]
+    UnsupportedTextSection {
+        /// Reason derived by this narrow parser.
+        reason: &'static str,
+    },
 }
 
 impl Error {
@@ -302,15 +399,25 @@ impl Error {
     #[must_use]
     pub const fn coverage(&self) -> Option<InstructionCoverage> {
         match self {
-            Self::TextTooLarge { .. }
-            | Self::TruncatedInstruction { .. }
-            | Self::RegisterFileTooLarge { .. }
-            | Self::ZeroStepBudget => None,
             Self::UnsupportedEncoding { coverage, .. }
             | Self::UnsupportedSourceOperand { coverage, .. }
+            | Self::UnsupportedF32Class { coverage, .. }
             | Self::RegisterOutOfBounds { coverage, .. }
             | Self::ExecutionBudgetExceeded { coverage, .. }
             | Self::MissingTerminator { coverage, .. } => Some(*coverage),
+            Self::TextTooLarge { .. }
+            | Self::TruncatedInstruction { .. }
+            | Self::RegisterFileTooLarge { .. }
+            | Self::ZeroStepBudget
+            | Self::ElfTooLarge { .. }
+            | Self::ElfTruncated { .. }
+            | Self::UnsupportedElfIdent { .. }
+            | Self::UnsupportedElfHeader { .. }
+            | Self::ProgramHeadersUnsupported { .. }
+            | Self::RelocationsUnsupported { .. }
+            | Self::UnsupportedElfSection { .. }
+            | Self::MissingExecutableText
+            | Self::UnsupportedTextSection { .. } => None,
         }
     }
 }
@@ -443,9 +550,7 @@ fn apply_instruction(
         } => {
             let left = read_register(registers, source0, pc, *coverage)?;
             let right = read_register(registers, source1, pc, *coverage)?;
-            let result = lane_binary(left, right, |left, right| {
-                (f32::from_bits(left) + f32::from_bits(right)).to_bits()
-            });
+            let result = lane_f32_add(left, right, pc, *coverage)?;
             write_register(registers, destination, result, pc, *coverage)?;
             coverage.add_f32 = coverage.add_f32.saturating_add(1);
         }
@@ -455,6 +560,43 @@ fn apply_instruction(
         }
     }
     Ok(false)
+}
+
+fn lane_f32_add(
+    left: [u32; WAVE32_LANES],
+    right: [u32; WAVE32_LANES],
+    pc: usize,
+    coverage: InstructionCoverage,
+) -> Result<[u32; WAVE32_LANES]> {
+    let mut output = [0u32; WAVE32_LANES];
+    for ((destination, left), right) in output.iter_mut().zip(left).zip(right) {
+        ensure_normal_f32(left, "source0", pc, coverage)?;
+        ensure_normal_f32(right, "source1", pc, coverage)?;
+        let result = (f32::from_bits(left) + f32::from_bits(right)).to_bits();
+        ensure_normal_f32(result, "result", pc, coverage)?;
+        *destination = result;
+    }
+    Ok(output)
+}
+
+fn ensure_normal_f32(
+    bits: u32,
+    operand: &'static str,
+    pc: usize,
+    mut coverage: InstructionCoverage,
+) -> Result<()> {
+    let exponent = bits & 0x7f80_0000;
+    if exponent != 0 && exponent != 0x7f80_0000 {
+        return Ok(());
+    }
+    coverage.refuse();
+    Err(UnsupportedF32ClassSnafu {
+        operand,
+        bits,
+        pc,
+        coverage,
+    }
+    .build())
 }
 
 fn read_register(
@@ -563,6 +705,55 @@ mod tests {
             assert_eq!(*value, expected.to_bits());
         }
         assert_eq!(report.coverage().add_f32_count(), 1);
+    }
+
+    #[test]
+    fn rejects_subnormal_sources_and_non_normal_f32_results() {
+        let text = [
+            0x00, 0x03, 0x06, 0x06, // v_add_f32_e32 v3, v0, v1
+            0x00, 0x00, 0xb0, 0xbf,
+        ];
+        let subnormal = Wave32Program::new(
+            text.to_vec(),
+            vec![[1; 32], [1.0f32.to_bits(); 32], [0; 32], [0; 32]],
+            2,
+        )
+        .expect("fixture is bounded and aligned")
+        .execute()
+        .expect_err("subnormal source is outside the host-float contract");
+        assert!(matches!(
+            subnormal,
+            Error::UnsupportedF32Class {
+                operand: "source0",
+                ..
+            }
+        ));
+
+        let infinity = Wave32Program::new(
+            text.to_vec(),
+            vec![
+                [f32::MAX.to_bits(); 32],
+                [f32::MAX.to_bits(); 32],
+                [0; 32],
+                [0; 32],
+            ],
+            2,
+        )
+        .expect("fixture is bounded and aligned")
+        .execute()
+        .expect_err("infinite result is outside the host-float contract");
+        assert!(matches!(
+            infinity,
+            Error::UnsupportedF32Class {
+                operand: "result",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reads_the_target_from_the_contract_single_source_of_truth() {
+        assert_eq!(gfx1100_target(), "gfx1100");
     }
 
     #[test]
