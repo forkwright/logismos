@@ -648,7 +648,10 @@ mod tests {
             "optional selection must resolve to no device"
         );
         assert!(
-            matches!(missing.not_found::<()>(1), Err(crate::Error::NoDeviceWithUuid { .. })),
+            matches!(
+                missing.not_found::<()>(1),
+                Err(crate::Error::NoDeviceWithUuid { .. })
+            ),
             "required UUID selection must report the UUID-specific missing-device error"
         );
     }
