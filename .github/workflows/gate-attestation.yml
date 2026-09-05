@@ -52,14 +52,10 @@
 # is the actual proof. hipcore genuinely links against real HIP now —
 # this is not a fallback or a widened exemption.
 #
-# NOTE(kernels crate / HIP, watch on the adoption PR): crates/kernels/build.rs
-# separately invokes `hipcc` (ROCm >= 6.4) to compile .hip kernel sources,
-# and falls back to a CPU-only, `logismos_no_gpu_kernels`-cfg'd build with a
-# `cargo:warning` when hipcc is absent from PATH — by design, so `cargo
-# check` runs on a machine without a full ROCm toolchain. `hipcc` is not
-# added to system_packages here — only hipcore's header/link requirement
-# (the one blocking every gate run) is in scope for this fix, so kernels
-# still takes its documented CPU-only fallback on GH-hosted ubuntu-latest.
+# NOTE(kernels crate / HIP): `hipcc` is not installed on this hosted runner.
+# Each build command therefore selects `LOGISMOS_HIP_BUILD=cpu-only`
+# explicitly. That produces a no-kernel build for header/ABI and CPU-reference
+# evidence; a real HIP compile must select `required` in its separate lane.
 #
 # WHY doctest_cmd is empty: .kanon-ci.toml's pipeline has no doctest stage —
 # mirroring the local gate exactly, not inventing new coverage.
@@ -105,9 +101,9 @@ jobs:
     uses: forkwright/.github/.github/workflows/hybrid-gate.yml@main
     with:
       fmt_cmd: "python3 scripts/check_runtime_scope.py && cargo fmt --all -- --check && bash scripts/check-kanon-root-ssot.sh"
-      check_cmd: "cargo check --workspace --all-targets"
-      clippy_cmd: "cargo clippy --workspace --all-targets -- -D warnings"
-      nextest_cmd: "cargo nextest run --workspace --no-fail-fast && cargo nextest run --release -p kernels --no-fail-fast"
+      check_cmd: "LOGISMOS_HIP_BUILD=cpu-only cargo check --workspace --all-targets"
+      clippy_cmd: "LOGISMOS_HIP_BUILD=cpu-only cargo clippy --workspace --all-targets -- -D warnings"
+      nextest_cmd: "LOGISMOS_HIP_BUILD=cpu-only cargo nextest run --workspace --no-fail-fast && LOGISMOS_HIP_BUILD=cpu-only cargo nextest run --release -p kernels --no-fail-fast"
       doctest_cmd: ""
       system_packages: "libamdhip64-dev"
       needs_fleet_repo_token: false

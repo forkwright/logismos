@@ -1,0 +1,25 @@
+name: GPU-denied boundary
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - name: Install boundary dependency
+        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
+      - name: Prove GPU denial and CPU execution
+        run: bash scripts/gpu-denied-witness.sh
+      - name: Prove explicit HIP build modes
+        run: bash scripts/check-hip-build-modes.sh

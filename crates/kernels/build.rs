@@ -5,12 +5,9 @@
 //! single static archive that Rust consumes via
 //! `cargo:rustc-link-lib=static=logismos_kernels`.
 //!
-//! Requires `hipcc` on PATH (ROCm ≥ 6.4). On a machine without
-//! `hipcc` we fall through to a "no-GPU" build: only the CPU
-//! references compile. That fallback exists so `cargo check` can run
-//! on a developer machine without ROCm; nothing non-test actually
-//! depends on this state at runtime (the launchers return
-//! [`Error::NoGpuBuild`] when no kernel archive was linked).
+//! `LOGISMOS_HIP_BUILD=required` compiles those sources with `hipcc`
+//! (ROCm ≥ 6.4) and fails if the compiler is absent. `cpu-only` builds
+//! the CPU references only; the launchers return [`Error::NoGpuBuild`].
 
 #![expect(
     clippy::doc_markdown,
@@ -22,6 +19,16 @@ use std::path::{Path, PathBuf};
 // kanon:ignore RUST/no-direct-process-command -- a build script runs before the workspace is built, so no project process wrapper is linkable here
 use std::process::Command;
 
+const HIP_BUILD_MODE_ENV: &str = "LOGISMOS_HIP_BUILD";
+const HIP_BUILD_REQUIRED: &str = "required";
+const HIP_BUILD_CPU_ONLY: &str = "cpu-only";
+const HIP_TARGET: &str = include_str!("../../contracts/gpu-target.txt").trim_ascii();
+
+enum HipBuildMode {
+    Required,
+    CpuOnly,
+}
+
 fn main() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(logismos_no_gpu_kernels)");
     println!("cargo:rerun-if-changed=build.rs");
@@ -30,22 +37,29 @@ fn main() -> Result<(), String> {
         println!("cargo:rerun-if-changed={}", entry.display());
     }
     println!("cargo:rerun-if-env-changed=HIPCC");
+    println!("cargo:rerun-if-env-changed={HIP_BUILD_MODE_ENV}");
     println!("cargo:rerun-if-env-changed=LOGISMOS_SKIP_HIP_BUILD");
+    println!("cargo:rerun-if-changed=../../contracts/gpu-target.txt");
 
     if env::var("LOGISMOS_SKIP_HIP_BUILD").is_ok() {
-        println!("cargo:warning=LOGISMOS_SKIP_HIP_BUILD set — skipping HIP kernel compile");
+        return Err(
+            "LOGISMOS_SKIP_HIP_BUILD is retired; set LOGISMOS_HIP_BUILD=cpu-only instead"
+                .to_string(),
+        );
+    }
+
+    if matches!(hip_build_mode()?, HipBuildMode::CpuOnly) {
+        println!("cargo:warning=HIP kernel compile disabled (LOGISMOS_HIP_BUILD=cpu-only)");
+        println!("cargo:rustc-cfg=logismos_no_gpu_kernels");
         return Ok(());
     }
 
     let hipcc = env::var("HIPCC").unwrap_or_else(|_| "hipcc".to_string());
     if which(&hipcc).is_none() {
-        println!(
-            "cargo:warning=hipcc not found on PATH; skipping HIP kernel compile. \
-             Set HIPCC=/path/to/hipcc or install ROCm."
-        );
-        // Emit a placeholder cfg so Rust code can tell.
-        println!("cargo:rustc-cfg=logismos_no_gpu_kernels");
-        return Ok(());
+        return Err(format!(
+            "hipcc not found on PATH while {HIP_BUILD_MODE_ENV}={HIP_BUILD_REQUIRED}; \
+             set HIPCC=/path/to/hipcc or select {HIP_BUILD_CPU_ONLY}"
+        ));
     }
 
     let out_dir = match env::var("OUT_DIR") {
@@ -70,7 +84,7 @@ fn main() -> Result<(), String> {
         // kanon:ignore RUST/no-direct-process-command -- invoking hipcc is the build script's purpose
         let status = match Command::new(&hipcc)
             .args([
-                "--offload-arch=gfx1100",
+                &format!("--offload-arch={HIP_TARGET}"),
                 "-O3",
                 "-std=c++17",
                 "-fPIC",
@@ -122,6 +136,18 @@ fn main() -> Result<(), String> {
     println!("cargo:rustc-link-lib=dylib=stdc++");
 
     Ok(())
+}
+
+fn hip_build_mode() -> Result<HipBuildMode, String> {
+    match env::var(HIP_BUILD_MODE_ENV) {
+        Ok(value) if value == HIP_BUILD_REQUIRED => Ok(HipBuildMode::Required),
+        Ok(value) if value == HIP_BUILD_CPU_ONLY => Ok(HipBuildMode::CpuOnly),
+        Ok(value) => Err(format!(
+            "invalid {HIP_BUILD_MODE_ENV}={value:?}; expected {HIP_BUILD_REQUIRED} or {HIP_BUILD_CPU_ONLY}"
+        )),
+        Err(env::VarError::NotPresent) => Ok(HipBuildMode::Required),
+        Err(error) => Err(format!("read {HIP_BUILD_MODE_ENV}: {error}")),
+    }
 }
 
 /// Remove a stale static archive, logging (but not failing) on I/O error.
