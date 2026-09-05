@@ -66,7 +66,7 @@ def require_distinct_network_namespace(actual: str, expected: str) -> None:
         raise AssertionError('network namespace was not isolated')
 
 
-# NEGATIVE: validate the isolation predicate itself, rather than relying only
+# WHY: validate the isolation predicate itself, rather than relying only
 # on a host/sandbox comparison that could accidentally use unlike identifiers.
 try:
     require_distinct_network_namespace(sandbox_network_inode, sandbox_network_inode)
