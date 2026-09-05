@@ -27,6 +27,7 @@ fi
 
 HOST_HOME=${HOME:-}
 SANDBOX_HOME=/tmp/home
+LIBCLANG_PATH=/usr/lib64/rocm/llvm/lib
 
 mount_args=(
     --tmpfs /
@@ -47,6 +48,17 @@ mount_args=(
     --proc /proc
 )
 
+# ROCm packages use /opt/rocm on the official Ubuntu toolchain image. Bind
+# only that read-only compiler tree when it exists; the sandbox still has a
+# synthetic /dev, /sys, /run, and its own network namespace.
+if [[ -d /opt/rocm ]]; then
+    mount_args+=(
+        --dir /opt
+        --ro-bind /opt/rocm /opt/rocm
+    )
+    LIBCLANG_PATH=/opt/rocm/llvm/lib
+fi
+
 if [[ -n "$HOST_HOME" && -d "$HOST_HOME/.cargo/bin" && -d "$HOST_HOME/.rustup" ]]; then
     mount_args+=(
         --dir "$(dirname -- "$HOST_HOME")"
@@ -62,4 +74,4 @@ fi
 
 # WHY: descriptor inheritance can bypass a pathname-only device policy, so the
 # supervisor closes every descriptor except stdin/stdout/stderr before bwrap.
-exec /usr/bin/python3 "$SUPERVISOR" "$BWRAP" "$SETPRIV" "$ROOT" "$SANDBOX_HOME" "${mount_args[@]}" -- "$@"
+exec /usr/bin/python3 "$SUPERVISOR" "$BWRAP" "$SETPRIV" "$ROOT" "$SANDBOX_HOME" "$LIBCLANG_PATH" "${mount_args[@]}" -- "$@"

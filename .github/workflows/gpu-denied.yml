@@ -23,3 +23,23 @@ jobs:
         run: bash scripts/gpu-denied-witness.sh
       - name: Prove explicit HIP build modes
         run: bash scripts/check-hip-build-modes.sh
+
+  hip-code-object:
+    # Official ROCm 6.4.4 development image, pinned by its linux/amd64
+    # manifest digest. This job compiles code only: the witness enters the
+    # GPU-denied boundary before invoking Cargo or hipcc.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: rocm/dev-ubuntu-24.04@sha256:31418ac10a3769a71eaef330c07280d1d999d7074621339b8f93c484c35f6078
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - name: Install GPU-denied boundary dependencies
+        run: apt-get update && apt-get install --yes --no-install-recommends bubblewrap python3 util-linux
+      - name: Prefetch locked Rust sources
+        run: cargo fetch --locked
+      - name: Compile and inspect HIP code objects without a GPU
+        run: bash scripts/hip-code-object-witness.sh

@@ -15,7 +15,7 @@ use kernels::rms_norm::{cpu as rms_cpu, launch_rms_norm_fp16};
 use kernels::rope::{cpu as rope_cpu, launch_rope_fp16_in_place};
 use kernels::softmax::{cpu as softmax_cpu, launch_softmax_fp16};
 use rand::rngs::SmallRng;
-use rand::{Rng, RngExt, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 fn have_gpu() -> bool {
     matches!(hipcore::device::device_count(), Ok(c) if c > 0)

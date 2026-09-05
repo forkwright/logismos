@@ -7,7 +7,7 @@ import sys
 
 
 def main() -> None:
-    bwrap, setpriv, root, sandbox_home, *remaining = sys.argv[1:]
+    bwrap, setpriv, root, sandbox_home, libclang_path, *remaining = sys.argv[1:]
     separator = remaining.index("--")
     mount_args = remaining[:separator]
     command = remaining[separator + 1 :]
@@ -48,7 +48,7 @@ def main() -> None:
         f"{root}/target",
         "--setenv",
         "LIBCLANG_PATH",
-        "/usr/lib64/rocm/llvm/lib",
+        libclang_path,
         *mount_args,
         "--chdir",
         root,

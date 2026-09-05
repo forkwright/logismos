@@ -1,7 +1,9 @@
 # Forge CI pipeline for forkwright/logismos.
 #
 # archetype: B
-# forge-only: true until menos returns with ROCm 6.4 available
+# Menos build and test stages are CPU-only and run inside the GPU-denied
+# boundary. The separate Forge HIP witness compiles and inspects real device
+# code objects without initializing a GPU runtime.
 #
 # Mirrors harmonia's / aletheia's .kanon-ci.toml with logismos-specific
 # adjustments.
@@ -45,15 +47,15 @@ cmd = "cargo fmt --all -- --check"
 timeout_secs = 300
 
 [stages."cargo check"]
-cmd = "cargo check --workspace --all-targets --jobs 8"
+cmd = "bash scripts/gpu-denied-runner.sh -- /bin/sh -ceu 'LOGISMOS_HIP_BUILD=cpu-only cargo check --workspace --all-targets --jobs 8'"
 timeout_secs = 1800
 
 [stages."cargo clippy"]
-cmd = "cargo clippy --workspace --all-targets --jobs 8 -- -D warnings"
+cmd = "bash scripts/gpu-denied-runner.sh -- /bin/sh -ceu 'LOGISMOS_HIP_BUILD=cpu-only cargo clippy --workspace --all-targets --jobs 8 -- -D warnings'"
 timeout_secs = 1800
 
 [stages."cargo nextest"]
-cmd = "cargo nextest run --workspace --build-jobs 8 --test-threads 8 --no-fail-fast"
+cmd = "bash scripts/gpu-denied-runner.sh -- /bin/sh -ceu 'LOGISMOS_HIP_BUILD=cpu-only cargo nextest run --workspace --build-jobs 8 --test-threads 8 --no-fail-fast'"
 timeout_secs = 2400
 
 # License metadata lives in `.kanon-license-fingerprint.toml`, the canonical
