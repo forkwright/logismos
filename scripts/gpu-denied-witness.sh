@@ -40,7 +40,7 @@ trap 'interrupt INT' INT
 trap 'interrupt TERM' TERM
 
 HOST_MOUNT_NS=$(/usr/bin/readlink /proc/self/ns/mnt)
-HOST_NETWORK_NS=$(/usr/bin/stat --format '%d:%i' /proc/self/ns/net)
+HOST_NETWORK_NS=$(/usr/bin/stat --dereference --format '%d:%i' /proc/self/ns/net)
 HOST_PID_NS=$(/usr/bin/readlink /proc/self/ns/pid)
 
 {
@@ -59,9 +59,24 @@ sandbox_mount_namespace = os.readlink('/proc/self/ns/mnt')
 sandbox_network_namespace = os.stat('/proc/self/ns/net')
 sandbox_network_inode = f'{sandbox_network_namespace.st_dev}:{sandbox_network_namespace.st_ino}'
 sandbox_pid_namespace = os.readlink('/proc/self/ns/pid')
+
+
+def require_distinct_network_namespace(actual: str, expected: str) -> None:
+    if actual == expected:
+        raise AssertionError('network namespace was not isolated')
+
+
+# NEGATIVE: validate the isolation predicate itself, rather than relying only
+# on a host/sandbox comparison that could accidentally use unlike identifiers.
+try:
+    require_distinct_network_namespace(sandbox_network_inode, sandbox_network_inode)
+except AssertionError:
+    pass
+else:
+    raise AssertionError('network namespace isolation predicate accepted itself')
+require_distinct_network_namespace(sandbox_network_inode, host_network_namespace)
 if (
     sandbox_mount_namespace == host_mount_namespace
-    or sandbox_network_inode == host_network_namespace
     or sandbox_pid_namespace == host_pid_namespace
 ):
     raise AssertionError('one or more required namespaces were not isolated')
