@@ -12,6 +12,7 @@ from pathlib import Path
 
 BWRAP = Path('/usr/bin/bwrap')
 SETPRIV = Path('/usr/bin/setpriv')
+UNSHARE = Path('/usr/bin/unshare')
 SANDBOX_CARGO_HOME = Path('/tmp/cargo')
 SANDBOX_HOME = Path('/tmp/home')
 SANDBOX_RUST_ROOT = Path('/opt/gpu-denied')
@@ -353,6 +354,10 @@ def _sandbox_args(root: Path, target: Path, command: list[str]) -> list[str]:
     return [
         str(BWRAP),
         '--unshare-all',
+        # WHY: the private network namespace is established by the fixed
+        # unshare launcher below. Retaining it prevents Bubblewrap from
+        # configuring loopback in a host policy that forbids RTM_NEWADDR.
+        '--share-net',
         '--unshare-user',
         '--die-with-parent',
         '--new-session',
@@ -372,12 +377,29 @@ def _sandbox_args(root: Path, target: Path, command: list[str]) -> list[str]:
     ]
 
 
+def _namespace_launcher_args(sandbox_args: list[str]) -> list[str]:
+    # WHY: util-linux unshare creates the private network namespace without
+    # assigning an address. Bubblewrap would otherwise bring loopback up as
+    # part of its network setup, which some ordinary container policies deny.
+    return [
+        str(UNSHARE),
+        '--user',
+        '--map-root-user',
+        '--net',
+        '--',
+        *sandbox_args,
+    ]
+
+
 def main() -> int:
     if len(sys.argv) < 4 or sys.argv[2] != '--':
         print('usage: gpu-denied-exec.py ROOT -- COMMAND [ARG...]', file=sys.stderr)
         return 64
     if not BWRAP.is_file() or not os.access(BWRAP, os.X_OK):
         print('gpu-denied runner requires /usr/bin/bwrap; refusing to execute', file=sys.stderr)
+        return 69
+    if not UNSHARE.is_file() or not os.access(UNSHARE, os.X_OK):
+        print('gpu-denied runner requires /usr/bin/unshare; refusing to execute', file=sys.stderr)
         return 69
     if not SETPRIV.is_file() or not os.access(SETPRIV, os.X_OK):
         print('gpu-denied runner requires /usr/bin/setpriv; refusing to execute', file=sys.stderr)
@@ -392,7 +414,7 @@ def main() -> int:
         root, target = _prepare_worktree(sys.argv[1])
         _validate_standard_descriptors(root)
         _close_inherited_descriptors()
-        os.execv(BWRAP, _sandbox_args(root, target, sys.argv[3:]))
+        os.execv(UNSHARE, _namespace_launcher_args(_sandbox_args(root, target, sys.argv[3:])))
     except BoundaryError as error:
         print(f'gpu-denied runner: {error}', file=sys.stderr)
         return 69

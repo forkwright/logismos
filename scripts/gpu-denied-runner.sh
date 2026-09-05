@@ -17,6 +17,12 @@ if [[ ! -x /usr/bin/bwrap ]]; then
     exit 69
 fi
 
+if [[ ! -x /usr/bin/unshare ]]; then
+    builtin printf '%s\n' \
+        'gpu-denied runner requires /usr/bin/unshare; refusing to execute outside the boundary' >&2
+    exit 69
+fi
+
 if [[ ! -x /usr/bin/setpriv ]]; then
     builtin printf '%s\n' \
         'gpu-denied runner requires /usr/bin/setpriv; refusing to execute outside the boundary' >&2

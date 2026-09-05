@@ -40,25 +40,41 @@ trap 'interrupt INT' INT
 trap 'interrupt TERM' TERM
 
 HOST_MOUNT_NS=$(/usr/bin/readlink /proc/self/ns/mnt)
-HOST_NETWORK_NS=$(/usr/bin/readlink /proc/self/ns/net)
+HOST_NETWORK_NS=$(/usr/bin/stat --format '%d:%i' /proc/self/ns/net)
 HOST_PID_NS=$(/usr/bin/readlink /proc/self/ns/pid)
 
 {
     /usr/bin/timeout 60 "$RUNNER" -- /usr/bin/python3 - \
         "$ROOT" "$HOST_MOUNT_NS" "$HOST_NETWORK_NS" "$HOST_PID_NS" <<'PYTHON'
 import os
+import fcntl
+import socket
+import struct
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-host_namespaces = tuple(sys.argv[2:])
-sandbox_namespaces = tuple(
-    os.readlink(f'/proc/self/ns/{name}') for name in ('mnt', 'net', 'pid')
-)
-if sandbox_namespaces == host_namespaces or any(
-    sandbox == host for sandbox, host in zip(sandbox_namespaces, host_namespaces, strict=True)
+host_mount_namespace, host_network_namespace, host_pid_namespace = sys.argv[2:]
+sandbox_mount_namespace = os.readlink('/proc/self/ns/mnt')
+sandbox_network_namespace = os.stat('/proc/self/ns/net')
+sandbox_network_inode = f'{sandbox_network_namespace.st_dev}:{sandbox_network_namespace.st_ino}'
+sandbox_pid_namespace = os.readlink('/proc/self/ns/pid')
+if (
+    sandbox_mount_namespace == host_mount_namespace
+    or sandbox_network_inode == host_network_namespace
+    or sandbox_pid_namespace == host_pid_namespace
 ):
     raise AssertionError('one or more required namespaces were not isolated')
+
+# INVARIANT: this is the private network namespace created before Bubblewrap.
+# Its loopback must remain down: a host listener cannot be reached through it.
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+    loopback_flags = struct.unpack(
+        '16sH14x',
+        fcntl.ioctl(probe.fileno(), 0x8913, struct.pack('16sH14x', b'lo', 0)),
+    )[1]
+if loopback_flags & 0x1:
+    raise AssertionError('private network namespace loopback is unexpectedly up')
 
 status = {}
 for line in Path('/proc/self/status').read_text(encoding='utf-8').splitlines():
@@ -111,7 +127,7 @@ else:
 target_marker = root / 'target/gpu-denied-target-write'
 target_marker.write_text('expected', encoding='utf-8')
 target_marker.unlink()
-print('gpu-denied namespace, privilege, mount, and environment witness: PASS')
+print('gpu-denied namespace, privilege, mount, network, and environment witness: PASS')
 PYTHON
 } 2>&1 | /usr/bin/cat
 

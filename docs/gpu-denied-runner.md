@@ -16,7 +16,7 @@ a pipe when launching it from a terminal.
 ## Enforced boundary
 
 The runner requires the fixed system paths `/usr/bin/bash`, `/usr/bin/bwrap`,
-`/usr/bin/setpriv`, and `/usr/bin/python3`. Bash privileged mode and Python
+`/usr/bin/unshare`, `/usr/bin/setpriv`, and `/usr/bin/python3`. Bash privileged mode and Python
 isolated mode prevent their caller-supplied language startup hooks from
 running before the supervisor. The runner refuses to run when a prerequisite
 is unavailable, refuses a root invocation, and never falls back to running the
@@ -25,9 +25,13 @@ cgroup, and network namespaces; all capabilities dropped; nested user
 namespaces disabled; and `no_new_privs` set.
 
 The host or CI executor must run the wrapper as a non-root account and permit
-unprivileged user namespaces. A container seccomp profile or host policy that
-blocks namespace creation is a hard prerequisite failure, not a reason to run
-the requested command outside the boundary.
+unprivileged user namespaces. The fixed `unshare` launcher first creates a
+private user and network namespace without assigning a loopback address;
+Bubblewrap retains that private network namespace while creating the remaining
+namespaces. This avoids requiring Bubblewrap to configure loopback, while the
+network remains isolated and loopback-down. A container seccomp profile or host
+policy that blocks this namespace creation is a hard prerequisite failure, not
+a reason to run the requested command outside the boundary.
 
 The pinned ROCm container job provisions a dedicated non-root account before
 entering the boundary. Its networked `cargo fetch` is a trusted provisioning
@@ -65,8 +69,10 @@ target; this preserves ordinary Cargo artifact reuse without permitting a
 writable alias to a file elsewhere on the host. Standard output and error
 remain deliberate byte-egress channels to the invoking process.
 
-The witness uses synthetic inherited descriptors, startup hooks, symlink and
-hard-link targets, Unix and TCP listeners, and a pseudo-terminal. It never
+The witness proves the network namespace inode differs from the host, loopback
+is down, and a host TCP listener is unreachable. It also uses synthetic
+inherited descriptors, startup hooks, symlink and hard-link targets, Unix and
+TCP listeners, and a pseudo-terminal. It never
 opens, probes, or issues an `ioctl` to a real accelerator device. It also
 proves that an existing Unix socket in the writable target makes the runner
 fail closed.
