@@ -662,8 +662,8 @@ mod tests {
         uuid: Option<DeviceUuid>,
         pci_bus_id: &str,
         vram_gib: u64,
-    ) -> DeviceInfo {
-        DeviceInfo {
+    ) -> Result<DeviceInfo> {
+        Ok(DeviceInfo {
             ordinal,
             props: DeviceProps {
                 isa: isa::configured_target_token().to_string(),
@@ -676,20 +676,19 @@ mod tests {
                 clock_rate_khz: 1,
                 identity: DeviceIdentity::from_runtime(
                     uuid,
-                    PciBusId::new(pci_bus_id.to_string())
-                        .expect("fixture PCI bus ID must be valid"),
+                    PciBusId::new(pci_bus_id.to_string())?,
                 ),
             },
-        }
+        })
     }
 
     #[test]
-    fn uuid_selection_survives_ordinal_renumbering() {
+    fn uuid_selection_survives_ordinal_renumbering() -> Result<()> {
         let uuid = DeviceUuid::new([7; 16]);
-        let first_visibility = [fixture(0, Some(uuid), "0000:01:00.0", 48)];
+        let first_visibility = [fixture(0, Some(uuid), "0000:01:00.0", 48)?];
         let renumbered_visibility = [
-            fixture(0, None, "0000:02:00.0", 24),
-            fixture(1, Some(uuid), "0000:01:00.0", 48),
+            fixture(0, None, "0000:02:00.0", 24)?,
+            fixture(1, Some(uuid), "0000:01:00.0", 48)?,
         ];
         let selector = first_visibility[0].identity().preferred_selector();
         assert_eq!(
@@ -700,19 +699,18 @@ mod tests {
             Some(1),
             "UUID selection must find the same device after ordinal renumbering"
         );
+        Ok(())
     }
 
     #[test]
-    fn all_zero_uuid_falls_back_to_pci_selection() {
-        let device = fixture(3, None, "0000:03:00.0", 24);
+    fn all_zero_uuid_falls_back_to_pci_selection() -> Result<()> {
+        let device = fixture(3, None, "0000:03:00.0", 24)?;
         assert_eq!(
             device.identity().preferred_selector(),
-            DeviceSelector::PciBusId(
-                PciBusId::new("0000:03:00.0".to_string())
-                    .expect("fixture PCI bus ID must be valid")
-            ),
+            DeviceSelector::PciBusId(PciBusId::new("0000:03:00.0".to_string())?),
             "missing UUID must select by PCI topology"
         );
+        Ok(())
     }
 
     #[test]
@@ -734,9 +732,9 @@ mod tests {
     }
 
     #[test]
-    fn target_support_does_not_depend_on_vram_capacity_or_marketing_name() {
-        let workstation = fixture(0, Some(DeviceUuid::new([1; 16])), "0000:01:00.0", 48);
-        let consumer = fixture(1, Some(DeviceUuid::new([2; 16])), "0000:02:00.0", 24);
+    fn target_support_does_not_depend_on_vram_capacity_or_marketing_name() -> Result<()> {
+        let workstation = fixture(0, Some(DeviceUuid::new([1; 16])), "0000:01:00.0", 48)?;
+        let consumer = fixture(1, Some(DeviceUuid::new([2; 16])), "0000:02:00.0", 24)?;
         assert!(
             workstation.props().matches_target_architecture(),
             "48 GiB fixture must be accepted"
@@ -745,16 +743,17 @@ mod tests {
             consumer.props().matches_target_architecture(),
             "24 GiB fixture must be accepted"
         );
+        Ok(())
     }
 
     #[test]
-    fn absent_requested_and_optional_devices_are_distinct() {
+    fn absent_requested_and_optional_devices_are_distinct() -> Result<()> {
         let devices = [fixture(
             0,
             Some(DeviceUuid::new([1; 16])),
             "0000:01:00.0",
             24,
-        )];
+        )?];
         let missing = DeviceSelector::Uuid(DeviceUuid::new([9; 16]));
         assert!(
             devices.iter().all(|info| !missing.matches(info)),
@@ -772,12 +771,12 @@ mod tests {
             ),
             "required UUID selection must report the UUID-specific missing-device error"
         );
+        Ok(())
     }
 
     #[test]
-    fn gpu_boundary_pure_pci_bus_id_validates_bounds_and_normalizes_case() {
-        let id = PciBusId::new("ABCD:EF:1F.7".to_string())
-            .expect("canonical uppercase PCI bus ID must be accepted");
+    fn gpu_boundary_pure_pci_bus_id_validates_bounds_and_normalizes_case() -> Result<()> {
+        let id = PciBusId::new("ABCD:EF:1F.7".to_string())?;
         assert_eq!(id.as_str(), "abcd:ef:1f.7");
 
         for invalid in [
@@ -795,31 +794,29 @@ mod tests {
                 "invalid PCI bus ID was accepted: {invalid}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn gpu_boundary_pure_runtime_identity_discards_nil_uuid() {
-        let pci_bus_id =
-            PciBusId::new("0000:01:00.0".to_string()).expect("fixture PCI bus ID must be valid");
+    fn gpu_boundary_pure_runtime_identity_discards_nil_uuid() -> Result<()> {
+        let pci_bus_id = PciBusId::new("0000:01:00.0".to_string())?;
         let identity = DeviceIdentity::from_runtime(Some(DeviceUuid::new([0; 16])), pci_bus_id);
         assert_eq!(identity.uuid(), None);
+        Ok(())
     }
 
     #[test]
     fn gpu_boundary_pure_resource_device_mismatch_is_typed_without_ffi() {
         let expected = Device::for_test(2);
         let actual = Device::for_test(7);
-        let error = expected
-            .ensure_same_device(&actual, "test operation")
-            .expect_err("different ordinals must fail");
         assert!(matches!(
-            error,
-            crate::Error::DeviceMismatch {
+            expected.ensure_same_device(&actual, "test operation"),
+            Err(crate::Error::DeviceMismatch {
                 op: "test operation",
                 expected: 2,
                 actual: 7,
                 ..
-            }
+            })
         ));
     }
 }
