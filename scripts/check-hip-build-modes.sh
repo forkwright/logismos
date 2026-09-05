@@ -31,7 +31,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
             LOGISMOS_HIP_BUILD=cpu-only OUT_DIR="$out/empty-cpu/out" "$out/kernels-build"
         ) >"$out/empty-cpu.log"
         grep -F "cargo:rustc-cfg=logismos_no_gpu_kernels" "$out/empty-cpu.log"
-        if [[ -e "$out/empty-cpu/out/liblogismos_kernels.a" ]]; then
+        if [ -e "$out/empty-cpu/out/liblogismos_kernels.a" ]; then
             echo "cpu-only empty source fixture produced a kernel archive" >&2
             exit 1
         fi
