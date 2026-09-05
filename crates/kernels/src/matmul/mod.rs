@@ -130,7 +130,7 @@ fn check_matmul_shape(m: i32, n: i32, k: i32) -> Result<()> {
 ///
 /// - [`Error::UnsupportedShape`] if `M`/`N`/`K` would drive an
 ///   element-index product past `i32::MAX` inside the kernel.
-/// - [`Error::NoGpuBuild`] if `hipcc` wasn't available at build time.
+/// - [`Error::NoGpuBuild`] for an explicit CPU-only build.
 /// - [`Error::Hip`] if the stream's device cannot be made current.
 /// - [`Error::Launch`] if the kernel fails.
 ///

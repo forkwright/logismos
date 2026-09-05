@@ -39,6 +39,7 @@ on:
 # head SHA. Nothing here writes to a PR.
 permissions:
   actions: write
+  checks: read
   contents: read
   pull-requests: read
 
