@@ -1,7 +1,7 @@
 # llms.txt - Logismos AI navigation index
 
-> Rust-native GPU inference runtime for AMD W7900 (gfx1100).
-> HIP + hipBLASLt. Public on GitHub: forkwright/logismos.
+> An agent-aware operating environment for local AI compute, targeting AMD gfx1100.
+> Rust, HIP and owned WMMA kernels. Public on GitHub: forkwright/logismos.
 
 ## LLM corpus
 
@@ -31,6 +31,8 @@ See [CLAUDE.md](CLAUDE.md) for how to resolve the kanon checkout root on this bo
 
 - `crates/core/` - current stable public model trait (`EmbeddingModel`)
 - `crates/hipcore/` - HIP FFI surface, device/stream/memory
+- `crates/placement/` - deterministic, action-free per-device resource plans
+- `crates/emulation/` - bounded original CPU functional instruction witnesses
 - `crates/kernels/` - HIP + CPU reference kernels
 - `crates/transformers/` - transformer building blocks (attention, norms)
 - `crates/encoders/` - encoder model impls (Stella, ModernBERT)
