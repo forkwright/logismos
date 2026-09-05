@@ -1,7 +1,7 @@
 <!--
-scope: logismos repo conventions (Rust+HIP inference runtime, W7900 primary target)
+scope: logismos repo conventions (Rust-native agent-aware inference, gfx1100 target)
 defers_to: kanon standards at kanon's crates/basanos/standards/ (checkout-root resolution below)
-tightens: no-external-ML-framework rule, HIP FFI as lowest acceptable layer, per-kernel CPU-reference-test policy
+tightens: original inference implementations, explicit hardware-access boundary, per-kernel CPU-reference-test policy
 -->
 
 # Logismos - operating instructions
@@ -17,10 +17,12 @@ per machine. This repo holds code plus repo-local agent docs (`CLAUDE.md`, `AGEN
 
 ## What logismos is
 
-A Rust-native local inference platform on a HIP + hipBLASLt foundation, with W7900 (gfx1100) as
-the primary target. Logismos owns loading, quantization, inference, and serving. Model formation,
-general training, behavioral evaluation, and model release belong to the named producer; Logismos
-owns runtime parity, correctness, compatibility, resource, and serving evidence.
+An agent-aware operating environment for local AI compute, with an owned HIP/WMMA foundation
+and gfx1100 as its initial architecture target. A W7900-only installation is a normal supported
+configuration; the optional RX 7900 XTX requires independent qualification. Logismos owns loading,
+quantization, inference, serving, and their typed artifact/profile/resource contracts. Aletheia owns
+work intent; Tropos and systemd retain host modes and process-lifecycle enforcement. Model formation,
+general training, and model release remain outside Logismos's authority.
 
 Consumers pick the minimum subset of crates they need. `core` exposes
 the stable trait surface. Implementations live in dedicated crates.
@@ -74,9 +76,12 @@ L1-L4 gate. No haste to invent decoration.
 ## Boundaries
 
 - **Do not** add a dependency on another ML framework (no candle,
- torch, burn, tract, ort, llama.cpp, vLLM). FFI to ROCm is the lowest
- acceptable layer.
-- **Do not** add backends speculatively.
+ torch, burn, tract, ort, llama.cpp, vLLM). Upstream runtime and emulator
+ code is Read-only prior art: write original implementations, not renamed ports.
+- **Do not** add backends outside the accepted program. HIP is the production
+ substrate; an original experimental HSA/ROCr provider is approved behind
+ the hardware-access boundary. It preserves `amdgpu` and does not authorize
+ PCI takeover, firmware changes, resets, or power-policy changes.
 - **Do not** create general training or model-release authority. Bounded adaptation may enter only
   through a named consumer contract that defines its persistent output owner, retention and
   revocation, and rollback; execution authority does not imply release authority.
@@ -92,11 +97,14 @@ L1-L4 gate. No haste to invent decoration.
 - Public types `#[non_exhaustive]` where future extension is plausible.
 - Comments answer WHY, not WHAT.
 - `#![deny(unsafe_op_in_unsafe_fn)]` at crate root.
-- HIP FFI is the only place unsafe is acceptable at scale. Each unsafe
- block carries a safety comment.
+- The hardware-access boundary in `hipcore` owns unsafe device/runtime access.
+ Each unsafe block carries a safety comment; pure planning and test simulation
+ do not initialize HIP or claim hardware qualification.
 
-Rust gate is forge-primary via `.kanon-ci.toml` (ROCm 6.4 on menos
-forge). Run `kanon lint --rust` locally before push until menos returns.
+The required public CI gate verifies repository and CPU/build contracts.
+Hardware is available, but qualification is a separate operator-coordinated
+lane. Agent tests run in the GPU-denied runner; neither a mock flag nor an
+empty hardware-test run is evidence of safe or correct GPU execution.
 
 `kanon gate --stamp` cannot complete on a non-ROCm host: `hipcore`'s
 build script fails hard without real HIP headers (forkwright/logismos#14),
@@ -126,7 +134,7 @@ Operating principle, memory system, and global constraints come from
 - Kanon prefix: `lo`
 - Config source: `workflow/kanon.toml [projects.logismos]`
 - Standards source: `crates/basanos/standards/STANDARDS.md`
-- MCP routing catalog: `workflow/AGENTS-mcp-tools.md`
+- MCP routing catalog: not vendored in this repo (see the kanon toolkit's `workflow/AGENTS-mcp-tools.md`)
 
 Run `kanon docs sync --check --repo logismos` to verify this generated
 section and `kanon docs sync --apply --repo logismos` to refresh it.

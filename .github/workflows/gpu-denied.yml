@@ -1,0 +1,167 @@
+name: GPU-denied boundary
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install boundary dependency
+        run: sudo apt-get update && sudo apt-get install --yes bubblewrap shellcheck util-linux
+      - name: Admit unprivileged namespace bootstrap
+        run: bash scripts/ci-hosted-userns.sh
+      - name: Resolve repository Rust toolchain
+        id: rust_toolchain
+        run: python3 scripts/ci-rust-toolchain.py
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+          components: ${{ steps.rust_toolchain.outputs.components }}
+      - name: Record trusted C compiler chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/cc
+          direct_target=$(/usr/bin/readlink /usr/bin/cc || true)
+          canonical_target=$(/usr/bin/readlink -f /usr/bin/cc)
+          test -x "$canonical_target"
+          printf 'host C compiler direct=/usr/bin/cc -> %s\n' "${direct_target:-regular-file}"
+          printf 'host C compiler canonical=%s\n' "$canonical_target"
+      - name: Provision locked Rust sources without executing workspace code
+        shell: bash
+        env:
+          PINNED_TOOLCHAIN: ${{ steps.rust_toolchain.outputs.channel }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-locked-crates.py Cargo.lock
+          ci_account_home=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
+          ci_cargo_home=$(realpath --canonicalize-existing "$ci_account_home/.cargo")
+          ci_rustup_home=$(realpath --canonicalize-existing "$ci_account_home/.rustup")
+          ci_username=$(/usr/bin/id -un)
+          case "$ci_cargo_home:$ci_rustup_home" in
+            "$ci_account_home/.cargo:$ci_account_home/.rustup") ;;
+            *) echo 'pinned Rust sources are not canonical account paths' >&2; exit 69 ;;
+          esac
+          cd /tmp
+          /usr/bin/env -i \
+            HOME="$ci_account_home" USER="$ci_username" LOGNAME="$ci_username" \
+            PATH="$ci_cargo_home/bin:/usr/bin:/bin" \
+            CARGO_HOME="$ci_cargo_home" RUSTUP_HOME="$ci_rustup_home" \
+            RUSTUP_TOOLCHAIN="$PINNED_TOOLCHAIN" \
+            "$ci_cargo_home/bin/cargo" fetch --locked \
+              --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
+      - name: Prove the minimal inspection graph is HIP-free
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Include build dependencies: a future build.rs edge could acquire
+          # HIP even when the final Rust linkage graph did not name it.
+          dependency_graph=$(scripts/gpu-denied-runner.sh -- /bin/sh -ceu \
+            'cargo tree --locked -p bin --edges normal,build --prefix none --format "{p}"')
+          if printf '%s\n' "$dependency_graph" | \
+              grep -Eq '^(hipcore|kernels|taxis) v'; then
+            printf '%s\n' 'minimal bin graph unexpectedly contains a HIP dependency' >&2
+            printf '%s\n' "$dependency_graph" >&2
+            exit 1
+          fi
+      - name: Check boundary scripts
+        run: |
+          shellcheck scripts/gpu-denied-runner.sh scripts/gpu-denied-witness.sh \
+            scripts/check-hip-build-modes.sh scripts/ci-hosted-userns.sh \
+            scripts/ci-hip-code-object.sh
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          for name in ('gpu-denied-exec.py', 'ci-locked-crates.py', 'ci-rust-toolchain.py'):
+              source = Path('scripts', name).read_text(encoding='utf-8')
+              compile(source, name, 'exec')
+          PYTHON
+      - name: Prove GPU denial and CPU execution
+        run: bash scripts/gpu-denied-witness.sh
+      - name: Prove explicit HIP build modes
+        run: bash scripts/check-hip-build-modes.sh
+      - name: Reject malformed HIP code-object metadata
+        run: bash scripts/test-hip-code-object-witness.sh
+
+  hip-code-object:
+    # Official ROCm 6.4.4 development image, pinned by its linux/amd64
+    # manifest digest. This job compiles code only: the witness enters the
+    # GPU-denied boundary before invoking Cargo or hipcc.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Admit unprivileged namespace bootstrap
+        run: bash scripts/ci-hosted-userns.sh
+      - name: Resolve repository Rust toolchain
+        id: rust_toolchain
+        run: python3 scripts/ci-rust-toolchain.py
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+          components: ${{ steps.rust_toolchain.outputs.components }}
+      - name: Compile and inspect HIP code objects without a GPU
+        shell: bash
+        env:
+          PINNED_TOOLCHAIN: ${{ steps.rust_toolchain.outputs.channel }}
+        run: |
+          set -euo pipefail
+          if [[ -e "$GITHUB_WORKSPACE/target" || -L "$GITHUB_WORKSPACE/target" ]]; then
+            printf '%s\n' 'refusing preexisting HIP target directory' >&2
+            exit 69
+          fi
+          mkdir -- "$GITHUB_WORKSPACE/target"
+          sudo chown --no-dereference 10001:10001 -- "$GITHUB_WORKSPACE/target"
+          source_owner=$(/usr/bin/stat --format '%u' "$GITHUB_WORKSPACE")
+          if [[ "$source_owner" == 10001 ]]; then
+            printf '%s\n' 'workspace source owner collides with the fixed gpu-ci account' >&2
+            exit 69
+          fi
+          source_owned_paths=$(find "$GITHUB_WORKSPACE" -path "$GITHUB_WORKSPACE/target" -prune \
+            -o -uid 10001 -print -quit)
+          if [[ -n "$source_owned_paths" ]]; then
+            printf 'workspace source unexpectedly owned by gpu-ci: %s\n' "$source_owned_paths" >&2
+            exit 69
+          fi
+          source_write_paths=$(find "$GITHUB_WORKSPACE" -path "$GITHUB_WORKSPACE/target" -prune \
+            -o -perm /022 -print -quit)
+          if [[ -n "$source_write_paths" ]]; then
+            printf 'workspace source unexpectedly group/world writable: %s\n' "$source_write_paths" >&2
+            exit 69
+          fi
+          host_account_home=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
+          host_cargo_bin=$(realpath --canonicalize-existing "$host_account_home/.cargo/bin")
+          host_rustup_home=$(realpath --canonicalize-existing "$host_account_home/.rustup")
+          case "$host_cargo_bin:$host_rustup_home" in
+            "$host_account_home/.cargo/bin:$host_account_home/.rustup") ;;
+            *) echo 'pinned Rust sources are not canonical account paths' >&2; exit 69 ;;
+          esac
+          build_context="$RUNNER_TEMP/gpu-denied-rocm-context"
+          image_tag="logismos-gpu-denied:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$build_context"
+          docker build --file "$GITHUB_WORKSPACE/.github/ci/gpu-denied-rocm.Dockerfile" \
+            --tag "$image_tag" "$build_context"
+          # The Docker image is non-root. Its unmasked system paths are needed
+          # only to let Bubblewrap mount the final private /proc filesystem.
+          docker run --rm \
+            --user gpu-ci \
+            --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --security-opt systempaths=unconfined \
+            --workdir /workspace \
+            --env PINNED_TOOLCHAIN \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace" \
+            --mount "type=bind,src=$host_cargo_bin,dst=/opt/ci-rust/cargo/bin,readonly" \
+            --mount "type=bind,src=$host_rustup_home,dst=/opt/ci-rust/rustup,readonly" \
+            "$image_tag" /usr/bin/bash --noprofile --norc \
+              /workspace/scripts/ci-hip-code-object.sh /workspace

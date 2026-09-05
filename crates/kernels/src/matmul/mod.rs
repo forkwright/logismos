@@ -10,7 +10,9 @@ use std::ffi::c_void;
 
 use hipcore::Stream;
 
-use crate::error::{NoGpuBuildSnafu, Result, UnsupportedShapeSnafu};
+#[cfg(logismos_no_gpu_kernels)]
+use crate::error::NoGpuBuildSnafu;
+use crate::error::{Result, UnsupportedShapeSnafu};
 // WHY cfg-gated: only the `not(logismos_no_gpu_kernels)` launcher body builds
 // launch errors, so an unconditional import fails `-D warnings` on hipcc-less
 // (CPU-only) builds.
@@ -129,6 +131,7 @@ fn check_matmul_shape(m: i32, n: i32, k: i32) -> Result<()> {
 /// - [`Error::UnsupportedShape`] if `M`/`N`/`K` would drive an
 ///   element-index product past `i32::MAX` inside the kernel.
 /// - [`Error::NoGpuBuild`] if `hipcc` wasn't available at build time.
+/// - [`Error::Hip`] if the stream's device cannot be made current.
 /// - [`Error::Launch`] if the kernel fails.
 ///
 /// # Safety
@@ -157,6 +160,10 @@ pub unsafe fn launch_matmul_fp16(
 
     #[cfg(not(logismos_no_gpu_kernels))]
     {
+        // A resource dropped or replaced immediately before this call may have
+        // changed HIP's thread-local current device. Restore the stream owner
+        // at the last safe boundary; this is mandatory for a NULL stream.
+        stream.make_current()?;
         let raw_stream = stream.raw().cast::<c_void>();
         let code = match variant {
             // SAFETY: FFI call; all pointers valid per function
