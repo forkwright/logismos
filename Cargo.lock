@@ -58,6 +58,7 @@ version = "1.0.11"
 dependencies = [
  "placement",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

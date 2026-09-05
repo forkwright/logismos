@@ -11,6 +11,9 @@ publish = false
 placement = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [[bin]]
 name = "logismos"
 path = "src/main.rs"
