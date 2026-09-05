@@ -70,8 +70,10 @@ fn main() -> Result<(), String> {
     let cpp_sources = walk_with_ext(&PathBuf::from("src"), "cpp");
 
     if hip_sources.is_empty() && cpp_sources.is_empty() {
-        println!("cargo:warning=no HIP/CPP sources under src/; nothing to build");
-        return Ok(());
+        return Err(format!(
+            "no HIP/CPP sources under src/ while {HIP_BUILD_MODE_ENV}={HIP_BUILD_REQUIRED}; \
+             only {HIP_BUILD_CPU_ONLY} may produce no kernel archive"
+        ));
     }
 
     compile_sources(&hipcc, &out_dir, &hip_sources, &cpp_sources)?;

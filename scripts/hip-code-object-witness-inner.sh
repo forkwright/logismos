@@ -65,6 +65,30 @@ verify_code_object_metadata() {
     printf '%s\n' "$code_objects"
 }
 
+verify_syntax_rejection() {
+    local build_script=$1
+    local hipcc=$2
+    local source=$3
+    local fixture_root=$4
+    local relative_source=${source#"$ROOT/crates/kernels/"}
+    local fixture_source="$fixture_root/$relative_source"
+    local fixture_log="$fixture_root/compiler.log"
+
+    cp -R -- "$ROOT/crates/kernels/src" "$fixture_root/src"
+    mkdir -p "$fixture_root/out"
+    printf '\nextern "C" __global__ void logismos_syntax_witness( {\n' >>"$fixture_source"
+
+    if (
+        cd "$fixture_root"
+        LOGISMOS_HIP_BUILD=required HIPCC="$hipcc" OUT_DIR="$fixture_root/out" "$build_script"
+    ) >"$fixture_log" 2>&1; then
+        fail "syntax-error fixture unexpectedly compiled: $relative_source"
+    fi
+    if ! grep -F "${relative_source}:" "$fixture_log" | grep -Fq 'error: expected expression'; then
+        fail "syntax-error fixture did not report its injected parser diagnostic: $relative_source"
+    fi
+}
+
 main() {
     if [[ "$#" -ne 0 ]]; then
         fail "inner helper accepts no arguments"
@@ -136,11 +160,19 @@ main() {
         fail "code-object inspection did not prove target $target"
     fi
 
+    build_script="$witness_target/kernels-build-script"
+    rustc "$ROOT/crates/kernels/build.rs" -o "$build_script"
+    for source in "${hip_sources[@]}"; do
+        fixture_root=$(mktemp -d "$scratch/logismos-hip-syntax.XXXXXX")
+        verify_syntax_rejection "$build_script" "$hipcc" "$source" "$fixture_root"
+    done
+
     receipt="$witness_target/receipt.txt"
-    printf 'target=%s\ncompiler=%s\nresource_dir=%s\narchive=%s\narchive_members=%s\ncode_objects=%s\n' \
-        "$target" "$compiler_version" "$resource_dir" "$archive" "${#hip_sources[@]}" "$code_objects" >"$receipt"
-    printf 'HIP code-object evidence: target=%s archive-members=%s code-objects=%s compiler=%s receipt=%s\n' \
-        "$target" "${#hip_sources[@]}" "$code_objects" "$compiler_version" "$receipt"
+    printf 'target=%s\ncompiler=%s\nresource_dir=%s\narchive=%s\narchive_members=%s\ncode_objects=%s\nsyntax_rejections=%s\n' \
+        "$target" "$compiler_version" "$resource_dir" "$archive" "${#hip_sources[@]}" "$code_objects" \
+        "${#hip_sources[@]}" >"$receipt"
+    printf 'HIP code-object evidence: target=%s archive-members=%s code-objects=%s syntax-rejections=%s compiler=%s receipt=%s\n' \
+        "$target" "${#hip_sources[@]}" "$code_objects" "${#hip_sources[@]}" "$compiler_version" "$receipt"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

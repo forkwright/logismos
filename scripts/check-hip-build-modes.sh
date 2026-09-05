@@ -25,6 +25,29 @@ OUT="$ROOT/target/hip-build-mode-witness"
         LOGISMOS_HIP_BUILD=cpu-only OUT_DIR="$out/cpu" "$out/kernels-build" >"$out/cpu.log"
         grep -F "cargo:rustc-cfg=logismos_no_gpu_kernels" "$out/cpu.log"
 
+        mkdir -p "$out/empty-cpu"
+        (
+            cd "$out/empty-cpu"
+            LOGISMOS_HIP_BUILD=cpu-only OUT_DIR="$out/empty-cpu/out" "$out/kernels-build"
+        ) >"$out/empty-cpu.log"
+        grep -F "cargo:rustc-cfg=logismos_no_gpu_kernels" "$out/empty-cpu.log"
+        if [[ -e "$out/empty-cpu/out/liblogismos_kernels.a" ]]; then
+            echo "cpu-only empty source fixture produced a kernel archive" >&2
+            exit 1
+        fi
+
+        mkdir -p "$out/empty-required"
+        if (
+            cd "$out/empty-required"
+            LOGISMOS_HIP_BUILD=required HIPCC=/bin/true OUT_DIR="$out/empty-required/out" \
+                "$out/kernels-build"
+        ) >"$out/empty-required.log" 2>&1; then
+            echo "required HIP mode accepted an empty HIP/CPP source tree" >&2
+            exit 1
+        fi
+        grep -F "no HIP/CPP sources under src/ while LOGISMOS_HIP_BUILD=required" \
+            "$out/empty-required.log"
+
         mkdir -p "$out/required"
         if LOGISMOS_HIP_BUILD=required HIPCC=/not-a-hipcc OUT_DIR="$out/required" \
             "$out/kernels-build" >"$out/required.log" 2>&1; then

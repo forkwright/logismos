@@ -84,8 +84,9 @@ build script reads it for every `--offload-arch` flag. Build mode is selected
 with `LOGISMOS_HIP_BUILD`:
 
 - `cpu-only` emits `logismos_no_gpu_kernels` and omits the HIP archive.
-- `required` invokes `hipcc`; a missing compiler or compiler error fails the
-  build.
+- `required` invokes `hipcc`; a missing compiler, compiler error, or empty
+  HIP/CPP source discovery fails the build. Only `cpu-only` may omit the
+  kernel archive.
 
 An unset mode selects `required`. `LOGISMOS_SKIP_HIP_BUILD` is retired and
 fails with its explicit replacement. The build-mode witness proves CPU mode
@@ -113,11 +114,14 @@ CI job.
 Run `scripts/hip-code-object-witness.sh` for the required-HIP lane. This public
 entry point always enters the denied runner, then compiles the in-tree HIP
 sources and inspects the archive's offload bundles and exact target metadata.
-It rejects missing objects and malformed or wrong-architecture metadata.
+After that positive pass, it copies each HIP source to a temporary fixture,
+injects a syntax error, and verifies the compiled `build.rs` path rejects the
+source-specific parser diagnostic. It rejects missing objects and malformed or
+wrong-architecture metadata.
 `target/hip-code-object-witness/receipt.txt` records the observed compiler,
-resource directory, archive membership and code-object count. The receipt
-describes that invocation; it is neither a hardware result nor evidence that
-another toolchain or revision passed.
+resource directory, archive membership, code-object count, and syntax-rejection
+count. The receipt describes that invocation; it is neither a hardware result
+nor evidence that another toolchain or revision passed.
 
 ## Threat-model limits
 
