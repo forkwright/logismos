@@ -37,8 +37,10 @@ GitHub-hosted Ubuntu runners may require the CI-only
 `scripts/ci-hosted-userns.sh` admission helper before either boundary job. It
 is guarded to those ephemeral hosted runners, reads the exact AppArmor
 user-namespace sysctl, accepts only `0` or `1`, and verifies `0` before the
-boundary starts. It does not change the runner, grant the sandbox a capability,
-or apply to development hosts. A failed admission remains a hard failure.
+boundary starts. Its environment checks prevent accidental invocation on a
+development host; they are not a security boundary against a deliberate host
+operator. The workflow-scoped change does not alter the runner or grant the
+sandbox a capability. A failed admission remains a hard failure.
 
 The pinned ROCm container job provisions a dedicated non-root account before
 entering the boundary. Its networked `cargo fetch` is a trusted provisioning
@@ -47,6 +49,12 @@ uses an empty environment, and does not execute build scripts. Compilation and
 object inspection begin only after the GPU-denied runner succeeds. The job
 uses the exact release in `rust-toolchain.toml`, not an ambient latest-stable
 toolchain.
+
+The HIP job starts its explicit pinned container without `--privileged`,
+additional device mounts, or added capabilities. Its root provisioning process
+therefore retains Docker's default capability set; only the later `gpu-ci`
+invocation is the sandboxed workload, with inherited and ambient capabilities
+dropped before it enters the denied runner.
 
 The mount namespace contains:
 

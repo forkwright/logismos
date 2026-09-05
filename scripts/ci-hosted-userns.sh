@@ -18,8 +18,10 @@ if ! initial_value=$(/usr/sbin/sysctl -n "$APPARMOR_USERNS_KEY"); then
     exit 69
 fi
 case "$initial_value" in
-    0) ;;
-    1) /usr/bin/sudo /usr/sbin/sysctl -w "$APPARMOR_USERNS_KEY=0" >/dev/null ;;
+    0|1)
+        builtin printf 'hosted user-namespace admission initial %s=%s\n' \
+            "$APPARMOR_USERNS_KEY" "$initial_value"
+        ;;
     *)
         builtin printf 'hosted user-namespace admission rejected unexpected %s value: %s\n' \
             "$APPARMOR_USERNS_KEY" "$initial_value" >&2
@@ -27,8 +29,15 @@ case "$initial_value" in
         ;;
 esac
 
-if [[ $(/usr/sbin/sysctl -n "$APPARMOR_USERNS_KEY") != 0 ]]; then
+if [[ "$initial_value" == 1 ]]; then
+    /usr/bin/sudo /usr/sbin/sysctl -w "$APPARMOR_USERNS_KEY=0" >/dev/null
+fi
+
+final_value=$(/usr/sbin/sysctl -n "$APPARMOR_USERNS_KEY")
+if [[ "$final_value" != 0 ]]; then
     builtin printf '%s\n' \
         'hosted user-namespace admission could not enable the required executor prerequisite' >&2
     exit 69
 fi
+builtin printf 'hosted user-namespace admission verified %s=%s\n' \
+    "$APPARMOR_USERNS_KEY" "$final_value"

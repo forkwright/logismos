@@ -22,24 +22,7 @@ jobs:
         run: bash scripts/ci-hosted-userns.sh
       - name: Resolve repository Rust toolchain
         id: rust_toolchain
-        run: |
-          python3 - <<'PYTHON'
-          import os
-          import re
-          import tomllib
-          from pathlib import Path
-
-          config = tomllib.loads(Path('rust-toolchain.toml').read_text(encoding='utf-8'))
-          channel = config['toolchain']['channel']
-          components = config['toolchain'].get('components', [])
-          if re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', channel) is None:
-              raise SystemExit('rust-toolchain.toml must pin an exact stable release')
-          if any(re.fullmatch(r'[a-z0-9_-]+', item) is None for item in components):
-              raise SystemExit('rust-toolchain.toml contains an invalid component')
-          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
-              print(f'channel={channel}', file=output)
-              print(f'components={",".join(components)}', file=output)
-          PYTHON
+        run: python3 scripts/ci-rust-toolchain.py
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ steps.rust_toolchain.outputs.channel }}
@@ -65,8 +48,9 @@ jobs:
             scripts/ci-hip-code-object.sh
           python3 - <<'PYTHON'
           from pathlib import Path
-          source = Path('scripts/gpu-denied-exec.py').read_text(encoding='utf-8')
-          compile(source, 'gpu-denied-exec.py', 'exec')
+          for name in ('gpu-denied-exec.py', 'ci-rust-toolchain.py'):
+              source = Path('scripts', name).read_text(encoding='utf-8')
+              compile(source, name, 'exec')
           PYTHON
       - name: Prove GPU denial and CPU execution
         run: bash scripts/gpu-denied-witness.sh
@@ -89,24 +73,11 @@ jobs:
         run: bash scripts/ci-hosted-userns.sh
       - name: Resolve repository Rust toolchain
         id: rust_toolchain
-        run: |
-          python3 - <<'PYTHON'
-          import os
-          import re
-          import tomllib
-          from pathlib import Path
-
-          config = tomllib.loads(Path('rust-toolchain.toml').read_text(encoding='utf-8'))
-          channel = config['toolchain']['channel']
-          components = config['toolchain'].get('components', [])
-          if re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', channel) is None:
-              raise SystemExit('rust-toolchain.toml must pin an exact stable release')
-          if any(re.fullmatch(r'[a-z0-9_-]+', item) is None for item in components):
-              raise SystemExit('rust-toolchain.toml contains an invalid component')
-          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
-              print(f'channel={channel}', file=output)
-              print(f'components={",".join(components)}', file=output)
-          PYTHON
+        run: python3 scripts/ci-rust-toolchain.py
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+          components: ${{ steps.rust_toolchain.outputs.components }}
       - name: Compile and inspect HIP code objects without a GPU
         shell: bash
         env:
@@ -114,11 +85,20 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/target"
+          host_account_home=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
+          host_cargo_bin=$(realpath --canonicalize-existing "$host_account_home/.cargo/bin")
+          host_rustup_home=$(realpath --canonicalize-existing "$host_account_home/.rustup")
+          case "$host_cargo_bin:$host_rustup_home" in
+            "$host_account_home/.cargo/bin:$host_account_home/.rustup") ;;
+            *) echo 'pinned Rust sources are not canonical account paths' >&2; exit 69 ;;
+          esac
           # The denied runner itself rebinds source read-only and only target writable.
           docker run --rm \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
             --workdir /workspace \
             --env PINNED_TOOLCHAIN \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace" \
+            --mount "type=bind,src=$host_cargo_bin,dst=/opt/ci-rust/cargo/bin,readonly" \
+            --mount "type=bind,src=$host_rustup_home,dst=/opt/ci-rust/rustup,readonly" \
             rocm/dev-ubuntu-24.04@sha256:31418ac10a3769a71eaef330c07280d1d999d7074621339b8f93c484c35f6078 \
             /usr/bin/bash --noprofile --norc /workspace/scripts/ci-hip-code-object.sh /workspace

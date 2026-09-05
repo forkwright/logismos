@@ -16,28 +16,22 @@ fi
 
 readonly WORKSPACE=$1
 readonly CI_HOME=/home/gpu-ci
-export HOME=/root
-export CARGO_HOME=/root/.cargo
-export RUSTUP_HOME=/root/.rustup
+readonly HOSTED_RUST_ROOT=/opt/ci-rust
+readonly HOSTED_CARGO_BIN=$HOSTED_RUST_ROOT/cargo/bin
+readonly HOSTED_RUSTUP=$HOSTED_RUST_ROOT/rustup
+if [[ ! -d "$HOSTED_CARGO_BIN" || ! -d "$HOSTED_RUSTUP" ]]; then
+    builtin printf '%s\n' 'ci-hip-code-object requires mounted pinned Rust sources' >&2
+    exit 69
+fi
 
 apt-get update
-apt-get install --yes --no-install-recommends bubblewrap ca-certificates curl python3 util-linux
-curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail \
-    https://sh.rustup.rs | sh -s -- --profile minimal --default-toolchain "$PINNED_TOOLCHAIN" -y
+apt-get install --yes --no-install-recommends bubblewrap python3 util-linux
 
 useradd --create-home --user-group --shell /bin/bash gpu-ci
-test -d "$CARGO_HOME/bin"
-test -d "$RUSTUP_HOME"
 install -d -m 0755 -o gpu-ci -g gpu-ci \
     "$CI_HOME/.cargo" "$CI_HOME/.rustup" "$WORKSPACE/target"
-cp -a -- "$CARGO_HOME/bin" "$CI_HOME/.cargo/bin"
-cp -a -- "$RUSTUP_HOME/." "$CI_HOME/.rustup/"
-
-for cache in registry git; do
-    if [[ -d "$CARGO_HOME/$cache" ]]; then
-        cp -a -- "$CARGO_HOME/$cache" "$CI_HOME/.cargo/$cache"
-    fi
-done
+cp -a -- "$HOSTED_CARGO_BIN" "$CI_HOME/.cargo/bin"
+cp -a -- "$HOSTED_RUSTUP/." "$CI_HOME/.rustup/"
 chown -R gpu-ci:gpu-ci -- "$CI_HOME/.cargo" "$CI_HOME/.rustup" "$WORKSPACE/target"
 
 python3 - "$WORKSPACE/Cargo.lock" <<'PYTHON'
