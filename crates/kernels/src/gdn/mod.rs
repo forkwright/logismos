@@ -106,7 +106,7 @@ impl<'a> RecurrentInput<'a> {
     /// supplied scalar is non-finite.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the recurrence's seven tensors and three scalar dimensions are its complete fixed contract"
+        reason = "the six input buffers, scale and two dimensions form the fixed recurrence contract"
     )]
     pub fn new(
         q: &'a [f32],

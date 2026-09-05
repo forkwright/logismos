@@ -13,8 +13,8 @@
 //! ephemeral crate and runs `cargo check` against it, asserting the
 //! build fails with E0382 ("use of moved value").
 //!
-//! No `ROCm` hardware exists anywhere in this fleet, so this never
-//! executes GPU code. Borrow checking is a compile-time-only pass, so
+//! These fixtures perform borrow checking only and never execute GPU
+//! code. Borrow checking is a compile-time-only pass, so
 //! `cargo check` proves the invariant without a device: it needs only
 //! the HIP headers + `libamdhip64` link target for `hipcore` itself to
 //! build, which CI provisions (`libamdhip64-dev`) and this repo's other
