@@ -23,6 +23,8 @@ jobs:
         run: bash scripts/gpu-denied-witness.sh
       - name: Prove explicit HIP build modes
         run: bash scripts/check-hip-build-modes.sh
+      - name: Reject malformed HIP code-object metadata
+        run: bash scripts/test-hip-code-object-witness.sh
 
   hip-code-object:
     # Official ROCm 6.4.4 development image, pinned by its linux/amd64
