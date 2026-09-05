@@ -30,10 +30,13 @@ semantically respects that boundary.
 ## Dependency rules
 
 - Lower tiers never depend on higher tiers.
-- `core` and `hipcore` have no Logismos-local dependencies.
-- `placement` has no HIP or other Logismos-local dependency; `bin` consumes it
-  without linking the device runtime for the `plan` command.
-- `emulation` is an independent CPU test aid, not a production device backend.
+- `core` and `gpu-target` have no Logismos-local dependencies. `gpu-target` is
+  pure parsing over the checked-in target token; it neither links nor probes HIP.
+- `hipcore`, `placement`, and `emulation` depend on `gpu-target` so architecture
+  identity and suffix syntax have one implementation.
+- `placement` has no HIP/device-runtime dependency; `bin` consumes it without
+  linking the device runtime for the `plan` command.
+- `emulation` is a CPU test aid, not a production device backend.
 - `taxis` depends locally on `hipcore`.
 - `kernels` depends locally on `hipcore` and `taxis`; it does not depend on `core`.
 - Cross-tier deps must be justified. Within-tier deps are code smell.
@@ -52,9 +55,11 @@ semantically respects that boundary.
 
 ## Resource ownership
 
-Stable device identities are distinct from visible ordinals. Architecture capabilities, not SKU
-names or a 48-GB threshold, determine compatibility. Every allocation and resource estimate belongs
-to one device; an optional absent device cannot disable an otherwise valid single-device plan.
+Stable device identities are distinct from visible ordinals. The configured base architecture,
+not SKU names or a 48-GB threshold, determines current admission. Validated feature suffixes are
+descriptive input, not an independent semantic-support qualification. Every allocation and resource
+estimate belongs to one device; an optional absent device cannot disable an otherwise valid
+single-device plan.
 
 Artifact identity, execution-profile requests, memory estimates, host allowances, and observed
 residency are separate facts. Repeated profiles reference one artifact identity. Byte arithmetic

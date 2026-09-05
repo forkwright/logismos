@@ -1,0 +1,11 @@
+[package]
+name = "gpu-target"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure parser and single-source contract for logismos GPU ISA target tokens."
+publish = false
+
+[lints]
+workspace = true

@@ -8,6 +8,7 @@ description = "Pure typed per-device resource-placement planning for logismos."
 publish = false
 
 [dependencies]
+gpu-target.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 snafu = { workspace = true }

@@ -30,6 +30,7 @@ See [CLAUDE.md](CLAUDE.md) for how to resolve the kanon checkout root on this bo
 ## Key crates
 
 - `crates/core/` - current stable public model trait (`EmbeddingModel`)
+- `crates/gpu-target/` - pure configured-ISA token and feature-suffix parser
 - `crates/hipcore/` - HIP FFI surface, device/stream/memory
 - `crates/placement/` - deterministic, action-free per-device resource plans
 - `crates/emulation/` - bounded original CPU functional instruction witnesses

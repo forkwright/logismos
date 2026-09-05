@@ -322,6 +322,7 @@ dependencies = [
 name = "emulation"
 version = "1.0.11"
 dependencies = [
+ "gpu-target",
  "snafu",
  "tempfile",
 ]
@@ -403,6 +404,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
+name = "gpu-target"
+version = "1.0.11"
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -441,6 +446,7 @@ name = "hipcore"
 version = "1.0.11"
 dependencies = [
  "bindgen",
+ "gpu-target",
  "half",
  "snafu",
  "tempfile",
@@ -690,6 +696,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "placement"
 version = "1.0.11"
 dependencies = [
+ "gpu-target",
  "serde",
  "serde_json",
  "snafu",

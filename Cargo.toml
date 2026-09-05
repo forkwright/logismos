@@ -26,6 +26,7 @@ multiple_crate_versions = "allow"
 
 [workspace.dependencies]
 # Tier-1 foundation deps (Phase 1).
+gpu-target = { path = "crates/gpu-target" }
 half = "2.4"
 smallvec = { version = "1.13", features = ["union"] }
 thiserror = "2"

@@ -14,7 +14,7 @@ fn device_properties_match_target_capability() {
     let d = Device::new(0).expect("open device 0");
     let p = d.props();
     assert!(
-        p.supports_target(),
+        p.matches_target_architecture(),
         "device ISA `{}` does not match the configured HIP target",
         p.isa
     );

@@ -1,6 +1,6 @@
 //! Safe device discovery and selection over the HIP runtime API.
 
-use std::ffi::c_int;
+use std::ffi::{c_char, c_int};
 use std::fmt;
 use std::sync::Arc;
 
@@ -9,10 +9,6 @@ use crate::error::{
     NoDeviceWithUuidSnafu, NoSuchDeviceSnafu, Result, UnsupportedIsaSnafu, check,
 };
 use crate::ffi;
-
-fn hip_target() -> &'static str {
-    include_str!("../../../contracts/gpu-target.txt").trim()
-}
 
 /// Device ordinal assigned by HIP for the current process visibility set.
 ///
@@ -216,19 +212,23 @@ impl DeviceProps {
         &self.identity
     }
 
-    /// Whether this ISA is exactly the configured target, with only valid HIP
-    /// feature suffixes permitted after the architecture name.
+    /// Whether this ISA has the configured base architecture and a canonical
+    /// HIP feature-suffix spelling.
+    ///
+    /// Feature suffixes are syntax-checked, not interpreted as proof that an
+    /// arbitrary feature state is supported by this build.
     #[must_use]
-    pub fn supports_target(&self) -> bool {
-        isa_matches_target(&self.isa)
+    pub fn matches_target_architecture(&self) -> bool {
+        gpu_target::matches_configured_architecture(&self.isa)
     }
 
     fn require_target(&self) -> Result<()> {
-        if self.supports_target() {
+        if self.matches_target_architecture() {
             Ok(())
         } else {
             UnsupportedIsaSnafu {
                 isa: self.isa.clone(),
+                configured: gpu_target::configured_target_token(),
             }
             .fail()
         }
@@ -295,8 +295,10 @@ pub struct MemoryBudget {
 /// Safe handle to a supported HIP device.
 ///
 /// `Device` is cheap to clone — it holds an `Arc` to immutable per-device
-/// state. Construction rejects an unsupported ISA before making the device
-/// current, allocating memory, creating streams, or dispatching work.
+/// state. Construction rejects a malformed ISA token or nonmatching base
+/// architecture before making the device current, allocating memory, creating
+/// streams, or dispatching work. Reported feature suffixes remain descriptive;
+/// syntactic admission is not independent feature qualification.
 #[derive(Clone)]
 pub struct Device {
     inner: Arc<DeviceInner>,
@@ -317,7 +319,8 @@ impl Device {
     /// # Errors
     ///
     /// - [`crate::Error::NoSuchDevice`] if `ordinal` is not visible.
-    /// - [`crate::Error::UnsupportedIsa`] if the device ISA cannot execute this build's target.
+    /// - [`crate::Error::UnsupportedIsa`] if the reported ISA is malformed or
+    ///   its base architecture differs from this build's target.
     /// - [`crate::Error::Runtime`] for HIP API failures.
     pub fn new(ordinal: DeviceOrdinal) -> Result<Self> {
         let info = query_device(ordinal)?;
@@ -329,8 +332,9 @@ impl Device {
     /// # Errors
     ///
     /// Returns a selector-specific missing-device error when no visible device
-    /// matches, [`crate::Error::UnsupportedIsa`] before HIP activation for an
-    /// incompatible device, or [`crate::Error::Runtime`] for HIP failures.
+    /// matches, [`crate::Error::UnsupportedIsa`] before HIP activation for a
+    /// malformed or nonmatching architecture, or [`crate::Error::Runtime`] for
+    /// HIP failures.
     pub fn select(selector: &DeviceSelector) -> Result<Self> {
         Self::select_optional(selector)?.map_or_else(|| selector.not_found(device_count()?), Ok)
     }
@@ -343,7 +347,8 @@ impl Device {
     /// # Errors
     ///
     /// Returns [`crate::Error::UnsupportedIsa`] before HIP activation for a
-    /// matched incompatible device, or [`crate::Error::Runtime`] for HIP failures.
+    /// malformed or nonmatching architecture, or [`crate::Error::Runtime`] for
+    /// HIP failures.
     pub fn select_optional(selector: &DeviceSelector) -> Result<Option<Self>> {
         let devices = enumerate_devices()?;
         let Some(info) = devices.into_iter().find(|info| selector.matches(info)) else {
@@ -531,7 +536,7 @@ fn query_pci_bus_id(ordinal: DeviceOrdinal) -> Result<PciBusId> {
     // non-conforming runtime value is observed and rejected rather than
     // silently truncated into something that happens to look canonical.
     const BUFFER_BYTES: usize = 32;
-    let mut raw = [0_i8; BUFFER_BYTES];
+    let mut raw: [c_char; BUFFER_BYTES] = [0; BUFFER_BYTES];
     let len = c_int::try_from(raw.len()).map_err(|error| {
         InternalSnafu {
             message: format!("PCI bus ID buffer length is outside the c_int range: {error}"),
@@ -590,24 +595,6 @@ fn ensure_same_device_ordinals(
     }
 }
 
-fn isa_matches_target(isa: &str) -> bool {
-    let Some((architecture, suffixes)) = isa.split_once(':') else {
-        return isa == hip_target();
-    };
-    architecture == hip_target() && suffixes.split(':').all(valid_isa_feature)
-}
-
-fn valid_isa_feature(feature: &str) -> bool {
-    let Some((name, state)) = feature.split_at_checked(feature.len().saturating_sub(1)) else {
-        return false;
-    };
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-        && matches!(state, "+" | "-")
-}
-
 fn device_prop_u32<T>(field: &'static str, value: T) -> Result<u32>
 where
     u32: TryFrom<T>,
@@ -621,13 +608,14 @@ where
     })
 }
 
-fn cstr_from_array(bytes: &[i8]) -> String {
+fn cstr_from_array(bytes: &[c_char]) -> String {
     let end = bytes
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
     let slice: &[u8] = unsafe {
-        // SAFETY: i8 and u8 have identical layout; `bytes` remains live.
+        // SAFETY: `c_char` and `u8` have identical size and alignment;
+        // `bytes` remains live for the returned slice.
         core::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), end)
     };
     String::from_utf8_lossy(slice).into_owned()
@@ -651,7 +639,7 @@ pub fn device_count() -> Result<i32> {
 #[cfg(test)]
 fn test_props() -> DeviceProps {
     DeviceProps {
-        isa: hip_target().to_string(),
+        isa: gpu_target::configured_target_token().to_string(),
         name: String::new(),
         total_vram_bytes: 0,
         compute_units: 0,
@@ -678,7 +666,7 @@ mod tests {
         DeviceInfo {
             ordinal,
             props: DeviceProps {
-                isa: hip_target().to_string(),
+                isa: gpu_target::configured_target_token().to_string(),
                 name: "fixture".to_string(),
                 total_vram_bytes: vram_gib * GIB,
                 compute_units: 1,
@@ -693,34 +681,6 @@ mod tests {
                 ),
             },
         }
-    }
-
-    #[test]
-    fn target_isa_accepts_valid_feature_suffixes() {
-        assert!(
-            isa_matches_target(hip_target()),
-            "bare target ISA must be accepted"
-        );
-        assert!(
-            isa_matches_target(&format!("{}:sramecc+:xnack-", hip_target())),
-            "valid HIP feature suffixes must be accepted"
-        );
-    }
-
-    #[test]
-    fn target_isa_rejects_lookalikes_and_malformed_suffixes() {
-        assert!(
-            !isa_matches_target("gfx11000"),
-            "lookalike ISA must not match"
-        );
-        assert!(
-            !isa_matches_target(&format!("{}:xnack", hip_target())),
-            "feature suffix must include its state"
-        );
-        assert!(
-            !isa_matches_target(&format!("{}::xnack+", hip_target())),
-            "empty feature suffix must not match"
-        );
     }
 
     #[test]
@@ -778,11 +738,11 @@ mod tests {
         let workstation = fixture(0, Some(DeviceUuid::new([1; 16])), "0000:01:00.0", 48);
         let consumer = fixture(1, Some(DeviceUuid::new([2; 16])), "0000:02:00.0", 24);
         assert!(
-            workstation.props().supports_target(),
+            workstation.props().matches_target_architecture(),
             "48 GiB fixture must be accepted"
         );
         assert!(
-            consumer.props().supports_target(),
+            consumer.props().matches_target_architecture(),
             "24 GiB fixture must be accepted"
         );
     }

@@ -113,14 +113,16 @@ pub enum Error {
         location: snafu::Location,
     },
 
-    /// Detected ISA does not match the expected gfx1100 target.
+    /// Detected ISA does not match the configured target architecture.
     ///
     /// Non-fatal at construction time (a logismos consumer may choose
     /// to continue on another ISA), but surfaced so callers can decide.
-    #[snafu(display("unsupported ISA `{isa}`, expected `gfx1100`"))]
+    #[snafu(display("ISA `{isa}` does not match configured target architecture `{configured}`"))]
     UnsupportedIsa {
         /// ISA reported by `hipGetDeviceProperties`.
         isa: String,
+        /// Full configured target token used for the architecture comparison.
+        configured: &'static str,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
