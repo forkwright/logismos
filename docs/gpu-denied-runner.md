@@ -59,7 +59,8 @@ dropped before it enters the denied runner.
 The mount namespace contains:
 
 - a synthetic `/dev`, empty `/sys` and `/run`, private `/proc` and `/tmp`, and
-  an `/etc` containing at most the host's read-only dynamic-loader cache;
+  an `/etc` containing at most the host's read-only dynamic-loader cache and,
+  when `/usr/bin/cc` uses it, the one verified `/etc/alternatives/cc` link;
 - the host `/usr` and an optional system `/opt/rocm`, read-only;
 - the worktree read-only, with only its real, non-mounted `target/` directory
   rebound writable; and

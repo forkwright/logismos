@@ -280,8 +280,36 @@ def _environment_args(environment: list[tuple[str, str]]) -> list[str]:
     return args
 
 
+def _compiler_alias_mount_args() -> list[str]:
+    compiler = Path('/usr/bin/cc')
+    try:
+        target = os.readlink(compiler)
+    except OSError as error:
+        if error.errno == errno.EINVAL:
+            return []
+        raise BoundaryError(f'cannot inspect the system C compiler link: {error}') from error
+    alias = Path(target)
+    expected_alias = Path('/etc/alternatives/cc')
+    if alias != expected_alias:
+        return []
+    try:
+        resolved_compiler = expected_alias.resolve(strict=True)
+    except OSError as error:
+        raise BoundaryError(f'cannot resolve the system C compiler alias: {error}') from error
+    if (
+        not resolved_compiler.is_file()
+        or not os.access(resolved_compiler, os.X_OK)
+        or not resolved_compiler.is_relative_to(Path('/usr'))
+    ):
+        raise BoundaryError('the system C compiler alias does not resolve under /usr')
+    # WHY: Ubuntu's /usr/bin/cc may use precisely this root-owned alternative.
+    # Mounting the single link preserves the compiler without exposing /etc.
+    return ['--dir', str(expected_alias.parent), '--ro-bind', str(expected_alias), str(expected_alias)]
+
+
 def _sandbox_args(root: Path, target: Path, command: list[str]) -> list[str]:
     toolchain_args, toolchain_environment = _toolchain_mount_args()
+    compiler_alias_args = _compiler_alias_mount_args()
     environment = [
         ('HOME', str(SANDBOX_HOME)),
         ('USER', 'gpu-denied'),
@@ -309,6 +337,7 @@ def _sandbox_args(root: Path, target: Path, command: list[str]) -> list[str]:
         (
             '--dir',
             '/etc',
+            *compiler_alias_args,
             '--symlink',
             'usr/bin',
             '/bin',

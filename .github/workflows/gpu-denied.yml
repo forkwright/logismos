@@ -27,14 +27,47 @@ jobs:
         with:
           toolchain: ${{ steps.rust_toolchain.outputs.channel }}
           components: ${{ steps.rust_toolchain.outputs.components }}
+      - name: Record trusted C compiler chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/cc
+          direct_target=$(/usr/bin/readlink /usr/bin/cc || true)
+          canonical_target=$(/usr/bin/readlink -f /usr/bin/cc)
+          test -x "$canonical_target"
+          printf 'host C compiler direct=/usr/bin/cc -> %s\n' "${direct_target:-regular-file}"
+          printf 'host C compiler canonical=%s\n' "$canonical_target"
+      - name: Provision locked Rust sources without executing workspace code
+        shell: bash
+        env:
+          PINNED_TOOLCHAIN: ${{ steps.rust_toolchain.outputs.channel }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-locked-crates.py Cargo.lock
+          ci_account_home=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
+          ci_cargo_home=$(realpath --canonicalize-existing "$ci_account_home/.cargo")
+          ci_rustup_home=$(realpath --canonicalize-existing "$ci_account_home/.rustup")
+          ci_username=$(/usr/bin/id -un)
+          case "$ci_cargo_home:$ci_rustup_home" in
+            "$ci_account_home/.cargo:$ci_account_home/.rustup") ;;
+            *) echo 'pinned Rust sources are not canonical account paths' >&2; exit 69 ;;
+          esac
+          cd /tmp
+          /usr/bin/env -i \
+            HOME="$ci_account_home" USER="$ci_username" LOGNAME="$ci_username" \
+            PATH="$ci_cargo_home/bin:/usr/bin:/bin" \
+            CARGO_HOME="$ci_cargo_home" RUSTUP_HOME="$ci_rustup_home" \
+            RUSTUP_TOOLCHAIN="$PINNED_TOOLCHAIN" \
+            "$ci_cargo_home/bin/cargo" fetch --locked \
+              --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
       - name: Prove the minimal inspection graph is HIP-free
         shell: bash
         run: |
           set -euo pipefail
           # Include build dependencies: a future build.rs edge could acquire
           # HIP even when the final Rust linkage graph did not name it.
-          dependency_graph=$(cargo tree --locked -p bin \
-            --edges normal,build --prefix none --format '{p}')
+          dependency_graph=$(scripts/gpu-denied-runner.sh -- /bin/sh -ceu \
+            'cargo tree --locked -p bin --edges normal,build --prefix none --format "{p}"')
           if printf '%s\n' "$dependency_graph" | \
               grep -Eq '^(hipcore|kernels|taxis) v'; then
             printf '%s\n' 'minimal bin graph unexpectedly contains a HIP dependency' >&2
@@ -48,7 +81,7 @@ jobs:
             scripts/ci-hip-code-object.sh
           python3 - <<'PYTHON'
           from pathlib import Path
-          for name in ('gpu-denied-exec.py', 'ci-rust-toolchain.py'):
+          for name in ('gpu-denied-exec.py', 'ci-locked-crates.py', 'ci-rust-toolchain.py'):
               source = Path('scripts', name).read_text(encoding='utf-8')
               compile(source, name, 'exec')
           PYTHON

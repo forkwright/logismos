@@ -120,7 +120,13 @@ if unexpected_devices:
     raise AssertionError(f'unexpected synthetic /dev entries: {sorted(unexpected_devices)}')
 if os.listdir('/sys') or os.listdir('/run'):
     raise AssertionError('masked host runtime trees are not empty')
-if set(os.listdir('/etc')) - {'ld.so.cache'}:
+allowed_etc_entries = {'ld.so.cache'}
+alternatives = Path('/etc/alternatives')
+if alternatives.exists():
+    if not alternatives.is_dir() or set(entry.name for entry in alternatives.iterdir()) != {'cc'}:
+        raise AssertionError('sandbox /etc alternatives expose more than the C compiler alias')
+    allowed_etc_entries.add('alternatives')
+if set(os.listdir('/etc')) - allowed_etc_entries:
     raise AssertionError('sandbox /etc exposes more than the dynamic-loader cache')
 
 if os.environ['HOME'] != '/tmp/home' or os.environ['CARGO_HOME'] != '/tmp/cargo':

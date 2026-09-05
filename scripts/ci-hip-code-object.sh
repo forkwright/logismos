@@ -34,21 +34,7 @@ cp -a -- "$HOSTED_CARGO_BIN" "$CI_HOME/.cargo/bin"
 cp -a -- "$HOSTED_RUSTUP/." "$CI_HOME/.rustup/"
 chown -R gpu-ci:gpu-ci -- "$CI_HOME/.cargo" "$CI_HOME/.rustup" "$WORKSPACE/target"
 
-python3 - "$WORKSPACE/Cargo.lock" <<'PYTHON'
-import sys
-import tomllib
-from pathlib import Path
-
-lock = tomllib.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
-allowed = 'registry+https://github.com/rust-lang/crates.io-index'
-unexpected = sorted({
-    package['source']
-    for package in lock.get('package', [])
-    if 'source' in package and package['source'] != allowed
-})
-if unexpected:
-    raise SystemExit(f'Cargo.lock contains non-crates.io sources: {unexpected}')
-PYTHON
+python3 "$WORKSPACE/scripts/ci-locked-crates.py" "$WORKSPACE/Cargo.lock"
 
 cd /tmp
 /usr/bin/setpriv \
