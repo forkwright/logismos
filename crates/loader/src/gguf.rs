@@ -79,11 +79,11 @@ pub enum GgmlType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
-    I8 = 16,
-    I16 = 17,
-    I32 = 18,
-    I64 = 19,
-    F64 = 20,
+    I8 = 24,
+    I16 = 25,
+    I32 = 26,
+    I64 = 27,
+    F64 = 28,
     BF16 = 30,
 }
 
@@ -104,11 +104,11 @@ impl GgmlType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
-            16 => Self::I8,
-            17 => Self::I16,
-            18 => Self::I32,
-            19 => Self::I64,
-            20 => Self::F64,
+            24 => Self::I8,
+            25 => Self::I16,
+            26 => Self::I32,
+            27 => Self::I64,
+            28 => Self::F64,
             30 => Self::BF16,
             other => {
                 return GgufSnafu {

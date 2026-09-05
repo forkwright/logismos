@@ -500,6 +500,17 @@ fn reader_rejects_unknown_ggml_type_before_profile_creation() -> Result<()> {
 }
 
 #[test]
+fn reader_rejects_unsupported_iq_ggml_type_before_profile_creation() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("unsupported-iq-ggml-type.gguf");
+    // GGML_TYPE_IQ2_XXS = 16. It must not be mistaken for I8.
+    std::fs::write(&path, one_tensor_fixture(16, &[1], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
 fn reader_rejects_metadata_count_above_inspection_limit() -> Result<()> {
     let dir = tempdir_for_test();
     let path = dir.join("too-many-metadata-entries.gguf");
