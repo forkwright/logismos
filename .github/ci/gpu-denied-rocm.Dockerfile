@@ -1,5 +1,5 @@
-# Official ROCm 6.4.4 development image, pinned by its linux/amd64 manifest digest.
-FROM rocm/dev-ubuntu-24.04@sha256:31418ac10a3769a71eaef330c07280d1d999d7074621339b8f93c484c35f6078
+# Official ROCm 7.1.1 complete image, pinned by its linux/amd64 manifest digest.
+FROM rocm/dev-ubuntu-24.04@sha256:c6648f6a60470959f5f9c653ce8397d72fc0adda455942b265a5f973c9ee5891
 
 # WHY: This fixed unprivileged identity owns only the hosted job's target/.
 # The build context is empty, so no workspace bytes are available during build.

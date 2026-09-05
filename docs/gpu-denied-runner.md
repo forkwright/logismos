@@ -50,6 +50,10 @@ object inspection begin only after the GPU-denied runner succeeds. The job
 uses the exact release in `rust-toolchain.toml`, not an ambient latest-stable
 toolchain.
 
+The ROCm image tag and linux/amd64 digest have one authority:
+`.github/ci/gpu-denied-rocm.Dockerfile`; the workflow deliberately does not
+duplicate that pin.
+
 The HIP job builds its derived image with Docker's default capabilities but an
 empty context, so no workspace code is available during provisioning. The
 runtime container starts as `gpu-ci` without `--privileged`, additional device

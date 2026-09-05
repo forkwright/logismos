@@ -93,9 +93,9 @@ jobs:
         run: bash scripts/test-hip-code-object-witness.sh
 
   hip-code-object:
-    # Official ROCm 6.4.4 development image, pinned by its linux/amd64
-    # manifest digest. This job compiles code only: the witness enters the
-    # GPU-denied boundary before invoking Cargo or hipcc.
+    # The Dockerfile pins the declared ROCm baseline by linux/amd64 digest.
+    # This job compiles code only: the witness enters the GPU-denied boundary
+    # before invoking Cargo or hipcc.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

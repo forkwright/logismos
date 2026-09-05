@@ -155,8 +155,19 @@ main() {
         fi
     done
 
-    metadata=$(cd "$scratch/inspect" && "$llvm_objdump" --offloading "$archive")
+    metadata_file="$scratch/inspect/offloading.txt"
+    if ! (cd "$scratch/inspect" && "$llvm_objdump" --offloading "$archive" >"$metadata_file"); then
+        fail "llvm-objdump could not inspect the kernel archive offloading metadata"
+    fi
+    metadata=$(<"$metadata_file")
     if ! code_objects=$(verify_code_object_metadata "$metadata" "$target" "${#hip_sources[@]}"); then
+        printf 'HIP code-object inspection diagnostic: archive=%s bytes=%s expected_target=%s expected_objects=%s\n' \
+            "$archive" "$(wc -c <"$archive")" "$target" "${#hip_sources[@]}" >&2
+        printf 'HIP code-object inspection diagnostic: archive_members=%s\n' "$(tr '\n' ',' <<<"$members")" >&2
+        printf 'HIP code-object inspection diagnostic: llvm_objdump=%s\n' \
+            "$("$llvm_objdump" --version | head -n 1)" >&2
+        printf '%s\n' 'HIP code-object inspection diagnostic: offloading metadata (first 80 lines):' >&2
+        head -n 80 -- "$metadata_file" >&2
         fail "code-object inspection did not prove target $target"
     fi
 
