@@ -3,6 +3,8 @@
 //! This module deliberately accepts only dense one-head recurrent input. It
 //! is a correctness oracle for a future device kernel, not a model adapter or
 //! a permissive fallback for unsupported GDN variants.
+//! Bounds describe the admitted shapes and numerical domain, not a memory
+//! quota; allocation exhaustion remains a process-level failure.
 
 use snafu::Snafu;
 
@@ -69,7 +71,7 @@ pub enum GdnError {
     NonFiniteArithmetic {
         /// Named recurrence stage.
         stage: &'static str,
-        /// Flat output or state index.
+        /// Index within the named stage's token, state or value axis.
         index: usize,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
@@ -208,8 +210,8 @@ impl RecurrentOutput {
 ///
 /// # Errors
 ///
-/// Returns [`GdnError::NonFiniteArithmetic`] if a decay, state update, or
-/// output calculation becomes non-finite.
+/// Returns [`GdnError::NonFiniteArithmetic`] if a decay, projection, delta,
+/// state update, or output calculation becomes non-finite.
 pub fn recurrent_fwd(input: &RecurrentInput<'_>) -> GdnResult<RecurrentOutput> {
     let output_len = checked_product(
         input.token_count,
