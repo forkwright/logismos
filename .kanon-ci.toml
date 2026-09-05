@@ -2,7 +2,7 @@
 #
 # archetype: B
 # Menos build and test stages are CPU-only and run inside the GPU-denied
-# boundary. The separate Forge HIP witness compiles and inspects real device
+# boundary. The separate hosted HIP witness compiles and inspects real device
 # code objects without initializing a GPU runtime.
 #
 # Mirrors harmonia's / aletheia's .kanon-ci.toml with logismos-specific

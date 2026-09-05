@@ -100,7 +100,7 @@ jobs:
   gate:
     uses: forkwright/.github/.github/workflows/hybrid-gate.yml@main
     with:
-      fmt_cmd: "python3 scripts/check_runtime_scope.py && cargo fmt --all -- --check && bash scripts/check-kanon-root-ssot.sh"
+      fmt_cmd: "python3 scripts/check_runtime_scope.py && python3 scripts/check_document_contracts.py && cargo fmt --all -- --check && bash scripts/check-kanon-root-ssot.sh"
       check_cmd: "LOGISMOS_HIP_BUILD=cpu-only cargo check --workspace --all-targets"
       clippy_cmd: "LOGISMOS_HIP_BUILD=cpu-only cargo clippy --workspace --all-targets -- -D warnings"
       nextest_cmd: "LOGISMOS_HIP_BUILD=cpu-only cargo nextest run --workspace --no-fail-fast && LOGISMOS_HIP_BUILD=cpu-only cargo nextest run --release -p kernels --no-fail-fast"
