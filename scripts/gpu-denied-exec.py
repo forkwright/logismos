@@ -285,7 +285,7 @@ def _compiler_alias_mount_args() -> list[str]:
     try:
         target = os.readlink(compiler)
     except OSError as error:
-        if error.errno == errno.EINVAL:
+        if error.errno in (errno.EINVAL, errno.ENOENT):
             return []
         raise BoundaryError(f'cannot inspect the system C compiler link: {error}') from error
     alias = Path(target)
@@ -303,8 +303,17 @@ def _compiler_alias_mount_args() -> list[str]:
     ):
         raise BoundaryError('the system C compiler alias does not resolve under /usr')
     # WHY: Ubuntu's /usr/bin/cc may use precisely this root-owned alternative.
-    # Mounting the single link preserves the compiler without exposing /etc.
-    return ['--dir', str(expected_alias.parent), '--ro-bind', str(expected_alias), str(expected_alias)]
+    # Recreate the link to its validated /usr target instead of bind-mounting
+    # it: binding dereferences the link and makes GCC believe its executable
+    # lives under /etc, breaking its self-relative plugin lookup.  This is
+    # optional support for compiler commands, not a requirement for pure ones.
+    return [
+        '--dir',
+        str(expected_alias.parent),
+        '--symlink',
+        str(resolved_compiler),
+        str(expected_alias),
+    ]
 
 
 def _sandbox_args(root: Path, target: Path, command: list[str]) -> list[str]:

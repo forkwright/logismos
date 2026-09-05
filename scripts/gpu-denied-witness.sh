@@ -125,6 +125,16 @@ alternatives = Path('/etc/alternatives')
 if alternatives.exists():
     if not alternatives.is_dir() or set(entry.name for entry in alternatives.iterdir()) != {'cc'}:
         raise AssertionError('sandbox /etc alternatives expose more than the C compiler alias')
+    alias = alternatives / 'cc'
+    canonical_compiler = alias.resolve(strict=True)
+    if (
+        not alias.is_symlink()
+        or not canonical_compiler.is_relative_to(Path('/usr'))
+        or not canonical_compiler.is_file()
+        or not os.access(canonical_compiler, os.X_OK)
+        or not os.access('/usr/bin/cc', os.X_OK)
+    ):
+        raise AssertionError('sandbox C compiler alias is not a usable canonical /usr symlink')
     allowed_etc_entries.add('alternatives')
 if set(os.listdir('/etc')) - allowed_etc_entries:
     raise AssertionError('sandbox /etc exposes more than the dynamic-loader cache')

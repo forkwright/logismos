@@ -50,11 +50,20 @@ object inspection begin only after the GPU-denied runner succeeds. The job
 uses the exact release in `rust-toolchain.toml`, not an ambient latest-stable
 toolchain.
 
-The HIP job starts its explicit pinned container without `--privileged`,
-additional device mounts, or added capabilities. Its root provisioning process
-therefore retains Docker's default capability set; only the later `gpu-ci`
-invocation is the sandboxed workload, with inherited and ambient capabilities
-dropped before it enters the denied runner.
+The HIP job builds its derived image with Docker's default capabilities but an
+empty context, so no workspace code is available during provisioning. The
+runtime container starts as `gpu-ci` without `--privileged`, additional device
+mounts, or added capabilities. Its inherited and ambient capabilities are
+dropped again before it enters the denied runner.
+
+The HIP lane builds a small image from the pinned ROCm base with an empty
+context: it installs only the boundary tools and creates `gpu-ci`. The image
+runs as that non-root account and is the only Docker invocation using
+`systempaths=unconfined`, solely to permit Bubblewrap's final private `/proc`
+mount. It retains Docker's default private PID and network namespaces; it adds
+no host PID namespace, devices, capabilities, or privileged mode. The hosted
+workspace source is not changed: only `target/` is chowned to `gpu-ci`, and the
+runner then rebinds the source read-only with only that target writable.
 
 The mount namespace contains:
 

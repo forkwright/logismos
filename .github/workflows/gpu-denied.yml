@@ -118,6 +118,24 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/target"
+          sudo chown --recursive 10001:10001 "$GITHUB_WORKSPACE/target"
+          source_owner=$(/usr/bin/stat --format '%u' "$GITHUB_WORKSPACE")
+          if [[ "$source_owner" == 10001 ]]; then
+            printf '%s\n' 'workspace source owner collides with the fixed gpu-ci account' >&2
+            exit 69
+          fi
+          source_owned_paths=$(find "$GITHUB_WORKSPACE" -path "$GITHUB_WORKSPACE/target" -prune \
+            -o -uid 10001 -print -quit)
+          if [[ -n "$source_owned_paths" ]]; then
+            printf 'workspace source unexpectedly owned by gpu-ci: %s\n' "$source_owned_paths" >&2
+            exit 69
+          fi
+          source_write_paths=$(find "$GITHUB_WORKSPACE" -path "$GITHUB_WORKSPACE/target" -prune \
+            -o -perm /022 -print -quit)
+          if [[ -n "$source_write_paths" ]]; then
+            printf 'workspace source unexpectedly group/world writable: %s\n' "$source_write_paths" >&2
+            exit 69
+          fi
           host_account_home=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
           host_cargo_bin=$(realpath --canonicalize-existing "$host_account_home/.cargo/bin")
           host_rustup_home=$(realpath --canonicalize-existing "$host_account_home/.rustup")
@@ -125,13 +143,21 @@ jobs:
             "$host_account_home/.cargo/bin:$host_account_home/.rustup") ;;
             *) echo 'pinned Rust sources are not canonical account paths' >&2; exit 69 ;;
           esac
-          # The denied runner itself rebinds source read-only and only target writable.
+          build_context="$RUNNER_TEMP/gpu-denied-rocm-context"
+          image_tag="logismos-gpu-denied:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$build_context"
+          docker build --file "$GITHUB_WORKSPACE/.github/ci/gpu-denied-rocm.Dockerfile" \
+            --tag "$image_tag" "$build_context"
+          # The Docker image is non-root. Its unmasked system paths are needed
+          # only to let Bubblewrap mount the final private /proc filesystem.
           docker run --rm \
+            --user gpu-ci \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --security-opt systempaths=unconfined \
             --workdir /workspace \
             --env PINNED_TOOLCHAIN \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace" \
             --mount "type=bind,src=$host_cargo_bin,dst=/opt/ci-rust/cargo/bin,readonly" \
             --mount "type=bind,src=$host_rustup_home,dst=/opt/ci-rust/rustup,readonly" \
-            rocm/dev-ubuntu-24.04@sha256:31418ac10a3769a71eaef330c07280d1d999d7074621339b8f93c484c35f6078 \
-            /usr/bin/bash --noprofile --norc /workspace/scripts/ci-hip-code-object.sh /workspace
+            "$image_tag" /usr/bin/bash --noprofile --norc \
+              /workspace/scripts/ci-hip-code-object.sh /workspace
