@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 placement = { workspace = true }
-loader = { workspace = true }
+loader = { path = "../loader", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

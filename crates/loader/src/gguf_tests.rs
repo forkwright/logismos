@@ -1,6 +1,7 @@
 //! `gguf.rs` tests, `#[path]`-included as a sibling file per `RUST/file-too-long`.
 
 use super::*;
+use std::sync::{Arc, Barrier};
 // WHY not via `use super::*`: the parent's `Error` import is declared
 // `#[expect(unused_imports)]` for intra-doc links; resolving these
 // assertions through this dedicated import keeps that expectation
@@ -52,6 +53,17 @@ pub(crate) fn fixture_bytes() -> Vec<u8> {
     buf
 }
 
+fn sha256_text(inspection: &Inspection) -> Result<String> {
+    let ArtifactDigest::Sha256(digest) = inspection.digest else {
+        return GgufSnafu {
+            offset: 0u64,
+            msg: "whole-file inspection did not return SHA-256".to_string(),
+        }
+        .fail();
+    };
+    Ok(digest.to_string())
+}
+
 #[test]
 fn align_up_rounds_correctly() -> Result<()> {
     assert_eq!(align_up(0, 32)?, 0);
@@ -62,6 +74,7 @@ fn align_up_rounds_correctly() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "tensor")]
 fn reads_fixture_bytes() -> Result<()> {
     let dir = tempdir_for_test();
     let path = dir.join("fixture.gguf");
@@ -102,13 +115,6 @@ fn whole_file_inspection_returns_known_observed_sha256() -> Result<()> {
     std::fs::write(&path, &bytes)?;
 
     let inspection = inspect_gguf_with_sha256(&path)?;
-    let ArtifactDigest::Sha256(digest) = inspection.digest else {
-        return GgufSnafu {
-            offset: 0u64,
-            msg: "whole-file inspection did not return SHA-256".to_string(),
-        }
-        .fail();
-    };
     let expected_file_len = u64::try_from(bytes.len()).map_err(|_| {
         GgufSnafu {
             offset: 0u64,
@@ -118,9 +124,78 @@ fn whole_file_inspection_returns_known_observed_sha256() -> Result<()> {
     })?;
     assert_eq!(inspection.file_len, expected_file_len);
     assert_eq!(
-        digest.to_string(),
+        sha256_text(&inspection)?,
         "623d94e17734e71bc68433a1f9121ae9b59f4aabc33fdf74f7b5cc62b61c3980",
         "the digest covers complete fixture bytes, not GGUF metadata only"
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_whole_file_hashes_share_no_seek_cursor() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("concurrent-sha256.gguf");
+    std::fs::write(&path, fixture_bytes())?;
+    let reader = Arc::new(Reader::open(&path)?);
+    let barrier = Arc::new(Barrier::new(3));
+
+    let (first, second) = std::thread::scope(|scope| {
+        let first_reader = Arc::clone(&reader);
+        let first_barrier = Arc::clone(&barrier);
+        let first = scope.spawn(move || {
+            first_barrier.wait();
+            first_reader
+                .inspect_with_sha256()
+                .and_then(|inspection| sha256_text(&inspection))
+        });
+        let second_reader = Arc::clone(&reader);
+        let second_barrier = Arc::clone(&barrier);
+        let second = scope.spawn(move || {
+            second_barrier.wait();
+            second_reader
+                .inspect_with_sha256()
+                .and_then(|inspection| sha256_text(&inspection))
+        });
+        barrier.wait();
+        (first.join(), second.join())
+    });
+    let first = first.map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: "first concurrent SHA-256 worker panicked".to_string(),
+        }
+        .build()
+    })??;
+    let second = second.map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: "second concurrent SHA-256 worker panicked".to_string(),
+        }
+        .build()
+    })??;
+    let expected = "623d94e17734e71bc68433a1f9121ae9b59f4aabc33fdf74f7b5cc62b61c3980";
+    assert_eq!(first, expected);
+    assert_eq!(second, expected);
+    Ok(())
+}
+
+#[test]
+fn whole_file_hash_retains_opened_file_identity_after_path_replacement() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("replaceable.gguf");
+    let original = fixture_bytes();
+    std::fs::write(&path, &original)?;
+    let reader = Reader::open(&path)?;
+
+    let moved_original = dir.join("original-renamed-away.gguf");
+    std::fs::rename(&path, &moved_original)?;
+    std::fs::write(&path, vec![0u8; original.len()])?;
+
+    let inspection = reader.inspect_with_sha256()?;
+    let digest = sha256_text(&inspection)?;
+    assert_eq!(
+        digest,
+        "623d94e17734e71bc68433a1f9121ae9b59f4aabc33fdf74f7b5cc62b61c3980"
     );
     Ok(())
 }
@@ -261,6 +336,7 @@ fn huge_tensor_count_returns_err_not_abort() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "tensor")]
 fn dims_product_overflow_is_rejected_not_wrapped_to_zero() -> Result<()> {
     // WHY(forkwright/logismos#36): `desc.dims.iter().product()` used
     // ordinary wrapping multiplication in a release build. A dims
@@ -286,6 +362,7 @@ fn dims_product_overflow_is_rejected_not_wrapped_to_zero() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "tensor")]
 fn byte_range_for_rejects_byte_count_overflow() -> Result<()> {
     // WHY(forkwright/logismos#56): distinct from the dims-product
     // overflow above — this exercises the *new* `checked_mul` on
@@ -334,6 +411,7 @@ fn byte_range_for_rejects_byte_count_overflow() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "tensor")]
 fn byte_range_for_rejects_out_of_bounds_data() -> Result<()> {
     // WHY(forkwright/logismos#56): `byte_range_for`'s
     // `end_usize > mmap.len()` branch had no test — every existing
@@ -466,6 +544,7 @@ fn rejects_duplicate_tensor_name() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "tensor")]
 fn get_rejects_after_external_truncation() -> Result<()> {
     // WHY(forkwright/logismos#60): the mmap SAFETY comment states
     // the backing file must not be mutated while the mapping is
@@ -490,7 +569,7 @@ fn inspection_reports_exact_tensor_types_and_serialized_extents() -> Result<()> 
     std::fs::write(&path, hybrid_profile_fixture_bytes()?)?;
 
     let profile = Reader::open(&path)?.inspect()?;
-    assert_eq!(profile.digest, ArtifactDigest::Unverified);
+    assert_eq!(profile.digest, ArtifactDigest::NotComputed);
     assert_eq!(profile.model.architecture.as_deref(), Some("qwen3"));
     assert_eq!(profile.model.name.as_deref(), Some("synthetic-hybrid"));
     assert_eq!(profile.model.file_type, Some(12));

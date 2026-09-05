@@ -192,14 +192,7 @@ fn map_inspection_error(error: &loader::Error) -> CliError {
     let kind = match error {
         loader::Error::Io { .. } => InspectionError::UnreadableInput,
         loader::Error::MmapStale { .. } => InspectionError::ConcurrentMutation,
-        loader::Error::Gguf { .. }
-        | loader::Error::Safetensors { .. }
-        | loader::Error::UnknownFormat { .. }
-        | loader::Error::TensorNotFound { .. }
-        | loader::Error::ShapeMismatch { .. }
-        | loader::Error::UnsupportedDType { .. }
-        | loader::Error::Msg { .. }
-        | _ => InspectionError::InvalidGguf,
+        loader::Error::Gguf { .. } | loader::Error::Msg { .. } | _ => InspectionError::InvalidGguf,
     };
     CliError::Inspection(kind)
 }

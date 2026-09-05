@@ -7,11 +7,18 @@ license.workspace = true
 description = "Weight loaders: safetensors (upstream) + own GGUF reader; weight-name mapping."
 publish = false
 
+[features]
+default = ["tensor"]
+# Tensor adapters retain the established `WeightProvider`/`taxis` surface.
+# Metadata-only consumers such as `logismos inspect` disable this feature so
+# they cannot link HIP through `taxis`.
+tensor = ["dep:half", "dep:safetensors", "dep:taxis"]
+
 [dependencies]
-taxis = { workspace = true }
-half = { workspace = true }
+taxis = { workspace = true, optional = true }
+half = { workspace = true, optional = true }
 snafu = { workspace = true }
-safetensors = { workspace = true }
+safetensors = { workspace = true, optional = true }
 memmap2 = { workspace = true }
 sha2 = { workspace = true }
 

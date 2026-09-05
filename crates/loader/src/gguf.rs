@@ -28,14 +28,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memmap2::Mmap;
 use sha2::{Digest, Sha256};
 
-use crate::error::{GgufSnafu, Result, TensorNotFoundSnafu};
+#[cfg(feature = "tensor")]
+use crate::error::TensorNotFoundSnafu;
+use crate::error::{GgufSnafu, MmapStaleSnafu, Result};
 // WHY imported without a code reference: the `# Errors` sections below link to
 // `Error` variants by intra-doc path, which rustdoc resolves only against items
 // in scope. Split from the group above so the expectation covers this import
@@ -45,7 +47,8 @@ use crate::error::{GgufSnafu, Result, TensorNotFoundSnafu};
     reason = "resolves intra-doc links in this module's `# Errors` sections"
 )]
 use crate::error::Error;
-use crate::{TensorView, WeightProvider, check_mmap_not_truncated};
+#[cfg(feature = "tensor")]
+use crate::{TensorView, WeightProvider};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_V3: u32 = 3;
@@ -61,6 +64,7 @@ const MIN_METADATA_ENTRY_BYTES: u64 = 13;
 const MIN_TENSOR_DESCRIPTOR_BYTES: u64 = 24;
 const SHA256_DIGEST_BYTES: usize = 32;
 const SHA256_READ_BUFFER_BYTES: usize = 64 * 1024;
+const SHA256_READ_BUFFER_BYTES_U64: u64 = 64 * 1024;
 
 /// ggml / GGUF dtype tag. Numeric ids match the spec verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -158,6 +162,7 @@ impl GgmlType {
         })
     }
 
+    #[cfg(feature = "tensor")]
     fn to_taxis_dtype(self) -> Result<taxis::DType> {
         Ok(match self {
             Self::F32 => taxis::DType::F32,
@@ -253,8 +258,8 @@ impl fmt::Display for Sha256Digest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ArtifactDigest {
-    /// The caller has not supplied separately verified digest evidence.
-    Unverified,
+    /// No digest was computed for this inspection.
+    NotComputed,
     /// SHA-256 streamed from the file opened by the GGUF reader.
     Sha256(Sha256Digest),
 }
@@ -336,6 +341,16 @@ pub struct Reader {
     mmap: Arc<Mmap>,
     metadata: HashMap<String, MetaValue>,
     tensors: Vec<TensorDescriptor>,
+    #[cfg(feature = "tensor")]
+    tensor_by_name: HashMap<String, usize>,
+    data_region_start: u64,
+    alignment: u64,
+}
+
+struct ParsedArchive {
+    metadata: HashMap<String, MetaValue>,
+    tensors: Vec<TensorDescriptor>,
+    #[cfg(feature = "tensor")]
     tensor_by_name: HashMap<String, usize>,
     data_region_start: u64,
     alignment: u64,
@@ -355,8 +370,24 @@ impl Reader {
         // SAFETY: see `safetensors::Reader::open`.
         let mmap = unsafe { Mmap::map(&file)? };
         let mmap = Arc::new(mmap);
+        let parsed = Self::parse(&mmap)?;
+        let reader = Self {
+            path: path.to_path_buf(),
+            file,
+            mmap,
+            metadata: parsed.metadata,
+            tensors: parsed.tensors,
+            #[cfg(feature = "tensor")]
+            tensor_by_name: parsed.tensor_by_name,
+            data_region_start: parsed.data_region_start,
+            alignment: parsed.alignment,
+        };
+        reader.validate_tensor_extents()?;
+        Ok(reader)
+    }
 
-        let mut cur = Cursor::new(&mmap);
+    fn parse(mmap: &Mmap) -> Result<ParsedArchive> {
+        let mut cur = Cursor::new(mmap);
         cur.check_magic()?;
         let version = cur.read_u32()?;
         if version != GGUF_V3 {
@@ -440,18 +471,16 @@ impl Reader {
         let after_header = cur.pos;
         let data_region_start = align_up(after_header, alignment)?;
 
-        let reader = Self {
-            path: path.to_path_buf(),
-            file,
-            mmap,
+        #[cfg(not(feature = "tensor"))]
+        let _ = tensor_by_name;
+        Ok(ParsedArchive {
             metadata,
             tensors,
+            #[cfg(feature = "tensor")]
             tensor_by_name,
             data_region_start,
             alignment,
-        };
-        reader.validate_tensor_extents()?;
-        Ok(reader)
+        })
     }
 
     /// Path opened.
@@ -486,7 +515,7 @@ impl Reader {
     /// [`Error::MmapStale`] if the mapped file's size changed after open, or
     /// [`Error::Gguf`] if a checked aggregate overflows.
     pub fn inspect(&self) -> Result<Inspection> {
-        check_mmap_not_truncated(&self.path, self.mmap.len())?;
+        let file_len = self.check_file_not_stale()?;
         let mut census = BTreeMap::new();
         let mut tensors = Vec::new();
         for desc in &self.tensors {
@@ -541,15 +570,9 @@ impl Reader {
             .collect();
 
         Ok(Inspection {
-            file_len: u64::try_from(self.mmap.len()).map_err(|_| {
-                GgufSnafu {
-                    offset: 0u64,
-                    msg: format!("GGUF file length {} exceeds u64::MAX", self.mmap.len()),
-                }
-                .build()
-            })?,
+            file_len,
             alignment: self.alignment,
-            digest: ArtifactDigest::Unverified,
+            digest: ArtifactDigest::NotComputed,
             model: ModelMetadata {
                 architecture: metadata_string(&self.metadata, "general.architecture"),
                 name: metadata_string(&self.metadata, "general.name"),
@@ -563,15 +586,16 @@ impl Reader {
 
     /// Inspect the mapped artifact and stream its complete SHA-256 digest.
     ///
-    /// The digest stream is cloned from the same file handle used to create
-    /// this reader's mmap. Length checks before and after hashing reject common
-    /// truncation/re-save races. They cannot detect a concurrent same-length
-    /// rewrite, so the returned digest is neither source provenance nor proof
-    /// of artifact immutability.
+    /// Positional reads from the same file handle used to create this reader's
+    /// mmap avoid a shared seek cursor, including for concurrent callers.
+    /// Handle-length checks before and after hashing reject truncation and
+    /// growth without following an unbounded tail. They cannot detect a
+    /// concurrent same-length rewrite, so the returned digest is neither source
+    /// provenance nor proof of artifact immutability.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the opened file cannot be cloned, sought, or read;
+    /// [`Error::Io`] if the opened file cannot be inspected or read;
     /// [`Error::MmapStale`] if its length changes while it is inspected.
     pub fn inspect_with_sha256(&self) -> Result<Inspection> {
         let mut inspection = self.inspect()?;
@@ -580,26 +604,86 @@ impl Reader {
     }
 
     fn streamed_sha256(&self) -> Result<Sha256Digest> {
-        check_mmap_not_truncated(&self.path, self.mmap.len())?;
-        let mut digest_file = self.file.try_clone()?;
-        digest_file.seek(SeekFrom::Start(0))?;
+        let file_len = self.check_file_not_stale()?;
         let mut hasher = Sha256::new();
         let mut buffer = vec![0u8; SHA256_READ_BUFFER_BYTES];
-        loop {
-            let bytes_read = digest_file.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-            hasher.update(buffer.get(..bytes_read).ok_or_else(|| {
+        let mut offset = 0u64;
+        while offset < file_len {
+            let remaining = file_len.checked_sub(offset).ok_or_else(|| {
                 GgufSnafu {
                     offset: 0u64,
-                    msg: "SHA-256 read length exceeds its buffer".to_string(),
+                    msg: "SHA-256 offset exceeds the opened file length".to_string(),
+                }
+                .build()
+            })?;
+            let read_len =
+                usize::try_from(remaining.min(SHA256_READ_BUFFER_BYTES_U64)).map_err(|_| {
+                    GgufSnafu {
+                        offset,
+                        msg: "SHA-256 bounded read length exceeds usize::MAX".to_string(),
+                    }
+                    .build()
+                })?;
+            let bytes = buffer.get_mut(..read_len).ok_or_else(|| {
+                GgufSnafu {
+                    offset,
+                    msg: "SHA-256 bounded read exceeds its buffer".to_string(),
+                }
+                .build()
+            })?;
+            let bytes_read = self.file.read_at(bytes, offset)?;
+            if bytes_read == 0 {
+                return GgufSnafu {
+                    offset,
+                    msg: "GGUF file ended before its opened length during SHA-256".to_string(),
+                }
+                .fail();
+            }
+            hasher.update(bytes.get(..bytes_read).ok_or_else(|| {
+                GgufSnafu {
+                    offset,
+                    msg: "SHA-256 read length exceeds its bounded buffer".to_string(),
                 }
                 .build()
             })?);
+            offset = offset
+                .checked_add(u64::try_from(bytes_read).map_err(|_| {
+                    GgufSnafu {
+                        offset,
+                        msg: "SHA-256 read length exceeds u64::MAX".to_string(),
+                    }
+                    .build()
+                })?)
+                .ok_or_else(|| {
+                    GgufSnafu {
+                        offset,
+                        msg: "SHA-256 offset overflows u64".to_string(),
+                    }
+                    .build()
+                })?;
         }
-        check_mmap_not_truncated(&self.path, self.mmap.len())?;
+        self.check_file_not_stale()?;
         Ok(Sha256Digest(hasher.finalize().into()))
+    }
+
+    fn check_file_not_stale(&self) -> Result<u64> {
+        let expected_len = u64::try_from(self.mmap.len()).map_err(|_| {
+            GgufSnafu {
+                offset: 0u64,
+                msg: format!("GGUF file length {} exceeds u64::MAX", self.mmap.len()),
+            }
+            .build()
+        })?;
+        let actual_len = self.file.metadata()?.len();
+        if actual_len != expected_len {
+            return MmapStaleSnafu {
+                path: self.path.clone(),
+                expected_len,
+                actual_len,
+            }
+            .fail();
+        }
+        Ok(expected_len)
     }
 }
 
@@ -618,6 +702,7 @@ pub fn inspect_gguf_with_sha256(path: &Path) -> Result<Inspection> {
 
 impl Reader {
     /// Look up a tensor descriptor by name.
+    #[cfg(feature = "tensor")]
     fn descriptor_by_name(&self, name: &str) -> Result<&TensorDescriptor> {
         let idx = self.tensor_by_name.get(name).copied().ok_or_else(|| {
             TensorNotFoundSnafu {
@@ -690,6 +775,7 @@ impl Reader {
 
     /// Compute a tensor's `[start, end)` byte range inside the mmap'd file
     /// and convert both ends to `usize`.
+    #[cfg(feature = "tensor")]
     fn byte_range_for(&self, desc: &TensorDescriptor) -> Result<(usize, usize)> {
         let extent = self.extent_for(desc)?;
         let start = usize::try_from(extent.start).map_err(|_| {
@@ -739,9 +825,10 @@ impl Reader {
     }
 }
 
+#[cfg(feature = "tensor")]
 impl WeightProvider for Reader {
     fn get(&self, name: &str) -> Result<TensorView<'_>> {
-        check_mmap_not_truncated(&self.path, self.mmap.len())?;
+        self.check_file_not_stale()?;
         let desc = self.descriptor_by_name(name)?;
         let dtype = desc.ggml_type.to_taxis_dtype()?;
         let (start_usize, end_usize) = self.byte_range_for(desc)?;

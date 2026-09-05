@@ -23,6 +23,7 @@ pub enum Error {
     },
 
     /// Upstream safetensors parser failure.
+    #[cfg(feature = "tensor")]
     #[snafu(display("safetensors: {message}"))]
     Safetensors {
         /// Stringified upstream error.
@@ -45,6 +46,7 @@ pub enum Error {
     },
 
     /// Requested tensor does not exist in the archive.
+    #[cfg(feature = "tensor")]
     #[snafu(display("tensor `{name}` not found in archive"))]
     TensorNotFound {
         /// Missing tensor name.
@@ -56,6 +58,7 @@ pub enum Error {
 
     /// Archive tensor shape disagrees with the declared dtype × element
     /// count.
+    #[cfg(feature = "tensor")]
     #[snafu(display(
         "tensor `{name}` shape mismatch: dtype={dtype:?} elem_count={elem_count} \
          expected {expected_bytes}B, got {actual_bytes}B"
@@ -77,6 +80,7 @@ pub enum Error {
     },
 
     /// Dtype not supported by the Phase-2 loader.
+    #[cfg(feature = "tensor")]
     #[snafu(display("tensor `{name}` has unsupported dtype {dtype:?}"))]
     UnsupportedDType {
         /// Tensor name.
@@ -89,6 +93,7 @@ pub enum Error {
     },
 
     /// `Archive::open` could not dispatch on file extension.
+    #[cfg(feature = "tensor")]
     #[snafu(display("unknown archive format at {}", path.display()))]
     UnknownFormat {
         /// Offending path.
@@ -130,6 +135,7 @@ pub enum Error {
     },
 }
 
+#[cfg(feature = "tensor")]
 impl From<::safetensors::SafeTensorError> for Error {
     fn from(value: ::safetensors::SafeTensorError) -> Self {
         SafetensorsSnafu {
