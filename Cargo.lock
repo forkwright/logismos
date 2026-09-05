@@ -319,6 +319,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "emulation"
+version = "1.0.11"
+dependencies = [
+ "snafu",
+ "tempfile",
+]
+
+[[package]]
 name = "encoders"
 version = "1.0.11"
 dependencies = [
