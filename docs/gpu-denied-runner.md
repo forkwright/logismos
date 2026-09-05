@@ -17,17 +17,25 @@ a pipe when launching it from a terminal.
 
 The runner requires the fixed system paths `/usr/bin/bash`, `/usr/bin/bwrap`,
 `/usr/bin/setpriv`, and `/usr/bin/python3`. Bash privileged mode and Python
-isolated mode prevent caller-supplied startup hooks from running before the
-supervisor. The runner refuses to run when a prerequisite is unavailable,
-refuses a root invocation, and never falls back to running the command
-directly. The command runs with private user, mount, PID, IPC, UTS, cgroup, and
-network namespaces; all capabilities dropped; nested user namespaces
-disabled; and `no_new_privs` set.
+isolated mode prevent their caller-supplied language startup hooks from
+running before the supervisor. The runner refuses to run when a prerequisite
+is unavailable, refuses a root invocation, and never falls back to running the
+command directly. The command runs with private user, mount, PID, IPC, UTS,
+cgroup, and network namespaces; all capabilities dropped; nested user
+namespaces disabled; and `no_new_privs` set.
 
 The host or CI executor must run the wrapper as a non-root account and permit
 unprivileged user namespaces. A container seccomp profile or host policy that
 blocks namespace creation is a hard prerequisite failure, not a reason to run
 the requested command outside the boundary.
+
+The pinned ROCm container job provisions a dedicated non-root account before
+entering the boundary. Its networked `cargo fetch` is a trusted provisioning
+step: it runs from `/tmp`, accepts only crates.io sources from the lockfile,
+uses an empty environment, and does not execute build scripts. Compilation and
+object inspection begin only after the GPU-denied runner succeeds. The job
+uses the exact release in `rust-toolchain.toml`, not an ambient latest-stable
+toolchain.
 
 The mount namespace contains:
 
@@ -101,9 +109,11 @@ CI job.
 The boundary contains the requested command and its descendants as an
 ordinary unprivileged workload. It trusts the host kernel, Bubblewrap,
 `setpriv`, the runner and supervisor, the mounted system/toolchain files, and
-the process that invokes the runner. It is not a boundary against a host
-administrator, a compromised kernel or sandbox binary, or a same-UID host
-process racing trusted inputs before Bubblewrap enters the namespaces.
+the process that invokes the runner. That trusted invoker must also supply a
+safe dynamic-loader environment: the loader processes variables such as
+`LD_PRELOAD` before a shell script can clear them. It is not a boundary against
+a host administrator, a compromised kernel or sandbox binary, or a same-UID
+host process racing trusted inputs before Bubblewrap enters the namespaces.
 
 It does not provide CPU, memory, process-count, wall-time, or target-disk
 quotas. The writable `target/` remains on the host and must be treated as

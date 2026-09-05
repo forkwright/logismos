@@ -60,8 +60,13 @@ def _reject_special_files(
     skip_top_level: frozenset[str] = frozenset(),
     allow_contained_hardlinks: bool = False,
 ) -> None:
+    def reject_walk_error(error: OSError) -> None:
+        raise BoundaryError(f'cannot inspect worktree mount source: {error}') from error
+
     hardlinks: dict[tuple[int, int], tuple[int, int, Path]] = {}
-    for current, directories, files in os.walk(source, topdown=True, followlinks=False):
+    for current, directories, files in os.walk(
+        source, topdown=True, onerror=reject_walk_error, followlinks=False
+    ):
         current_path = Path(current)
         if current_path == source and skip_top_level:
             directories[:] = [name for name in directories if name not in skip_top_level]

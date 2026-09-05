@@ -22,6 +22,8 @@ cleanup() {
     /usr/bin/rm -f -- \
         "$ROOT/target/gpu-denied-hardlink-a" \
         "$ROOT/target/gpu-denied-hardlink-b"
+    /usr/bin/chmod 0700 "$ROOT/target/gpu-denied-unreadable" 2>/dev/null || true
+    /usr/bin/rm -rf -- "$ROOT/target/gpu-denied-unreadable"
     /usr/bin/rm -rf -- "$FIXTURE_DIR"
     /usr/bin/rm -rf -- "$LINK_FIXTURE_DIR"
 }
@@ -308,6 +310,30 @@ finally:
     target_socket_path.unlink(missing_ok=True)
 if target_socket_result.returncode != 69 or b'host endpoint' not in target_socket_result.stderr:
     raise AssertionError('pre-existing target socket was not rejected')
+
+unreadable_dir = root / 'target/gpu-denied-unreadable'
+unreadable_socket_path = unreadable_dir / 'host-endpoint.sock'
+unreadable_alias = fixture / 'unreadable-alias'
+unreadable_dir.mkdir(mode=0o700)
+unreadable_alias.symlink_to(unreadable_dir, target_is_directory=True)
+unreadable_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    unreadable_listener.bind(str(unreadable_alias / unreadable_socket_path.name))
+    unreadable_listener.listen()
+    unreadable_dir.chmod(0)
+    unreadable_result = run(
+        [str(runner), '--', '/usr/bin/true'],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+finally:
+    unreadable_dir.chmod(0o700)
+    unreadable_listener.close()
+    unreadable_socket_path.unlink(missing_ok=True)
+    unreadable_dir.rmdir()
+if unreadable_result.returncode != 69 or b'cannot inspect' not in unreadable_result.stderr:
+    raise AssertionError('unreadable target directory was not rejected')
 
 host_file = fixture / 'host-only'
 host_file.write_text('synthetic host data', encoding='utf-8')
