@@ -8,6 +8,7 @@ use std::ffi::c_int;
 
 use snafu::Snafu;
 
+use crate::device::{DeviceUuid, PciBusId};
 use crate::ffi;
 
 /// Result alias used throughout `hipcore`.
@@ -39,6 +40,26 @@ pub enum Error {
         ordinal: c_int,
         /// Devices reported by `hipGetDeviceCount`.
         count: c_int,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A requested PCI-addressed device is not visible to HIP.
+    #[snafu(display("device with PCI bus ID `{pci_bus_id}` not found"))]
+    NoDeviceWithPciBusId {
+        /// Stable PCI topology identifier requested by the caller.
+        pci_bus_id: PciBusId,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A requested UUID-addressed device is not visible to HIP.
+    #[snafu(display("device with UUID `{uuid}` not found"))]
+    NoDeviceWithUuid {
+        /// Stable UUID requested by the caller.
+        uuid: DeviceUuid,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,

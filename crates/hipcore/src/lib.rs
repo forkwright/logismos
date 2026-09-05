@@ -50,7 +50,10 @@ pub mod memory;
 pub mod pod;
 pub mod stream;
 
-pub use crate::device::{Device, DeviceProps, MemoryBudget, PciBusId};
+pub use crate::device::{
+    Device, DeviceIdentity, DeviceInfo, DeviceProps, DeviceSelector, DeviceUuid, MemoryBudget,
+    PciBusId, enumerate_devices,
+};
 pub use crate::error::{Error, ErrorKind, Result, check};
 pub use crate::memory::{DeviceBuffer, PendingCopy};
 pub use crate::pod::BytePod;
