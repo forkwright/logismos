@@ -18,7 +18,16 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - name: Install boundary dependency
-        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
+        run: sudo apt-get update && sudo apt-get install --yes bubblewrap shellcheck util-linux
+      - name: Check boundary scripts
+        run: |
+          shellcheck scripts/gpu-denied-runner.sh scripts/gpu-denied-witness.sh \
+            scripts/check-hip-build-modes.sh
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          source = Path('scripts/gpu-denied-exec.py').read_text(encoding='utf-8')
+          compile(source, 'gpu-denied-exec.py', 'exec')
+          PYTHON
       - name: Prove GPU denial and CPU execution
         run: bash scripts/gpu-denied-witness.sh
       - name: Prove explicit HIP build modes
