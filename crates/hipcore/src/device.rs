@@ -589,8 +589,8 @@ mod tests {
     #[test]
     fn uuid_selection_survives_ordinal_renumbering() {
         let uuid = DeviceUuid::new([7; 16]);
-        let first_visibility = vec![fixture(0, Some(uuid), "0000:01:00.0", 48)];
-        let renumbered_visibility = vec![
+        let first_visibility = [fixture(0, Some(uuid), "0000:01:00.0", 48)];
+        let renumbered_visibility = [
             fixture(0, None, "0000:02:00.0", 24),
             fixture(1, Some(uuid), "0000:01:00.0", 48),
         ];
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn absent_requested_and_optional_devices_are_distinct() {
-        let devices = vec![fixture(
+        let devices = [fixture(
             0,
             Some(DeviceUuid::new([1; 16])),
             "0000:01:00.0",
@@ -647,11 +647,8 @@ mod tests {
             optional.is_none(),
             "optional selection must resolve to no device"
         );
-        let error = missing
-            .not_found::<()>(1)
-            .expect_err("required selection must fail");
         assert!(
-            matches!(error, crate::Error::NoDeviceWithUuid { .. }),
+            matches!(missing.not_found::<()>(1), Err(crate::Error::NoDeviceWithUuid { .. })),
             "required UUID selection must report the UUID-specific missing-device error"
         );
     }

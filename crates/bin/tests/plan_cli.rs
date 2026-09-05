@@ -1,5 +1,10 @@
 //! Process-level contracts for the `logismos plan` CLI.
 
+#![expect(
+    clippy::expect_used,
+    reason = "process-contract assertions use expect() to give focused test failures"
+)]
+
 use std::{
     io::Write,
     process::{Command, Output, Stdio},

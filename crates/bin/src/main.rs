@@ -19,7 +19,7 @@ const MAX_PLAN_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
 fn main() -> ExitCode {
     match run() {
-        Ok(outcome) => write_outcome(outcome),
+        Ok(outcome) => write_outcome(&outcome),
         Err(error) => {
             eprintln!("{error}");
             ExitCode::from(2)
@@ -93,18 +93,15 @@ fn read_input(reader: &mut impl Read) -> Result<String, CliError> {
     String::from_utf8(bytes).map_err(|_| CliError::Input("placement input must be UTF-8"))
 }
 
-fn write_outcome(outcome: placement::PlanOutcome) -> ExitCode {
-    let exit_code = match outcome {
-        placement::PlanOutcome::Plan { .. } => ExitCode::SUCCESS,
-        placement::PlanOutcome::Refusal { .. } => ExitCode::from(1),
-        _ => ExitCode::from(1),
+fn write_outcome(outcome: &placement::PlanOutcome) -> ExitCode {
+    let exit_code = if matches!(outcome, placement::PlanOutcome::Plan { .. }) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     };
-    let output = match serde_json::to_string(&outcome) {
-        Ok(output) => output,
-        Err(_) => {
-            eprintln!("unable to serialize placement result");
-            return ExitCode::from(2);
-        }
+    let Ok(output) = serde_json::to_string(outcome) else {
+        eprintln!("unable to serialize placement result");
+        return ExitCode::from(2);
     };
     if writeln!(io::stdout().lock(), "{output}").is_err() {
         eprintln!("unable to write placement result");
