@@ -103,20 +103,20 @@ pub enum Error {
         location: snafu::Location,
     },
 
-    /// The mapped file's length no longer matches what was observed
-    /// when the mapping was created — most likely a concurrent re-save
-    /// or truncation of a weights file the loader has open.
+    /// An opened file's length no longer matches the length that bounded an
+    /// mmap or owned inspection stream — most likely a concurrent re-save or
+    /// truncation of an artifact the loader has open.
     #[snafu(display(
-        "{} changed size since it was mapped ({expected_len}B -> {actual_len}B); \
-         refusing a stale mapping",
+        "{} changed size during inspection ({expected_len}B -> {actual_len}B); \
+         refusing a stale observation",
         path.display()
     ))]
     MmapStale {
         /// The file whose length changed.
         path: PathBuf,
-        /// Length observed when the mapping was created.
+        /// Length observed when the operation began.
         expected_len: u64,
-        /// Length observed on the just-completed re-stat.
+        /// Length observed on the just-completed handle re-stat.
         actual_len: u64,
         /// Source code location where the error was reported.
         #[snafu(implicit)]

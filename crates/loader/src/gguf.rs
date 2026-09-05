@@ -6,8 +6,9 @@
 //! - Metadata KV pairs (all 13 value types per the spec).
 //! - Tensor descriptors (name + dims + ggml-type + data-offset).
 //!
-//! The tensor-data payload is mmap-backed and lookups return a
-//! borrowed `&[u8]` slice anchored on the mmap.
+//! Tensor-serving [`Reader`] instances keep the payload mmap-backed, while
+//! [`inspect_gguf_with_sha256`] parses an owned header observation and streams
+//! the remaining bytes from one retained file handle.
 //!
 //! ## Scope
 //!
@@ -65,6 +66,15 @@ const MIN_TENSOR_DESCRIPTOR_BYTES: u64 = 24;
 const SHA256_DIGEST_BYTES: usize = 32;
 const SHA256_READ_BUFFER_BYTES: usize = 64 * 1024;
 const SHA256_READ_BUFFER_BYTES_U64: u64 = 64 * 1024;
+const GGUF_FIXED_HEADER_BYTES: u64 = 4 + 4 + 8 + 8;
+const GGUF_STRING_LENGTH_BYTES: u64 = 8;
+const GGUF_METADATA_TYPE_BYTES: u64 = 4;
+const GGUF_METADATA_ARRAY_HEADER_BYTES: u64 = 4 + 8;
+const GGUF_MAX_ARRAY_ELEMENT_ENVELOPE_BYTES: u64 = 8;
+const GGUF_TENSOR_RANK_BYTES: u64 = 4;
+const GGUF_TENSOR_DIM_BYTES: u64 = 8;
+const GGUF_TENSOR_TYPE_BYTES: u64 = 4;
+const GGUF_TENSOR_OFFSET_BYTES: u64 = 8;
 
 /// ggml / GGUF dtype tag. Numeric ids match the spec verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -260,7 +270,7 @@ impl fmt::Display for Sha256Digest {
 pub enum ArtifactDigest {
     /// No digest was computed for this inspection.
     NotComputed,
-    /// SHA-256 streamed from the file opened by the GGUF reader.
+    /// SHA-256 of the exact byte stream observed from one opened file handle.
     Sha256(Sha256Digest),
 }
 
@@ -314,13 +324,13 @@ pub struct GgmlTypeCensus {
 ///
 /// The profile identifies exact descriptor types and on-disk extents. It does
 /// not decode tensor payloads, reserve device memory, classify execution
-/// support, or establish source provenance. Its facts derive from the original
-/// mmap and require the caller not to mutate the backing artifact while it is
-/// open; size checks catch truncation, not a same-length content replacement.
+/// support, or establish source provenance. [`inspect_gguf_with_sha256`]
+/// derives both the parsed facts and digest from one observed byte stream;
+/// [`Reader::inspect`] instead reflects its immutable-backing mmap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Inspection {
-    /// GGUF v3 file length observed while the archive is mapped.
+    /// GGUF v3 file length used to bound the observation and tensor extents.
     pub file_len: u64,
     /// Alignment used to locate the tensor-data region.
     pub alignment: u64,
@@ -339,12 +349,7 @@ pub struct Reader {
     path: PathBuf,
     file: File,
     mmap: Arc<Mmap>,
-    metadata: HashMap<String, MetaValue>,
-    tensors: Vec<TensorDescriptor>,
-    #[cfg(feature = "tensor")]
-    tensor_by_name: HashMap<String, usize>,
-    data_region_start: u64,
-    alignment: u64,
+    parsed: ParsedArchive,
 }
 
 struct ParsedArchive {
@@ -356,8 +361,161 @@ struct ParsedArchive {
     alignment: u64,
 }
 
+struct InspectionObservation {
+    parsed: ParsedArchive,
+    file_len: u64,
+    hashed_prefix_len: u64,
+    hasher: Sha256,
+}
+
+impl ParsedArchive {
+    fn inspection(&self, file_len: u64, digest: ArtifactDigest) -> Result<Inspection> {
+        let mut census = BTreeMap::new();
+        let mut tensors = Vec::new();
+        for desc in &self.tensors {
+            let extent = self.extent_for(desc, file_len)?;
+            let entry = census.entry(desc.ggml_type).or_insert((0u64, 0u64, 0u64));
+            entry.0 = entry.0.checked_add(1).ok_or_else(|| {
+                GgufSnafu {
+                    offset: extent.start,
+                    msg: "GGUF type census tensor count overflows u64".to_string(),
+                }
+                .build()
+            })?;
+            entry.1 = entry.1.checked_add(extent.elements).ok_or_else(|| {
+                GgufSnafu {
+                    offset: extent.start,
+                    msg: format!(
+                        "GGUF type census element count overflows u64 for {:?}",
+                        desc.ggml_type
+                    ),
+                }
+                .build()
+            })?;
+            entry.2 = entry.2.checked_add(extent.byte_len).ok_or_else(|| {
+                GgufSnafu {
+                    offset: extent.start,
+                    msg: format!(
+                        "GGUF type census byte count overflows u64 for {:?}",
+                        desc.ggml_type
+                    ),
+                }
+                .build()
+            })?;
+            tensors.push(InspectedTensor {
+                name: desc.name.clone(),
+                dims: desc.dims.clone(),
+                ggml_type: desc.ggml_type,
+                logical_elements: extent.elements,
+                file_offset: extent.start,
+                byte_len: extent.byte_len,
+            });
+        }
+        let type_census = census
+            .into_iter()
+            .map(
+                |(ggml_type, (tensor_count, logical_elements, byte_len))| GgmlTypeCensus {
+                    ggml_type,
+                    tensor_count,
+                    logical_elements,
+                    byte_len,
+                },
+            )
+            .collect();
+
+        Ok(Inspection {
+            file_len,
+            alignment: self.alignment,
+            digest,
+            model: ModelMetadata {
+                architecture: metadata_string(&self.metadata, "general.architecture"),
+                name: metadata_string(&self.metadata, "general.name"),
+                file_type: metadata_u32(&self.metadata, "general.file_type"),
+                quantization_version: metadata_u32(&self.metadata, "general.quantization_version"),
+            },
+            tensors,
+            type_census,
+        })
+    }
+
+    fn extent_for(&self, desc: &TensorDescriptor, file_len: u64) -> Result<TensorExtent> {
+        let elements = checked_element_count(desc)?;
+        let byte_len = checked_byte_len(desc, elements)?;
+        let start = self
+            .data_region_start
+            .checked_add(desc.data_offset)
+            .ok_or_else(|| {
+                GgufSnafu {
+                    offset: self.data_region_start,
+                    msg: format!(
+                        "tensor `{}` start offset overflows u64: region_start={} + data_offset={}",
+                        desc.name, self.data_region_start, desc.data_offset
+                    ),
+                }
+                .build()
+            })?;
+        let end = start.checked_add(byte_len).ok_or_else(|| {
+            GgufSnafu {
+                offset: start,
+                msg: format!(
+                    "tensor `{}` end offset overflows u64: start={start} + byte_count={byte_len}",
+                    desc.name
+                ),
+            }
+            .build()
+        })?;
+        if end > file_len {
+            return GgufSnafu {
+                offset: start,
+                msg: format!(
+                    "tensor `{}` data out of file bounds: [{start}..{end}] vs file len {file_len}",
+                    desc.name
+                ),
+            }
+            .fail();
+        }
+        Ok(TensorExtent {
+            elements,
+            start,
+            end,
+            byte_len,
+        })
+    }
+
+    fn validate_tensor_extents(&self, file_len: u64) -> Result<()> {
+        let mut extents = Vec::new();
+        for desc in &self.tensors {
+            let extent = self.extent_for(desc, file_len)?;
+            extents.push((extent.start, extent.end, desc.name.as_str()));
+        }
+        extents.sort_unstable_by_key(|(start, _, _)| *start);
+        for pair in extents.windows(2) {
+            let (_, previous_end, previous_name) = pair[0];
+            let (next_start, _, next_name) = pair[1];
+            if next_start < previous_end {
+                return GgufSnafu {
+                    offset: next_start,
+                    msg: format!(
+                        "tensor `{next_name}` overlaps tensor `{previous_name}`: start {next_start} before prior end {previous_end}"
+                    ),
+                }
+                .fail();
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Reader {
     /// Open a GGUF file from disk.
+    ///
+    /// # Backing-file requirement
+    ///
+    /// The opened inode must not be modified for this reader's lifetime.
+    /// Length checks reject common truncation and growth cases, but cannot make
+    /// an mmap safe against a concurrent same-length rewrite. Use
+    /// [`inspect_gguf_with_sha256`] for receipt-only inspection of an arbitrary
+    /// path; that entry point does not mmap the input.
     ///
     /// # Errors
     ///
@@ -367,27 +525,24 @@ impl Reader {
     /// layout, or an out-of-file/overlapping tensor extent.
     pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)?;
-        // SAFETY: see `safetensors::Reader::open`.
+        // SAFETY: the public backing-file requirement above is the condition
+        // required by file-backed mmap. The length guard narrows accidental
+        // misuse but does not establish immutability against another writer.
         let mmap = unsafe { Mmap::map(&file)? };
         let mmap = Arc::new(mmap);
         let parsed = Self::parse(&mmap)?;
+        parsed.validate_tensor_extents(mmap_len(&mmap)?)?;
         let reader = Self {
             path: path.to_path_buf(),
             file,
             mmap,
-            metadata: parsed.metadata,
-            tensors: parsed.tensors,
-            #[cfg(feature = "tensor")]
-            tensor_by_name: parsed.tensor_by_name,
-            data_region_start: parsed.data_region_start,
-            alignment: parsed.alignment,
+            parsed,
         };
-        reader.validate_tensor_extents()?;
         Ok(reader)
     }
 
-    fn parse(mmap: &Mmap) -> Result<ParsedArchive> {
-        let mut cur = Cursor::new(mmap);
+    fn parse(bytes: &[u8]) -> Result<ParsedArchive> {
+        let mut cur = Cursor::new(bytes);
         cur.check_magic()?;
         let version = cur.read_u32()?;
         if version != GGUF_V3 {
@@ -490,22 +645,22 @@ impl Reader {
 
     /// Alignment used for the tensor-data region.
     pub fn alignment(&self) -> u64 {
-        self.alignment
+        self.parsed.alignment
     }
 
     /// Offset in the file where tensor-data starts.
     pub fn data_region_start(&self) -> u64 {
-        self.data_region_start
+        self.parsed.data_region_start
     }
 
     /// Read-only view of the metadata map.
     pub fn metadata(&self) -> &HashMap<String, MetaValue> {
-        &self.metadata
+        &self.parsed.metadata
     }
 
     /// Full list of tensor descriptors in file order.
     pub fn tensor_descriptors(&self) -> &[TensorDescriptor] {
-        &self.tensors
+        &self.parsed.tensors
     }
 
     /// Inspect the mapped artifact without decoding tensor payloads or using HIP.
@@ -516,260 +671,277 @@ impl Reader {
     /// [`Error::Gguf`] if a checked aggregate overflows.
     pub fn inspect(&self) -> Result<Inspection> {
         let file_len = self.check_file_not_stale()?;
-        let mut census = BTreeMap::new();
-        let mut tensors = Vec::new();
-        for desc in &self.tensors {
-            let extent = self.extent_for(desc)?;
-            let entry = census.entry(desc.ggml_type).or_insert((0u64, 0u64, 0u64));
-            entry.0 = entry.0.checked_add(1).ok_or_else(|| {
-                GgufSnafu {
-                    offset: extent.start,
-                    msg: "GGUF type census tensor count overflows u64".to_string(),
-                }
-                .build()
-            })?;
-            entry.1 = entry.1.checked_add(extent.elements).ok_or_else(|| {
-                GgufSnafu {
-                    offset: extent.start,
-                    msg: format!(
-                        "GGUF type census element count overflows u64 for {:?}",
-                        desc.ggml_type
-                    ),
-                }
-                .build()
-            })?;
-            entry.2 = entry.2.checked_add(extent.byte_len).ok_or_else(|| {
-                GgufSnafu {
-                    offset: extent.start,
-                    msg: format!(
-                        "GGUF type census byte count overflows u64 for {:?}",
-                        desc.ggml_type
-                    ),
-                }
-                .build()
-            })?;
-            tensors.push(InspectedTensor {
-                name: desc.name.clone(),
-                dims: desc.dims.clone(),
-                ggml_type: desc.ggml_type,
-                logical_elements: extent.elements,
-                file_offset: extent.start,
-                byte_len: extent.byte_len,
-            });
-        }
-        let type_census = census
-            .into_iter()
-            .map(
-                |(ggml_type, (tensor_count, logical_elements, byte_len))| GgmlTypeCensus {
-                    ggml_type,
-                    tensor_count,
-                    logical_elements,
-                    byte_len,
-                },
-            )
-            .collect();
-
-        Ok(Inspection {
-            file_len,
-            alignment: self.alignment,
-            digest: ArtifactDigest::NotComputed,
-            model: ModelMetadata {
-                architecture: metadata_string(&self.metadata, "general.architecture"),
-                name: metadata_string(&self.metadata, "general.name"),
-                file_type: metadata_u32(&self.metadata, "general.file_type"),
-                quantization_version: metadata_u32(&self.metadata, "general.quantization_version"),
-            },
-            tensors,
-            type_census,
-        })
-    }
-
-    /// Inspect the mapped artifact and stream its complete SHA-256 digest.
-    ///
-    /// Positional reads from the same file handle used to create this reader's
-    /// mmap avoid a shared seek cursor, including for concurrent callers.
-    /// Handle-length checks before and after hashing reject truncation and
-    /// growth without following an unbounded tail. They cannot detect a
-    /// concurrent same-length rewrite, so the returned digest is neither source
-    /// provenance nor proof of artifact immutability.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Io`] if the opened file cannot be inspected or read;
-    /// [`Error::MmapStale`] if its length changes while it is inspected.
-    pub fn inspect_with_sha256(&self) -> Result<Inspection> {
-        let mut inspection = self.inspect()?;
-        inspection.digest = ArtifactDigest::Sha256(self.streamed_sha256()?);
-        Ok(inspection)
-    }
-
-    fn streamed_sha256(&self) -> Result<Sha256Digest> {
-        let file_len = self.check_file_not_stale()?;
-        let mut hasher = Sha256::new();
-        let mut buffer = vec![0u8; SHA256_READ_BUFFER_BYTES];
-        let mut offset = 0u64;
-        while offset < file_len {
-            let remaining = file_len.checked_sub(offset).ok_or_else(|| {
-                GgufSnafu {
-                    offset: 0u64,
-                    msg: "SHA-256 offset exceeds the opened file length".to_string(),
-                }
-                .build()
-            })?;
-            let read_len =
-                usize::try_from(remaining.min(SHA256_READ_BUFFER_BYTES_U64)).map_err(|_| {
-                    GgufSnafu {
-                        offset,
-                        msg: "SHA-256 bounded read length exceeds usize::MAX".to_string(),
-                    }
-                    .build()
-                })?;
-            let bytes = buffer.get_mut(..read_len).ok_or_else(|| {
-                GgufSnafu {
-                    offset,
-                    msg: "SHA-256 bounded read exceeds its buffer".to_string(),
-                }
-                .build()
-            })?;
-            let bytes_read = self.file.read_at(bytes, offset)?;
-            if bytes_read == 0 {
-                return GgufSnafu {
-                    offset,
-                    msg: "GGUF file ended before its opened length during SHA-256".to_string(),
-                }
-                .fail();
-            }
-            hasher.update(bytes.get(..bytes_read).ok_or_else(|| {
-                GgufSnafu {
-                    offset,
-                    msg: "SHA-256 read length exceeds its bounded buffer".to_string(),
-                }
-                .build()
-            })?);
-            offset = offset
-                .checked_add(u64::try_from(bytes_read).map_err(|_| {
-                    GgufSnafu {
-                        offset,
-                        msg: "SHA-256 read length exceeds u64::MAX".to_string(),
-                    }
-                    .build()
-                })?)
-                .ok_or_else(|| {
-                    GgufSnafu {
-                        offset,
-                        msg: "SHA-256 offset overflows u64".to_string(),
-                    }
-                    .build()
-                })?;
-        }
-        self.check_file_not_stale()?;
-        Ok(Sha256Digest(hasher.finalize().into()))
+        self.parsed
+            .inspection(file_len, ArtifactDigest::NotComputed)
     }
 
     fn check_file_not_stale(&self) -> Result<u64> {
-        let expected_len = u64::try_from(self.mmap.len()).map_err(|_| {
-            GgufSnafu {
-                offset: 0u64,
-                msg: format!("GGUF file length {} exceeds u64::MAX", self.mmap.len()),
-            }
-            .build()
-        })?;
-        let actual_len = self.file.metadata()?.len();
-        if actual_len != expected_len {
-            return MmapStaleSnafu {
-                path: self.path.clone(),
-                expected_len,
-                actual_len,
-            }
-            .fail();
-        }
+        let expected_len = mmap_len(&self.mmap)?;
+        check_open_file_len(&self.file, &self.path, expected_len)?;
         Ok(expected_len)
     }
 }
 
 /// Open, bound-check, inspect, and whole-file hash a GGUF v3 artifact.
 ///
+/// This receipt-only path does not mmap the input. It copies and validates a
+/// bounded header prefix, includes those exact owned bytes in the digest, then
+/// streams the remaining bytes from the same retained file handle. A
+/// same-length concurrent writer can still make the observation a mixture of
+/// versions, but the returned metadata and digest describe the same observed
+/// stream. The digest is not source provenance or proof of an atomic snapshot.
+///
 /// This is CPU-only metadata inspection. It does not load a model, initialize
-/// HIP, admit a workload, or claim that a digest proves source provenance.
+/// HIP, or admit a workload.
 ///
 /// # Errors
 ///
-/// Propagates [`Reader::open`] parse and resource-limit errors plus
-/// [`Reader::inspect_with_sha256`] I/O and concurrent-size-change errors.
+/// [`Error::Io`] if the path cannot be opened, inspected, or read;
+/// [`Error::Gguf`] for a malformed header, invalid tensor extent, parser
+/// resource limit, or internal bound overflow; [`Error::MmapStale`] if the
+/// retained file changes length during observation.
 pub fn inspect_gguf_with_sha256(path: &Path) -> Result<Inspection> {
-    Reader::open(path)?.inspect_with_sha256()
+    let file = File::open(path)?;
+    inspect_open_file_with_sha256(&file, path)
+}
+
+fn inspect_open_file_with_sha256(file: &File, path: &Path) -> Result<Inspection> {
+    let observation = observe_prefix(file, path, maximum_header_snapshot_bytes()?)?;
+    finish_observation(file, path, observation)
+}
+
+fn observe_prefix(file: &File, path: &Path, prefix_limit: u64) -> Result<InspectionObservation> {
+    let file_len = file.metadata()?.len();
+    let hashed_prefix_len = file_len.min(prefix_limit);
+    let prefix_len = usize::try_from(hashed_prefix_len).map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: format!("GGUF header observation {hashed_prefix_len} exceeds usize::MAX"),
+        }
+        .build()
+    })?;
+    let mut prefix = Vec::new();
+    prefix.try_reserve_exact(prefix_len).map_err(|error| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: format!("unable to reserve {prefix_len} bytes for GGUF header: {error}"),
+        }
+        .build()
+    })?;
+    prefix.resize(prefix_len, 0u8);
+    read_exact_at(file, path, file_len, 0, &mut prefix)?;
+
+    // The parser consumes only descriptors, not alignment padding or tensor
+    // payload. Validate the captured descriptor bytes before reading the rest
+    // of an arbitrary-size artifact. Extents deliberately use `file_len`, not
+    // `prefix.len()`, so a legal large alignment may put the data region well
+    // beyond this owned prefix.
+    let parsed = Reader::parse(&prefix)?;
+    parsed.validate_tensor_extents(file_len)?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(&prefix);
+    Ok(InspectionObservation {
+        parsed,
+        file_len,
+        hashed_prefix_len,
+        hasher,
+    })
+}
+
+fn finish_observation(
+    file: &File,
+    path: &Path,
+    mut observation: InspectionObservation,
+) -> Result<Inspection> {
+    let mut buffer = vec![0u8; SHA256_READ_BUFFER_BYTES];
+    let mut offset = observation.hashed_prefix_len;
+    while offset < observation.file_len {
+        let remaining = observation.file_len.checked_sub(offset).ok_or_else(|| {
+            GgufSnafu {
+                offset,
+                msg: "SHA-256 offset exceeds the opened file length".to_string(),
+            }
+            .build()
+        })?;
+        let read_len =
+            usize::try_from(remaining.min(SHA256_READ_BUFFER_BYTES_U64)).map_err(|_| {
+                GgufSnafu {
+                    offset,
+                    msg: "SHA-256 bounded read length exceeds usize::MAX".to_string(),
+                }
+                .build()
+            })?;
+        let bytes = buffer.get_mut(..read_len).ok_or_else(|| {
+            GgufSnafu {
+                offset,
+                msg: "SHA-256 bounded read exceeds its buffer".to_string(),
+            }
+            .build()
+        })?;
+        read_exact_at(file, path, observation.file_len, offset, bytes)?;
+        observation.hasher.update(bytes);
+        offset = offset
+            .checked_add(u64::try_from(read_len).map_err(|_| {
+                GgufSnafu {
+                    offset,
+                    msg: "SHA-256 read length exceeds u64::MAX".to_string(),
+                }
+                .build()
+            })?)
+            .ok_or_else(|| {
+                GgufSnafu {
+                    offset,
+                    msg: "SHA-256 offset overflows u64".to_string(),
+                }
+                .build()
+            })?;
+    }
+    check_open_file_len(file, path, observation.file_len)?;
+    let digest = ArtifactDigest::Sha256(Sha256Digest(observation.hasher.finalize().into()));
+    observation.parsed.inspection(observation.file_len, digest)
+}
+
+fn read_exact_at(
+    file: &File,
+    path: &Path,
+    expected_file_len: u64,
+    offset: u64,
+    destination: &mut [u8],
+) -> Result<()> {
+    let mut filled = 0usize;
+    while filled < destination.len() {
+        let read_offset = offset
+            .checked_add(u64::try_from(filled).map_err(|_| {
+                GgufSnafu {
+                    offset,
+                    msg: "GGUF positional read length exceeds u64::MAX".to_string(),
+                }
+                .build()
+            })?)
+            .ok_or_else(|| {
+                GgufSnafu {
+                    offset,
+                    msg: "GGUF positional read offset overflows u64".to_string(),
+                }
+                .build()
+            })?;
+        let bytes_read = match file.read_at(&mut destination[filled..], read_offset) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if bytes_read == 0 {
+            check_open_file_len(file, path, expected_file_len)?;
+            return GgufSnafu {
+                offset: read_offset,
+                msg: "GGUF file ended before its opened length during observation".to_string(),
+            }
+            .fail();
+        }
+        filled = filled.checked_add(bytes_read).ok_or_else(|| {
+            GgufSnafu {
+                offset: read_offset,
+                msg: "GGUF positional read length overflows usize".to_string(),
+            }
+            .build()
+        })?;
+    }
+    Ok(())
+}
+
+fn maximum_header_snapshot_bytes() -> Result<u64> {
+    // Every metadata entry has one key length, one type, and at most an array
+    // header (24 bytes total). A scalar string needs only an 8-byte value
+    // length in place of that 12-byte array header. Arrays-of-arrays are
+    // rejected, so every admitted array element needs at most 8 envelope bytes
+    // (including a string length); all string payload bytes share the separate
+    // cumulative bound. Each tensor takes one name length, rank, four possible
+    // dimensions, type, and offset (56 bytes), plus its bounded name payload.
+    // Alignment padding is not parsed and therefore is intentionally absent.
+    let metadata_entry_envelope = GGUF_STRING_LENGTH_BYTES
+        .checked_add(GGUF_METADATA_TYPE_BYTES)
+        .and_then(|bytes| bytes.checked_add(GGUF_METADATA_ARRAY_HEADER_BYTES));
+    let tensor_descriptor_envelope = GGUF_STRING_LENGTH_BYTES
+        .checked_add(GGUF_TENSOR_RANK_BYTES)
+        .and_then(|bytes| {
+            u64::from(MAX_TENSOR_DIMS)
+                .checked_mul(GGUF_TENSOR_DIM_BYTES)
+                .and_then(|dimension_bytes| bytes.checked_add(dimension_bytes))
+        })
+        .and_then(|bytes| bytes.checked_add(GGUF_TENSOR_TYPE_BYTES))
+        .and_then(|bytes| bytes.checked_add(GGUF_TENSOR_OFFSET_BYTES));
+    metadata_entry_envelope
+        .and_then(|entry_bytes| MAX_METADATA_COUNT.checked_mul(entry_bytes))
+        .and_then(|metadata_bytes| {
+            MAX_TOTAL_METADATA_ARRAY_ELEMENTS
+                .checked_mul(GGUF_MAX_ARRAY_ELEMENT_ENVELOPE_BYTES)
+                .and_then(|array_bytes| metadata_bytes.checked_add(array_bytes))
+        })
+        .and_then(|bytes| bytes.checked_add(MAX_TOTAL_STRING_BYTES))
+        .and_then(|bytes| {
+            tensor_descriptor_envelope.and_then(|descriptor_bytes| {
+                MAX_TENSOR_COUNT
+                    .checked_mul(descriptor_bytes)
+                    .and_then(|tensor_bytes| bytes.checked_add(tensor_bytes))
+            })
+        })
+        .and_then(|bytes| bytes.checked_add(GGUF_FIXED_HEADER_BYTES))
+        .ok_or_else(|| {
+            GgufSnafu {
+                offset: 0u64,
+                msg: "GGUF header observation bound overflows u64".to_string(),
+            }
+            .build()
+        })
+}
+
+fn mmap_len(mmap: &Mmap) -> Result<u64> {
+    u64::try_from(mmap.len()).map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: format!("GGUF mmap length {} exceeds u64::MAX", mmap.len()),
+        }
+        .build()
+    })
+}
+
+fn check_open_file_len(file: &File, path: &Path, expected_len: u64) -> Result<()> {
+    let actual_len = file.metadata()?.len();
+    if actual_len != expected_len {
+        return MmapStaleSnafu {
+            path: path.to_path_buf(),
+            expected_len,
+            actual_len,
+        }
+        .fail();
+    }
+    Ok(())
 }
 
 impl Reader {
     /// Look up a tensor descriptor by name.
     #[cfg(feature = "tensor")]
     fn descriptor_by_name(&self, name: &str) -> Result<&TensorDescriptor> {
-        let idx = self.tensor_by_name.get(name).copied().ok_or_else(|| {
-            TensorNotFoundSnafu {
-                name: name.to_string(),
-            }
-            .build()
-        })?;
-        self.tensors.get(idx).ok_or_else(|| {
+        let idx = self
+            .parsed
+            .tensor_by_name
+            .get(name)
+            .copied()
+            .ok_or_else(|| {
+                TensorNotFoundSnafu {
+                    name: name.to_string(),
+                }
+                .build()
+            })?;
+        self.parsed.tensors.get(idx).ok_or_else(|| {
             GgufSnafu {
                 offset: 0u64,
                 msg: format!(
                     "internal: tensor index {idx} out of range (len={})",
-                    self.tensors.len()
+                    self.parsed.tensors.len()
                 ),
             }
             .build()
-        })
-    }
-
-    fn extent_for(&self, desc: &TensorDescriptor) -> Result<TensorExtent> {
-        let elements = checked_element_count(desc)?;
-        let byte_len = checked_byte_len(desc, elements)?;
-        let start = self
-            .data_region_start
-            .checked_add(desc.data_offset)
-            .ok_or_else(|| {
-                GgufSnafu {
-                    offset: self.data_region_start,
-                    msg: format!(
-                        "tensor `{}` start offset overflows u64: region_start={} + data_offset={}",
-                        desc.name, self.data_region_start, desc.data_offset
-                    ),
-                }
-                .build()
-            })?;
-        let end = start.checked_add(byte_len).ok_or_else(|| {
-            GgufSnafu {
-                offset: start,
-                msg: format!(
-                    "tensor `{}` end offset overflows u64: start={start} + byte_count={byte_len}",
-                    desc.name
-                ),
-            }
-            .build()
-        })?;
-        let mmap_len = u64::try_from(self.mmap.len()).map_err(|_| {
-            GgufSnafu {
-                offset: start,
-                msg: format!("GGUF mmap length {} exceeds u64::MAX", self.mmap.len()),
-            }
-            .build()
-        })?;
-        if end > mmap_len {
-            return GgufSnafu {
-                offset: start,
-                msg: format!(
-                    "tensor `{}` data out of file bounds: [{start}..{end}] vs file len {mmap_len}",
-                    desc.name
-                ),
-            }
-            .fail();
-        }
-        Ok(TensorExtent {
-            elements,
-            start,
-            end,
-            byte_len,
         })
     }
 
@@ -777,7 +949,7 @@ impl Reader {
     /// and convert both ends to `usize`.
     #[cfg(feature = "tensor")]
     fn byte_range_for(&self, desc: &TensorDescriptor) -> Result<(usize, usize)> {
-        let extent = self.extent_for(desc)?;
+        let extent = self.parsed.extent_for(desc, mmap_len(&self.mmap)?)?;
         let start = usize::try_from(extent.start).map_err(|_| {
             GgufSnafu {
                 offset: extent.start,
@@ -799,29 +971,6 @@ impl Reader {
             .build()
         })?;
         Ok((start, end))
-    }
-
-    fn validate_tensor_extents(&self) -> Result<()> {
-        let mut extents = Vec::new();
-        for desc in &self.tensors {
-            let extent = self.extent_for(desc)?;
-            extents.push((extent.start, extent.end, desc.name.as_str()));
-        }
-        extents.sort_unstable_by_key(|(start, _, _)| *start);
-        for pair in extents.windows(2) {
-            let (_, previous_end, previous_name) = pair[0];
-            let (next_start, _, next_name) = pair[1];
-            if next_start < previous_end {
-                return GgufSnafu {
-                    offset: next_start,
-                    msg: format!(
-                        "tensor `{next_name}` overlaps tensor `{previous_name}`: start {next_start} before prior end {previous_end}"
-                    ),
-                }
-                .fail();
-            }
-        }
-        Ok(())
     }
 }
 
@@ -869,11 +1018,15 @@ impl WeightProvider for Reader {
     }
 
     fn names(&self) -> Vec<String> {
-        self.tensors.iter().map(|t| t.name.clone()).collect()
+        self.parsed
+            .tensors
+            .iter()
+            .map(|tensor| tensor.name.clone())
+            .collect()
     }
 
     fn len(&self) -> usize {
-        self.tensors.len()
+        self.parsed.tensors.len()
     }
 }
 
@@ -1100,18 +1253,18 @@ fn reject_zero_length_dimension(name: &str, dims: &[u64], offset: u64) -> Result
     Ok(())
 }
 
-/// Tiny stream-cursor over a mmap.
+/// Tiny stream cursor over an observed byte slice.
 struct Cursor<'a> {
-    mmap: &'a [u8],
+    bytes: &'a [u8],
     pos: u64,
     total_string_bytes: u64,
     total_metadata_array_elements: u64,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(mmap: &'a [u8]) -> Self {
+    fn new(bytes: &'a [u8]) -> Self {
         Self {
-            mmap,
+            bytes,
             pos: 0,
             total_string_bytes: 0,
             total_metadata_array_elements: 0,
@@ -1119,17 +1272,20 @@ impl<'a> Cursor<'a> {
     }
 
     fn remaining_len(&self) -> Result<u64> {
-        let mmap_len = u64::try_from(self.mmap.len()).map_err(|_| {
+        let observed_len = u64::try_from(self.bytes.len()).map_err(|_| {
             GgufSnafu {
                 offset: self.pos,
-                msg: format!("GGUF mmap length {} exceeds u64::MAX", self.mmap.len()),
+                msg: format!(
+                    "GGUF observed byte length {} exceeds u64::MAX",
+                    self.bytes.len()
+                ),
             }
             .build()
         })?;
-        mmap_len.checked_sub(self.pos).ok_or_else(|| {
+        observed_len.checked_sub(self.pos).ok_or_else(|| {
             GgufSnafu {
                 offset: self.pos,
-                msg: "GGUF cursor exceeds mmap length".to_string(),
+                msg: "GGUF cursor exceeds observed byte length".to_string(),
             }
             .build()
         })
@@ -1163,7 +1319,7 @@ impl<'a> Cursor<'a> {
             }
             .build()
         })?;
-        let out = self.mmap.get(pos_usize..end).ok_or_else(|| {
+        let out = self.bytes.get(pos_usize..end).ok_or_else(|| {
             GgufSnafu {
                 offset: self.pos,
                 msg: format!("out-of-bounds read of {n}B at {}", self.pos),

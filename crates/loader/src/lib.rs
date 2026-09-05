@@ -13,10 +13,12 @@
 //!
 //! With `tensor`, both formats expose a common `WeightProvider` trait and
 //! resolve through an `Archive` enum so consumers can write format-agnostic
-//! code. Metadata-only callers disable that feature and consequently do not
-//! depend on `taxis` or HIP. A small [`mapping::NameMap`] utility translates
-//! model-family HF names onto logismos-internal keys; tables live in each
-//! model's module under `decoders` / `encoders` / `embed`.
+//! code. In the minimal `cargo build -p bin` graph, `bin` disables that feature
+//! and consequently does not depend on `taxis` or HIP. Workspace-wide feature
+//! unification can still enable `loader/tensor` when another selected package
+//! requests it. A small [`mapping::NameMap`] utility translates model-family
+//! HF names onto logismos-internal keys; tables live in each model's module
+//! under `decoders` / `encoders` / `embed`.
 //!
 //! Phase 2 scope:
 //! - Read metadata + tensor bytes.

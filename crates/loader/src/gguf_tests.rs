@@ -64,6 +64,10 @@ fn sha256_text(inspection: &Inspection) -> Result<String> {
     Ok(digest.to_string())
 }
 
+fn expected_sha256_text(bytes: &[u8]) -> String {
+    Sha256Digest(Sha256::digest(bytes).into()).to_string()
+}
+
 #[test]
 fn align_up_rounds_correctly() -> Result<()> {
     assert_eq!(align_up(0, 32)?, 0);
@@ -132,29 +136,25 @@ fn whole_file_inspection_returns_known_observed_sha256() -> Result<()> {
 }
 
 #[test]
-fn concurrent_whole_file_hashes_share_no_seek_cursor() -> Result<()> {
+fn concurrent_whole_file_inspections_use_independent_retained_handles() -> Result<()> {
     let dir = tempdir_for_test();
     let path = dir.join("concurrent-sha256.gguf");
     std::fs::write(&path, fixture_bytes())?;
-    let reader = Arc::new(Reader::open(&path)?);
+    let path = Arc::new(path);
     let barrier = Arc::new(Barrier::new(3));
 
     let (first, second) = std::thread::scope(|scope| {
-        let first_reader = Arc::clone(&reader);
+        let first_path = Arc::clone(&path);
         let first_barrier = Arc::clone(&barrier);
         let first = scope.spawn(move || {
             first_barrier.wait();
-            first_reader
-                .inspect_with_sha256()
-                .and_then(|inspection| sha256_text(&inspection))
+            inspect_gguf_with_sha256(&first_path).and_then(|inspection| sha256_text(&inspection))
         });
-        let second_reader = Arc::clone(&reader);
+        let second_path = Arc::clone(&path);
         let second_barrier = Arc::clone(&barrier);
         let second = scope.spawn(move || {
             second_barrier.wait();
-            second_reader
-                .inspect_with_sha256()
-                .and_then(|inspection| sha256_text(&inspection))
+            inspect_gguf_with_sha256(&second_path).and_then(|inspection| sha256_text(&inspection))
         });
         barrier.wait();
         (first.join(), second.join())
@@ -185,18 +185,82 @@ fn whole_file_hash_retains_opened_file_identity_after_path_replacement() -> Resu
     let path = dir.join("replaceable.gguf");
     let original = fixture_bytes();
     std::fs::write(&path, &original)?;
-    let reader = Reader::open(&path)?;
+    let file = File::open(&path)?;
 
     let moved_original = dir.join("original-renamed-away.gguf");
     std::fs::rename(&path, &moved_original)?;
     std::fs::write(&path, vec![0u8; original.len()])?;
 
-    let inspection = reader.inspect_with_sha256()?;
+    let inspection = inspect_open_file_with_sha256(&file, &path)?;
     let digest = sha256_text(&inspection)?;
     assert_eq!(
         digest,
         "623d94e17734e71bc68433a1f9121ae9b59f4aabc33fdf74f7b5cc62b61c3980"
     );
+    Ok(())
+}
+
+#[test]
+fn receipt_hash_matches_owned_prefix_and_tail_observed_after_same_length_rewrite() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("interphase-rewrite.gguf");
+    let mut original = fixture_bytes();
+    original.extend(std::iter::repeat_n(0xa5u8, 256));
+    std::fs::write(&path, &original)?;
+    let file = File::open(&path)?;
+
+    // The fixture's parsed header ends at byte 114. This deliberately splits
+    // inside alignment padding so the exact owned header observation is fixed
+    // before the simulated concurrent writer replaces the remaining bytes.
+    let prefix_len = 120u64;
+    let observation = observe_prefix(&file, &path, prefix_len)?;
+    let mut replacement = original.clone();
+    let split = usize::try_from(prefix_len).map_err(|_| {
+        GgufSnafu {
+            offset: prefix_len,
+            msg: "test prefix length exceeds usize::MAX".to_string(),
+        }
+        .build()
+    })?;
+    replacement[split..].fill(0x5a);
+    std::fs::write(&path, &replacement)?;
+
+    let inspection = finish_observation(&file, &path, observation)?;
+    let mut observed = original[..split].to_vec();
+    observed.extend_from_slice(&replacement[split..]);
+    assert_eq!(sha256_text(&inspection)?, expected_sha256_text(&observed));
+    let observed_len = u64::try_from(observed.len()).map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: "test observation length exceeds u64::MAX".to_string(),
+        }
+        .build()
+    })?;
+    assert_eq!(inspection.file_len, observed_len);
+    assert_eq!(inspection.tensors.len(), 1);
+    assert_eq!(inspection.tensors[0].name, "one");
+    Ok(())
+}
+
+#[test]
+fn receipt_rejects_truncation_between_prefix_and_tail_observation() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("interphase-truncation.gguf");
+    let mut bytes = fixture_bytes();
+    bytes.extend(std::iter::repeat_n(0u8, 256));
+    std::fs::write(&path, bytes)?;
+    let file = File::open(&path)?;
+    let prefix_len = 120u64;
+    let observation = observe_prefix(&file, &path, prefix_len)?;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)?
+        .set_len(prefix_len)?;
+    assert!(matches!(
+        finish_observation(&file, &path, observation),
+        Err(Error::MmapStale { .. })
+    ));
     Ok(())
 }
 
@@ -600,17 +664,60 @@ fn inspection_rejects_stale_mmap_after_external_truncation() -> Result<()> {
 }
 
 #[test]
-fn whole_file_inspection_rejects_size_changing_concurrent_mutation() -> Result<()> {
+fn owned_prefix_receipt_rejects_malformed_truncated_and_oversize_headers() -> Result<()> {
     let dir = tempdir_for_test();
-    let path = dir.join("stale-whole-file-digest.gguf");
-    std::fs::write(&path, fixture_bytes())?;
-    let reader = Reader::open(&path)?;
-    std::fs::write(&path, b"short")?;
-
+    let malformed = dir.join("receipt-bad-magic.gguf");
+    std::fs::write(&malformed, b"NOPE-this-is-not-gguf")?;
     assert!(matches!(
-        reader.inspect_with_sha256(),
-        Err(Error::MmapStale { .. })
+        inspect_gguf_with_sha256(&malformed),
+        Err(Error::Gguf { .. })
     ));
+
+    let truncated = dir.join("receipt-truncated-header.gguf");
+    std::fs::write(&truncated, GGUF_MAGIC)?;
+    assert!(matches!(
+        inspect_gguf_with_sha256(&truncated),
+        Err(Error::Gguf { .. })
+    ));
+
+    let oversize = dir.join("receipt-oversize-count.gguf");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(GGUF_MAGIC);
+    bytes.extend_from_slice(&GGUF_V3.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&(MAX_METADATA_COUNT + 1).to_le_bytes());
+    std::fs::write(&oversize, bytes)?;
+    assert!(matches!(
+        inspect_gguf_with_sha256(&oversize),
+        Err(Error::Gguf { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn header_parse_uses_full_file_length_for_large_alignment_extents() -> Result<()> {
+    let alignment = 1u32 << 31;
+    let mut header = Vec::new();
+    header.extend_from_slice(GGUF_MAGIC);
+    header.extend_from_slice(&GGUF_V3.to_le_bytes());
+    header.extend_from_slice(&1u64.to_le_bytes());
+    header.extend_from_slice(&1u64.to_le_bytes());
+    append_u32_metadata(&mut header, "general.alignment", alignment)?;
+    append_tensor_descriptor(&mut header, "far-away", &[1], 0, 0)?;
+
+    let parsed = Reader::parse(&header)?;
+    assert_eq!(parsed.data_region_start, u64::from(alignment));
+    let full_file_len = u64::from(alignment).checked_add(4).ok_or_else(|| {
+        GgufSnafu {
+            offset: u64::from(alignment),
+            msg: "test file length overflows u64".to_string(),
+        }
+        .build()
+    })?;
+    parsed.validate_tensor_extents(full_file_len)?;
+    let inspection = parsed.inspection(full_file_len, ArtifactDigest::NotComputed)?;
+    assert_eq!(inspection.tensors[0].file_offset, u64::from(alignment));
+    assert!(full_file_len > maximum_header_snapshot_bytes()?);
     Ok(())
 }
 

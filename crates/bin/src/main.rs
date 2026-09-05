@@ -1,7 +1,9 @@
 //! # logismos binary
 //!
 //! The `plan` and `inspect` subcommands are CPU-only: they neither initialise
-//! HIP nor start a service.
+//! HIP nor start a service. The minimal `cargo build -p bin` dependency graph
+//! also excludes HIP; broader workspace feature unification can produce a
+//! different linkage graph without changing that command behavior.
 
 use std::{
     env,

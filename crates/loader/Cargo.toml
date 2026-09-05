@@ -10,8 +10,9 @@ publish = false
 [features]
 default = ["tensor"]
 # Tensor adapters retain the established `WeightProvider`/`taxis` surface.
-# Metadata-only consumers such as `logismos inspect` disable this feature so
-# they cannot link HIP through `taxis`.
+# The minimal `cargo build -p bin` graph disables this feature, so that graph
+# cannot link HIP through `taxis`. Selecting other workspace packages can
+# unify features and enable this optional edge.
 tensor = ["dep:half", "dep:safetensors", "dep:taxis"]
 
 [dependencies]

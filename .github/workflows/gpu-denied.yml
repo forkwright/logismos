@@ -42,6 +42,20 @@ jobs:
         with:
           toolchain: ${{ steps.rust_toolchain.outputs.channel }}
           components: ${{ steps.rust_toolchain.outputs.components }}
+      - name: Prove the minimal inspection graph is HIP-free
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Include build dependencies: a future build.rs edge could acquire
+          # HIP even when the final Rust linkage graph did not name it.
+          dependency_graph=$(cargo tree --locked -p bin \
+            --edges normal,build --prefix none --format '{p}')
+          if printf '%s\n' "$dependency_graph" | \
+              grep -Eq '^(hipcore|kernels|taxis) v'; then
+            printf '%s\n' 'minimal bin graph unexpectedly contains a HIP dependency' >&2
+            printf '%s\n' "$dependency_graph" >&2
+            exit 1
+          fi
       - name: Check boundary scripts
         run: |
           shellcheck scripts/gpu-denied-runner.sh scripts/gpu-denied-witness.sh \
