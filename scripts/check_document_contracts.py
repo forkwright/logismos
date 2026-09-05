@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Check authored navigation paths and generated golden-artifact inventory."""
+"""Check authored navigation paths and generated golden-artifact inventory.
+
+`crates/basanos` is the one excluded crate root: these documents use it to
+point at Kanon's separate standards checkout, which this repository cannot
+resolve. Every other concrete `crates/...` reference is local navigation and
+must exist here.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +32,7 @@ MARKDOWN_TARGET: Final = re.compile(r"\]\(([^)]+)\)")
 OUTPUT_HEADING: Final = re.compile(r"^Outputs at .+:$")
 OUTPUT_BULLET: Final = re.compile(r"^\s*-\s+([A-Za-z0-9_.-]+)\s+—.*$")
 WRITE_METHODS: Final = frozenset({"write_text", "write_bytes"})
+EXTERNAL_CRATE_ROOTS: Final = frozenset({"basanos"})
 
 
 def fail(message: str) -> None:
@@ -42,17 +49,14 @@ def is_concrete_crate_path(candidate: str) -> bool:
     )
 
 
-def navigation_paths(root: Path, document: Path) -> set[Path]:
+def navigation_paths(document: Path) -> set[Path]:
     text = document.read_text(encoding="utf-8")
     candidates = [*INLINE_CODE.findall(text), *MARKDOWN_TARGET.findall(text)]
-    local_crates = {
-        path.name for path in (root / "crates").iterdir() if path.is_dir()
-    }
     return {
         Path(candidate.rstrip("/"))
         for candidate in candidates
         if is_concrete_crate_path(candidate)
-        and PurePosixPath(candidate.rstrip("/")).parts[1] in local_crates
+        and PurePosixPath(candidate.rstrip("/")).parts[1] not in EXTERNAL_CRATE_ROOTS
     }
 
 
@@ -66,7 +70,7 @@ def check_navigation_paths(root: Path) -> None:
     missing_paths = sorted(
         f"{document}: {path}"
         for document in AUTHORED_NAVIGATION_DOCUMENTS
-        for path in navigation_paths(root, root / document)
+        for path in navigation_paths(root / document)
         if not (root / path).exists()
     )
     if missing_paths:
@@ -196,7 +200,7 @@ def write_navigation_fixture(root: Path, missing_path: bool = False) -> None:
     (root / "crates/core").mkdir(parents=True, exist_ok=True)
     (root / "AGENTS.md").write_text("`crates/core`\n", encoding="utf-8")
     if missing_path:
-        (root / "llms.txt").write_text("`crates/core/missing`\n", encoding="utf-8")
+        (root / "llms.txt").write_text("`crates/sample`\n", encoding="utf-8")
 
 
 def write_generator_fixture(root: Path, documented_provenance: str) -> None:
@@ -226,7 +230,7 @@ def run_self_tests() -> None:
         write_navigation_fixture(root)
         check_navigation_paths(root)
         write_navigation_fixture(root, missing_path=True)
-        expect_failure(lambda: check_navigation_paths(root), "llms.txt: crates/core/missing")
+        expect_failure(lambda: check_navigation_paths(root), "llms.txt: crates/sample")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
