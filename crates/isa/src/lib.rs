@@ -13,6 +13,8 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use snafu::Snafu;
+
 /// The complete configured target token, trimmed of its file terminator.
 ///
 /// Consumers that make decisions from this value should parse it with
@@ -49,7 +51,11 @@ impl<'a> TargetIsa<'a> {
             .split_once(':')
             .map_or((raw, None), |(base, suffixes)| (base, Some(suffixes)));
         if !valid_architecture(architecture) {
-            return Err(ParseError::new(ParseErrorKind::InvalidArchitecture, 0));
+            return Err(ParseSnafu {
+                kind: ParseErrorKind::InvalidArchitecture,
+                feature_index: 0_usize,
+            }
+            .build());
         }
 
         let mut features = Vec::new();
@@ -58,7 +64,11 @@ impl<'a> TargetIsa<'a> {
             for (index, encoded) in suffixes.split(':').enumerate() {
                 let feature = parse_feature(encoded, index)?;
                 if !names.insert(feature.name) {
-                    return Err(ParseError::new(ParseErrorKind::DuplicateFeature, index));
+                    return Err(ParseSnafu {
+                        kind: ParseErrorKind::DuplicateFeature,
+                        feature_index: index,
+                    }
+                    .build());
                 }
                 features.push(feature);
             }
@@ -138,20 +148,16 @@ pub enum ParseErrorKind {
 }
 
 /// Error returned when an ISA target token is not canonical.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
+#[snafu(display("invalid GPU ISA token: {kind} at feature index {feature_index}"))]
 pub struct ParseError {
     kind: ParseErrorKind,
     feature_index: usize,
+    #[snafu(implicit)]
+    location: snafu::Location,
 }
 
 impl ParseError {
-    const fn new(kind: ParseErrorKind, feature_index: usize) -> Self {
-        Self {
-            kind,
-            feature_index,
-        }
-    }
-
     /// Return the parse-failure classification.
     #[must_use]
     pub const fn kind(self) -> ParseErrorKind {
@@ -167,24 +173,18 @@ impl ParseError {
     }
 }
 
-impl fmt::Display for ParseError {
+impl fmt::Display for ParseErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let description = match self.kind {
-            ParseErrorKind::InvalidArchitecture => "invalid architecture",
-            ParseErrorKind::EmptyFeature => "empty feature",
-            ParseErrorKind::MissingFeatureState => "missing feature state",
-            ParseErrorKind::InvalidFeatureName => "invalid feature name",
-            ParseErrorKind::DuplicateFeature => "duplicate feature",
+        let description = match self {
+            Self::InvalidArchitecture => "invalid architecture",
+            Self::EmptyFeature => "empty feature",
+            Self::MissingFeatureState => "missing feature state",
+            Self::InvalidFeatureName => "invalid feature name",
+            Self::DuplicateFeature => "duplicate feature",
         };
-        write!(
-            formatter,
-            "invalid GPU ISA token: {description} at feature index {}",
-            self.feature_index
-        )
+        formatter.write_str(description)
     }
 }
-
-impl std::error::Error for ParseError {}
 
 /// Whether `candidate` has the configured base architecture and a valid token.
 ///
@@ -213,20 +213,32 @@ fn valid_architecture(architecture: &str) -> bool {
 
 fn parse_feature(encoded: &str, index: usize) -> Result<IsaFeature<'_>, ParseError> {
     if encoded.is_empty() {
-        return Err(ParseError::new(ParseErrorKind::EmptyFeature, index));
+        return Err(ParseSnafu {
+            kind: ParseErrorKind::EmptyFeature,
+            feature_index: index,
+        }
+        .build());
     }
     let (name, state) = if let Some(name) = encoded.strip_suffix('+') {
         (name, FeatureState::Enabled)
     } else if let Some(name) = encoded.strip_suffix('-') {
         (name, FeatureState::Disabled)
     } else {
-        return Err(ParseError::new(ParseErrorKind::MissingFeatureState, index));
+        return Err(ParseSnafu {
+            kind: ParseErrorKind::MissingFeatureState,
+            feature_index: index,
+        }
+        .build());
     };
     let mut bytes = name.bytes();
     if !matches!(bytes.next(), Some(first) if first.is_ascii_lowercase())
         || !bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
     {
-        return Err(ParseError::new(ParseErrorKind::InvalidFeatureName, index));
+        return Err(ParseSnafu {
+            kind: ParseErrorKind::InvalidFeatureName,
+            feature_index: index,
+        }
+        .build());
     }
     Ok(IsaFeature { name, state })
 }
@@ -286,5 +298,9 @@ mod tests {
             .expect_err("duplicate feature names must fail");
         assert_eq!(error.kind(), ParseErrorKind::DuplicateFeature);
         assert_eq!(error.feature_index(), 1);
+        assert!(
+            error.location.file().ends_with("crates/isa/src/lib.rs"),
+            "SNAFU must retain the parse failure's source location"
+        );
     }
 }
