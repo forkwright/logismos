@@ -32,7 +32,7 @@ use half::f16;
 use hipcore::{Device, DeviceBuffer, Event, Stream};
 use kernels::matmul::{Variant, launch_matmul_fp16};
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use snafu::Snafu;
 
 const PEAK_TFLOPS: f64 = 123.0;

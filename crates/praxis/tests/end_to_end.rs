@@ -11,7 +11,7 @@ use half::f16;
 use hipcore::Device;
 use praxis::{CosSinTable, matmul, rms_norm, rope_apply, softmax};
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use taxis::{Shape, Tensor};
 
 fn have_gpu() -> bool {
