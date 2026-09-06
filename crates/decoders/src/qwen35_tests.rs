@@ -1199,6 +1199,10 @@ pub(crate) fn canonical_hybrid_fixture() -> std::result::Result<Fixture, String>
     canonical_hybrid_fixture_with_n_rot(None)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the mixed fixture names every hybrid tensor shape and quantized path explicitly"
+)]
 fn mixed_quantized_hybrid_fixture() -> std::result::Result<Fixture, String> {
     let mut fixture = fixture(0)?;
     set_u32(&mut fixture, EMBEDDING_LENGTH_KEY, to_u32(MIXED_HIDDEN)?)?;
@@ -1333,37 +1337,37 @@ fn mixed_quantized_hybrid_fixture() -> std::result::Result<Fixture, String> {
         &mut fixture,
         TOKEN_EMBEDDING_TENSOR,
         TEST_Q8_0_TYPE_ID,
-        repeated_quant_block(q8_one_block(), TEST_VOCABULARY * 8)?,
+        repeated_quant_block(&q8_one_block(), TEST_VOCABULARY * 8)?,
     )?;
     set_quant_payload(
         &mut fixture,
         "blk.0.attn_qkv.weight",
         TEST_Q4_K_TYPE_ID,
-        repeated_quant_block(q4_known_block(), 512)?,
+        repeated_quant_block(&q4_known_block(), 512)?,
     )?;
     set_quant_payload(
         &mut fixture,
         "blk.0.attn_gate.weight",
         TEST_Q5_K_TYPE_ID,
-        repeated_quant_block(q5_known_block(), 256)?,
+        repeated_quant_block(&q5_known_block(), 256)?,
     )?;
     set_quant_payload(
         &mut fixture,
         "blk.3.attn_v.weight",
         TEST_Q6_K_TYPE_ID,
-        repeated_quant_block(q6_known_block(), 256)?,
+        repeated_quant_block(&q6_known_block(), 256)?,
     )?;
     set_quant_payload(
         &mut fixture,
         "blk.3.attn_output.weight",
         TEST_IQ4_NL_TYPE_ID,
-        repeated_quant_block(iq4_nl_one_block(), 512 * 8)?,
+        repeated_quant_block(&iq4_nl_one_block(), 512 * 8)?,
     )?;
     set_quant_payload(
         &mut fixture,
         OUTPUT_TENSOR,
         TEST_IQ4_XS_TYPE_ID,
-        repeated_quant_block(iq4_xs_one_block(), TEST_VOCABULARY)?,
+        repeated_quant_block(&iq4_xs_one_block(), TEST_VOCABULARY)?,
     )?;
     Ok(fixture)
 }
@@ -2321,7 +2325,7 @@ fn append_q8_block(
     payload.extend(values.map(|value| value.to_le_bytes()[0]));
 }
 
-fn repeated_quant_block(block: Vec<u8>, rows: u64) -> std::result::Result<Vec<u8>, String> {
+fn repeated_quant_block(block: &[u8], rows: u64) -> std::result::Result<Vec<u8>, String> {
     let rows = usize::try_from(rows).map_err(|error| error.to_string())?;
     let capacity = block
         .len()
@@ -2329,7 +2333,7 @@ fn repeated_quant_block(block: Vec<u8>, rows: u64) -> std::result::Result<Vec<u8
         .ok_or_else(|| "mixed quantized payload size overflowed".to_string())?;
     let mut bytes = Vec::with_capacity(capacity);
     for _ in 0..rows {
-        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(block);
     }
     Ok(bytes)
 }
