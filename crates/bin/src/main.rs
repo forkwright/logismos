@@ -95,9 +95,9 @@ fn inspect_command(
     if path == "-" || arguments.next().is_some() {
         return Err(CliError::Inspection(InspectionError::InvalidArguments));
     }
-    let inspection = loader::gguf::inspect_gguf_with_sha256(Path::new(&path))
+    let observed = loader::gguf::observe_gguf_with_sha256(Path::new(&path))
         .map_err(|error| map_inspection_error(&error))?;
-    InspectionReceipt::from_inspection(inspection).map_err(CliError::Inspection)
+    InspectionReceipt::from_inspection(observed.inspection()).map_err(CliError::Inspection)
 }
 
 fn read_stdin() -> Result<String, CliError> {
@@ -233,7 +233,7 @@ struct InspectionReceipt {
 }
 
 impl InspectionReceipt {
-    fn from_inspection(inspection: loader::gguf::Inspection) -> Result<Self, InspectionError> {
+    fn from_inspection(inspection: &loader::gguf::Inspection) -> Result<Self, InspectionError> {
         let loader::gguf::ArtifactDigest::Sha256(digest) = inspection.digest else {
             return Err(InspectionError::Internal);
         };
@@ -241,7 +241,7 @@ impl InspectionReceipt {
             u64::try_from(inspection.tensors.len()).map_err(|_| InspectionError::Internal)?;
         let type_census = inspection
             .type_census
-            .into_iter()
+            .iter()
             .map(|entry| InspectionTypeCensus {
                 ggml_type: format!("{:?}", entry.ggml_type),
                 tensor_count: entry.tensor_count,
@@ -260,8 +260,8 @@ impl InspectionReceipt {
             file_bytes: inspection.file_len,
             tensor_count,
             model: InspectionModel {
-                architecture: inspection.model.architecture,
-                name: inspection.model.name,
+                architecture: inspection.model.architecture.clone(),
+                name: inspection.model.name.clone(),
                 file_type: inspection.model.file_type,
                 quantization_version: inspection.model.quantization_version,
             },

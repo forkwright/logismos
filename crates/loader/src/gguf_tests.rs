@@ -136,6 +136,105 @@ fn whole_file_inspection_returns_known_observed_sha256() -> Result<()> {
 }
 
 #[test]
+fn observed_artifact_preserves_exact_typed_metadata_and_tensor_descriptors() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("typed-observation.gguf");
+    std::fs::write(&path, hybrid_profile_fixture_bytes()?)?;
+
+    let artifact = observe_gguf_with_sha256(&path)?;
+    assert!(
+        matches!(
+            artifact.metadata().get("general.architecture"),
+            Some(MetaValue::String(value)) if value == "qwen3"
+        ),
+        "observation must retain the architecture as a GGUF string"
+    );
+    assert!(
+        matches!(
+            artifact.metadata().get("general.file_type"),
+            Some(MetaValue::U32(12))
+        ),
+        "observation must retain general.file_type as U32 rather than a widened number"
+    );
+    let descriptors = artifact.tensor_descriptors();
+    assert_eq!(
+        descriptors.len(),
+        2,
+        "source-order descriptor count must survive observation"
+    );
+    assert_eq!(descriptors[0].name, "blk.0.attn_q.weight");
+    assert_eq!(descriptors[0].dims, vec![2]);
+    assert_eq!(descriptors[0].ggml_type, GgmlType::F16);
+    assert_eq!(descriptors[1].name, "blk.0.gdn_a.weight");
+    assert_eq!(descriptors[1].dims, vec![256]);
+    assert_eq!(descriptors[1].ggml_type, GgmlType::Q4K);
+    Ok(())
+}
+
+#[test]
+fn observed_artifact_keeps_legacy_inspection_receipt_compatible() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("compatible-receipt.gguf");
+    std::fs::write(&path, fixture_bytes())?;
+
+    let artifact = observe_gguf_with_sha256(&path)?;
+    let receipt = inspect_gguf_with_sha256(&path)?;
+    assert_eq!(
+        artifact.inspection(),
+        &receipt,
+        "legacy receipt must remain a copy of the retained-file observation"
+    );
+    Ok(())
+}
+
+#[test]
+fn observed_artifact_rejects_malformed_and_unknown_storage_layouts() -> Result<()> {
+    let dir = tempdir_for_test();
+    let malformed = dir.join("observed-bad-magic.gguf");
+    std::fs::write(&malformed, b"not-a-gguf")?;
+    assert!(
+        matches!(
+            observe_gguf_with_sha256(&malformed),
+            Err(Error::Gguf { .. })
+        ),
+        "observation must not create an artifact for malformed GGUF"
+    );
+
+    let unknown = dir.join("observed-unknown-ggml-type.gguf");
+    std::fs::write(&unknown, one_tensor_fixture(999, &[1], 0, 0)?)?;
+    assert!(
+        matches!(observe_gguf_with_sha256(&unknown), Err(Error::Gguf { .. })),
+        "observation must refuse an unknown GGML storage layout"
+    );
+    Ok(())
+}
+
+#[test]
+fn observed_artifact_preserves_split_hints_without_binding_companion_files() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("split-00001-of-00002.gguf");
+    std::fs::write(&path, split_metadata_fixture_bytes()?)?;
+
+    let artifact = observe_gguf_with_sha256(&path)?;
+    assert!(
+        matches!(
+            artifact.metadata().get("split.count"),
+            Some(MetaValue::U32(2))
+        ),
+        "split count remains typed metadata, not a multi-file admission result"
+    );
+    assert!(
+        matches!(artifact.metadata().get("split.no"), Some(MetaValue::U32(0))),
+        "split index remains typed metadata, not evidence that a companion was read"
+    );
+    assert!(
+        !dir.join("split-00002-of-00002.gguf").exists(),
+        "fixture must prove observation does not discover or bind absent companions"
+    );
+    Ok(())
+}
+
+#[test]
 fn concurrent_whole_file_inspections_use_independent_retained_handles() -> Result<()> {
     let dir = tempdir_for_test();
     let path = dir.join("concurrent-sha256.gguf");
@@ -191,8 +290,8 @@ fn whole_file_hash_retains_opened_file_identity_after_path_replacement() -> Resu
     std::fs::rename(&path, &moved_original)?;
     std::fs::write(&path, vec![0u8; original.len()])?;
 
-    let inspection = inspect_open_file_with_sha256(&file, &path)?;
-    let digest = sha256_text(&inspection)?;
+    let observed = observe_open_file_with_sha256(&file, &path)?;
+    let digest = sha256_text(observed.inspection())?;
     assert_eq!(
         digest,
         "623d94e17734e71bc68433a1f9121ae9b59f4aabc33fdf74f7b5cc62b61c3980"
@@ -225,10 +324,13 @@ fn receipt_hash_matches_owned_prefix_and_tail_observed_after_same_length_rewrite
     replacement[split..].fill(0x5a);
     std::fs::write(&path, &replacement)?;
 
-    let inspection = finish_observation(&file, &path, observation)?;
+    let artifact = finish_observation(&file, &path, observation)?;
     let mut observed = original[..split].to_vec();
     observed.extend_from_slice(&replacement[split..]);
-    assert_eq!(sha256_text(&inspection)?, expected_sha256_text(&observed));
+    assert_eq!(
+        sha256_text(artifact.inspection())?,
+        expected_sha256_text(&observed)
+    );
     let observed_len = u64::try_from(observed.len()).map_err(|_| {
         GgufSnafu {
             offset: 0u64,
@@ -236,9 +338,9 @@ fn receipt_hash_matches_owned_prefix_and_tail_observed_after_same_length_rewrite
         }
         .build()
     })?;
-    assert_eq!(inspection.file_len, observed_len);
-    assert_eq!(inspection.tensors.len(), 1);
-    assert_eq!(inspection.tensors[0].name, "one");
+    assert_eq!(artifact.inspection().file_len, observed_len);
+    assert_eq!(artifact.inspection().tensors.len(), 1);
+    assert_eq!(artifact.inspection().tensors[0].name, "one");
     Ok(())
 }
 
@@ -832,6 +934,20 @@ fn hybrid_profile_fixture_bytes() -> Result<Vec<u8>> {
     buf.extend_from_slice(&[0u8; 4]);
     buf.extend_from_slice(&[0u8; 28]);
     buf.extend_from_slice(&[0u8; 144]);
+    Ok(buf)
+}
+
+fn split_metadata_fixture_bytes() -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(GGUF_MAGIC);
+    buf.extend_from_slice(&GGUF_V3.to_le_bytes());
+    buf.extend_from_slice(&1u64.to_le_bytes());
+    buf.extend_from_slice(&2u64.to_le_bytes());
+    append_u32_metadata(&mut buf, "split.count", 2)?;
+    append_u32_metadata(&mut buf, "split.no", 0)?;
+    append_tensor_descriptor(&mut buf, "first-part", &[1], 0, 0)?;
+    pad_to_data_region(&mut buf)?;
+    buf.extend_from_slice(&0f32.to_le_bytes());
     Ok(buf)
 }
 

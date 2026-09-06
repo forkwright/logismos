@@ -320,11 +320,11 @@ pub struct GgmlTypeCensus {
     pub byte_len: u64,
 }
 
-/// CPU-only, parse-derived GGUF artifact profile.
+/// CPU-only, parse-derived GGUF inspection receipt.
 ///
-/// The profile identifies exact descriptor types and on-disk extents. It does
+/// The receipt identifies exact descriptor types and on-disk extents. It does
 /// not decode tensor payloads, reserve device memory, classify execution
-/// support, or establish source provenance. [`inspect_gguf_with_sha256`]
+/// support, or establish source provenance. [`observe_gguf_with_sha256`]
 /// derives both the parsed facts and digest from one observed byte stream;
 /// [`Reader::inspect`] instead reflects its immutable-backing mmap.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +344,57 @@ pub struct Inspection {
     pub type_census: Vec<GgmlTypeCensus>,
 }
 
+/// Opaque facts observed from one retained GGUF file handle.
+///
+/// `ObservedArtifact` is constructed only by
+/// [`observe_gguf_with_sha256`], after that retained handle supplied both the
+/// bounded descriptor prefix and the complete SHA-256 stream. It keeps the
+/// typed metadata and source-order tensor descriptors available for a later
+/// architecture-specific admission boundary without making a caller-built
+/// [`Inspection`] authoritative.
+///
+/// This is an observation, not source provenance, an atomic snapshot, model
+/// admission, or a runtime support claim. In particular, a same-length
+/// concurrent rewrite can still yield a coherent digest and metadata for a
+/// mixed byte stream, and split GGUF companions are not discovered or bound.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ObservedArtifact {
+    inspection: Inspection,
+    parsed: ParsedArchive,
+}
+
+impl ObservedArtifact {
+    /// Borrow the compatible parse-derived receipt for this observation.
+    ///
+    /// The receipt is reporting data only. It is not an admission token: a
+    /// copied or modified [`Inspection`] cannot create or alter this opaque
+    /// observation.
+    #[must_use]
+    pub fn inspection(&self) -> &Inspection {
+        &self.inspection
+    }
+
+    /// Borrow metadata with its exact parsed GGUF value types.
+    ///
+    /// This preserves strings, numeric widths, booleans, and arrays for a
+    /// later architecture-specific validator; it does not interpret model
+    /// family semantics.
+    #[must_use]
+    pub fn metadata(&self) -> &HashMap<String, MetaValue> {
+        &self.parsed.metadata
+    }
+
+    /// Borrow validated tensor descriptors in source order.
+    ///
+    /// The descriptors retain exact GGML storage types and logical dimensions.
+    /// Their presence does not claim that the payload can be decoded or run.
+    #[must_use]
+    pub fn tensor_descriptors(&self) -> &[TensorDescriptor] {
+        &self.parsed.tensors
+    }
+}
+
 /// Owning GGUF archive.
 pub struct Reader {
     path: PathBuf,
@@ -352,6 +403,7 @@ pub struct Reader {
     parsed: ParsedArchive,
 }
 
+#[derive(Debug)]
 struct ParsedArchive {
     metadata: HashMap<String, MetaValue>,
     tensors: Vec<TensorDescriptor>,
@@ -682,9 +734,9 @@ impl Reader {
     }
 }
 
-/// Open, bound-check, inspect, and whole-file hash a GGUF v3 artifact.
+/// Open, bound-check, and whole-file observe a GGUF v3 artifact.
 ///
-/// This receipt-only path does not mmap the input. It copies and validates a
+/// This observation path does not mmap the input. It copies and validates a
 /// bounded header prefix, includes those exact owned bytes in the digest, then
 /// streams the remaining bytes from the same retained file handle. A
 /// same-length concurrent writer can still make the observation a mixture of
@@ -700,14 +752,30 @@ impl Reader {
 /// [`Error::Gguf`] for a malformed header, invalid tensor extent, parser
 /// resource limit, or internal bound overflow; [`Error::MmapStale`] if the
 /// retained file changes length during observation.
-pub fn inspect_gguf_with_sha256(path: &Path) -> Result<Inspection> {
+pub fn observe_gguf_with_sha256(path: &Path) -> Result<ObservedArtifact> {
     let file = File::open(path)?;
-    inspect_open_file_with_sha256(&file, path)
+    observe_open_file_with_sha256(&file, path)
 }
 
-fn inspect_open_file_with_sha256(file: &File, path: &Path) -> Result<Inspection> {
+fn observe_open_file_with_sha256(file: &File, path: &Path) -> Result<ObservedArtifact> {
     let observation = observe_prefix(file, path, maximum_header_snapshot_bytes()?)?;
     finish_observation(file, path, observation)
+}
+
+/// Open, bound-check, inspect, and whole-file hash a GGUF v3 artifact.
+///
+/// This compatibility helper returns a copy of the receipt retained by
+/// [`ObservedArtifact`]. New admission code should retain the opaque
+/// observation returned by [`observe_gguf_with_sha256`] instead.
+///
+/// # Errors
+///
+/// [`Error::Io`] if the path cannot be opened, inspected, or read;
+/// [`Error::Gguf`] for a malformed header, invalid tensor extent, parser
+/// resource limit, or internal bound overflow; [`Error::MmapStale`] if the
+/// retained file changes length during observation.
+pub fn inspect_gguf_with_sha256(path: &Path) -> Result<Inspection> {
+    Ok(observe_gguf_with_sha256(path)?.inspection().clone())
 }
 
 fn observe_prefix(file: &File, path: &Path, prefix_limit: u64) -> Result<InspectionObservation> {
@@ -753,7 +821,7 @@ fn finish_observation(
     file: &File,
     path: &Path,
     mut observation: InspectionObservation,
-) -> Result<Inspection> {
+) -> Result<ObservedArtifact> {
     let mut buffer = vec![0u8; SHA256_READ_BUFFER_BYTES];
     let mut offset = observation.hashed_prefix_len;
     while offset < observation.file_len {
@@ -799,7 +867,13 @@ fn finish_observation(
     }
     check_open_file_len(file, path, observation.file_len)?;
     let digest = ArtifactDigest::Sha256(Sha256Digest(observation.hasher.finalize().into()));
-    observation.parsed.inspection(observation.file_len, digest)
+    let inspection = observation
+        .parsed
+        .inspection(observation.file_len, digest)?;
+    Ok(ObservedArtifact {
+        inspection,
+        parsed: observation.parsed,
+    })
 }
 
 fn read_exact_at(
