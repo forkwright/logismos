@@ -23,7 +23,6 @@ const VALUES_PER_QUARTER: usize = 32;
 const QUARTERS_PER_HALF_BLOCK: usize = 4;
 const GEOMETRY: Geometry = Geometry {
     format: RowFormat::Q6K,
-    values_per_block: Q6_K_VALUES_PER_BLOCK,
     bytes_per_block: Q6_K_BLOCK_BYTES,
 };
 
@@ -106,7 +105,7 @@ impl Q6KBlock {
 /// Returns [`crate::Error`] when `value_count` is empty, not block-aligned,
 /// or overflows its serialized representation.
 pub fn row_byte_len(value_count: usize) -> Result<usize> {
-    row::byte_len(GEOMETRY, value_count)
+    row::byte_len::<Q6_K_VALUES_PER_BLOCK>(GEOMETRY, value_count)
 }
 /// Compute a sequential f32 dot product for one serialized `Q6_K` row.
 ///

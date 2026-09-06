@@ -9,7 +9,6 @@ pub const F32_ROW_VALUE_BYTES: usize = 4;
 
 const GEOMETRY: Geometry = Geometry {
     format: RowFormat::F32,
-    values_per_block: 1,
     bytes_per_block: F32_ROW_VALUE_BYTES,
 };
 
@@ -71,7 +70,7 @@ impl<'bytes> F32Row<'bytes> {
 /// Returns [`crate::Error`] when `value_count` is zero or byte-length
 /// multiplication overflows `usize`.
 pub fn row_byte_len(value_count: usize) -> Result<usize> {
-    row::byte_len(GEOMETRY, value_count)
+    row::byte_len::<1>(GEOMETRY, value_count)
 }
 /// Compute a sequential f32 dot product for one serialized f32 row.
 ///
@@ -81,6 +80,7 @@ pub fn row_byte_len(value_count: usize) -> Result<usize> {
 /// weights or activations, and non-finite products or running accumulator.
 pub fn row_dot_f32(serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
     row::dot(GEOMETRY, serialized_row, activations, |encoded| {
+        F32Row::parse(encoded)?;
         Ok([decode_one(encoded)])
     })
 }
@@ -94,7 +94,7 @@ fn decode_one(encoded: &[u8]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Error;
+    use crate::{Error, RowFormat, row_dot_f32 as dispatch_row_dot_f32};
 
     #[test]
     fn reads_finite_values_without_materializing_a_vector() -> Result<()> {
@@ -136,6 +136,32 @@ mod tests {
                 Err(Error::NonFiniteF32Weight { index: 0, .. })
             ),
             "non-finite f32 weights must be refused"
+        );
+    }
+
+    #[test]
+    fn dispatcher_dots_finite_little_endian_weights_sequentially() -> Result<()> {
+        let mut bytes = Vec::new();
+        for weight in [1.5_f32, -2.0, 0.25] {
+            bytes.extend(weight.to_le_bytes());
+        }
+        let result = dispatch_row_dot_f32(RowFormat::F32, &bytes, &[2.0, 3.0, 4.0])?;
+        assert_eq!(
+            result.to_bits(),
+            (-2.0_f32).to_bits(),
+            "the dispatcher must preserve the left-to-right f32 row-dot contract"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dispatcher_refuses_nonfinite_serialized_weight_before_arithmetic() {
+        assert!(
+            matches!(
+                dispatch_row_dot_f32(RowFormat::F32, &f32::INFINITY.to_le_bytes(), &[1.0]),
+                Err(Error::NonFiniteF32Weight { index: 0, .. })
+            ),
+            "F32 dispatcher must reject an infinite encoded weight as a weight parse error"
         );
     }
 }

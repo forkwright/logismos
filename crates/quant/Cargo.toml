@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "CPU TurboQuant layout, codebook, transform and packing contracts; GPU parity remains pending."
+description = "CPU GGML Q8_0/Q4_K/Q5_K/Q6_K and F32 row decoding; TurboQuant packing contracts."
 publish = false
 
 [dependencies]

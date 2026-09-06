@@ -20,7 +20,6 @@ pub const Q8_0_BLOCK_BYTES: usize = Q8_0_SCALE_BYTES + Q8_0_VALUE_BYTES;
 
 const GEOMETRY: Geometry = Geometry {
     format: RowFormat::Q8_0,
-    values_per_block: Q8_0_VALUES_PER_BLOCK,
     bytes_per_block: Q8_0_BLOCK_BYTES,
 };
 
@@ -119,7 +118,7 @@ pub fn row_dot_f32(serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
 /// Returns [`crate::Error`] when the logical width is zero, does not contain
 /// whole blocks, or its serialized byte count cannot fit in `usize`.
 pub fn row_byte_len(activation_len: usize) -> Result<usize> {
-    row::byte_len(GEOMETRY, activation_len)
+    row::byte_len::<Q8_0_VALUES_PER_BLOCK>(GEOMETRY, activation_len)
 }
 
 #[cfg(test)]

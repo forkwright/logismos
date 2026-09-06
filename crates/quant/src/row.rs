@@ -10,26 +10,28 @@ use crate::{Result, RowFormat};
 #[derive(Clone, Copy)]
 pub(crate) struct Geometry {
     pub(crate) format: RowFormat,
-    pub(crate) values_per_block: usize,
     pub(crate) bytes_per_block: usize,
 }
 
-pub(crate) fn byte_len(geometry: Geometry, value_count: usize) -> Result<usize> {
+pub(crate) fn byte_len<const VALUES: usize>(
+    geometry: Geometry,
+    value_count: usize,
+) -> Result<usize> {
     if value_count == 0 {
         return EmptyRowInputSnafu {
             format: geometry.format,
         }
         .fail();
     }
-    if !value_count.is_multiple_of(geometry.values_per_block) {
+    if !value_count.is_multiple_of(VALUES) {
         return InvalidRowInputLengthSnafu {
             format: geometry.format,
             actual: value_count,
-            block_elements: geometry.values_per_block,
+            block_elements: VALUES,
         }
         .fail();
     }
-    let block_count = value_count / geometry.values_per_block;
+    let block_count = value_count / VALUES;
     block_count
         .checked_mul(geometry.bytes_per_block)
         .ok_or_else(|| {
@@ -51,7 +53,7 @@ pub(crate) fn dot<const VALUES: usize, Decode>(
 where
     Decode: FnMut(&[u8]) -> Result<[f32; VALUES]>,
 {
-    let expected_bytes = byte_len(geometry, activations.len())?;
+    let expected_bytes = byte_len::<VALUES>(geometry, activations.len())?;
     if serialized_row.len() != expected_bytes {
         return RowByteLengthMismatchSnafu {
             format: geometry.format,
