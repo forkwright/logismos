@@ -57,9 +57,11 @@ main decoder blocks remain distinct from an optional auxiliary NextN block. This
 validate payloads or authorize execution. For payload access, `loader::gguf::VerifiedArtifact`
 owns one immutable byte backing under an explicit size limit and requires a matching SHA-256
 expectation. `decoders::Qwen35Weights` binds that backing to the structural profile and executes
-named F32/Q8_0/Q4_K/Q5_K/Q6_K matrix projections using [`quant`](crates/quant/src/lib.rs).
+named F32/Q8_0/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS matrix projections using
+[`quant`](crates/quant/src/lib.rs). The same checked block decoders support linear
+row decoding without repeated basis-vector projections.
 Its recurrent-attention executor owns layer-bound convolution/GDN state and commits state
-only after a successful step. IQ4 remains execution-refused. This explicit CPU path does not
+only after a successful step. Other unsupported formats fail explicitly. This explicit CPU path does not
 implement full decoder blocks, tokenizer/logits, NextN, or a complete model; it does not
 authenticate a publisher or reserve device memory. The existing mmap tensor adapter is separate.
 
