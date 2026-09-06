@@ -45,6 +45,18 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// GGUF declared a GGML storage type this loader does not recognize.
+    #[snafu(display("unknown ggml type id {type_id} at descriptor offset {offset}"))]
+    UnknownGgmlType {
+        /// Numeric GGML storage type id from the tensor descriptor.
+        type_id: u32,
+        /// Byte offset immediately after that id in the GGUF descriptor stream.
+        offset: u64,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// Requested tensor does not exist in the archive.
     #[cfg(feature = "tensor")]
     #[snafu(display("tensor `{name}` not found in archive"))]

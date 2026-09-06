@@ -4,7 +4,7 @@ Domain terms used throughout the logismos codebase.
 
 | Term | Definition |
 |------|-----------|
-| GDN | Gated Delta Net. Linear attention variant with gated delta rule. Phase 6a. |
+| GDN | Gated Delta Net. Linear-attention variant with a gated delta rule; bounded CPU references exist, while native Phase 6a delivery remains unimplemented. |
 | WMMA | Warp Matrix Multiply Accumulate. HIP intrinsic for matrix ops on wave32. |
 | wave32 | A wavefront of 32 lanes; the execution shape used by Logismos's gfx1100 kernels. |
 | gfx1100 | AMD RDNA3 ISA target shared by W7900 and RX 7900 XTX. Device identity and memory capacity are separate facts. |

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Pure deterministic admission and residency coordination for logismos."
+description = "Deterministic CPU-only, process-local admission and residency coordination."
 publish = false
 
 [dependencies]
