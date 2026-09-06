@@ -379,7 +379,7 @@ fn array_metadata_type_parses_elements() -> Result<()> {
         buf.extend_from_slice(&v.to_le_bytes());
     }
     let mut cur = Cursor::new(&buf);
-    let value = cur.read_meta_value_typed(9)?;
+    let value = cur.read_meta_value_typed(MetaValueType::Array)?;
     let MetaValue::Array(items) = value else {
         return GgufSnafu {
             offset: 0u64,
@@ -387,10 +387,53 @@ fn array_metadata_type_parses_elements() -> Result<()> {
         }
         .fail();
     };
-    assert_eq!(items.len(), 3);
-    assert!(matches!(items[0], MetaValue::U32(10)));
-    assert!(matches!(items[1], MetaValue::U32(20)));
-    assert!(matches!(items[2], MetaValue::U32(30)));
+    assert_eq!(items.element_type(), MetaValueType::U32);
+    assert_eq!(items.values().len(), 3);
+    assert!(matches!(items.values()[0], MetaValue::U32(10)));
+    assert!(matches!(items.values()[1], MetaValue::U32(20)));
+    assert!(matches!(items.values()[2], MetaValue::U32(30)));
+    Ok(())
+}
+
+#[test]
+fn empty_metadata_arrays_preserve_each_declared_scalar_type() -> Result<()> {
+    let scalar_types = [
+        (0u32, MetaValueType::U8),
+        (1u32, MetaValueType::I8),
+        (2u32, MetaValueType::U16),
+        (3u32, MetaValueType::I16),
+        (4u32, MetaValueType::U32),
+        (5u32, MetaValueType::I32),
+        (6u32, MetaValueType::F32),
+        (7u32, MetaValueType::Bool),
+        (8u32, MetaValueType::String),
+        (10u32, MetaValueType::U64),
+        (11u32, MetaValueType::I64),
+        (12u32, MetaValueType::F64),
+    ];
+    for (declared_id, expected_type) in scalar_types {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&declared_id.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let mut cursor = Cursor::new(&bytes);
+        let value = cursor.read_meta_value_typed(MetaValueType::Array)?;
+        let MetaValue::Array(array) = value else {
+            return GgufSnafu {
+                offset: 0u64,
+                msg: "expected empty GGUF array metadata".to_string(),
+            }
+            .fail();
+        };
+        assert_eq!(
+            array.element_type(),
+            expected_type,
+            "GGUF inner type id {declared_id} must survive an empty array"
+        );
+        assert!(
+            array.values().is_empty(),
+            "empty array with declared id {declared_id} must not gain values"
+        );
+    }
     Ok(())
 }
 
@@ -445,10 +488,11 @@ fn array_metadata_round_trips_through_reader_open() -> Result<()> {
         }
         .fail();
     };
-    assert_eq!(items.len(), 3);
-    assert!(matches!(items[0], MetaValue::U32(1)));
-    assert!(matches!(items[1], MetaValue::U32(2)));
-    assert!(matches!(items[2], MetaValue::U32(3)));
+    assert_eq!(items.element_type(), MetaValueType::U32);
+    assert_eq!(items.values().len(), 3);
+    assert!(matches!(items.values()[0], MetaValue::U32(1)));
+    assert!(matches!(items.values()[1], MetaValue::U32(2)));
+    assert!(matches!(items.values()[2], MetaValue::U32(3)));
     Ok(())
 }
 
@@ -462,8 +506,21 @@ fn nested_array_inner_type_is_rejected() {
     // return `Err`.
     let inner_type_bytes = 9u32.to_le_bytes();
     let mut cur = Cursor::new(&inner_type_bytes);
-    let result = cur.read_meta_value_typed(9);
+    let result = cur.read_meta_value_typed(MetaValueType::Array);
     assert!(matches!(result, Err(Error::Gguf { .. })));
+}
+
+#[test]
+fn unknown_metadata_array_element_type_is_rejected() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&999u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    let mut cursor = Cursor::new(&bytes);
+
+    assert!(matches!(
+        cursor.read_meta_value_typed(MetaValueType::Array),
+        Err(Error::Gguf { .. })
+    ));
 }
 
 #[test]
@@ -474,7 +531,7 @@ fn metadata_arrays_have_a_cumulative_element_limit() {
     let mut cur = Cursor::new(&buf);
     cur.total_metadata_array_elements = MAX_TOTAL_METADATA_ARRAY_ELEMENTS;
 
-    let result = cur.read_meta_value_typed(9);
+    let result = cur.read_meta_value_typed(MetaValueType::Array);
     assert!(matches!(result, Err(Error::Gguf { .. })));
 }
 

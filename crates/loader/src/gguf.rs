@@ -194,6 +194,103 @@ impl GgmlType {
     }
 }
 
+/// GGUF metadata type tag. Numeric ids match the GGUF v3 specification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+#[expect(
+    missing_docs,
+    reason = "variant names map 1:1 to GGUF v3 metadata type tags (see file header)"
+)]
+#[non_exhaustive]
+pub enum MetaValueType {
+    U8 = 0,
+    I8 = 1,
+    U16 = 2,
+    I16 = 3,
+    U32 = 4,
+    I32 = 5,
+    F32 = 6,
+    Bool = 7,
+    String = 8,
+    Array = 9,
+    U64 = 10,
+    I64 = 11,
+    F64 = 12,
+}
+
+impl MetaValueType {
+    fn from_u32(id: u32, offset: u64) -> Result<Self> {
+        Ok(match id {
+            0 => Self::U8,
+            1 => Self::I8,
+            2 => Self::U16,
+            3 => Self::I16,
+            4 => Self::U32,
+            5 => Self::I32,
+            6 => Self::F32,
+            7 => Self::Bool,
+            8 => Self::String,
+            9 => Self::Array,
+            10 => Self::U64,
+            11 => Self::I64,
+            12 => Self::F64,
+            other => {
+                return GgufSnafu {
+                    offset,
+                    msg: format!("unknown metadata type id {other}"),
+                }
+                .fail();
+            }
+        })
+    }
+
+    /// Return the canonical lower-case report tag for this GGUF type.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::U8 => "u8",
+            Self::I8 => "i8",
+            Self::U16 => "u16",
+            Self::I16 => "i16",
+            Self::U32 => "u32",
+            Self::I32 => "i32",
+            Self::F32 => "f32",
+            Self::Bool => "bool",
+            Self::String => "string",
+            Self::Array => "array",
+            Self::U64 => "u64",
+            Self::I64 => "i64",
+            Self::F64 => "f64",
+        }
+    }
+}
+
+/// Parsed GGUF metadata array preserving its declared element type.
+///
+/// GGUF records an element type even when the array is empty. Keeping that
+/// declaration in the parsed value prevents a diagnostic consumer from
+/// guessing an empty array's type from absent values.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct MetaArray {
+    element_type: MetaValueType,
+    values: Vec<MetaValue>,
+}
+
+impl MetaArray {
+    /// Return the element type declared in the GGUF array header.
+    #[must_use]
+    pub const fn element_type(&self) -> MetaValueType {
+        self.element_type
+    }
+
+    /// Borrow the parsed array values in serialized order.
+    #[must_use]
+    pub fn values(&self) -> &[MetaValue] {
+        &self.values
+    }
+}
+
 /// GGUF metadata value. All 13 spec value types.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -223,7 +320,29 @@ pub enum MetaValue {
     /// UTF-8 string.
     String(String),
     /// Typed array.
-    Array(Vec<MetaValue>),
+    Array(MetaArray),
+}
+
+impl MetaValue {
+    /// Return this value's exact GGUF type tag.
+    #[must_use]
+    pub const fn value_type(&self) -> MetaValueType {
+        match self {
+            Self::U8(_) => MetaValueType::U8,
+            Self::I8(_) => MetaValueType::I8,
+            Self::U16(_) => MetaValueType::U16,
+            Self::I16(_) => MetaValueType::I16,
+            Self::U32(_) => MetaValueType::U32,
+            Self::I32(_) => MetaValueType::I32,
+            Self::U64(_) => MetaValueType::U64,
+            Self::I64(_) => MetaValueType::I64,
+            Self::F32(_) => MetaValueType::F32,
+            Self::F64(_) => MetaValueType::F64,
+            Self::Bool(_) => MetaValueType::Bool,
+            Self::String(_) => MetaValueType::String,
+            Self::Array(_) => MetaValueType::Array,
+        }
+    }
 }
 
 /// Per-tensor header entry.
@@ -1522,34 +1641,37 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_meta_value(&mut self) -> Result<MetaValue> {
+        let type_offset = self.pos;
         let type_id = self.read_u32()?;
-        self.read_meta_value_typed(type_id)
+        self.read_meta_value_typed(MetaValueType::from_u32(type_id, type_offset)?)
     }
 
-    fn read_meta_value_typed(&mut self, type_id: u32) -> Result<MetaValue> {
-        Ok(match type_id {
-            0 => MetaValue::U8(self.read_u8()?),
-            1 => MetaValue::I8(self.read_i8()?),
-            2 => MetaValue::U16(self.read_u16()?),
-            3 => MetaValue::I16(self.read_i16()?),
-            4 => MetaValue::U32(self.read_u32()?),
-            5 => MetaValue::I32(self.read_i32()?),
-            6 => MetaValue::F32(self.read_f32()?),
-            7 => MetaValue::Bool(self.read_bool()?),
-            8 => MetaValue::String(self.read_string()?),
-            9 => {
+    fn read_meta_value_typed(&mut self, value_type: MetaValueType) -> Result<MetaValue> {
+        Ok(match value_type {
+            MetaValueType::U8 => MetaValue::U8(self.read_u8()?),
+            MetaValueType::I8 => MetaValue::I8(self.read_i8()?),
+            MetaValueType::U16 => MetaValue::U16(self.read_u16()?),
+            MetaValueType::I16 => MetaValue::I16(self.read_i16()?),
+            MetaValueType::U32 => MetaValue::U32(self.read_u32()?),
+            MetaValueType::I32 => MetaValue::I32(self.read_i32()?),
+            MetaValueType::F32 => MetaValue::F32(self.read_f32()?),
+            MetaValueType::Bool => MetaValue::Bool(self.read_bool()?),
+            MetaValueType::String => MetaValue::String(self.read_string()?),
+            MetaValueType::Array => {
+                let inner_type_offset = self.pos;
                 let inner_type = self.read_u32()?;
+                let inner_type = MetaValueType::from_u32(inner_type, inner_type_offset)?;
                 // WHY(forkwright/logismos#35): the GGUF v3 spec forbids
                 // arrays-of-arrays. Without this check a crafted file
-                // chains `inner_type = 9` at every nesting level, and
+                // chains `inner_type = MetaValueType::Array` at every nesting level, and
                 // each recursive `read_meta_value_typed` call below adds
                 // an unbounded stack frame — a ~1MB file can encode
                 // ~65,000 levels, enough to overflow the thread stack
                 // (an unrecoverable process crash, not a catchable panic).
-                if inner_type == 9 {
+                if inner_type == MetaValueType::Array {
                     return GgufSnafu {
                         offset: self.pos,
-                        msg: "gguf spec forbids arrays-of-arrays (inner_type=9)".to_string(),
+                        msg: "gguf spec forbids arrays-of-arrays (inner_type=Array)".to_string(),
                     }
                     .fail();
                 }
@@ -1593,18 +1715,14 @@ impl<'a> Cursor<'a> {
                     out.push(self.read_meta_value_typed(inner_type)?);
                 }
                 self.total_metadata_array_elements = total_metadata_array_elements;
-                MetaValue::Array(out)
+                MetaValue::Array(MetaArray {
+                    element_type: inner_type,
+                    values: out,
+                })
             }
-            10 => MetaValue::U64(self.read_u64()?),
-            11 => MetaValue::I64(self.read_i64()?),
-            12 => MetaValue::F64(self.read_f64()?),
-            other => {
-                return GgufSnafu {
-                    offset: self.pos,
-                    msg: format!("unknown metadata type id {other}"),
-                }
-                .fail();
-            }
+            MetaValueType::U64 => MetaValue::U64(self.read_u64()?),
+            MetaValueType::I64 => MetaValue::I64(self.read_i64()?),
+            MetaValueType::F64 => MetaValue::F64(self.read_f64()?),
         })
     }
 }

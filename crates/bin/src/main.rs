@@ -191,21 +191,22 @@ fn write_inspection_outcome(outcome: &InspectionOutcome) -> ExitCode {
     match outcome {
         InspectionOutcome::Receipt(receipt) => write_inspection_receipt(receipt),
         InspectionOutcome::Metadata { receipt, observed } => {
-            write_inspection_metadata_report(receipt, observed.metadata())
+            write_inspection_metadata_report(receipt, observed)
         }
     }
 }
 
 fn write_inspection_metadata_report(
     receipt: &InspectionReceipt,
-    metadata: &HashMap<String, loader::gguf::MetaValue>,
+    observed: &loader::gguf::ObservedArtifact,
 ) -> ExitCode {
     let report = InspectionMetadataReport {
         schema_version: INSPECTION_METADATA_SCHEMA_VERSION,
         outcome: "inspection_metadata",
         format: "gguf-v3",
         inspection: receipt,
-        metadata: MetadataEntries(metadata),
+        metadata: MetadataEntries(observed.metadata()),
+        tensors: TensorEntries(&observed.inspection().tensors),
     };
     let stdout = io::stdout();
     let mut writer = stdout.lock();
@@ -299,7 +300,7 @@ impl InspectionReceipt {
             .type_census
             .iter()
             .map(|entry| InspectionTypeCensus {
-                ggml_type: format!("{:?}", entry.ggml_type),
+                ggml_type: GgmlTypeName(entry.ggml_type),
                 tensor_count: entry.tensor_count,
                 logical_elements: entry.logical_elements,
                 serialized_bytes: entry.byte_len,
@@ -330,7 +331,8 @@ impl InspectionReceipt {
 ///
 /// This report is diagnostic output only. It exposes parsed file metadata but
 /// is not a model-admission authority, source-provenance assertion, or runtime
-/// support claim.
+/// support claim. Its tensor entries preserve descriptor source order and
+/// validated serialized extents; they do not decode tensor payloads.
 #[derive(Serialize)]
 struct InspectionMetadataReport<'a> {
     schema_version: u32,
@@ -338,6 +340,7 @@ struct InspectionMetadataReport<'a> {
     format: &'static str,
     inspection: &'a InspectionReceipt,
     metadata: MetadataEntries<'a>,
+    tensors: TensorEntries<'a>,
 }
 
 struct MetadataEntries<'a>(&'a HashMap<String, loader::gguf::MetaValue>);
@@ -378,35 +381,55 @@ impl Serialize for TaggedMetadataValue<'_> {
     {
         use loader::gguf::MetaValue;
 
+        let type_name = self.0.value_type().tag();
         match self.0 {
-            MetaValue::U8(value) => serialize_tagged_value(serializer, "u8", "value", value),
-            MetaValue::I8(value) => serialize_tagged_value(serializer, "i8", "value", value),
-            MetaValue::U16(value) => serialize_tagged_value(serializer, "u16", "value", value),
-            MetaValue::I16(value) => serialize_tagged_value(serializer, "i16", "value", value),
-            MetaValue::U32(value) => serialize_tagged_value(serializer, "u32", "value", value),
-            MetaValue::I32(value) => serialize_tagged_value(serializer, "i32", "value", value),
-            MetaValue::U64(value) => serialize_tagged_value(serializer, "u64", "value", value),
-            MetaValue::I64(value) => serialize_tagged_value(serializer, "i64", "value", value),
+            MetaValue::U8(value) => serialize_tagged_value(serializer, type_name, "value", value),
+            MetaValue::I8(value) => serialize_tagged_value(serializer, type_name, "value", value),
+            MetaValue::U16(value) => serialize_tagged_value(serializer, type_name, "value", value),
+            MetaValue::I16(value) => serialize_tagged_value(serializer, type_name, "value", value),
+            MetaValue::U32(value) => serialize_tagged_value(serializer, type_name, "value", value),
+            MetaValue::I32(value) => serialize_tagged_value(serializer, type_name, "value", value),
+            MetaValue::U64(value) => serialize_tagged_value(serializer, type_name, "value", value),
+            MetaValue::I64(value) => serialize_tagged_value(serializer, type_name, "value", value),
             MetaValue::F32(value) => {
                 let bits = format!("{:08x}", value.to_bits());
-                serialize_tagged_value(serializer, "f32", "bits", &bits)
+                serialize_tagged_value(serializer, type_name, "bits", &bits)
             }
             MetaValue::F64(value) => {
                 let bits = format!("{:016x}", value.to_bits());
-                serialize_tagged_value(serializer, "f64", "bits", &bits)
+                serialize_tagged_value(serializer, type_name, "bits", &bits)
             }
-            MetaValue::Bool(value) => serialize_tagged_value(serializer, "bool", "value", value),
+            MetaValue::Bool(value) => serialize_tagged_value(serializer, type_name, "value", value),
             MetaValue::String(value) => {
-                serialize_tagged_value(serializer, "string", "value", value)
+                serialize_tagged_value(serializer, type_name, "value", value)
             }
-            MetaValue::Array(values) => {
-                serialize_tagged_value(serializer, "array", "values", &MetadataArray(values))
-            }
+            MetaValue::Array(array) => serialize_tagged_array(
+                serializer,
+                type_name,
+                array.element_type().tag(),
+                &MetadataArray(array.values()),
+            ),
             _ => Err(serde::ser::Error::custom(
                 "unsupported GGUF metadata variant in metadata report",
             )),
         }
     }
+}
+
+fn serialize_tagged_array<S>(
+    serializer: S,
+    type_name: &'static str,
+    element_type: &'static str,
+    values: &MetadataArray<'_>,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut tagged = serializer.serialize_struct("TaggedMetadataValue", 3)?;
+    tagged.serialize_field("type", type_name)?;
+    tagged.serialize_field("element_type", element_type)?;
+    tagged.serialize_field("values", values)?;
+    tagged.end()
 }
 
 fn serialize_tagged_value<S, T>(
@@ -440,6 +463,50 @@ impl Serialize for MetadataArray<'_> {
     }
 }
 
+struct TensorEntries<'a>(&'a [loader::gguf::InspectedTensor]);
+
+impl Serialize for TensorEntries<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for tensor in self.0 {
+            sequence.serialize_element(&TensorEntry {
+                name: &tensor.name,
+                dims: &tensor.dims,
+                ggml_type: GgmlTypeName(tensor.ggml_type),
+                logical_elements: tensor.logical_elements,
+                file_offset: tensor.file_offset,
+                serialized_bytes: tensor.byte_len,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct TensorEntry<'a> {
+    name: &'a str,
+    dims: &'a [u64],
+    ggml_type: GgmlTypeName,
+    logical_elements: u64,
+    file_offset: u64,
+    serialized_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct GgmlTypeName(loader::gguf::GgmlType);
+
+impl Serialize for GgmlTypeName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(&format_args!("{:?}", self.0))
+    }
+}
+
 #[derive(Serialize)]
 struct ComputedDigest {
     algorithm: &'static str,
@@ -456,7 +523,7 @@ struct InspectionModel {
 
 #[derive(Serialize)]
 struct InspectionTypeCensus {
-    ggml_type: String,
+    ggml_type: GgmlTypeName,
     tensor_count: u64,
     logical_elements: u64,
     serialized_bytes: u64,

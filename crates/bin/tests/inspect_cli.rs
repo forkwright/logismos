@@ -84,8 +84,8 @@ fn full_metadata_fixture_bytes() -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"GGUF");
     bytes.extend_from_slice(&3u32.to_le_bytes());
-    bytes.extend_from_slice(&1u64.to_le_bytes());
-    bytes.extend_from_slice(&13u64.to_le_bytes());
+    bytes.extend_from_slice(&2u64.to_le_bytes());
+    bytes.extend_from_slice(&14u64.to_le_bytes());
 
     append_metadata_header(&mut bytes, "z.u8", 0);
     bytes.push(u8::MAX);
@@ -109,6 +109,9 @@ fn full_metadata_fixture_bytes() -> Vec<u8> {
     bytes.extend_from_slice(&6u32.to_le_bytes());
     bytes.extend_from_slice(&1u64.to_le_bytes());
     bytes.extend_from_slice(&0x7fc0_1234u32.to_le_bytes());
+    append_metadata_header(&mut bytes, "n.empty", 9);
+    bytes.extend_from_slice(&12u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
     append_metadata_header(&mut bytes, "p.u64", 10);
     bytes.extend_from_slice(&u64::MAX.to_le_bytes());
     append_metadata_header(&mut bytes, "o.i64", 11);
@@ -116,14 +119,21 @@ fn full_metadata_fixture_bytes() -> Vec<u8> {
     append_metadata_header(&mut bytes, "a.f64", 12);
     bytes.extend_from_slice(&0x7ff8_0000_0000_1234u64.to_le_bytes());
 
-    append_string(&mut bytes, "one");
+    append_string(&mut bytes, "z.tensor");
     bytes.extend_from_slice(&1u32.to_le_bytes());
-    bytes.extend_from_slice(&1u64.to_le_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&2u64.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.extend_from_slice(&0u64.to_le_bytes());
+    append_string(&mut bytes, "a.tensor");
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&3u64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&32u64.to_le_bytes());
     let padding = (32 - bytes.len() % 32) % 32;
     bytes.extend(std::iter::repeat_n(0u8, padding));
-    bytes.extend_from_slice(&0f32.to_le_bytes());
+    bytes.extend_from_slice(&[0u8; 4]);
+    bytes.extend_from_slice(&[0u8; 28]);
+    bytes.extend_from_slice(&[0u8; 12]);
     bytes
 }
 
@@ -147,6 +157,126 @@ fn metadata_value<'a>(report: &'a serde_json::Value, key: &str) -> &'a serde_jso
         .and_then(|entries| entries.iter().find(|entry| entry["key"] == key))
         .map(|entry| &entry["value"])
         .expect("metadata report must contain its declared key")
+}
+
+fn assert_tensor_report(report: &serde_json::Value) {
+    let tensors = report["tensors"]
+        .as_array()
+        .expect("metadata report must include source-order tensors");
+    assert_eq!(tensors.len(), 2, "fixture has two tensor descriptors");
+    assert_eq!(tensors[0]["name"], "z.tensor");
+    assert_eq!(tensors[0]["dims"], serde_json::json!([2]));
+    assert_eq!(tensors[0]["ggml_type"], "F16");
+    assert_eq!(tensors[0]["logical_elements"], 2);
+    assert_eq!(tensors[0]["serialized_bytes"], 4);
+    assert_eq!(tensors[1]["name"], "a.tensor");
+    assert_eq!(tensors[1]["dims"], serde_json::json!([3]));
+    assert_eq!(tensors[1]["ggml_type"], "F32");
+    assert_eq!(tensors[1]["logical_elements"], 3);
+    assert_eq!(tensors[1]["serialized_bytes"], 12);
+    assert_eq!(
+        tensors[1]["file_offset"].as_u64(),
+        tensors[0]["file_offset"].as_u64().map(|offset| offset + 32),
+        "validated tensor extents retain their serialized relative placement"
+    );
+    let tensor_bytes: u64 = tensors
+        .iter()
+        .map(|tensor| {
+            tensor["serialized_bytes"]
+                .as_u64()
+                .expect("tensor serialized extent must be u64")
+        })
+        .sum();
+    let census = report["inspection"]["type_census"]
+        .as_array()
+        .expect("inspection receipt must retain its type census");
+    assert_eq!(report["inspection"]["tensor_count"], 2);
+    assert_eq!(census[0]["ggml_type"], "F32");
+    assert_eq!(census[0]["serialized_bytes"], 12);
+    assert_eq!(census[1]["ggml_type"], "F16");
+    assert_eq!(census[1]["serialized_bytes"], 4);
+    let census_bytes: u64 = census
+        .iter()
+        .map(|entry| {
+            entry["serialized_bytes"]
+                .as_u64()
+                .expect("census serialized extent must be u64")
+        })
+        .sum();
+    assert_eq!(
+        tensor_bytes, census_bytes,
+        "per-tensor serialized extents must cohere with the aggregate census"
+    );
+}
+
+fn assert_metadata_key_order(report: &serde_json::Value) {
+    let keys: Vec<_> = report["metadata"]
+        .as_array()
+        .expect("metadata must be an array")
+        .iter()
+        .map(|entry| entry["key"].as_str().expect("metadata key must be text"))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "a.f64", "n.empty", "o.i64", "p.u64", "q.array", "r.string", "s.bool", "t.f32",
+            "u.i32", "v.u32", "w.i16", "x.u16", "y.i8", "z.u8",
+        ],
+        "metadata entries must sort by key rather than HashMap iteration"
+    );
+}
+
+fn assert_scalar_metadata_values(report: &serde_json::Value) {
+    assert_eq!(metadata_value(report, "z.u8")["type"], "u8");
+    assert_eq!(metadata_value(report, "y.i8")["type"], "i8");
+    assert_eq!(metadata_value(report, "x.u16")["type"], "u16");
+    assert_eq!(metadata_value(report, "w.i16")["type"], "i16");
+    assert_eq!(metadata_value(report, "v.u32")["type"], "u32");
+    assert_eq!(metadata_value(report, "u.i32")["type"], "i32");
+    assert_eq!(metadata_value(report, "t.f32")["type"], "f32");
+    assert_eq!(metadata_value(report, "s.bool")["type"], "bool");
+    assert_eq!(metadata_value(report, "r.string")["type"], "string");
+    assert_eq!(metadata_value(report, "p.u64")["type"], "u64");
+    assert_eq!(metadata_value(report, "o.i64")["type"], "i64");
+    assert_eq!(metadata_value(report, "a.f64")["type"], "f64");
+    assert_eq!(metadata_value(report, "z.u8")["value"], u8::MAX);
+    assert_eq!(metadata_value(report, "y.i8")["value"], -1);
+    assert_eq!(metadata_value(report, "x.u16")["value"], u16::MAX);
+    assert_eq!(metadata_value(report, "w.i16")["value"], -2);
+    assert_eq!(metadata_value(report, "v.u32")["value"], u32::MAX);
+    assert_eq!(metadata_value(report, "u.i32")["value"], -3);
+    assert_eq!(metadata_value(report, "s.bool")["value"], true);
+    assert_eq!(
+        metadata_value(report, "r.string")["value"],
+        "deliberate metadata output"
+    );
+    assert_eq!(metadata_value(report, "p.u64")["value"], u64::MAX);
+    assert_eq!(metadata_value(report, "o.i64")["value"], i64::MIN);
+    assert_eq!(metadata_value(report, "t.f32")["bits"], "80000000");
+    assert_eq!(metadata_value(report, "a.f64")["bits"], "7ff8000000001234");
+    assert!(
+        metadata_value(report, "t.f32").get("value").is_none(),
+        "negative zero is represented by IEEE bits rather than a lossy JSON number"
+    );
+}
+
+fn assert_array_metadata_values(report: &serde_json::Value) {
+    assert_eq!(metadata_value(report, "q.array")["type"], "array");
+    assert_eq!(metadata_value(report, "n.empty")["type"], "array");
+    let array_values = metadata_value(report, "q.array")["values"]
+        .as_array()
+        .expect("array metadata must expose tagged values");
+    assert_eq!(metadata_value(report, "q.array")["element_type"], "f32");
+    assert_eq!(array_values[0]["type"], "f32");
+    assert_eq!(array_values[0]["bits"], "7fc01234");
+    assert_eq!(metadata_value(report, "n.empty")["element_type"], "f64");
+    assert!(
+        metadata_value(report, "n.empty")["values"]
+            .as_array()
+            .expect("empty array metadata must expose values")
+            .is_empty(),
+        "empty metadata array retains its declared element type"
+    );
 }
 
 fn assert_typed_error(output: &Output, kind: &str) {
@@ -224,57 +354,10 @@ fn inspect_metadata_emits_deterministic_exactly_typed_values() {
         "metadata envelope embeds the ordinary inspection receipt"
     );
 
-    let keys: Vec<_> = report["metadata"]
-        .as_array()
-        .expect("metadata must be an array")
-        .iter()
-        .map(|entry| entry["key"].as_str().expect("metadata key must be text"))
-        .collect();
-    assert_eq!(
-        keys,
-        [
-            "a.f64", "o.i64", "p.u64", "q.array", "r.string", "s.bool", "t.f32", "u.i32", "v.u32",
-            "w.i16", "x.u16", "y.i8", "z.u8",
-        ],
-        "metadata entries must sort by key rather than HashMap iteration"
-    );
-    assert_eq!(metadata_value(&report, "z.u8")["type"], "u8");
-    assert_eq!(metadata_value(&report, "y.i8")["type"], "i8");
-    assert_eq!(metadata_value(&report, "x.u16")["type"], "u16");
-    assert_eq!(metadata_value(&report, "w.i16")["type"], "i16");
-    assert_eq!(metadata_value(&report, "v.u32")["type"], "u32");
-    assert_eq!(metadata_value(&report, "u.i32")["type"], "i32");
-    assert_eq!(metadata_value(&report, "t.f32")["type"], "f32");
-    assert_eq!(metadata_value(&report, "s.bool")["type"], "bool");
-    assert_eq!(metadata_value(&report, "r.string")["type"], "string");
-    assert_eq!(metadata_value(&report, "q.array")["type"], "array");
-    assert_eq!(metadata_value(&report, "p.u64")["type"], "u64");
-    assert_eq!(metadata_value(&report, "o.i64")["type"], "i64");
-    assert_eq!(metadata_value(&report, "a.f64")["type"], "f64");
-    assert_eq!(metadata_value(&report, "z.u8")["value"], u8::MAX);
-    assert_eq!(metadata_value(&report, "y.i8")["value"], -1);
-    assert_eq!(metadata_value(&report, "x.u16")["value"], u16::MAX);
-    assert_eq!(metadata_value(&report, "w.i16")["value"], -2);
-    assert_eq!(metadata_value(&report, "v.u32")["value"], u32::MAX);
-    assert_eq!(metadata_value(&report, "u.i32")["value"], -3);
-    assert_eq!(metadata_value(&report, "s.bool")["value"], true);
-    assert_eq!(
-        metadata_value(&report, "r.string")["value"],
-        "deliberate metadata output"
-    );
-    assert_eq!(metadata_value(&report, "p.u64")["value"], u64::MAX);
-    assert_eq!(metadata_value(&report, "o.i64")["value"], i64::MIN);
-    assert_eq!(metadata_value(&report, "t.f32")["bits"], "80000000");
-    assert_eq!(metadata_value(&report, "a.f64")["bits"], "7ff8000000001234");
-    assert!(
-        metadata_value(&report, "t.f32").get("value").is_none(),
-        "negative zero is represented by IEEE bits rather than a lossy JSON number"
-    );
-    let array_values = metadata_value(&report, "q.array")["values"]
-        .as_array()
-        .expect("array metadata must expose tagged values");
-    assert_eq!(array_values[0]["type"], "f32");
-    assert_eq!(array_values[0]["bits"], "7fc01234");
+    assert_tensor_report(&report);
+    assert_metadata_key_order(&report);
+    assert_scalar_metadata_values(&report);
+    assert_array_metadata_values(&report);
 }
 
 #[test]
