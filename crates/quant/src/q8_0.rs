@@ -101,7 +101,7 @@ impl Q8_0Block {
 /// Returns [`crate::Error`] when the row geometry is invalid, a `Q8_0` scale or
 /// activation is non-finite, or a product or running accumulator is non-finite.
 pub fn row_dot_f32(serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
-    let expected_bytes = checked_row_byte_len(activations.len())?;
+    let expected_bytes = row_byte_len(activations.len())?;
     if serialized_row.len() != expected_bytes {
         return Q8RowByteLengthMismatchSnafu {
             actual: serialized_row.len(),
@@ -149,7 +149,16 @@ pub fn row_dot_f32(serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
     Ok(accumulator)
 }
 
-fn checked_row_byte_len(activation_len: usize) -> Result<usize> {
+/// Derive the exact serialized byte length for one complete `Q8_0` row.
+///
+/// WHY: tensor projection adapters and row execution must use the same checked
+/// block geometry, rather than maintaining separate length formulas.
+///
+/// # Errors
+///
+/// Returns [`crate::Error`] when the logical width is zero, does not contain
+/// whole blocks, or its serialized byte count cannot fit in `usize`.
+pub fn row_byte_len(activation_len: usize) -> Result<usize> {
     if activation_len == 0 {
         return EmptyQ8RowInputSnafu.fail();
     }
@@ -433,7 +442,7 @@ mod tests {
         let max_multiple = usize::MAX - (usize::MAX % Q8_0_VALUES_PER_BLOCK);
         assert!(
             matches!(
-                checked_row_byte_len(max_multiple),
+            row_byte_len(max_multiple),
                 Err(Error::Q8RowByteLengthOverflow { .. })
             ),
             "serialized row geometry overflow must be refused"
