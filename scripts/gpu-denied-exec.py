@@ -241,7 +241,10 @@ def _prepare_read_only_input(
         resolved = input_path.resolve(strict=True)
     except OSError as error:
         raise BoundaryError('cannot resolve read-only input path') from error
-    if resolved != input_path:
+    # `Path` deliberately normalizes `.` and repeated separators.  Compare the
+    # original argv spelling too: otherwise `/file//name` would pass despite
+    # not being the one canonical pathname the caller supplied for review.
+    if input_argument != str(resolved):
         raise BoundaryError('read-only input path must be canonical and contain no symlinks')
     if resolved == root or resolved.is_relative_to(root):
         raise BoundaryError('read-only input must be outside the worktree and writable target')
@@ -256,11 +259,38 @@ def _prepare_read_only_input(
         raise BoundaryError('cannot inspect read-only input') from error
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
         raise BoundaryError('read-only input must be a single-link regular file')
+    _reject_read_only_input_tree_alias(metadata, root)
     if resolved in _host_mount_points():
         raise BoundaryError('read-only input must not be a host mount point')
     if not os.access(resolved, os.R_OK):
         raise BoundaryError('read-only input is not readable by the runner account')
     return resolved
+
+
+def _reject_read_only_input_tree_alias(input_metadata: os.stat_result, root: Path) -> None:
+    """Reject a bind-directory spelling of an inode in the protected worktree.
+
+    A file bind mount does not increment `st_nlink`; an external pathname can
+    therefore name a writable `target/` inode despite the input's single-link
+    requirement.  Compare inode identity while walking the already protected
+    tree without following any symlinks.
+    """
+
+    def reject_walk_error(error: OSError) -> None:
+        raise BoundaryError('cannot inspect worktree for a read-only input alias') from error
+
+    identity = (input_metadata.st_dev, input_metadata.st_ino)
+    for current, directories, files in os.walk(
+        root, topdown=True, onerror=reject_walk_error, followlinks=False
+    ):
+        current_path = Path(current)
+        for name in (*directories, *files):
+            try:
+                candidate = (current_path / name).lstat()
+            except OSError as error:
+                raise BoundaryError('cannot inspect worktree for a read-only input alias') from error
+            if stat.S_ISREG(candidate.st_mode) and (candidate.st_dev, candidate.st_ino) == identity:
+                raise BoundaryError('read-only input aliases the protected worktree')
 
 
 def _validate_standard_descriptors(root: Path) -> None:

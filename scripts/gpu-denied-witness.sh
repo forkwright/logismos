@@ -22,6 +22,8 @@ cleanup() {
     /usr/bin/rm -f -- \
         "$ROOT/target/gpu-denied-hardlink-a" \
         "$ROOT/target/gpu-denied-hardlink-b"
+    /usr/bin/rm -f -- "$ROOT/target/debug/logismos"
+    /usr/bin/rmdir --ignore-fail-on-non-empty "$ROOT/target/debug" 2>/dev/null || true
     /usr/bin/chmod 0700 "$ROOT/target/gpu-denied-unreadable" 2>/dev/null || true
     /usr/bin/rm -rf -- "$ROOT/target/gpu-denied-unreadable"
     /usr/bin/rm -rf -- "$FIXTURE_DIR"
@@ -243,6 +245,14 @@ artifact = Path(os.environ['LOGISMOS_GPU_DENIED_INPUT'])
 assert artifact.read_bytes() == b'synthetic artifact bytes'
 assert list(artifact.parent.iterdir()) == [artifact]
 assert not Path(sys.argv[1]).exists()
+host_source = sys.argv[1].encode()
+mountinfo = Path('/proc/self/mountinfo').read_bytes()
+pid_one_command = Path('/proc/1/cmdline').read_bytes()
+# Host spelling is not an accessible file path, but is not confidential:
+# current Bubblewrap leaves it in its PID-1 command line and mount metadata
+# retains at least the synthetic artifact name/root component.
+assert host_source in pid_one_command
+assert Path(sys.argv[1]).name.encode() in mountinfo
 failed = 0
 actions = (
     lambda: artifact.write_bytes(b'unexpected'),
@@ -264,6 +274,43 @@ assert failed == len(actions)
 )
 if positive_input_result.returncode != 0:
     raise AssertionError(positive_input_result.stderr.decode(errors='replace'))
+
+
+# Match the documented outer/inner-shell pattern: the runner sets this
+# variable, so the outer caller must pass its expansion literally to a quoted
+# inner shell rather than expanding it before the boundary exists.
+documented_binary = root / 'target/debug/logismos'
+if documented_binary.exists() or documented_binary.is_symlink():
+    raise AssertionError('documented calling-pattern fixture path is unexpectedly occupied')
+documented_binary.parent.mkdir()
+documented_binary.write_text(
+    '#!/bin/sh\n'
+    'test "$1" = inspect\n'
+    'test "$2" = --input\n'
+    'test "$3" = /mnt/gpu-denied-input/artifact\n',
+    encoding='utf-8',
+)
+documented_binary.chmod(0o755)
+try:
+    documented_call_result = run(
+        [
+            str(runner),
+            '--ro-input-file',
+            str(approved_input),
+            '--',
+            '/bin/sh',
+            '-ceu',
+            'exec target/debug/logismos inspect --input "$LOGISMOS_GPU_DENIED_INPUT"',
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+finally:
+    documented_binary.unlink(missing_ok=True)
+    documented_binary.parent.rmdir()
+if documented_call_result.returncode != 0:
+    raise AssertionError(documented_call_result.stderr.decode(errors='replace'))
 
 
 def assert_rejected_read_only_input(label: str, input_path: Path) -> None:
@@ -306,6 +353,8 @@ try:
     for label, path in [
         ('relative', Path('relative-input')),
         ('noncanonical', noncanonical_parent / '..' / approved_input.name),
+        ('duplicate separator', f'{fixture}//{approved_input.name}'),
+        ('dot component', f'{fixture}/./{approved_input.name}'),
         ('symlink', symlink_input),
         ('symlink component', symlink_parent / approved_input.name),
         ('hard link', hardlink_source),
@@ -339,6 +388,23 @@ except supervisor.BoundaryError as error:
         raise AssertionError('read-only input mount-point rejection was not specific') from error
 else:
     raise AssertionError('read-only input mount point was not rejected')
+
+
+protected_alias = root / 'target/gpu-denied-bind-alias-source'
+protected_alias.write_bytes(b'synthetic protected inode')
+try:
+    try:
+        # A real bind-directory alias preserves this one-link inode identity.
+        # Exercise the census directly without requiring a privileged host
+        # mount in the GPU-denied witness.
+        supervisor._reject_read_only_input_tree_alias(protected_alias.lstat(), root)
+    except supervisor.BoundaryError as error:
+        if 'aliases the protected worktree' not in str(error):
+            raise AssertionError('read-only input alias rejection was not specific') from error
+    else:
+        raise AssertionError('protected-tree inode alias was not rejected')
+finally:
+    protected_alias.unlink(missing_ok=True)
 
 
 read_descriptor, write_descriptor = os.pipe()

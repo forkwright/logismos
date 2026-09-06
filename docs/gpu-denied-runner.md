@@ -18,12 +18,12 @@ a pipe when launching it from a terminal.
 `--ro-input-file` admits one exact artifact as an explicit, read-only host
 input. It is for an invoker already authorized to disclose that file's contents
 to the requested command; standard output and error remain deliberate egress
-channels. It never mounts a model directory or exposes the host pathname
-inside the sandbox.
+channels. It never mounts a model directory or makes the host source pathname
+an accessible sandbox file path.
 
 ```bash
 scripts/gpu-denied-runner.sh --ro-input-file /canonical/path/to/model.gguf -- \
-  target/debug/logismos inspect --input "$LOGISMOS_GPU_DENIED_INPUT"
+  /bin/sh -ceu 'exec target/debug/logismos inspect --input "$LOGISMOS_GPU_DENIED_INPUT"'
 ```
 
 The option accepts only a canonical absolute, readable, single-link regular
@@ -34,6 +34,14 @@ synthetic input path and sets `LOGISMOS_GPU_DENIED_INPUT` from the same internal
 constant, so callers and receipts never need the private host path. The
 `inspect` JSON receipts intentionally expose selected parsed model facts and a
 digest, but no input path.
+
+This is not host-path confidentiality. The exact-file bind can expose source
+root/name metadata in `/proc/self/mountinfo`, and the Bubblewrap PID-1 command
+line currently retains its host source argument. Those details, and arbitrary
+child or Bubblewrap diagnostics, are outside the runner's path-free guarantee.
+Only supervisor validation errors and the `inspect` JSON receipt are specified
+to omit the host input path; the selected artifact contents are intentional
+invoker-authorized egress.
 
 ## Enforced boundary
 
