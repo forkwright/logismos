@@ -292,6 +292,7 @@ dependencies = [
  "sha2",
  "snafu",
  "tempfile",
+ "test-fixtures",
 ]
 
 [[package]]
