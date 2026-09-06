@@ -78,6 +78,15 @@ fn align_up_rounds_correctly() -> Result<()> {
 }
 
 #[test]
+fn q8_0_descriptor_geometry_comes_from_quant() {
+    assert_eq!(
+        GgmlType::Q8_0.block_layout(),
+        Some((quant::Q8_0_VALUES_PER_BLOCK, quant::Q8_0_BLOCK_BYTES)),
+        "loader Q8_0 extents must use quant's canonical block geometry"
+    );
+}
+
+#[test]
 #[cfg(feature = "tensor")]
 fn reads_fixture_bytes() -> Result<()> {
     let dir = tempdir_for_test();

@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 half = { workspace = true }
+snafu.workspace = true
 
 [lints]
 workspace = true

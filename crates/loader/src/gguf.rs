@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memmap2::Mmap;
+use quant::{Q8_0_BLOCK_BYTES, Q8_0_VALUES_PER_BLOCK};
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "tensor")]
@@ -171,13 +172,13 @@ impl GgmlType {
         })
     }
 
-    fn block_layout(self) -> Option<(u64, u64)> {
+    fn block_layout(self) -> Option<(usize, usize)> {
         Some(match self {
             Self::Q4_0 | Self::IQ4NL => (32, 18),
             Self::Q4_1 => (32, 20),
             Self::Q5_0 => (32, 22),
             Self::Q5_1 => (32, 24),
-            Self::Q8_0 => (32, 34),
+            Self::Q8_0 => (Q8_0_VALUES_PER_BLOCK, Q8_0_BLOCK_BYTES),
             Self::Q8_1 => (32, 36),
             Self::Q2K => (256, 84),
             Self::Q3K => (256, 110),
@@ -1275,7 +1276,7 @@ fn checked_element_count(desc: &TensorDescriptor) -> Result<u64> {
 }
 
 fn checked_byte_len(desc: &TensorDescriptor, elements: u64) -> Result<u64> {
-    if let Some((block_elements, block_bytes)) = desc.ggml_type.block_layout() {
+    if let Some((block_elements, block_bytes)) = checked_block_geometry(desc)? {
         let row_elements = desc.dims.first().copied().ok_or_else(|| {
             GgufSnafu {
                 offset: desc.data_offset,
@@ -1417,6 +1418,33 @@ fn align_up(offset: u64, alignment: u64) -> Result<u64> {
             }
             .build()
         })
+}
+
+fn checked_block_geometry(desc: &TensorDescriptor) -> Result<Option<(u64, u64)>> {
+    let Some((block_elements, block_bytes)) = desc.ggml_type.block_layout() else {
+        return Ok(None);
+    };
+    let block_elements = u64::try_from(block_elements).map_err(|_| {
+        GgufSnafu {
+            offset: desc.data_offset,
+            msg: format!(
+                "tensor `{}` block element geometry exceeds u64 for {:?}",
+                desc.name, desc.ggml_type
+            ),
+        }
+        .build()
+    })?;
+    let block_bytes = u64::try_from(block_bytes).map_err(|_| {
+        GgufSnafu {
+            offset: desc.data_offset,
+            msg: format!(
+                "tensor `{}` block byte geometry exceeds u64 for {:?}",
+                desc.name, desc.ggml_type
+            ),
+        }
+        .build()
+    })?;
+    Ok(Some((block_elements, block_bytes)))
 }
 
 fn metadata_string(metadata: &HashMap<String, MetaValue>, key: &str) -> Option<String> {
