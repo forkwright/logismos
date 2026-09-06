@@ -18,7 +18,7 @@ must not initialize a GPU, start a process, or reserve physical memory merely by
 | T1 Infrastructure | Kernels, quantization, tokenization, loading, and caching |
 | T2 Model families | Transformer operations and encoder/decoder implementations |
 | T3 Pipelines | End-to-end inference pipelines |
-| T4 Serving | Scheduling, sampling, and provider adapters |
+| T4 Serving | Scheduling, admission/residency coordination, sampling, and provider adapters |
 | T5 Entrypoint | Integration facade and binary |
 
 The exact crate inventory derives from `cargo metadata --format-version 1 --no-deps --locked`; it
@@ -34,8 +34,9 @@ semantically respects that boundary.
   pure parsing over the checked-in target token; it neither links nor probes HIP.
 - `hipcore`, `placement`, and `emulation` depend on `isa` so target-architecture
   identity and suffix syntax have one implementation.
-- `placement` has no HIP/device-runtime dependency; `bin` consumes it without
-  linking the device runtime for the `plan` command.
+- `placement` and `sched` have no HIP/device-runtime dependency. `bin` consumes
+  `placement` for `plan` and metadata-only `loader` for `inspect` without
+  linking the device runtime.
 - `emulation` is a CPU test aid, not a production device backend.
 - `taxis` depends locally on `hipcore`.
 - `kernels` depends locally on `hipcore` and `taxis`; it does not depend on `core`.
@@ -64,7 +65,12 @@ single-device plan.
 Artifact identity, execution-profile requests, memory estimates, host allowances, and observed
 residency are separate facts. Repeated profiles reference one artifact identity. Byte arithmetic
 is checked. A successful resource plan is an admission calculation, not a physical reservation,
-an optimal placement claim, or permission to stop another workload.
+an optimal placement claim, or permission to stop another workload. The CPU-only
+`placement::ReservationLedger` and `sched::Scheduler` add process-local,
+opaque-capability admission accounting after planning; they do not establish
+unique host ownership, allocate a device, or establish physical residency.
+Their detailed state protocol and proof limits belong to the `sched` rustdoc
+and canonical `projects/logismos/STATE.md`, not this overview.
 
 The host-mode compiler consumes resolved inference contracts rather than maintaining its own
 model-memory formula. Host inventories, external GPU consumers and operator policy stay private

@@ -32,7 +32,8 @@ See [CLAUDE.md](CLAUDE.md) for how to resolve the kanon checkout root on this bo
 - `crates/core/` - current stable public model trait (`EmbeddingModel`)
 - `crates/isa/` - pure configured target-ISA token and feature-suffix parser
 - `crates/hipcore/` - HIP FFI surface, device/stream/memory
-- `crates/placement/` - deterministic, action-free per-device resource plans
+- `crates/placement/` - deterministic action-free resource plans and process-local reservation accounting
+- `crates/sched/` - bounded CPU-only admission/residency coordination
 - `crates/emulation/` - bounded original CPU functional instruction witnesses
 - `crates/kernels/` - HIP + CPU reference kernels
 - `crates/transformers/` - transformer building blocks (attention, norms)
@@ -40,7 +41,8 @@ See [CLAUDE.md](CLAUDE.md) for how to resolve the kanon checkout root on this bo
 - `crates/embed/` - embedding pipeline
 - `crates/rerank/` - `Reranker` trait and cross-encoder implementations (GteReranker, ModernBERT CPU)
 - `crates/quant/` - quantization schemes (TurboQuant 3-bit)
-- `crates/loader/` - safetensors + GGUF v3 reader
+- `crates/loader/` - safetensors + bounded GGUF v3 observation
+- `crates/bin/` - CPU-only `plan` and typed GGUF `inspect` commands
 - `crates/tokenize/` - tokenizer facade
 - `crates/logismos/` - top-level integration facade
 

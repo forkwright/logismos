@@ -54,7 +54,7 @@ the precise threat model. Ordinary compilation is not a hardware-test permit.
 | Embedding model wiring | `crates/embed/` |
 | Reranker contract + implementations | `crates/rerank/` |
 | TTS pipeline component | `crates/tts/` |
-| Speculative-decoding scheduler | `crates/sched/` |
+| Scheduling and admission/residency coordination | `crates/sched/` |
 | Embedding-model public trait (`EmbeddingModel`) | `crates/core/` |
 | Provider adapter (HTTP/MCP) | `crates/hermeneus/` |
 | STT pipeline | `crates/ekphrasis/` |
