@@ -30,11 +30,13 @@ use loader::gguf::{MetaValue, VerifiedArtifact};
 use minijinja::{Environment, UndefinedBehavior, context};
 use minijinja_contrib::pycompat::unknown_method_callback;
 use serde::Serialize;
+use snafu::ResultExt;
 use tokenize::{TokenizerByteLimit, TokenizerIdentity, VerifiedTokenizer};
 
 use crate::error::{
-    AllocationSnafu, CancelledSnafu, DecoderSnafu, EmptyPromptSnafu, InvalidConfigurationSnafu,
-    LimitExceededSnafu, MetadataSnafu, SpecialTokenPolicySnafu, TemplateSnafu, TokenizerSnafu,
+    AllocationSnafu, CancelledSnafu, DecodeSnafu, DecoderSnafu, EmptyPromptSnafu,
+    InvalidConfigurationSnafu, LimitExceededSnafu, LogitShapeSnafu, MetadataSnafu,
+    RenderedUtf8Snafu, SpecialTokenPolicySnafu, TemplateSnafu, TokenizerSnafu,
     VocabularyMismatchSnafu,
 };
 
@@ -255,7 +257,7 @@ impl Cancellation for NeverCancelled {
 /// Validated artifact special-token policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SpecialTokenPolicy {
-    bos_id: u32,
+    bos_id: Option<u32>,
     eos_id: u32,
     add_bos: bool,
     add_eos: bool,
@@ -288,19 +290,14 @@ impl<'artifact> TextPipeline<'artifact> {
             companion.identity,
             limits.tokenizer_bytes,
         )
-        .map_err(|error| {
-            TokenizerSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })?;
+        .context(TokenizerSnafu)?;
         let metadata = artifact.observation().metadata();
         let template = metadata_string(metadata, CHAT_TEMPLATE_KEY)?;
         check_limit("template bytes", template.len(), limits.template_bytes)?;
         let special_tokens = verify_vocabulary(
             metadata,
             tokenizer.tokenizer(),
-            metadata_u32(metadata, BOS_TOKEN_ID_KEY)?,
+            metadata_optional_u32(metadata, BOS_TOKEN_ID_KEY)?,
             metadata_u32(metadata, EOS_TOKEN_ID_KEY)?,
             metadata_bool_or_false(metadata, ADD_BOS_TOKEN_KEY)?,
             metadata_bool_or_false(metadata, ADD_EOS_TOKEN_KEY)?,
@@ -308,12 +305,7 @@ impl<'artifact> TextPipeline<'artifact> {
             metadata_optional_u32(metadata, EOM_TOKEN_ID_KEY)?,
         )?;
         let environment = compile_template(template, limits)?;
-        let weights = Qwen35Weights::try_from_verified(artifact).map_err(|error| {
-            DecoderSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })?;
+        let weights = Qwen35Weights::try_from_verified(artifact).context(DecoderSnafu)?;
         Ok(Self {
             weights,
             tokenizer,
@@ -342,20 +334,18 @@ impl<'artifact> TextPipeline<'artifact> {
             .tokenizer
             .tokenizer()
             .encode(&rendered, false)
-            .map_err(|error| {
-                TokenizerSnafu {
-                    message: error.to_string(),
+            .context(TokenizerSnafu)?;
+        prompt.try_reserve(2).context(AllocationSnafu {
+            target: "prompt special-token prefix/suffix",
+        })?;
+        if self.special_tokens.add_bos {
+            let bos_id = self.special_tokens.bos_id.ok_or_else(|| {
+                SpecialTokenPolicySnafu {
+                    rule: "add_bos requires a declared BOS token ID",
                 }
                 .build()
             })?;
-        prompt.try_reserve(2).map_err(|_| {
-            AllocationSnafu {
-                target: "prompt special-token prefix/suffix",
-            }
-            .build()
-        })?;
-        if self.special_tokens.add_bos {
-            prompt.insert(0, self.special_tokens.bos_id);
+            prompt.insert(0, bos_id);
         }
         if self.special_tokens.add_eos {
             prompt.push(self.special_tokens.eos_id);
@@ -385,33 +375,15 @@ impl<'artifact> TextPipeline<'artifact> {
                 self.limits.context_tokens,
                 Qwen35LogitSelection::LastToken,
             )
-            .map_err(|error| {
-                DecoderSnafu {
-                    message: error.to_string(),
-                }
-                .build()
-            })?;
-        let mut execution = plan.execution().map_err(|error| {
-            DecoderSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })?;
+            .context(DecoderSnafu)?;
+        let mut execution = plan.execution().context(DecoderSnafu)?;
         check_cancelled(cancellation, "prompt decoder step")?;
-        let mut logits = execution.step(&prompt).map_err(|error| {
-            DecoderSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })?;
+        let mut logits = execution.step(&prompt).context(DecoderSnafu)?;
         let mut generated = Vec::new();
         generated
             .try_reserve_exact(request.max_output_tokens)
-            .map_err(|_| {
-                AllocationSnafu {
-                    target: "generated token IDs",
-                }
-                .build()
+            .context(AllocationSnafu {
+                target: "generated token IDs",
             })?;
         let finish_reason = loop {
             check_cancelled(cancellation, "greedy selection")?;
@@ -424,25 +396,16 @@ impl<'artifact> TextPipeline<'artifact> {
                 break FinishReason::Length;
             }
             check_cancelled(cancellation, "next decoder step")?;
-            logits = execution.step(&[next]).map_err(|error| {
-                DecoderSnafu {
-                    message: error.to_string(),
-                }
-                .build()
-            })?;
+            logits = execution.step(&[next]).context(DecoderSnafu)?;
         };
         check_cancelled(cancellation, "collective output decoding")?;
         let text = self
             .tokenizer
             .tokenizer()
             .decode(&generated, false)
-            .map_err(|error| {
-                TokenizerSnafu {
-                    message: error.to_string(),
-                }
-                .build()
-            })?;
+            .context(TokenizerSnafu)?;
         check_limit("decoded output bytes", text.len(), self.limits.output_bytes)?;
+        check_cancelled(cancellation, "publishing completed response")?;
         Ok(Generation {
             text,
             token_ids: generated,
@@ -512,13 +475,8 @@ impl<'artifact> TextPipeline<'artifact> {
         let template = self
             .environment
             .template_from_str(&self.template)
-            .map_err(|error| {
-                TemplateSnafu {
-                    message: error.to_string(),
-                }
-                .build()
-            })?;
-        let mut output = ByteCappedWriter::new(self.limits.rendered_bytes);
+            .context(TemplateSnafu)?;
+        let mut output = ByteCappedWriter::new(self.limits.rendered_bytes)?;
         let result = template.render_captured_to(
             context!(messages => request.messages, add_generation_prompt => true, enable_thinking => request.enable_thinking, tools => Vec::<()>::new()),
             &mut output,
@@ -531,12 +489,7 @@ impl<'artifact> TextPipeline<'artifact> {
             }
             .fail();
         }
-        result.map_err(|error| {
-            TemplateSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })?;
+        result.context(TemplateSnafu)?;
         output.into_string()
     }
 }
@@ -556,12 +509,9 @@ fn compile_template<'template>(
         }
         .fail();
     }
-    environment.template_from_str(template).map_err(|error| {
-        TemplateSnafu {
-            message: error.to_string(),
-        }
-        .build()
-    })?;
+    environment
+        .template_from_str(template)
+        .context(TemplateSnafu)?;
     Ok(environment)
 }
 
@@ -610,7 +560,7 @@ fn metadata_optional_u32(
 fn verify_vocabulary(
     metadata: &std::collections::HashMap<String, MetaValue>,
     tokenizer: &tokenize::Tokenizer,
-    bos_id: u32,
+    bos_id: Option<u32>,
     eos_id: u32,
     add_bos: bool,
     add_eos: bool,
@@ -643,8 +593,24 @@ fn verify_vocabulary(
             return VocabularyMismatchSnafu { id }.fail();
         }
     }
+    if add_bos && bos_id.is_none() {
+        return SpecialTokenPolicySnafu {
+            rule: "add_bos requires a declared BOS token ID",
+        }
+        .fail();
+    }
     let mut stop_ids = vec![eos_id];
-    for id in [bos_id, eos_id].into_iter().chain(eot_id).chain(eom_id) {
+    for id in eot_id.into_iter().chain(eom_id) {
+        if !stop_ids.contains(&id) {
+            stop_ids.push(id);
+        }
+    }
+    for id in bos_id
+        .into_iter()
+        .chain([eos_id])
+        .chain(eot_id)
+        .chain(eom_id)
+    {
         if values
             .get(usize::try_from(id).map_err(|_| {
                 SpecialTokenPolicySnafu {
@@ -660,21 +626,19 @@ fn verify_vocabulary(
             }
             .fail();
         }
-        if id != bos_id && !stop_ids.contains(&id) {
-            stop_ids.push(id);
-        }
         let token = tokenizer.id_to_token(id).ok_or_else(|| {
             SpecialTokenPolicySnafu {
                 rule: "declared special token has no tokenizer string",
             }
             .build()
         })?;
-        let encoded = tokenizer.encode(&token, false).map_err(|error| {
-            TokenizerSnafu {
-                message: error.to_string(),
+        if !tokenizer.is_special_token(id) {
+            return SpecialTokenPolicySnafu {
+                rule: "declared special token is not marked special by tokenizer.json",
             }
-            .build()
-        })?;
+            .fail();
+        }
+        let encoded = tokenizer.encode(&token, false).context(TokenizerSnafu)?;
         if encoded.as_slice() != [id] {
             return SpecialTokenPolicySnafu {
                 rule: "declared special token does not encode to exactly its artifact ID",
@@ -690,12 +654,7 @@ fn verify_vocabulary(
                 }
                 .fail();
             }
-            let encoded = tokenizer.encode(spelling, false).map_err(|error| {
-                TokenizerSnafu {
-                    message: error.to_string(),
-                }
-                .build()
-            })?;
+            let encoded = tokenizer.encode(spelling, false).context(TokenizerSnafu)?;
             if encoded.as_slice() != [id] {
                 return SpecialTokenPolicySnafu {
                     rule: "a recognized Qwen EOG spelling must encode to exactly its token ID",
@@ -718,24 +677,21 @@ fn verify_vocabulary(
 
 fn greedy_last_logits(logits: &[f32], vocabulary: usize) -> Result<u32> {
     if logits.len() != vocabulary {
-        return DecoderSnafu {
-            message: "decoder returned logits with an unexpected shape".to_owned(),
+        return LogitShapeSnafu {
+            actual: logits.len(),
+            expected: vocabulary,
         }
         .fail();
     }
-    let index = decode::greedy(logits).map_err(|error| {
-        DecoderSnafu {
-            message: error.to_string(),
-        }
-        .build()
-    })?;
+    let index = decode::greedy(logits).context(DecodeSnafu)?;
     if usize::try_from(index)
         .ok()
         .filter(|index| *index < vocabulary)
         .is_none()
     {
-        return DecoderSnafu {
-            message: "greedy sampler selected an out-of-range token ID".to_owned(),
+        return LogitShapeSnafu {
+            actual: usize::try_from(index).unwrap_or(usize::MAX),
+            expected: vocabulary,
         }
         .fail();
     }
@@ -769,21 +725,20 @@ struct ByteCappedWriter {
 }
 
 impl ByteCappedWriter {
-    fn new(maximum: usize) -> Self {
-        Self {
-            output: Vec::new(),
+    fn new(maximum: usize) -> Result<Self> {
+        let mut output = Vec::new();
+        output.try_reserve_exact(maximum).context(AllocationSnafu {
+            target: "rendered template bytes",
+        })?;
+        Ok(Self {
+            output,
             maximum,
             attempted: 0,
             exceeded: false,
-        }
+        })
     }
     fn into_string(self) -> Result<String> {
-        String::from_utf8(self.output).map_err(|error| {
-            TemplateSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })
+        String::from_utf8(self.output).context(RenderedUtf8Snafu)
     }
 }
 
@@ -814,6 +769,7 @@ mod tests {
     use std::num::{NonZeroU64, NonZeroUsize};
 
     use loader::gguf::{ArtifactByteLimit, Sha256Digest};
+    use minijinja::ErrorKind;
     use sha2::{Digest, Sha256};
     use test_fixtures::{Qwen35FixtureConfig, build_qwen35_fixture};
     use tokenize::TokenizerDigest;
@@ -821,6 +777,7 @@ mod tests {
     use super::*;
 
     const TOKENS: [&str; 5] = ["[UNK]", "<bos>", "<eos>", "hello", "assistant"];
+    type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
     fn test_limits(tokenizer_bytes: usize) -> std::result::Result<PipelineLimits, std::io::Error> {
         let tokenizer_bytes = NonZeroUsize::new(tokenizer_bytes).ok_or_else(|| {
@@ -858,7 +815,7 @@ mod tests {
         greedy_token_id: u32,
         add_bos: bool,
         add_eos: bool,
-    ) -> Result<(tempfile::TempDir, VerifiedArtifact)> {
+    ) -> TestResult<(tempfile::TempDir, VerifiedArtifact)> {
         let fixture = build_qwen35_fixture(&Qwen35FixtureConfig {
             tokens: TOKENS.iter().map(|token| (*token).to_owned()).collect(),
             bos_token_id: 1,
@@ -869,77 +826,48 @@ mod tests {
                 .to_owned(),
             greedy_token_id,
         })
-        .map_err(|message| TemplateSnafu { message }.build())?;
-        let directory = tempfile::tempdir().map_err(|error| {
-            TemplateSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })?;
+        .map_err(std::io::Error::other)?;
+        let directory = tempfile::tempdir()?;
         let path = directory.path().join("synthetic.gguf");
-        std::fs::write(&path, &fixture.bytes).map_err(|error| {
-            TemplateSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })?;
-        let limit = NonZeroU64::new(fixture.byte_len).ok_or_else(|| {
-            InvalidConfigurationSnafu {
-                rule: "synthetic fixture must have a non-zero byte length",
-            }
-            .build()
-        })?;
+        std::fs::write(&path, &fixture.bytes)?;
+        let limit = NonZeroU64::new(fixture.byte_len)
+            .ok_or_else(|| std::io::Error::other("synthetic fixture has zero byte length"))?;
         let artifact = VerifiedArtifact::load(
             &path,
             Sha256Digest::from_bytes(fixture.sha256),
             ArtifactByteLimit::new(limit),
-        )
-        .map_err(|error| {
-            DecoderSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })?;
+        )?;
         Ok((directory, artifact))
     }
 
-    fn pipeline_for(artifact: &VerifiedArtifact) -> Result<TextPipeline<'_>> {
+    fn pipeline_for(artifact: &VerifiedArtifact) -> TestResult<TextPipeline<'_>> {
         let tokenizer_json = tokenizer_json();
         let digest = TokenizerDigest::from_bytes(Sha256::digest(tokenizer_json.as_bytes()).into());
-        TextPipeline::new(
+        Ok(TextPipeline::new(
             artifact,
             TokenizerCompanion::new(
                 tokenizer_json.as_bytes(),
                 TokenizerIdentity::new(tokenizer_json.len(), digest),
             ),
-            test_limits(tokenizer_json.len()).map_err(|error| {
-                TemplateSnafu {
-                    message: error.to_string(),
-                }
-                .build()
-            })?,
-        )
+            test_limits(tokenizer_json.len())?,
+        )?)
     }
     #[test]
     fn crate_identity_matches_role() {
         assert_eq!(env!("CARGO_PKG_NAME"), CRATE_NAME);
     }
     #[test]
-    fn capped_writer_refuses_overflow_without_partial_chunk() {
-        let mut writer = ByteCappedWriter::new(3);
+    fn capped_writer_refuses_overflow_without_partial_chunk() -> TestResult<()> {
+        let mut writer = ByteCappedWriter::new(3)?;
         assert_eq!(writer.write(b"ok").ok(), Some(2));
         assert!(writer.write(b"no").is_err());
         assert_eq!(writer.output, b"ok");
+        Ok(())
     }
 
     #[test]
-    fn template_limits_refuse_fuel_overflow_and_silent_recursion_cap() -> Result<()> {
-        let mut limits = test_limits(1).map_err(|error| {
-            TemplateSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })?;
+    fn template_limits_refuse_fuel_overflow_and_silent_recursion_cap() -> TestResult<()> {
+        let mut limits = test_limits(1)?;
         limits.template_fuel = u64::MAX;
         assert!(matches!(
             limits.validate(),
@@ -955,16 +883,8 @@ mod tests {
     }
 
     #[test]
-    fn template_resolution_has_no_registered_or_host_loader_authority() -> Result<()> {
-        let environment = compile_template(
-            "hello",
-            test_limits(1).map_err(|error| {
-                TemplateSnafu {
-                    message: error.to_string(),
-                }
-                .build()
-            })?,
-        )?;
+    fn template_resolution_has_no_registered_or_host_loader_authority() -> TestResult<()> {
+        let environment = compile_template("hello", test_limits(1)?)?;
         for source in [
             "{% include 'missing' %}",
             "{% set target = 'missing' %}{% include target %}",
@@ -973,95 +893,26 @@ mod tests {
             "{% extends 'missing' %}{% block body %}x{% endblock %}",
             "{% extends '<string>' %}{% block body %}x{% endblock %}",
         ] {
-            let template = environment.template_from_str(source).map_err(|error| {
-                TemplateSnafu {
-                    message: error.to_string(),
-                }
-                .build()
-            })?;
+            let template = environment.template_from_str(source)?;
             assert!(
-                template.render(()).is_err(),
+                matches!(
+                    template.render(()),
+                    Err(error) if error.kind() == ErrorKind::TemplateNotFound
+                ),
                 "source unexpectedly resolved: {source}"
             );
         }
         let ignored = environment
-            .template_from_str("a{% include 'missing' ignore missing %}b")
-            .map_err(|error| {
-                TemplateSnafu {
-                    message: error.to_string(),
-                }
-                .build()
-            })?
-            .render(())
-            .map_err(|error| {
-                TemplateSnafu {
-                    message: error.to_string(),
-                }
-                .build()
-            })?;
+            .template_from_str("a{% include 'missing' ignore missing %}b")?
+            .render(())?;
         assert_eq!(ignored, "ab");
         Ok(())
     }
 
     #[test]
-    fn verified_gguf_template_tokenizer_and_greedy_generation_are_bound() -> Result<()> {
-        let tokenizer_json = tokenizer_json();
-        let tokenizer_digest =
-            TokenizerDigest::from_bytes(Sha256::digest(tokenizer_json.as_bytes()).into());
-        let fixture = build_qwen35_fixture(&Qwen35FixtureConfig {
-            tokens: TOKENS.iter().map(|token| (*token).to_owned()).collect(),
-            bos_token_id: 1,
-            eos_token_id: 2,
-            add_bos: true,
-            add_eos: false,
-            chat_template: "{% if messages[0].content.startswith('h') %}hello{% endif %}"
-                .to_owned(),
-            greedy_token_id: 3,
-        })
-        .map_err(|message| TemplateSnafu { message }.build())?;
-        let directory = tempfile::tempdir().map_err(|error| {
-            TemplateSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })?;
-        let path = directory.path().join("synthetic.gguf");
-        std::fs::write(&path, &fixture.bytes).map_err(|error| {
-            TemplateSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })?;
-        let limit = NonZeroU64::new(fixture.byte_len).ok_or_else(|| {
-            InvalidConfigurationSnafu {
-                rule: "synthetic fixture must have a non-zero byte length",
-            }
-            .build()
-        })?;
-        let artifact = VerifiedArtifact::load(
-            &path,
-            Sha256Digest::from_bytes(fixture.sha256),
-            ArtifactByteLimit::new(limit),
-        )
-        .map_err(|error| {
-            DecoderSnafu {
-                message: error.to_string(),
-            }
-            .build()
-        })?;
-        let pipeline = TextPipeline::new(
-            &artifact,
-            TokenizerCompanion::new(
-                tokenizer_json.as_bytes(),
-                TokenizerIdentity::new(tokenizer_json.len(), tokenizer_digest),
-            ),
-            test_limits(tokenizer_json.len()).map_err(|error| {
-                TemplateSnafu {
-                    message: error.to_string(),
-                }
-                .build()
-            })?,
-        )?;
+    fn verified_gguf_template_tokenizer_and_greedy_generation_are_bound() -> TestResult<()> {
+        let (_directory, artifact) = verified_artifact(3, true, false)?;
+        let pipeline = pipeline_for(&artifact)?;
         let messages = [TextMessage::new(TextRole::User, "hello")];
         let generation =
             pipeline.generate(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
@@ -1072,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn eos_stops_before_collective_decoding() -> Result<()> {
+    fn eos_stops_before_collective_decoding() -> TestResult<()> {
         let (_directory, artifact) = verified_artifact(2, false, false)?;
         let pipeline = pipeline_for(&artifact)?;
         let messages = [TextMessage::new(TextRole::User, "hello")];
@@ -1085,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_after_prompt_step_returns_no_response_or_shared_state() -> Result<()> {
+    fn cancellation_after_prompt_step_returns_no_response_or_shared_state() -> TestResult<()> {
         struct CancelOnThirdCheck(std::cell::Cell<usize>);
         impl Cancellation for CancelOnThirdCheck {
             fn is_cancelled(&self) -> bool {

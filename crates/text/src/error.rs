@@ -15,6 +15,8 @@ pub enum Error {
     Allocation {
         /// Allocation purpose.
         target: &'static str,
+        /// Allocation failure returned by the standard library.
+        source: std::collections::TryReserveError,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
@@ -51,30 +53,62 @@ pub enum Error {
     },
 
     /// Template compilation or rendering failed.
-    #[snafu(display("text chat template failed: {message}"))]
+    #[snafu(display("text chat template failed: {source}"))]
     Template {
-        /// Sanitized template-engine error text.
-        message: String,
+        /// Template engine failure retaining its error chain.
+        source: minijinja::Error,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
     },
 
     /// Tokenizer parsing, encoding, or decoding failed.
-    #[snafu(display("text tokenizer failed: {message}"))]
+    #[snafu(display("text tokenizer failed: {source}"))]
     Tokenizer {
-        /// Sanitized tokenizer error text.
-        message: String,
+        /// Tokenizer failure retaining its error chain.
+        source: tokenize::Error,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
     },
 
     /// The artifact-bound decoder session failed.
-    #[snafu(display("text decoder failed: {message}"))]
+    #[snafu(display("text decoder failed: {source}"))]
     Decoder {
-        /// Sanitized decoder error text.
-        message: String,
+        /// Decoder failure retaining its error chain.
+        source: decoders::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The checked greedy sampler rejected decoder logits.
+    #[snafu(display("text greedy selection failed: {source}"))]
+    Decode {
+        /// Checked sampler failure retaining its error chain.
+        source: decode::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Decoder logits did not contain the single bounded vocabulary row.
+    #[snafu(display("text decoder logits have length {actual}, expected {expected}"))]
+    LogitShape {
+        /// Actual logit count.
+        actual: usize,
+        /// Required exact vocabulary width.
+        expected: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Rendered bytes violated the UTF-8 invariant required by a text template.
+    #[snafu(display("text template emitted invalid UTF-8: {source}"))]
+    RenderedUtf8 {
+        /// UTF-8 conversion failure retaining its error chain.
+        source: std::string::FromUtf8Error,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
