@@ -497,8 +497,8 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_refusals_preserve_pristine_retry_and_stable_translation()
-    -> std::result::Result<(), Box<dyn StdError>> {
+    fn qwen3_refuses_invalid_setup_and_request_limits() -> std::result::Result<(), Box<dyn StdError>>
+    {
         let artifact = artifact(&fixture()?)?;
         assert!(matches!(
             Qwen3EmbeddingModel::from_verified_cpu(
@@ -524,7 +524,6 @@ mod tests {
             Qwen3RolePrefixes::default(),
         )?;
         let opts = EncodeOpts::default();
-        let first = model.encode_cpu("alice", &opts)?;
         assert!(matches!(
             model.encode_cpu("", &opts),
             Err(crate::error::Error::EmptyInput { .. })
@@ -573,6 +572,24 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn qwen3_batch_limits_preserve_pristine_retry() -> std::result::Result<(), Box<dyn StdError>> {
+        let artifact = artifact(&fixture()?)?;
+        let model = Qwen3EmbeddingModel::from_verified_cpu(
+            &artifact,
+            verified_tokenizer(TokenizerModel::WordLevel)?,
+            Qwen3EmbeddingLimits {
+                max_text_bytes: 20,
+                max_tokens: 3,
+                max_batch_items: 3,
+            },
+            Qwen3RolePrefixes::default(),
+        )?;
+        let opts = EncodeOpts::default();
+        let first = model.encode_cpu("alice", &opts)?;
         let over_batch = ["alice", "alice", "alice", "alice"];
         assert!(matches!(
             model.encode_batch_cpu(&over_batch, &opts),
