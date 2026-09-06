@@ -41,6 +41,8 @@ pub struct Qwen3EmbeddingLimits {
     pub max_text_bytes: usize,
     /// Maximum token IDs after prefix and GGUF-declared special-token policy.
     pub max_tokens: usize,
+    /// Maximum input objects accepted by one bounded batch request.
+    pub max_batch_items: usize,
 }
 
 /// Artifact-bound CPU Qwen3 embedding model with last-token pooling.
@@ -67,9 +69,9 @@ impl<'artifact> Qwen3EmbeddingModel<'artifact> {
         limits: Qwen3EmbeddingLimits,
         prefixes: Qwen3RolePrefixes,
     ) -> Result<Self> {
-        if limits.max_text_bytes == 0 || limits.max_tokens == 0 {
+        if limits.max_text_bytes == 0 || limits.max_tokens == 0 || limits.max_batch_items == 0 {
             return InvalidLimitsSnafu {
-                rule: "setup byte and token limits must be nonzero",
+                rule: "setup byte, token, and batch-item limits must be nonzero",
             }
             .fail();
         }
@@ -127,7 +129,7 @@ impl<'artifact> Qwen3EmbeddingModel<'artifact> {
             tokenizer,
             max_text_bytes: limits.max_text_bytes,
             max_tokens: limits.max_tokens,
-            max_batch_items: limits.max_text_bytes.min(limits.max_tokens),
+            max_batch_items: limits.max_batch_items,
             prefixes,
             bos,
             eos,
@@ -449,6 +451,7 @@ mod tests {
         let limits = Qwen3EmbeddingLimits {
             max_text_bytes: 32,
             max_tokens: 4,
+            max_batch_items: 4,
         };
         let prefixes = Qwen3RolePrefixes {
             s2s_query: Some("alice ".to_owned()),
@@ -497,12 +500,26 @@ mod tests {
     fn qwen3_refusals_preserve_pristine_retry_and_stable_translation()
     -> std::result::Result<(), Box<dyn StdError>> {
         let artifact = artifact(&fixture()?)?;
+        assert!(matches!(
+            Qwen3EmbeddingModel::from_verified_cpu(
+                &artifact,
+                verified_tokenizer(TokenizerModel::WordLevel)?,
+                Qwen3EmbeddingLimits {
+                    max_text_bytes: 20,
+                    max_tokens: 3,
+                    max_batch_items: 0,
+                },
+                Qwen3RolePrefixes::default(),
+            ),
+            Err(crate::error::Error::InvalidLimits { .. })
+        ));
         let model = Qwen3EmbeddingModel::from_verified_cpu(
             &artifact,
             verified_tokenizer(TokenizerModel::WordLevel)?,
             Qwen3EmbeddingLimits {
                 max_text_bytes: 20,
                 max_tokens: 3,
+                max_batch_items: 3,
             },
             Qwen3RolePrefixes::default(),
         )?;
@@ -566,9 +583,9 @@ mod tests {
             })
         ));
         assert_eq!(model.encode_cpu("alice", &opts)?, first);
-        let batch = ["alice", "bob"];
+        let batch = ["alice", "bob", "alice"];
         let vectors = EmbeddingModel::encode_batch(&model, &batch, &opts)?;
-        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors.len(), 3);
         assert!(vectors.iter().flatten().all(|value| value.is_finite()));
         Ok(())
     }
@@ -593,6 +610,7 @@ mod tests {
             Qwen3EmbeddingLimits {
                 max_text_bytes: 32,
                 max_tokens: 4,
+                max_batch_items: 4,
             },
             Qwen3RolePrefixes::default(),
         ) else {
