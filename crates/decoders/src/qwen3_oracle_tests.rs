@@ -3,7 +3,7 @@
 //! The composition contract is pinned to `ggml-org/llama.cpp` revision
 //! `6a1a922d269908a29cbd4b49c27e6a8e7fd10fae`,
 //! `src/models/qwen3.cpp:18-45,76-155`. This test owns its raw F32/Q8 decode
-//! and numerical oracle and calls no production math, quantization, or RoPE helper.
+//! and numerical oracle and calls no production math, quantization, or `RoPE` helper.
 
 use std::num::NonZeroU64;
 
@@ -64,54 +64,45 @@ enum Fault {
     FirstTokenPool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Pairing {
-    SplitHalf,
-    Adjacent,
-}
+impl Fault {
+    const fn uses_causal_attention(self) -> bool {
+        !matches!(self, Self::NonCausal)
+    }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MatrixOrder {
-    OutputRows,
-    InputRows,
-}
+    const fn uses_modulo_gqa(self) -> bool {
+        matches!(self, Self::ModuloGqa)
+    }
 
-#[derive(Clone, Copy, Debug)]
-struct OraclePolicy {
-    causal: bool,
-    modulo_gqa: bool,
-    pairing: Pairing,
-    qk_norm: bool,
-    matrix_order: MatrixOrder,
-    swap_ffn_branches: bool,
-    attention_residual: bool,
-    ffn_residual: bool,
-    final_norm: bool,
-    first_token: bool,
-}
+    const fn uses_adjacent_rope(self) -> bool {
+        matches!(self, Self::AdjacentRope)
+    }
 
-impl OraclePolicy {
-    const fn for_fault(fault: Fault) -> Self {
-        Self {
-            causal: !matches!(fault, Fault::NonCausal),
-            modulo_gqa: matches!(fault, Fault::ModuloGqa),
-            pairing: if matches!(fault, Fault::AdjacentRope) {
-                Pairing::Adjacent
-            } else {
-                Pairing::SplitHalf
-            },
-            qk_norm: !matches!(fault, Fault::MissingQkNorm),
-            matrix_order: if matches!(fault, Fault::ColumnMajorMatrices) {
-                MatrixOrder::InputRows
-            } else {
-                MatrixOrder::OutputRows
-            },
-            swap_ffn_branches: matches!(fault, Fault::SwappedFfnBranches),
-            attention_residual: !matches!(fault, Fault::MissingAttentionResidual),
-            ffn_residual: !matches!(fault, Fault::MissingFfnResidual),
-            final_norm: !matches!(fault, Fault::MissingFinalNorm),
-            first_token: matches!(fault, Fault::FirstTokenPool),
-        }
+    const fn applies_qk_norm(self) -> bool {
+        !matches!(self, Self::MissingQkNorm)
+    }
+
+    const fn uses_input_major_matrices(self) -> bool {
+        matches!(self, Self::ColumnMajorMatrices)
+    }
+
+    const fn swaps_ffn_branches(self) -> bool {
+        matches!(self, Self::SwappedFfnBranches)
+    }
+
+    const fn applies_attention_residual(self) -> bool {
+        !matches!(self, Self::MissingAttentionResidual)
+    }
+
+    const fn applies_ffn_residual(self) -> bool {
+        !matches!(self, Self::MissingFfnResidual)
+    }
+
+    const fn applies_final_norm(self) -> bool {
+        !matches!(self, Self::MissingFinalNorm)
+    }
+
+    const fn pools_first_token(self) -> bool {
+        matches!(self, Self::FirstTokenPool)
     }
 }
 
@@ -434,7 +425,6 @@ fn verify_fixture(raw: &RawGguf) -> TestResult<VerifiedArtifact> {
 }
 
 fn oracle_last_hidden(raw: &RawGguf, token_ids: &[u32], fault: Fault) -> TestResult<Vec<f64>> {
-    let policy = OraclePolicy::for_fault(fault);
     let embedding = decode_matrix(raw, "token_embd.weight")?;
     let mut hidden = Vec::new();
     for token_id in token_ids {
@@ -442,9 +432,9 @@ fn oracle_last_hidden(raw: &RawGguf, token_ids: &[u32], fault: Fault) -> TestRes
         hidden.push(matrix_row(&embedding, token)?.to_vec());
     }
     for block in 0..BLOCKS {
-        hidden = oracle_block(raw, block, &hidden, policy)?;
+        hidden = oracle_block(raw, block, &hidden, fault)?;
     }
-    let normalized = if policy.final_norm {
+    let normalized = if fault.applies_final_norm() {
         let weights = decode_vector(raw, "output_norm.weight", HIDDEN)?;
         hidden
             .iter()
@@ -453,7 +443,7 @@ fn oracle_last_hidden(raw: &RawGguf, token_ids: &[u32], fault: Fault) -> TestRes
     } else {
         hidden
     };
-    let selected = if policy.first_token {
+    let selected = if fault.pools_first_token() {
         0
     } else {
         normalized
@@ -467,15 +457,11 @@ fn oracle_last_hidden(raw: &RawGguf, token_ids: &[u32], fault: Fault) -> TestRes
         .ok_or_else(|| "oracle pooled row is outside the token sequence".to_string())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the independent oracle keeps source-ordered attention and FFN composition visible"
-)]
 fn oracle_block(
     raw: &RawGguf,
     block: usize,
     hidden: &[Vec<f64>],
-    policy: OraclePolicy,
+    fault: Fault,
 ) -> TestResult<Vec<Vec<f64>>> {
     let attention_norm = decode_vector(raw, &block_name(block, "attn_norm.weight"), HIDDEN)?;
     let query_norm = decode_vector(
@@ -498,15 +484,15 @@ fn oracle_block(
     let mut values = Vec::new();
     for (position, row) in hidden.iter().enumerate() {
         let normalized = rms_norm(row, &attention_norm)?;
-        let mut query = project(&query_matrix, &normalized, policy.matrix_order)?;
-        let mut key = project(&key_matrix, &normalized, policy.matrix_order)?;
-        let value = project(&value_matrix, &normalized, policy.matrix_order)?;
-        if policy.qk_norm {
+        let mut query = project(&query_matrix, &normalized, fault)?;
+        let mut key = project(&key_matrix, &normalized, fault)?;
+        let value = project(&value_matrix, &normalized, fault)?;
+        if fault.applies_qk_norm() {
             normalize_heads(&mut query, QUERY_HEADS, &query_norm)?;
             normalize_heads(&mut key, KEY_VALUE_HEADS, &key_norm)?;
         }
-        apply_rope(&mut query, QUERY_HEADS, position, policy.pairing)?;
-        apply_rope(&mut key, KEY_VALUE_HEADS, position, policy.pairing)?;
+        apply_rope(&mut query, QUERY_HEADS, position, fault)?;
+        apply_rope(&mut key, KEY_VALUE_HEADS, position, fault)?;
         queries.push(query);
         keys.push(key);
         values.push(value);
@@ -514,9 +500,9 @@ fn oracle_block(
 
     let mut post_attention = Vec::new();
     for token in 0..hidden.len() {
-        let merged = oracle_attention(token, &queries, &keys, &values, policy)?;
-        let projected = project(&output_matrix, &merged, policy.matrix_order)?;
-        post_attention.push(if policy.attention_residual {
+        let merged = oracle_attention(token, &queries, &keys, &values, fault)?;
+        let projected = project(&output_matrix, &merged, fault)?;
+        post_attention.push(if fault.applies_attention_residual() {
             add_vectors(
                 hidden
                     .get(token)
@@ -535,9 +521,9 @@ fn oracle_block(
     let mut output = Vec::new();
     for row in &post_attention {
         let normalized = rms_norm(row, &ffn_norm)?;
-        let gate_values = project(&gate, &normalized, policy.matrix_order)?;
-        let up_values = project(&up, &normalized, policy.matrix_order)?;
-        let (activated, linear) = if policy.swap_ffn_branches {
+        let gate_values = project(&gate, &normalized, fault)?;
+        let up_values = project(&up, &normalized, fault)?;
+        let (activated, linear) = if fault.swaps_ffn_branches() {
             (up_values, gate_values)
         } else {
             (gate_values, up_values)
@@ -547,8 +533,8 @@ fn oracle_block(
             .zip(&linear)
             .map(|(gate_value, up_value)| silu(*gate_value) * up_value)
             .collect::<Vec<_>>();
-        let projected = project(&down, &fused, policy.matrix_order)?;
-        output.push(if policy.ffn_residual {
+        let projected = project(&down, &fused, fault)?;
+        output.push(if fault.applies_ffn_residual() {
             add_vectors(row, &projected)?
         } else {
             projected
@@ -563,15 +549,19 @@ fn oracle_attention(
     queries: &[Vec<f64>],
     keys: &[Vec<f64>],
     values: &[Vec<f64>],
-    policy: OraclePolicy,
+    fault: Fault,
 ) -> TestResult<Vec<f64>> {
     let query = queries.get(token).ok_or("oracle query token is missing")?;
-    let token_count = if policy.causal { token + 1 } else { keys.len() };
+    let token_count = if fault.uses_causal_attention() {
+        token + 1
+    } else {
+        keys.len()
+    };
     let group = QUERY_HEADS / KEY_VALUE_HEADS;
     let scale = f64_from_usize(HEAD_DIMENSION)?.sqrt().recip();
     let mut merged = Vec::new();
     for query_head in 0..QUERY_HEADS {
-        let key_value_head = if policy.modulo_gqa {
+        let key_value_head = if fault.uses_modulo_gqa() {
             query_head % KEY_VALUE_HEADS
         } else {
             query_head / group
@@ -626,12 +616,7 @@ fn normalize_heads(values: &mut [f64], heads: usize, weights: &[f64]) -> TestRes
     Ok(())
 }
 
-fn apply_rope(
-    values: &mut [f64],
-    heads: usize,
-    position: usize,
-    pairing: Pairing,
-) -> TestResult<()> {
+fn apply_rope(values: &mut [f64], heads: usize, position: usize, fault: Fault) -> TestResult<()> {
     if values.len() != heads * HEAD_DIMENSION {
         return Err("oracle RoPE received the wrong head geometry".to_string());
     }
@@ -641,9 +626,10 @@ fn apply_rope(
         for pair in 0..HEAD_DIMENSION / 2 {
             let pair_value = f64_from_usize(pair)?;
             let angle = position / f64::from(ROPE_BASE).powf(2.0 * pair_value / head_dimension);
-            let (left, right) = match pairing {
-                Pairing::SplitHalf => (pair, pair + HEAD_DIMENSION / 2),
-                Pairing::Adjacent => (pair * 2, pair * 2 + 1),
+            let (left, right) = if fault.uses_adjacent_rope() {
+                (pair * 2, pair * 2 + 1)
+            } else {
+                (pair, pair + HEAD_DIMENSION / 2)
             };
             let left_value = *head.get(left).ok_or("oracle RoPE left lane is missing")?;
             let right_value = *head.get(right).ok_or("oracle RoPE right lane is missing")?;
@@ -708,7 +694,7 @@ fn dot(left: &[f64], right: &[f64]) -> TestResult<f64> {
         .ok_or_else(|| "oracle dot product became non-finite".to_string())
 }
 
-fn project(matrix: &Matrix, input: &[f64], order: MatrixOrder) -> TestResult<Vec<f64>> {
+fn project(matrix: &Matrix, input: &[f64], fault: Fault) -> TestResult<Vec<f64>> {
     if input.len() != matrix.input {
         return Err("oracle projection input width is inconsistent".to_string());
     }
@@ -716,13 +702,13 @@ fn project(matrix: &Matrix, input: &[f64], order: MatrixOrder) -> TestResult<Vec
     for row in 0..matrix.output {
         let mut value = 0.0;
         for (column, activation) in input.iter().enumerate() {
-            let index = match order {
-                MatrixOrder::OutputRows => row
-                    .checked_mul(matrix.input)
-                    .and_then(|value| value.checked_add(column)),
-                MatrixOrder::InputRows => column
+            let index = if fault.uses_input_major_matrices() {
+                column
                     .checked_mul(matrix.output)
-                    .and_then(|value| value.checked_add(row)),
+                    .and_then(|value| value.checked_add(row))
+            } else {
+                row.checked_mul(matrix.input)
+                    .and_then(|value| value.checked_add(column))
             }
             .ok_or("oracle matrix index overflow")?;
             let weight = matrix
