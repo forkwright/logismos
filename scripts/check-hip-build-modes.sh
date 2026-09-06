@@ -116,6 +116,26 @@ OUT="$ROOT/target/hip-build-mode-witness"
             exit 1
         fi
         grep -F "LOGISMOS_SKIP_HIP_BUILD is retired" "$out/no-gpu-retired.log"
+
+        # WHY: Build-script fixtures alone cannot detect a consumer re-enabling
+        # the GPU feature through Cargo feature unification.
+        cd "$root"
+        cargo tree --offline --locked -p kernels --no-default-features --features gpu \
+            --edges normal,build --prefix none --format "{p}" >"$out/gpu-dependencies.log"
+        if ! grep -Eq "^(hipcore|taxis) " "$out/gpu-dependencies.log"; then
+            echo "GPU dependency witness failed to observe its forbidden case" >&2
+            exit 1
+        fi
+        cargo tree --offline --locked --no-default-features \
+            -p kernels -p transformers -p decoders \
+            --edges normal,build --prefix none --format "{p}" >"$out/cpu-dependencies.log"
+        if grep -Eq "^(hipcore|taxis) " "$out/cpu-dependencies.log"; then
+            echo "CPU consumers acquired a GPU runtime dependency" >&2
+            exit 1
+        fi
+        env -u LOGISMOS_HIP_BUILD HIPCC=/not-a-hipcc \
+            cargo check --offline --locked --no-default-features \
+                -p kernels -p transformers -p decoders --lib
     ' /bin/sh "$ROOT" "$OUT" </dev/null
 } 2>&1 | /usr/bin/cat
 

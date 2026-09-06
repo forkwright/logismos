@@ -150,8 +150,10 @@ enabled, build mode is selected with `LOGISMOS_HIP_BUILD`:
   kernel archive.
 
 An unset mode selects `required` when the GPU feature is enabled. Without
-that feature, only the CPU modules compile and the HIP archive is absent;
-an explicit `required` mode is a contradictory request and fails. Invalid
+that feature, the standalone `cpu_f32`, `gdn`, and `causal_conv` modules compile
+and the HIP archive is absent; launcher modules and their nested references
+are not exposed. An
+explicit `required` mode is a contradictory request and fails. Invalid
 modes and the retired `LOGISMOS_SKIP_HIP_BUILD` variable fail in either
 feature set. The build-mode witness proves those refusals and CPU-only
 execution inside the boundary without invoking a HIP compiler or device
@@ -160,7 +162,9 @@ runtime.
 Direct `kernels` users retain the default GPU feature. Workspace consumers
 select GPU launchers explicitly; CPU consumers disable default features.
 Cargo unifies features within a dependency graph, so mixing a GPU consumer
-with a CPU consumer can enable HIP for both. A minimal-graph check and the
+with a CPU consumer can enable HIP for both. The build-mode witness also
+checks the standalone CPU consumers' dependency graph and compiles their
+libraries with no GPU feature and no HIP compiler. A minimal-graph check and the
 OS-enforced runner prove different properties; neither replaces the other.
 
 The runner discovers libclang without executing an ambient program. It checks

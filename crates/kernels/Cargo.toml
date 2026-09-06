@@ -10,8 +10,8 @@ publish = false
 [features]
 # Preserve the established launcher API for direct/default `kernels` users.
 default = ["gpu"]
-# HIP launchers and their tensor/HIP error vocabulary. CPU references remain
-# available without this feature and never become an implicit launcher fallback.
+# HIP launcher modules, their nested references, and tensor/HIP error vocabulary.
+# Standalone cpu_f32, gdn, and causal_conv modules do not require this feature.
 gpu = ["dep:hipcore", "dep:taxis"]
 
 [dependencies]

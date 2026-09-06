@@ -44,7 +44,8 @@ semantically respects that boundary.
 - `emulation` is a CPU test aid, not a production device backend.
 - `taxis` depends locally on `hipcore`.
 - `kernels/gpu` enables the local `hipcore` and `taxis` dependencies and GPU
-  launcher modules. Its CPU references remain available without that feature;
+  launcher modules, including their nested parity references. Standalone
+  `cpu_f32`, `gdn`, and `causal_conv` remain available without that feature;
   `transformers` selects that CPU-only graph, while `praxis` explicitly enables
   GPU launchers. Direct `kernels` users retain the default GPU feature. The
   crate does not depend on `core`.
