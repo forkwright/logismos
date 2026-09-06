@@ -719,7 +719,13 @@ fn recurrent_gate(
                 .build()
             })?;
             let alpha_plus_dt = alpha_value + dt_value;
-            ensure_finite_scalar(alpha_plus_dt, "recurrent log-decay input", output.len())?;
+            if !alpha_plus_dt.is_finite() && !alpha_plus_dt.is_sign_negative() {
+                return RecurrentArithmeticSnafu {
+                    stage: "recurrent log-decay input",
+                    index: output.len(),
+                }
+                .fail();
+            }
             let gate = a_value * softplus(alpha_plus_dt);
             ensure_finite_scalar(gate, "recurrent log decay", output.len())?;
             output.push(gate);
@@ -889,6 +895,17 @@ mod tests {
                 "Qwen L2 must use max(sqrt(sum_sq), epsilon), not sqrt(sum_sq + epsilon)"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn softplus_saturates_negative_finite_overflow_in_log_decay() -> Result<()> {
+        let gates = recurrent_gate(&[-f32::MAX], &[-f32::MAX], &[-1.0], 1, 1)?;
+        assert_eq!(
+            gates,
+            vec![0.0],
+            "softplus(-infinity) is zero, so finite negative alpha and dt overflow must not reject the exact decay"
+        );
         Ok(())
     }
 }
