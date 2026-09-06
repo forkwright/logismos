@@ -12,6 +12,10 @@ const HALF_CODEPOINTS: [f32; 16] = [
     56.5,
 ];
 const XS_GROUP_SCALES: [f32; 8] = [-16.0, -7.5, -0.5, 0.0, 0.5, 3.5, 8.0, 15.5];
+// WHY: Independent literal header in pinned serialized field order: d,
+// scales_h, scales_l. It must not be constructed from decoder offsets.
+const XS_LITERAL_HEADER: [u8; 8] = [0x00, 0x38, 0x94, 0xfa, 0x10, 0x0f, 0x71, 0xf0];
+const XS_CODEPOINT_HEADER_REMAINDER: [u8; 6] = [0x00, 0x00, 0xf0, 0xf0, 0xf0, 0xf0];
 const PACKED_CODEPOINTS: [u8; 16] = [
     0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f,
 ];
@@ -42,7 +46,7 @@ fn iq4_nl_decodes_every_codepoint_from_both_nibble_planes() -> crate::Result<()>
 
 #[test]
 fn iq4_xs_decodes_all_group_scales_and_high_bit_planes() -> crate::Result<()> {
-    let bytes = xs_scale_witness(0x3800);
+    let bytes = xs_literal_header_witness();
     let decoded = Iq4XsBlock::parse(&bytes)?.decode_f32();
     assert_eq!(
         row_decode_f32(RowFormat::IQ4XS, &bytes, IQ4_XS_VALUES_PER_BLOCK)?,
@@ -135,7 +139,7 @@ fn iq4_rows_refuse_malformed_and_misaligned_inputs() {
 
 #[test]
 fn iq4_rows_refuse_nonfinite_scales_activations_and_products() {
-    let mut nonfinite_xs = xs_scale_witness(0x3800);
+    let mut nonfinite_xs = xs_literal_header_witness();
     nonfinite_xs[..2].copy_from_slice(&0x7e00_u16.to_le_bytes());
     assert!(
         matches!(
@@ -154,7 +158,7 @@ fn iq4_rows_refuse_nonfinite_scales_activations_and_products() {
         matches!(
             row_dot_f32(
                 RowFormat::IQ4XS,
-                &xs_scale_witness(0x3800),
+                &xs_literal_header_witness(),
                 &nonfinite_activations
             ),
             Err(Error::NonFiniteRowActivation {
@@ -197,20 +201,17 @@ fn nl_codepoint_block(scale_bits: u16) -> [u8; IQ4_NL_BLOCK_BYTES] {
     bytes
 }
 
-fn xs_scale_witness(scale_bits: u16) -> [u8; IQ4_XS_BLOCK_BYTES] {
+fn xs_literal_header_witness() -> [u8; IQ4_XS_BLOCK_BYTES] {
     let mut bytes = [0; IQ4_XS_BLOCK_BYTES];
-    bytes[..2].copy_from_slice(&scale_bits.to_le_bytes());
-    bytes[2..6].copy_from_slice(&[0x10, 0x0f, 0x71, 0xf0]);
-    bytes[6..8].copy_from_slice(&0xfa94_u16.to_le_bytes());
-    bytes[8..].fill(0x88);
+    bytes[..XS_LITERAL_HEADER.len()].copy_from_slice(&XS_LITERAL_HEADER);
+    bytes[XS_LITERAL_HEADER.len()..].fill(0x88);
     bytes
 }
 
 fn xs_codepoint_blocks(scale_bits: u16) -> [u8; IQ4_XS_BLOCK_BYTES] {
     let mut bytes = [0; IQ4_XS_BLOCK_BYTES];
     bytes[..2].copy_from_slice(&scale_bits.to_le_bytes());
-    bytes[2..6].fill(0xf0);
-    bytes[6..8].fill(0x00);
+    bytes[2..8].copy_from_slice(&XS_CODEPOINT_HEADER_REMAINDER);
     for group in 0..8 {
         bytes[8 + group * 16..8 + (group + 1) * 16].copy_from_slice(&PACKED_CODEPOINTS);
     }

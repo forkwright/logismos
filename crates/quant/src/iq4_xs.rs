@@ -23,7 +23,10 @@ pub const IQ4_XS_BLOCK_BYTES: usize =
 
 const GROUP_VALUES: usize = 32;
 const GROUP_COUNT: usize = IQ4_XS_VALUES_PER_BLOCK / GROUP_VALUES;
-const QUANT_OFFSET: usize = IQ4_XS_SCALE_BYTES + IQ4_XS_SCALE_LOW_BYTES + IQ4_XS_SCALE_HIGH_BYTES;
+const SCALE_OFFSET: usize = 0;
+const SCALE_HIGH_OFFSET: usize = SCALE_OFFSET + IQ4_XS_SCALE_BYTES;
+const SCALE_LOW_OFFSET: usize = SCALE_HIGH_OFFSET + IQ4_XS_SCALE_HIGH_BYTES;
+const QUANT_OFFSET: usize = SCALE_LOW_OFFSET + IQ4_XS_SCALE_LOW_BYTES;
 const GEOMETRY: Geometry = Geometry {
     format: RowFormat::IQ4XS,
     bytes_per_block: IQ4_XS_BLOCK_BYTES,
@@ -60,13 +63,15 @@ impl Iq4XsBlock {
     /// Decode this block into 256 f32 values.
     #[must_use]
     pub fn decode_f32(&self) -> [f32; IQ4_XS_VALUES_PER_BLOCK] {
-        let block_scale =
-            f16::from_bits(u16::from_le_bytes([self.bytes[0], self.bytes[1]])).to_f32();
-        let scale_low =
-            &self.bytes[IQ4_XS_SCALE_BYTES..IQ4_XS_SCALE_BYTES + IQ4_XS_SCALE_LOW_BYTES];
+        let block_scale = f16::from_bits(u16::from_le_bytes([
+            self.bytes[SCALE_OFFSET],
+            self.bytes[SCALE_OFFSET + 1],
+        ]))
+        .to_f32();
+        let scale_low = &self.bytes[SCALE_LOW_OFFSET..QUANT_OFFSET];
         let scale_high = u16::from_le_bytes([
-            self.bytes[IQ4_XS_SCALE_BYTES + IQ4_XS_SCALE_LOW_BYTES],
-            self.bytes[IQ4_XS_SCALE_BYTES + IQ4_XS_SCALE_LOW_BYTES + 1],
+            self.bytes[SCALE_HIGH_OFFSET],
+            self.bytes[SCALE_HIGH_OFFSET + 1],
         ]);
         let quantized = &self.bytes[QUANT_OFFSET..];
         let mut decoded = [0.0; IQ4_XS_VALUES_PER_BLOCK];
