@@ -842,6 +842,13 @@ mod tests {
 
     fn pipeline_for(artifact: &VerifiedArtifact) -> TestResult<TextPipeline<'_>> {
         let tokenizer_json = tokenizer_json();
+        pipeline_with_tokenizer(artifact, &tokenizer_json)
+    }
+
+    fn pipeline_with_tokenizer<'artifact>(
+        artifact: &'artifact VerifiedArtifact,
+        tokenizer_json: &str,
+    ) -> TestResult<TextPipeline<'artifact>> {
         let digest = TokenizerDigest::from_bytes(Sha256::digest(tokenizer_json.as_bytes()).into());
         Ok(TextPipeline::new(
             artifact,
@@ -932,6 +939,24 @@ mod tests {
         assert_eq!(generation.finish_reason(), FinishReason::EndOfSequence);
         assert!(generation.token_ids().is_empty());
         assert!(generation.text().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tokenizer_id_or_special_marker_mismatch_is_refused() -> TestResult<()> {
+        let (_directory, artifact) = verified_artifact(3, false, false)?;
+        let swapped_ids =
+            tokenizer_json().replace("\"hello\":3,\"assistant\":4", "\"hello\":4,\"assistant\":3");
+        assert!(
+            matches!(pipeline_with_tokenizer(&artifact, &swapped_ids), Err(error) if matches!(error.downcast_ref::<Error>(), Some(Error::VocabularyMismatch { .. })))
+        );
+        let ordinary_eos = tokenizer_json().replace(
+            "\"id\":2,\"content\":\"<eos>\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"special\":true",
+            "\"id\":2,\"content\":\"<eos>\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"special\":false",
+        );
+        assert!(
+            matches!(pipeline_with_tokenizer(&artifact, &ordinary_eos), Err(error) if matches!(error.downcast_ref::<Error>(), Some(Error::SpecialTokenPolicy { .. })))
+        );
         Ok(())
     }
 
