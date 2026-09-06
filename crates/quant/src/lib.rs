@@ -20,9 +20,13 @@
 use half::f16;
 
 pub mod error;
+pub mod q8_0;
 pub mod scheme;
 
 pub use crate::error::{Error, Result};
+pub use crate::q8_0::{
+    Q8_0_BLOCK_BYTES, Q8_0_SCALE_BYTES, Q8_0_VALUE_BYTES, Q8_0_VALUES_PER_BLOCK, Q8_0Block,
+};
 pub use crate::scheme::TurboQuantScheme;
 
 /// Number of scalar values represented by one `TurboQuant` block.
@@ -360,10 +364,11 @@ pub fn encode_turbo3_0_head(values: &[f32]) -> Result<[Turbo3Block; TURBOQUANT_B
 /// [`Error::Unsupported`] for valid input until the FWHT/codebook path lands.
 pub fn encode_turbo4_0_head(values: &[f32]) -> Result<[Turbo4Block; TURBOQUANT_BLOCKS_PER_HEAD]> {
     check_head_dim(values.len())?;
-    Err(Error::Unsupported {
+    crate::error::UnsupportedSnafu {
         operation: "turbo4_0 encode",
         reason: ENCODE_REASON,
-    })
+    }
+    .fail()
 }
 
 /// Decodes four [`Turbo3Block`]s into a 128-element `f32` vector.
@@ -396,11 +401,12 @@ pub fn decode_turbo3_0_head(blocks: &[Turbo3Block]) -> Result<[f32; TURBOQUANT_H
     fwht_128(&mut transformed);
 
     let Some(first_block) = blocks.first().copied() else {
-        return Err(Error::InvalidBlockCount {
+        return crate::error::InvalidBlockCountSnafu {
             scheme: TurboQuantScheme::Turbo3_0,
             got: blocks.len(),
             expected: TURBOQUANT_BLOCKS_PER_HEAD,
-        });
+        }
+        .fail();
     };
     let norm_bits = u16::from_le_bytes(first_block.norm_f16_le());
     let norm = f16::from_bits(norm_bits).to_f32();
@@ -420,21 +426,23 @@ pub fn decode_turbo3_0_head(blocks: &[Turbo3Block]) -> Result<[f32; TURBOQUANT_H
 /// [`Error::Unsupported`] for valid input until the FWHT/codebook path lands.
 pub fn decode_turbo4_0_head(blocks: &[Turbo4Block]) -> Result<[f32; TURBOQUANT_HEAD_DIM]> {
     check_block_count(TurboQuantScheme::Turbo4_0, blocks.len())?;
-    Err(Error::Unsupported {
+    crate::error::UnsupportedSnafu {
         operation: "turbo4_0 decode",
         reason: DECODE_REASON,
-    })
+    }
+    .fail()
 }
 
 fn check_index(scheme: TurboQuantScheme, position: usize, value: u8) -> Result<()> {
     let max = scheme.max_index();
     if value > max {
-        return Err(Error::IndexOutOfRange {
+        return crate::error::IndexOutOfRangeSnafu {
             scheme,
             position,
             value,
             max,
-        });
+        }
+        .fail();
     }
 
     Ok(())
@@ -442,10 +450,11 @@ fn check_index(scheme: TurboQuantScheme, position: usize, value: u8) -> Result<(
 
 fn check_head_dim(got: usize) -> Result<()> {
     if got != TURBOQUANT_HEAD_DIM {
-        return Err(Error::InvalidHeadDim {
+        return crate::error::InvalidHeadDimSnafu {
             got,
             expected: TURBOQUANT_HEAD_DIM,
-        });
+        }
+        .fail();
     }
 
     Ok(())
@@ -453,11 +462,12 @@ fn check_head_dim(got: usize) -> Result<()> {
 
 fn check_block_count(scheme: TurboQuantScheme, got: usize) -> Result<()> {
     if got != TURBOQUANT_BLOCKS_PER_HEAD {
-        return Err(Error::InvalidBlockCount {
+        return crate::error::InvalidBlockCountSnafu {
             scheme,
             got,
             expected: TURBOQUANT_BLOCKS_PER_HEAD,
-        });
+        }
+        .fail();
     }
 
     Ok(())
@@ -568,14 +578,18 @@ mod tests {
         let mut indices = [0; TURBOQUANT_VALUES_PER_BLOCK];
         indices[5] = TURBO3_0_MAX_INDEX + 1;
 
-        assert_eq!(
-            pack_turbo3_indices(&indices),
-            Err(Error::IndexOutOfRange {
-                scheme: TurboQuantScheme::Turbo3_0,
-                position: 5,
-                value: 8,
-                max: TURBO3_0_MAX_INDEX,
-            })
+        assert!(
+            matches!(
+                pack_turbo3_indices(&indices),
+                Err(Error::IndexOutOfRange {
+                    scheme: TurboQuantScheme::Turbo3_0,
+                    position: 5,
+                    value: 8,
+                    max: TURBO3_0_MAX_INDEX,
+                    ..
+                })
+            ),
+            "out-of-range turbo3 index must retain scheme, position, and limit"
         );
     }
 
@@ -584,14 +598,18 @@ mod tests {
         let mut indices = [0; TURBOQUANT_VALUES_PER_BLOCK];
         indices[9] = TURBO4_0_MAX_INDEX + 1;
 
-        assert_eq!(
-            pack_turbo4_indices(&indices),
-            Err(Error::IndexOutOfRange {
-                scheme: TurboQuantScheme::Turbo4_0,
-                position: 9,
-                value: 16,
-                max: TURBO4_0_MAX_INDEX,
-            })
+        assert!(
+            matches!(
+                pack_turbo4_indices(&indices),
+                Err(Error::IndexOutOfRange {
+                    scheme: TurboQuantScheme::Turbo4_0,
+                    position: 9,
+                    value: 16,
+                    max: TURBO4_0_MAX_INDEX,
+                    ..
+                })
+            ),
+            "out-of-range turbo4 index must retain scheme, position, and limit"
         );
     }
 
@@ -599,12 +617,16 @@ mod tests {
     fn encode_preflight_rejects_wrong_head_dim() {
         let err = encode_turbo3_0_head(&[]).err();
 
-        assert_eq!(
-            err,
-            Some(Error::InvalidHeadDim {
-                got: 0,
-                expected: TURBOQUANT_HEAD_DIM,
-            })
+        assert!(
+            matches!(
+                err,
+                Some(Error::InvalidHeadDim {
+                    got: 0,
+                    expected: TURBOQUANT_HEAD_DIM,
+                    ..
+                })
+            ),
+            "wrong head dimension must retain supplied and required lengths"
         );
     }
 
@@ -613,12 +635,16 @@ mod tests {
         let values = [0.0; TURBOQUANT_HEAD_DIM];
         let err = encode_turbo4_0_head(&values).err();
 
-        assert_eq!(
-            err,
-            Some(Error::Unsupported {
-                operation: "turbo4_0 encode",
-                reason: ENCODE_REASON,
-            })
+        assert!(
+            matches!(
+                err,
+                Some(Error::Unsupported {
+                    operation: "turbo4_0 encode",
+                    reason: ENCODE_REASON,
+                    ..
+                })
+            ),
+            "turbo4 encode must retain its precise unsupported reason"
         );
     }
 
@@ -626,13 +652,17 @@ mod tests {
     fn decode_preflight_rejects_wrong_block_count() {
         let err = decode_turbo3_0_head(&[]).err();
 
-        assert_eq!(
-            err,
-            Some(Error::InvalidBlockCount {
-                scheme: TurboQuantScheme::Turbo3_0,
-                got: 0,
-                expected: TURBOQUANT_BLOCKS_PER_HEAD,
-            })
+        assert!(
+            matches!(
+                err,
+                Some(Error::InvalidBlockCount {
+                    scheme: TurboQuantScheme::Turbo3_0,
+                    got: 0,
+                    expected: TURBOQUANT_BLOCKS_PER_HEAD,
+                    ..
+                })
+            ),
+            "wrong block count must retain scheme and required count"
         );
     }
 
@@ -645,12 +675,16 @@ mod tests {
         let blocks = [block; TURBOQUANT_BLOCKS_PER_HEAD];
         let err = decode_turbo4_0_head(&blocks).err();
 
-        assert_eq!(
-            err,
-            Some(Error::Unsupported {
-                operation: "turbo4_0 decode",
-                reason: DECODE_REASON,
-            })
+        assert!(
+            matches!(
+                err,
+                Some(Error::Unsupported {
+                    operation: "turbo4_0 decode",
+                    reason: DECODE_REASON,
+                    ..
+                })
+            ),
+            "turbo4 decode must retain its precise unsupported reason"
         );
     }
 
@@ -699,12 +733,16 @@ mod tests {
     #[test]
     fn encode_rejects_wrong_head_dim() {
         let err = encode_turbo3_0_head(&[]);
-        assert_eq!(
-            err,
-            Err(Error::InvalidHeadDim {
-                got: 0,
-                expected: TURBOQUANT_HEAD_DIM,
-            })
+        assert!(
+            matches!(
+                err,
+                Err(Error::InvalidHeadDim {
+                    got: 0,
+                    expected: TURBOQUANT_HEAD_DIM,
+                    ..
+                })
+            ),
+            "wrong head dimension must retain supplied and required lengths"
         );
     }
 

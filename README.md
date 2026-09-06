@@ -7,8 +7,9 @@ targeting AMD gfx1100, with owned HIP/WMMA kernels and progressively owned execu
 
 **Status:** HIP primitives, Stella CPU golden-fixture parity, action-free placement,
 process-local admission/residency coordination, and bounded instruction emulation exist.
-GGUF inspection and generic GDN/convolution CPU references are foundations, not native
-decoder serving or hardware qualification. The W7900 is available; the RX 7900 XTX is a
+GGUF inspection, structural preflight, Q8_0 block decoding and generic GDN/convolution CPU
+references are foundations, not native decoder serving or hardware qualification. The W7900
+is available; the RX 7900 XTX is a
 planned second device and requires its own qualification. The experimental below-HIP
 provider remains unimplemented.
 
@@ -49,6 +50,12 @@ adds typed metadata (including empty-array element types and float bits) and sou
 tensor extents from the same observation. Inspection does not prove conversion provenance,
 payload decoding, model support, or an atomic filesystem snapshot. The
 [GPU-denied runner](docs/gpu-denied-runner.md) can admit one exact read-only input for this work.
+
+[`decoders`](crates/decoders/src/lib.rs) derives a bounded Qwen3.5-family structural profile
+from an opaque observation: exact typed metadata determines tensor roles and shapes, and
+main decoder blocks remain distinct from an optional auxiliary NextN block. This does not
+validate payloads or authorize execution. [`quant`](crates/quant/src/q8_0.rs) separately
+decodes one checked Q8_0 block on the CPU; the GGUF reader does not yet decode those tensors.
 
 [`contracts/runtime-scope.toml`](contracts/runtime-scope.toml) records this product boundary.
 Bounded adaptation remains absent unless a named consumer contract supplies an output owner,
