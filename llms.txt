@@ -18,14 +18,15 @@ Structured reference data for AI agents is in `_llm/`:
 - [contracts/runtime-scope.toml](contracts/runtime-scope.toml): declared load/quantize/infer/serve boundary and structural guardrails
 - [CHANGELOG.md](CHANGELOG.md): Release history
 
-## Planning (in kanon)
+## Planning
 
-See [CLAUDE.md](CLAUDE.md) for how to resolve the kanon checkout root on this box:
+The operator-managed private planning corpus is canonical for Logismos's vision, roadmap, state,
+research dossiers, and phase plans. It deliberately has no public repository path or link. Ask the
+operator or approved planning service for the active material. [ARCHITECTURE.md](ARCHITECTURE.md)
+records implemented crate ownership; Kanon standards govern engineering practice.
 
-- `projects/logismos/vision.md` - what this is and what it is not
-- `projects/logismos/ROADMAP.md` - phased plan
-- `projects/logismos/STATE.md` - current state
-- `projects/logismos/phases/` - per-phase PLAN.md files
+- Active private planning material - governs future scope and sequencing
+- [ARCHITECTURE.md](ARCHITECTURE.md) - implemented crate topology and dependency model
 
 ## Key crates
 

@@ -73,7 +73,7 @@ an optimal placement claim, or permission to stop another workload. The CPU-only
 opaque-capability admission accounting after planning; they do not establish
 unique host ownership, allocate a device, or establish physical residency.
 Their detailed state protocol and proof limits belong to the `sched` rustdoc
-and canonical `projects/logismos/STATE.md`, not this overview.
+and the operator-managed private planning corpus, not this overview.
 
 The host-mode compiler consumes resolved inference contracts rather than maintaining its own
 model-memory formula. Host inventories, external GPU consumers and operator policy stay private

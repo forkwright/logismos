@@ -6,14 +6,17 @@ tightens: original inference implementations, explicit hardware-access boundary,
 
 # Logismos - operating instructions
 
-Read kanon's `projects/logismos/{vision,ROADMAP,STATE}.md` before substantive work. Planning
-canonical lives in kanon, a separate fleet-internal checkout — resolve its root per-box with the
-MCP tool `mcp__kanon__config_location_get` (intent `kanon-repo`), which returns an already-expanded
-path. The CLI form `kanon locate kanon-repo` prints its unexpanded `$KANON_ROOT` template rather
-than resolving it (tracked as forkwright/kanon#3484) — do not treat that output as a filesystem path.
-Without MCP access, ask the operator for the current checkout root; never hardcode one, it differs
-per machine. This repo holds code plus repo-local agent docs (`CLAUDE.md`, `AGENTS.md`,
-`README.md`).
+Before substantive work, obtain the applicable vision, roadmap, state, phase plan, research
+dossier, and naming decision from the operator-managed private planning corpus. It is canonical
+and deliberately has no public repository path or link; ask the operator or approved planning
+service for the active material. Do not infer a checkout location. Kanon standards live in a
+separate checkout: resolve its root per-box with the MCP tool
+`mcp__kanon__config_location_get` (intent `kanon-repo`), which returns an already-expanded path.
+The CLI form `kanon locate kanon-repo` prints its unexpanded `$KANON_ROOT` template rather than
+resolving it (tracked as forkwright/kanon#3484) — do not treat that output as a filesystem path.
+Without MCP access, ask the operator for the current standards checkout root; never hardcode one,
+it differs per machine. This repo holds code plus repo-local agent docs (`CLAUDE.md`,
+`AGENTS.md`, `README.md`).
 
 ## What logismos is
 
@@ -57,12 +60,13 @@ an existing ecosystem-Greek name, logismos inherits that name and its
 original home eventually consolidates onto ours.
 
 The current crate inventory is derived from Cargo workspace metadata. Do not maintain a second
-hand-written list here. See kanon's `projects/logismos/vision.md` for the role model, and run
-`python3 scripts/check_runtime_scope.py` to verify its concrete structural guardrails. The check
-does not replace semantic review of new behavior.
+hand-written list here. [ARCHITECTURE.md](ARCHITECTURE.md) records the implemented role model;
+the private planning corpus governs planned roles. Run
+`python3 scripts/check_runtime_scope.py` to verify concrete structural guardrails. The check does
+not replace semantic review of new behavior.
 
-New Greek names must pass kanon's `projects/logismos/gnomon.md`'s
-L1-L4 gate. No haste to invent decoration.
+New Greek names must pass the L1-L4 naming gate in the private planning corpus. No haste to
+invent decoration.
 
 ## What "done" looks like
 
@@ -120,7 +124,8 @@ not verify.
 Operating principle, memory system, and global constraints come from
 `~/.claude/CLAUDE.md`. Those rules apply here. Logismos-specific tightening:
 
-- Agents must scope work to the active kanon `projects/logismos/phases/NN-*/PLAN.md`. No scope creep into future phases.
+- Agents must scope work to the active phase plan supplied by the private planning corpus. No scope
+  creep into future phases.
 - A passing `cargo check` is not evidence of correctness. Every
  kernel carries a CPU reference test at 1e-3 tolerance.
 

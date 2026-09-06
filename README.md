@@ -114,20 +114,17 @@ neither that check nor functional emulation establishes hardware performance.
 
 ## Layout
 
-Planning canonical lives in kanon, under `projects/logismos/`; see [CLAUDE.md](CLAUDE.md) for how
-to resolve the kanon checkout root on this box:
-
-- `projects/logismos/vision.md` - what this is and what it is not.
-- `projects/logismos/ROADMAP.md` - phased plan.
-- `projects/logismos/STATE.md` - current state.
-- `projects/logismos/gnomon.md` - naming discipline inherited from the ecosystem.
-- `projects/logismos/research/` - research dossiers.
-- `projects/logismos/phases/NN-*/PLAN.md` - per-phase implementation specs.
+The operator-managed private planning corpus is canonical for Logismos's vision, roadmap,
+current state, naming decisions, research dossiers, and phase plans. It deliberately has no public
+repository path or link. Ask the operator or approved planning service for the material that
+governs a change. [ARCHITECTURE.md](ARCHITECTURE.md) records the implemented crate topology and
+ownership; Kanon standards govern engineering practice.
 
 Repo-local:
 
 - [CLAUDE.md](CLAUDE.md) - working instructions for AI assistants.
 - [AGENTS.md](AGENTS.md) - cross-tool bootstrap.
+- [ARCHITECTURE.md](ARCHITECTURE.md) - implemented crate topology and dependency model.
 - `crates/` - the workspace.
 - `phases/03-stella/golden/` - runtime test fixtures for Phase 3 parity test + Stella throughput bench.
 
