@@ -1,7 +1,7 @@
-//! Bounded CPU reference for one-head Gated Delta Rule recurrence.
+//! Bounded CPU references for single-head and grouped Gated Delta Rule recurrence.
 //!
-//! This module deliberately accepts only dense one-head recurrent input. It
-//! is a correctness oracle for a future device kernel, not a model adapter or
+//! This module accepts dense single-head and grouped multi-head recurrent input.
+//! It is a correctness oracle for a future device kernel, not a model adapter or
 //! a permissive fallback for unsupported GDN variants.
 //! Bounds describe the admitted shapes and numerical domain, not a memory
 //! quota; allocation exhaustion remains a process-level failure.
