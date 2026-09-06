@@ -103,7 +103,7 @@ impl<'artifact> Qwen35Weights<'artifact> {
             }
             .fail();
         }
-        let row_byte_len = row_byte_len(input_width).with_context(|| ProjectionLayoutSnafu {
+        let row_byte_len = row_byte_len(input_width).with_context(|_| ProjectionLayoutSnafu {
             name: tensor_name.clone(),
         })?;
         let expected_bytes = output_width.checked_mul(row_byte_len).ok_or_else(|| {
@@ -125,13 +125,13 @@ impl<'artifact> Qwen35Weights<'artifact> {
         let mut output = Vec::new();
         output
             .try_reserve_exact(output_width)
-            .with_context(|| ProjectionAllocationSnafu {
+            .with_context(|_| ProjectionAllocationSnafu {
                 name: tensor_name.clone(),
                 output_width,
             })?;
         for (row, row_bytes) in bytes.chunks_exact(row_byte_len).enumerate() {
             let value =
-                row_dot_f32(row_bytes, activations).with_context(|| ProjectionRowSnafu {
+                row_dot_f32(row_bytes, activations).with_context(|_| ProjectionRowSnafu {
                     name: tensor_name.clone(),
                     row,
                 })?;
@@ -139,5 +139,4 @@ impl<'artifact> Qwen35Weights<'artifact> {
         }
         Ok(output)
     }
-
 }
