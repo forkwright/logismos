@@ -26,7 +26,11 @@ const TEST_FULL_ATTENTION_INTERVAL: u64 = 4;
 const TEST_F32_BYTES: u64 = 4;
 const TEST_F32_TYPE_ID: u32 = 0;
 const TEST_Q8_0_TYPE_ID: u32 = 8;
+const TEST_Q4_K_TYPE_ID: u32 = 12;
+const TEST_Q5_K_TYPE_ID: u32 = 13;
+const TEST_Q6_K_TYPE_ID: u32 = 14;
 const TEST_IQ4_NL_TYPE_ID: u32 = 20;
+const TEST_IQ4_XS_TYPE_ID: u32 = 23;
 const TEST_Q_WIDTH: u64 = 8;
 const TEST_FULL_ATTENTION_OUTPUT_WIDTH: u64 = 4;
 const TEST_SSM_CONV_WIDTH: u64 = 16;
@@ -42,6 +46,9 @@ const CANONICAL_KEY_VALUE_HEADS: u64 = 2;
 const CANONICAL_HEAD_WIDTH: u64 = 128;
 const CANONICAL_CONTEXT: usize = 4;
 const CANONICAL_ROPE_SECTIONS: [i32; 4] = [11, 11, 10, 0];
+const MIXED_HIDDEN: u64 = 256;
+const MIXED_FEED_FORWARD: u64 = 256;
+const MIXED_INNER: u64 = 256;
 
 #[derive(Clone)]
 enum MetadataEntry {
@@ -326,6 +333,48 @@ fn canonical_hybrid_execution_honors_a_shorter_rope_rotation_domain()
         .map_err(|error| error.to_string())?;
     let actual = session.step(&[1, 2]).map_err(|error| error.to_string())?;
     assert_f32_matches_f64(&actual, &expected, "D=128 n_rot=64 canonical IMRoPE logits")
+}
+
+#[test]
+fn mixed_quantized_hybrid_execution_preserves_token_order_and_state()
+-> std::result::Result<(), String> {
+    let fixture = mixed_quantized_hybrid_fixture()?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let mut batched = weights.execution(3).map_err(|error| error.to_string())?;
+    let actual = batched.step(&[1, 2]).map_err(|error| error.to_string())?;
+    let mut sequential = weights.execution(3).map_err(|error| error.to_string())?;
+    let mut expected = sequential.step(&[1]).map_err(|error| error.to_string())?;
+    expected.extend(sequential.step(&[2]).map_err(|error| error.to_string())?);
+    assert_eq!(
+        actual, expected,
+        "mixed quant rows must retain token-order state"
+    );
+    assert!(
+        actual.iter().all(|value| value.is_finite()) && actual.iter().any(|value| *value != 0.0),
+        "every mixed quantized path must reach finite nonzero logits"
+    );
+    for name in [
+        TOKEN_EMBEDDING_TENSOR,
+        "blk.0.attn_qkv.weight",
+        "blk.0.attn_gate.weight",
+        "blk.3.attn_v.weight",
+        "blk.3.attn_output.weight",
+        OUTPUT_TENSOR,
+    ] {
+        let mut without_path = fixture.clone();
+        zero_serialized_tensor(&mut without_path, name)?;
+        let payload = verify_fixture(&without_path)?;
+        let weights =
+            Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+        let mut execution = weights.execution(3).map_err(|error| error.to_string())?;
+        let without = execution.step(&[1, 2]).map_err(|error| error.to_string())?;
+        assert_ne!(
+            actual, without,
+            "mixed-format path `{name}` must materially contribute to logits"
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -978,6 +1027,36 @@ fn set_q8_payload(
     Ok(())
 }
 
+fn set_quant_payload(
+    fixture: &mut Fixture,
+    name: &str,
+    ggml_type: u32,
+    payload: Vec<u8>,
+) -> std::result::Result<(), String> {
+    let Some(tensor) = fixture
+        .tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == name)
+    else {
+        return Err(format!("fixture tensor `{name}` was not found"));
+    };
+    tensor.ggml_type = ggml_type;
+    tensor.payload = payload;
+    Ok(())
+}
+
+fn zero_serialized_tensor(fixture: &mut Fixture, name: &str) -> std::result::Result<(), String> {
+    let Some(tensor) = fixture
+        .tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == name)
+    else {
+        return Err(format!("fixture tensor `{name}` was not found"));
+    };
+    tensor.payload.fill(0);
+    Ok(())
+}
+
 fn set_iq4_nl_payload(
     fixture: &mut Fixture,
     name: &str,
@@ -1118,6 +1197,175 @@ fn asymmetric_values(value_count: usize, phase: usize) -> Vec<f32> {
 
 pub(crate) fn canonical_hybrid_fixture() -> std::result::Result<Fixture, String> {
     canonical_hybrid_fixture_with_n_rot(None)
+}
+
+fn mixed_quantized_hybrid_fixture() -> std::result::Result<Fixture, String> {
+    let mut fixture = fixture(0)?;
+    set_u32(&mut fixture, EMBEDDING_LENGTH_KEY, to_u32(MIXED_HIDDEN)?)?;
+    set_u32(
+        &mut fixture,
+        FEED_FORWARD_LENGTH_KEY,
+        to_u32(MIXED_FEED_FORWARD)?,
+    )?;
+    set_u32(&mut fixture, SSM_INNER_SIZE_KEY, to_u32(MIXED_INNER)?)?;
+    set_u32(&mut fixture, SSM_STATE_SIZE_KEY, 64)?;
+    set_u32(&mut fixture, HEAD_COUNT_KEY, 4)?;
+    set_u32(&mut fixture, KEY_VALUE_HEAD_COUNT_KEY, 2)?;
+    set_u32(&mut fixture, KEY_LENGTH_KEY, 128)?;
+    set_u32(&mut fixture, VALUE_LENGTH_KEY, 128)?;
+    mutate_tensor_shape(
+        &mut fixture,
+        TOKEN_EMBEDDING_TENSOR,
+        vec![MIXED_HIDDEN, TEST_VOCABULARY],
+    )?;
+    mutate_tensor_shape(&mut fixture, OUTPUT_NORM_TENSOR, vec![MIXED_HIDDEN])?;
+    mutate_tensor_shape(
+        &mut fixture,
+        OUTPUT_TENSOR,
+        vec![MIXED_HIDDEN, TEST_VOCABULARY],
+    )?;
+    for block in 0..3_u8 {
+        let prefix = format!("blk.{block}");
+        for role in [ATTN_NORM_ROLE, POST_ATTENTION_NORM_ROLE] {
+            mutate_tensor_shape(
+                &mut fixture,
+                &format!("{prefix}.{role}"),
+                vec![MIXED_HIDDEN],
+            )?;
+        }
+        mutate_tensor_shape(
+            &mut fixture,
+            &format!("{prefix}.{ATTN_GATE_ROLE}"),
+            vec![MIXED_HIDDEN, MIXED_INNER],
+        )?;
+        mutate_tensor_shape(
+            &mut fixture,
+            &format!("{prefix}.{ATTN_QKV_ROLE}"),
+            vec![MIXED_HIDDEN, MIXED_INNER + 256],
+        )?;
+        for role in [FFN_DOWN_ROLE, FFN_GATE_ROLE, FFN_UP_ROLE, SSM_OUT_ROLE] {
+            mutate_tensor_shape(
+                &mut fixture,
+                &format!("{prefix}.{role}"),
+                vec![MIXED_HIDDEN, MIXED_HIDDEN],
+            )?;
+        }
+        for role in [SSM_ALPHA_ROLE, SSM_BETA_ROLE] {
+            mutate_tensor_shape(
+                &mut fixture,
+                &format!("{prefix}.{role}"),
+                vec![MIXED_HIDDEN, TEST_TIME_STEP_RANK],
+            )?;
+        }
+        mutate_tensor_shape(
+            &mut fixture,
+            &format!("{prefix}.{SSM_CONV1D_ROLE}"),
+            vec![TEST_CONV_KERNEL, MIXED_INNER + 256],
+        )?;
+        mutate_tensor_shape(
+            &mut fixture,
+            &format!("{prefix}.{SSM_NORM_ROLE}"),
+            vec![MIXED_INNER / TEST_TIME_STEP_RANK],
+        )?;
+    }
+    for role in [ATTN_NORM_ROLE, POST_ATTENTION_NORM_ROLE] {
+        mutate_tensor_shape(&mut fixture, &format!("blk.3.{role}"), vec![MIXED_HIDDEN])?;
+    }
+    for role in [FFN_DOWN_ROLE, FFN_GATE_ROLE, FFN_UP_ROLE] {
+        mutate_tensor_shape(
+            &mut fixture,
+            &format!("blk.3.{role}"),
+            vec![MIXED_HIDDEN, MIXED_HIDDEN],
+        )?;
+    }
+    mutate_tensor_shape(&mut fixture, "blk.3.attn_k.weight", vec![MIXED_HIDDEN, 256])?;
+    mutate_tensor_shape(&mut fixture, "blk.3.attn_v.weight", vec![MIXED_HIDDEN, 256])?;
+    mutate_tensor_shape(
+        &mut fixture,
+        "blk.3.attn_q.weight",
+        vec![MIXED_HIDDEN, 1024],
+    )?;
+    mutate_tensor_shape(
+        &mut fixture,
+        "blk.3.attn_output.weight",
+        vec![512, MIXED_HIDDEN],
+    )?;
+    mutate_tensor_shape(&mut fixture, "blk.3.attn_k_norm.weight", vec![128])?;
+    mutate_tensor_shape(&mut fixture, "blk.3.attn_q_norm.weight", vec![128])?;
+
+    let names = fixture
+        .tensors
+        .iter()
+        .map(|tensor| tensor.name.clone())
+        .collect::<Vec<_>>();
+    for name in names {
+        set_f32_repeated(&mut fixture, &name, 0.0)?;
+    }
+    for name in [
+        OUTPUT_NORM_TENSOR,
+        "blk.0.attn_norm.weight",
+        "blk.1.attn_norm.weight",
+        "blk.2.attn_norm.weight",
+        "blk.3.attn_norm.weight",
+        "blk.0.post_attention_norm.weight",
+        "blk.1.post_attention_norm.weight",
+        "blk.2.post_attention_norm.weight",
+        "blk.3.post_attention_norm.weight",
+        "blk.0.ssm_norm.weight",
+        "blk.1.ssm_norm.weight",
+        "blk.2.ssm_norm.weight",
+        "blk.3.attn_k_norm.weight",
+        "blk.3.attn_q_norm.weight",
+    ] {
+        set_f32_repeated(&mut fixture, name, 1.0)?;
+    }
+    for block in 0..3_u8 {
+        set_f32_repeated(&mut fixture, &format!("blk.{block}.ssm_a"), -1.0)?;
+        set_f32_repeated(&mut fixture, &format!("blk.{block}.ssm_dt.bias"), 0.1)?;
+        set_f32_repeated(
+            &mut fixture,
+            &format!("blk.{block}.ssm_conv1d.weight"),
+            0.01,
+        )?;
+        set_f32_repeated(&mut fixture, &format!("blk.{block}.ssm_out.weight"), 0.01)?;
+    }
+    set_quant_payload(
+        &mut fixture,
+        TOKEN_EMBEDDING_TENSOR,
+        TEST_Q8_0_TYPE_ID,
+        repeated_quant_block(q8_one_block(), TEST_VOCABULARY * 8)?,
+    )?;
+    set_quant_payload(
+        &mut fixture,
+        "blk.0.attn_qkv.weight",
+        TEST_Q4_K_TYPE_ID,
+        repeated_quant_block(q4_known_block(), 512)?,
+    )?;
+    set_quant_payload(
+        &mut fixture,
+        "blk.0.attn_gate.weight",
+        TEST_Q5_K_TYPE_ID,
+        repeated_quant_block(q5_known_block(), 256)?,
+    )?;
+    set_quant_payload(
+        &mut fixture,
+        "blk.3.attn_v.weight",
+        TEST_Q6_K_TYPE_ID,
+        repeated_quant_block(q6_known_block(), 256)?,
+    )?;
+    set_quant_payload(
+        &mut fixture,
+        "blk.3.attn_output.weight",
+        TEST_IQ4_NL_TYPE_ID,
+        repeated_quant_block(iq4_nl_one_block(), 512 * 8)?,
+    )?;
+    set_quant_payload(
+        &mut fixture,
+        OUTPUT_TENSOR,
+        TEST_IQ4_XS_TYPE_ID,
+        repeated_quant_block(iq4_xs_one_block(), TEST_VOCABULARY)?,
+    )?;
+    Ok(fixture)
 }
 
 #[expect(
@@ -2073,6 +2321,74 @@ fn append_q8_block(
     payload.extend(values.map(|value| value.to_le_bytes()[0]));
 }
 
+fn repeated_quant_block(block: Vec<u8>, rows: u64) -> std::result::Result<Vec<u8>, String> {
+    let rows = usize::try_from(rows).map_err(|error| error.to_string())?;
+    let capacity = block
+        .len()
+        .checked_mul(rows)
+        .ok_or_else(|| "mixed quantized payload size overflowed".to_string())?;
+    let mut bytes = Vec::with_capacity(capacity);
+    for _ in 0..rows {
+        bytes.extend_from_slice(&block);
+    }
+    Ok(bytes)
+}
+
+fn q8_one_block() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(34);
+    bytes.extend_from_slice(&0x3c00_u16.to_le_bytes());
+    bytes.extend(std::iter::repeat_n(1_u8, 32));
+    bytes
+}
+
+fn q4_known_block() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 144];
+    bytes[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    bytes[2..4].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    bytes[4..8].fill(1);
+    bytes[8..12].fill(1);
+    bytes[12..16].fill(0x11);
+    bytes[16..].fill(0x21);
+    bytes
+}
+
+fn q5_known_block() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 176];
+    bytes[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    bytes[2..4].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    bytes[4..8].fill(1);
+    bytes[8..12].fill(1);
+    bytes[12..16].fill(0x11);
+    bytes[16..48].fill(0x03);
+    bytes[48..].fill(0x21);
+    bytes
+}
+
+fn q6_known_block() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 210];
+    bytes[..128].fill(0x10);
+    bytes[128..192].fill(0xe4);
+    bytes[192..208].fill(1);
+    bytes[208..].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    bytes
+}
+
+fn iq4_nl_one_block() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 18];
+    bytes[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    bytes[2..].fill(0x88);
+    bytes
+}
+
+fn iq4_xs_one_block() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 136];
+    bytes[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    bytes[2..4].copy_from_slice(&0xaaaa_u16.to_le_bytes());
+    bytes[4..8].fill(0x11);
+    bytes[8..].fill(0x88);
+    bytes
+}
+
 fn ordered_projection_activations() -> std::result::Result<Vec<f32>, String> {
     let count = u8::try_from(TEST_PROJECTION_INPUT_WIDTH)
         .map_err(|error| format!("test projection width must fit u8: {error}"))?;
@@ -2277,15 +2593,24 @@ fn tensor_bytes(tensor: &FixtureTensor) -> std::result::Result<u64, String> {
                 .checked_mul(block_bytes)
                 .ok_or_else(|| "test Q8_0 tensor byte count overflowed".to_string())
         }
-        TEST_IQ4_NL_TYPE_ID => {
-            const VALUES_PER_BLOCK: u64 = 32;
-            const BYTES_PER_BLOCK: u64 = 18;
-            if !logical_elements.is_multiple_of(VALUES_PER_BLOCK) {
-                return Err("test IQ4NL tensor elements must occupy complete blocks".to_string());
+        TEST_Q4_K_TYPE_ID | TEST_Q5_K_TYPE_ID | TEST_Q6_K_TYPE_ID | TEST_IQ4_NL_TYPE_ID
+        | TEST_IQ4_XS_TYPE_ID => {
+            let (values_per_block, bytes_per_block) = match tensor.ggml_type {
+                TEST_Q4_K_TYPE_ID => (256_u64, 144_u64),
+                TEST_Q5_K_TYPE_ID => (256_u64, 176_u64),
+                TEST_Q6_K_TYPE_ID => (256_u64, 210_u64),
+                TEST_IQ4_NL_TYPE_ID => (32_u64, 18_u64),
+                TEST_IQ4_XS_TYPE_ID => (256_u64, 136_u64),
+                _ => return Err("test fixture quantized type dispatch drifted".to_string()),
+            };
+            if !logical_elements.is_multiple_of(values_per_block) {
+                return Err(
+                    "test block-quant tensor elements must occupy complete blocks".to_string(),
+                );
             }
-            (logical_elements / VALUES_PER_BLOCK)
-                .checked_mul(BYTES_PER_BLOCK)
-                .ok_or_else(|| "test IQ4NL tensor byte count overflowed".to_string())
+            (logical_elements / values_per_block)
+                .checked_mul(bytes_per_block)
+                .ok_or_else(|| "test block-quant tensor byte count overflowed".to_string())
         }
         other => Err(format!("test fixture does not support GGML type {other}")),
     }
