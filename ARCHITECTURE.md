@@ -37,9 +37,10 @@ semantically respects that boundary.
 - `placement` and `sched` have no HIP/device-runtime dependency. `bin` consumes
   `placement` for `plan` and metadata-only `loader` for `inspect` without
   linking the device runtime.
-- `decoders` consumes metadata-only `loader` for structural profiles, without
-  linking HIP. The lower-level `quant` crate owns Q8_0 block geometry; `loader`
-  reuses it for inspection instead of maintaining a second layout definition.
+- `decoders` consumes `loader` without its tensor adapter and consumes `quant`
+  for explicit CPU Q8_0 projection, without linking HIP. Structural profiles
+  remain distinct from payload-bound execution. The lower-level `quant` crate
+  owns Q8_0 block and row geometry; inspection and projection reuse that owner.
 - `emulation` is a CPU test aid, not a production device backend.
 - `taxis` depends locally on `hipcore`.
 - `kernels` depends locally on `hipcore` and `taxis`; it does not depend on `core`.
@@ -78,6 +79,20 @@ and the operator-managed private planning corpus, not this overview.
 The host-mode compiler consumes resolved inference contracts rather than maintaining its own
 model-memory formula. Host inventories, external GPU consumers and operator policy stay private
 and outside the inference runtime's authority.
+
+## Native payload ownership
+
+`loader::gguf::VerifiedArtifact` owns one immutable serialized backing, admitted
+under an explicit byte limit and matched against a required SHA-256 expectation.
+Its metadata and tensor borrows come from those same bytes. This content binding
+does not establish publisher authenticity, a filesystem snapshot, or a total
+host-memory reservation. Existing observation receipts remain reporting data.
+
+`decoders::Qwen35Weights` binds the existing structural contract to that owner
+and executes named Q8_0 matrix projections through `quant`. Unsupported formats
+are explicit refusals. This is neither a complete decoder nor an implicit CPU
+fallback for a GPU operation; native model execution and admission integration
+remain separate requirements.
 
 ## cfg flags
 
