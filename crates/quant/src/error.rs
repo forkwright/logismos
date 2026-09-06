@@ -86,4 +86,78 @@ pub enum Error {
         #[snafu(implicit)]
         location: snafu::Location,
     },
+
+    /// A `Q8_0` row-dot operation received no activation values.
+    #[snafu(display("q8_0 row dot requires at least one activation value"))]
+    EmptyQ8RowInput {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A `Q8_0` row-dot activation length cannot form whole `Q8_0` blocks.
+    #[snafu(display(
+        "q8_0 row dot activation length {actual} is not a multiple of block width {block_elements}"
+    ))]
+    InvalidQ8RowInputLength {
+        /// Supplied activation count.
+        actual: usize,
+        /// Required values in each `Q8_0` block.
+        block_elements: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Computing the serialized `Q8_0` row length overflowed `usize`.
+    #[snafu(display(
+        "q8_0 row dot serialized length overflows: {block_count} blocks of {block_bytes} bytes"
+    ))]
+    Q8RowByteLengthOverflow {
+        /// Number of `Q8_0` blocks implied by the activation length.
+        block_count: usize,
+        /// Bytes in each serialized `Q8_0` block.
+        block_bytes: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Serialized `Q8_0` bytes did not exactly cover the activation row.
+    #[snafu(display("q8_0 row dot needs {expected} serialized bytes, got {actual}"))]
+    Q8RowByteLengthMismatch {
+        /// Supplied serialized byte count.
+        actual: usize,
+        /// Byte count implied by the activation row.
+        expected: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A `Q8_0` row-dot activation is not finite.
+    #[snafu(display("q8_0 row dot activation at index {index} is not finite"))]
+    NonFiniteQ8Activation {
+        /// Flat activation index within the row.
+        index: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A `Q8_0` row-dot intermediate is not finite.
+    #[snafu(display(
+        "q8_0 row dot {stage} is not finite at block {block_index}, lane {lane_index}"
+    ))]
+    NonFiniteQ8Arithmetic {
+        /// Arithmetic stage that overflowed or became non-finite.
+        stage: &'static str,
+        /// Zero-based `Q8_0` block index.
+        block_index: usize,
+        /// Zero-based value index inside the `Q8_0` block.
+        lane_index: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }
