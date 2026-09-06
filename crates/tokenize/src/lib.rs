@@ -36,8 +36,11 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::error::{
-    ByteLengthMismatchSnafu, ByteLimitExceededSnafu, DigestMismatchSnafu, InvalidByteLimitSnafu,
-    UpstreamSnafu,
+    ByteLengthMismatchSnafu, ByteLimitExceededSnafu, DigestMismatchSnafu,
+    ExpectedVocabularyLengthMismatchSnafu, InvalidByteLimitSnafu,
+    SpecialTokenEncodingMismatchSnafu, SpecialTokenIdOutOfRangeSnafu, SpecialTokenMissingSnafu,
+    SpecialTokenNotMarkedSnafu, UpstreamSnafu, VocabularyIdOutOfRangeSnafu,
+    VocabularyLengthMismatchSnafu, VocabularyMismatchSnafu,
 };
 
 pub use crate::error::{Error, Result};
@@ -191,6 +194,115 @@ impl VerifiedTokenizer {
     pub const fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
     }
+
+    /// Verify an expected ordered vocabulary against this exact tokenizer.
+    ///
+    /// `expected_count` is supplied separately so callers can stream borrowed
+    /// spellings from an artifact without allocating a second vocabulary. The
+    /// iterator must produce exactly that count.
+    /// Each expected spelling must appear at precisely its sequential token ID,
+    /// and resolve back to that same ID through the tokenizer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::VocabularyLengthMismatch`] when the expected and
+    /// tokenizer vocabulary counts differ,
+    /// [`Error::ExpectedVocabularyLengthMismatch`] when the iterator disagrees
+    /// with `expected_count`, or [`Error::VocabularyMismatch`] when either
+    /// direction of an expected ID/spelling association differs, or
+    /// [`Error::VocabularyIdOutOfRange`] when a sequential position cannot fit
+    /// the tokenizer's `u32` ID domain.
+    pub fn verify_exact_vocabulary<'expected>(
+        &self,
+        expected_count: usize,
+        expected: impl Iterator<Item = &'expected str>,
+    ) -> Result<()> {
+        let actual_count = self.tokenizer.vocab_size();
+        if expected_count != actual_count {
+            return VocabularyLengthMismatchSnafu {
+                expected: expected_count,
+                actual: actual_count,
+            }
+            .fail();
+        }
+        let mut expected = expected;
+        for index in 0..expected_count {
+            let spelling = expected.next().ok_or_else(|| {
+                ExpectedVocabularyLengthMismatchSnafu {
+                    expected: expected_count,
+                    actual: index,
+                }
+                .build()
+            })?;
+            let id = vocabulary_id(index)?;
+            if self.tokenizer.id_to_token(id).as_deref() != Some(spelling)
+                || self.tokenizer.token_to_id(spelling) != Some(id)
+            {
+                return VocabularyMismatchSnafu { id }.fail();
+            }
+        }
+        if expected.next().is_some() {
+            let actual = expected_count.checked_add(1).ok_or_else(|| {
+                ExpectedVocabularyLengthMismatchSnafu {
+                    expected: expected_count,
+                    actual: expected_count,
+                }
+                .build()
+            })?;
+            return ExpectedVocabularyLengthMismatchSnafu {
+                expected: expected_count,
+                actual,
+            }
+            .fail();
+        }
+        Ok(())
+    }
+
+    /// Verify one declared special-token ID against an already selected vocabulary.
+    ///
+    /// The caller supplies the selected vocabulary size because this tokenizer
+    /// does not own an artifact vocabulary. Callers should first use
+    /// [`Self::verify_exact_vocabulary`] for that vocabulary, then use this
+    /// method for each policy-selected special ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed special-token error when `id` is outside the selected
+    /// vocabulary, lacks a tokenizer spelling, is not marked special, or does
+    /// not encode by itself back to `id`; propagates [`Error::Upstream`] when
+    /// the tokenizer cannot encode the declared spelling.
+    pub fn verify_declared_special_id(&self, vocabulary_size: usize, id: u32) -> Result<()> {
+        let index = usize::try_from(id).map_err(|_| {
+            SpecialTokenIdOutOfRangeSnafu {
+                id,
+                vocabulary_size,
+            }
+            .build()
+        })?;
+        if index >= vocabulary_size {
+            return SpecialTokenIdOutOfRangeSnafu {
+                id,
+                vocabulary_size,
+            }
+            .fail();
+        }
+        let spelling = self
+            .tokenizer
+            .id_to_token(id)
+            .ok_or_else(|| SpecialTokenMissingSnafu { id }.build())?;
+        if !self.tokenizer.is_special_token(id) {
+            return SpecialTokenNotMarkedSnafu { id }.fail();
+        }
+        let encoded = self.tokenizer.encode(&spelling, false)?;
+        if encoded.as_slice() != [id] {
+            return SpecialTokenEncodingMismatchSnafu { id }.fail();
+        }
+        Ok(())
+    }
+}
+
+fn vocabulary_id(index: usize) -> Result<u32> {
+    u32::try_from(index).map_err(|_| VocabularyIdOutOfRangeSnafu { index }.build())
 }
 
 impl fmt::Debug for VerifiedTokenizer {
@@ -348,6 +460,54 @@ mod tests {
       }
     }"#;
 
+    const SPECIAL_TOKENIZER: &str = r#"{
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": [
+        {"id": 1, "content": "<special>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+      ],
+      "normalizer": null,
+      "pre_tokenizer": { "type": "Whitespace" },
+      "post_processor": null,
+      "decoder": null,
+      "model": {
+        "type": "WordLevel",
+        "vocab": {
+          "[UNK]": 0,
+          "<special>": 1,
+          "hello": 2
+        },
+        "unk_token": "[UNK]"
+      }
+    }"#;
+
+    const SPARSE_TOKENIZER: &str = r#"{
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": [],
+      "normalizer": null,
+      "pre_tokenizer": { "type": "Whitespace" },
+      "post_processor": null,
+      "decoder": null,
+      "model": {
+        "type": "WordLevel",
+        "vocab": {
+          "[UNK]": 0,
+          "hello": 2
+        },
+        "unk_token": "[UNK]"
+      }
+    }"#;
+
+    fn verified_tokenizer(bytes: &[u8]) -> Result<VerifiedTokenizer> {
+        let digest = TokenizerDigest::from_bytes(Sha256::digest(bytes).into());
+        let identity = TokenizerIdentity::new(bytes.len(), digest);
+        let limit = TokenizerByteLimit::try_new(bytes.len())?;
+        VerifiedTokenizer::from_bytes(bytes, identity, limit)
+    }
+
     /// Build a tiny WordLevel `tokenizer.json` on disk so the
     /// round-trip test runs without pulling any real model file.
     fn write_trivial_tokenizer(path: &Path) -> std::io::Result<()> {
@@ -497,6 +657,80 @@ mod tests {
         assert!(matches!(
             VerifiedTokenizer::from_bytes(bytes, wrong_digest, limit),
             Err(Error::DigestMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn verified_tokenizer_requires_an_exact_ordered_vocabulary() -> Result<()> {
+        let verified = verified_tokenizer(TRIVIAL_TOKENIZER.as_bytes())?;
+        let expected = ["[UNK]", "hello", "world", "the", "quick", "fox"];
+        verified.verify_exact_vocabulary(expected.len(), expected.into_iter())?;
+
+        assert!(matches!(
+            verified.verify_exact_vocabulary(expected.len() - 1, expected.into_iter()),
+            Err(Error::VocabularyLengthMismatch { .. })
+        ));
+        assert!(matches!(
+            verified.verify_exact_vocabulary(expected.len() + 1, expected.into_iter()),
+            Err(Error::VocabularyLengthMismatch { .. })
+        ));
+        assert!(matches!(
+            verified.verify_exact_vocabulary(
+                expected.len(),
+                ["[UNK]", "hello", "hello", "the", "quick", "fox"].into_iter(),
+            ),
+            Err(Error::VocabularyMismatch { id: 2, .. })
+        ));
+        assert!(matches!(
+            verified.verify_exact_vocabulary(expected.len(), expected[..5].iter().copied()),
+            Err(Error::ExpectedVocabularyLengthMismatch { actual: 5, .. })
+        ));
+        assert!(matches!(
+            verified.verify_exact_vocabulary(
+                expected.len(),
+                ["[UNK]", "hello", "world", "the", "quick", "fox", "extra"].into_iter(),
+            ),
+            Err(Error::ExpectedVocabularyLengthMismatch { actual: 7, .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn vocabulary_position_refuses_u32_domain_overflow() {
+        let Some(index) = usize::try_from(u32::MAX)
+            .ok()
+            .and_then(|maximum| maximum.checked_add(1))
+        else {
+            return;
+        };
+        assert!(matches!(
+            vocabulary_id(index),
+            Err(Error::VocabularyIdOutOfRange { index: actual, .. }) if actual == index
+        ));
+    }
+
+    #[test]
+    fn verified_tokenizer_checks_declared_special_ids() -> Result<()> {
+        let special = verified_tokenizer(SPECIAL_TOKENIZER.as_bytes())?;
+        let expected = ["[UNK]", "<special>", "hello"];
+        special.verify_exact_vocabulary(expected.len(), expected.into_iter())?;
+        special.verify_declared_special_id(expected.len(), 1)?;
+        assert!(matches!(
+            special.verify_declared_special_id(expected.len(), 3),
+            Err(Error::SpecialTokenIdOutOfRange { .. })
+        ));
+
+        let ordinary = verified_tokenizer(TRIVIAL_TOKENIZER.as_bytes())?;
+        assert!(matches!(
+            ordinary.verify_declared_special_id(ordinary.tokenizer().vocab_size(), 1),
+            Err(Error::SpecialTokenNotMarked { id: 1, .. })
+        ));
+
+        let sparse = verified_tokenizer(SPARSE_TOKENIZER.as_bytes())?;
+        assert!(matches!(
+            sparse.verify_declared_special_id(sparse.tokenizer().vocab_size(), 1),
+            Err(Error::SpecialTokenMissing { id: 1, .. })
         ));
         Ok(())
     }

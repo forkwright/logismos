@@ -294,7 +294,7 @@ impl<'artifact> TextPipeline<'artifact> {
         let metadata = artifact.observation().metadata();
         let template = metadata_string(metadata, CHAT_TEMPLATE_KEY)?;
         check_limit("template bytes", template.len(), limits.template_bytes)?;
-        let special_tokens = verify_vocabulary(metadata, tokenizer.tokenizer())?;
+        let special_tokens = verify_vocabulary(metadata, &tokenizer)?;
         let environment = compile_template(template, limits)?;
         let weights = Qwen35Weights::try_from_verified(artifact).context(DecoderSnafu)?;
         Ok(Self {
@@ -554,7 +554,7 @@ fn metadata_optional_u32(
 
 fn verify_vocabulary(
     metadata: &std::collections::HashMap<String, MetaValue>,
-    tokenizer: &tokenize::Tokenizer,
+    tokenizer: &VerifiedTokenizer,
 ) -> Result<SpecialTokenPolicy> {
     let beginning_token = metadata_optional_u32(metadata, BOS_TOKEN_ID_KEY)?;
     let sequence_end = metadata_u32(metadata, EOS_TOKEN_ID_KEY)?;
@@ -584,7 +584,7 @@ fn verify_vocabulary(
         tokenizer,
         [beginning_token, Some(sequence_end), turn_end, message_end],
     )?;
-    add_recognized_qwen_stops(tokenizer, &mut stop_ids)?;
+    add_recognized_qwen_stops(tokenizer, values.len(), &mut stop_ids)?;
     Ok(SpecialTokenPolicy {
         bos_id: beginning_token,
         eos_id: sequence_end,
@@ -594,35 +594,34 @@ fn verify_vocabulary(
     })
 }
 
-fn verify_exact_vocabulary(values: &[MetaValue], tokenizer: &tokenize::Tokenizer) -> Result<()> {
-    if values.len() != tokenizer.vocab_size() {
-        return InvalidConfigurationSnafu {
+fn verify_exact_vocabulary(values: &[MetaValue], tokenizer: &VerifiedTokenizer) -> Result<()> {
+    for value in values {
+        if !matches!(value, MetaValue::String(_)) {
+            return MetadataSnafu { key: TOKENS_KEY }.fail();
+        }
+    }
+    match tokenizer.verify_exact_vocabulary(
+        values.len(),
+        values.iter().filter_map(|value| match value {
+            MetaValue::String(value) => Some(value.as_str()),
+            _ => None,
+        }),
+    ) {
+        Ok(()) => Ok(()),
+        Err(tokenize::Error::VocabularyLengthMismatch { .. }) => InvalidConfigurationSnafu {
             rule: "artifact token table and tokenizer vocabulary length differ",
         }
-        .fail();
-    }
-    for (index, value) in values.iter().enumerate() {
-        let id = u32::try_from(index).map_err(|_| {
-            InvalidConfigurationSnafu {
-                rule: "artifact token ID exceeds u32",
-            }
-            .build()
-        })?;
-        let MetaValue::String(expected) = value else {
-            return MetadataSnafu { key: TOKENS_KEY }.fail();
-        };
-        if tokenizer.id_to_token(id).as_deref() != Some(expected)
-            || tokenizer.token_to_id(expected) != Some(id)
-        {
-            return VocabularyMismatchSnafu { id }.fail();
+        .fail(),
+        Err(tokenize::Error::VocabularyMismatch { id, .. }) => {
+            VocabularyMismatchSnafu { id }.fail()
         }
+        Err(error) => Err(error).context(TokenizerSnafu),
     }
-    Ok(())
 }
 
 fn verify_declared_special_tokens(
     values: &[MetaValue],
-    tokenizer: &tokenize::Tokenizer,
+    tokenizer: &VerifiedTokenizer,
     identifiers: [Option<u32>; 4],
 ) -> Result<()> {
     for identifier in identifiers.into_iter().flatten() {
@@ -633,61 +632,52 @@ fn verify_declared_special_tokens(
 
 fn verify_special_token(
     values: &[MetaValue],
-    tokenizer: &tokenize::Tokenizer,
+    tokenizer: &VerifiedTokenizer,
     identifier: u32,
 ) -> Result<()> {
-    let offset = usize::try_from(identifier).map_err(|_| {
-        SpecialTokenPolicySnafu {
-            rule: "special token ID does not fit usize",
-        }
-        .build()
-    })?;
-    if values.get(offset).is_none() || tokenizer.id_to_token(identifier).is_none() {
-        return SpecialTokenPolicySnafu {
+    match tokenizer.verify_declared_special_id(values.len(), identifier) {
+        Ok(()) => Ok(()),
+        Err(
+            tokenize::Error::SpecialTokenIdOutOfRange { .. }
+            | tokenize::Error::SpecialTokenMissing { .. },
+        ) => SpecialTokenPolicySnafu {
             rule: "declared special token ID is absent from exact vocabulary",
         }
-        .fail();
-    }
-    let spelling = tokenizer.id_to_token(identifier).ok_or_else(|| {
-        SpecialTokenPolicySnafu {
-            rule: "declared special token has no tokenizer string",
-        }
-        .build()
-    })?;
-    if !tokenizer.is_special_token(identifier) {
-        return SpecialTokenPolicySnafu {
+        .fail(),
+        Err(tokenize::Error::SpecialTokenNotMarked { .. }) => SpecialTokenPolicySnafu {
             rule: "declared special token is not marked special by tokenizer.json",
         }
-        .fail();
-    }
-    let encoded = tokenizer.encode(&spelling, false).context(TokenizerSnafu)?;
-    if encoded.as_slice() != [identifier] {
-        return SpecialTokenPolicySnafu {
+        .fail(),
+        Err(tokenize::Error::SpecialTokenEncodingMismatch { .. }) => SpecialTokenPolicySnafu {
             rule: "declared special token does not encode to exactly its artifact ID",
         }
-        .fail();
+        .fail(),
+        Err(error) => Err(error).context(TokenizerSnafu),
     }
-    Ok(())
 }
 
 fn add_recognized_qwen_stops(
-    tokenizer: &tokenize::Tokenizer,
+    tokenizer: &VerifiedTokenizer,
+    vocabulary_size: usize,
     stop_ids: &mut Vec<u32>,
 ) -> Result<()> {
     for spelling in ["<|im_end|>", "<|endoftext|>"] {
-        if let Some(identifier) = tokenizer.token_to_id(spelling) {
-            if !tokenizer.is_special_token(identifier) {
-                return SpecialTokenPolicySnafu {
-                    rule: "a recognized Qwen EOG spelling must be tokenizer-special",
+        if let Some(identifier) = tokenizer.tokenizer().token_to_id(spelling) {
+            match tokenizer.verify_declared_special_id(vocabulary_size, identifier) {
+                Ok(()) => {}
+                Err(tokenize::Error::SpecialTokenNotMarked { .. }) => {
+                    return SpecialTokenPolicySnafu {
+                        rule: "a recognized Qwen EOG spelling must be tokenizer-special",
+                    }
+                    .fail();
                 }
-                .fail();
-            }
-            let encoded = tokenizer.encode(spelling, false).context(TokenizerSnafu)?;
-            if encoded.as_slice() != [identifier] {
-                return SpecialTokenPolicySnafu {
-                    rule: "a recognized Qwen EOG spelling must encode to exactly its token ID",
+                Err(tokenize::Error::SpecialTokenEncodingMismatch { .. }) => {
+                    return SpecialTokenPolicySnafu {
+                        rule: "a recognized Qwen EOG spelling must encode to exactly its token ID",
+                    }
+                    .fail();
                 }
-                .fail();
+                Err(error) => return Err(error).context(TokenizerSnafu),
             }
             if !stop_ids.contains(&identifier) {
                 stop_ids.push(identifier);
