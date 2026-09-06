@@ -106,19 +106,21 @@ pub enum GgmlType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
-    /// Inspection-only `GGML_TYPE_IQ4_NL` storage layout.
+    /// `GGML_TYPE_IQ4_NL` storage layout.
     ///
     /// Source: `ggml-org/llama.cpp` `6a1a922d269908a29cbd4b49c27e6a8e7fd10fae`,
     /// `ggml/include/ggml.h` (id 20), `ggml/src/ggml.c` (block type), and
-    /// `ggml/src/ggml-common.h` (`QK4_NL` and `block_iq4_nl`). This permits
-    /// descriptor inspection only; tensor decoding remains unsupported.
+    /// `ggml/src/ggml-common.h` (`QK4_NL` and `block_iq4_nl`). The generic
+    /// loader tensor adapter remains unsupported; executable CPU row handling
+    /// belongs to `quant`.
     IQ4NL = 20,
-    /// Inspection-only `GGML_TYPE_IQ4_XS` storage layout.
+    /// `GGML_TYPE_IQ4_XS` storage layout.
     ///
     /// Source: `ggml-org/llama.cpp` `6a1a922d269908a29cbd4b49c27e6a8e7fd10fae`,
     /// `ggml/include/ggml.h` (id 23), `ggml/src/ggml.c` (block type), and
-    /// `ggml/src/ggml-common.h` (`QK_K` and `block_iq4_xs`). This permits
-    /// descriptor inspection only; tensor decoding remains unsupported.
+    /// `ggml/src/ggml-common.h` (`QK_K` and `block_iq4_xs`). The generic
+    /// loader tensor adapter remains unsupported; executable CPU row handling
+    /// belongs to `quant`.
     IQ4XS = 23,
     I8 = 24,
     I16 = 25,
@@ -179,7 +181,8 @@ impl GgmlType {
 
     fn block_layout(self) -> Option<(usize, usize)> {
         Some(match self {
-            Self::Q4_0 | Self::IQ4NL => (32, 18),
+            Self::Q4_0 => (32, 18),
+            Self::IQ4NL => (quant::IQ4_NL_VALUES_PER_BLOCK, quant::IQ4_NL_BLOCK_BYTES),
             Self::Q4_1 => (32, 20),
             Self::Q5_0 => (32, 22),
             Self::Q5_1 => (32, 24),
@@ -191,7 +194,7 @@ impl GgmlType {
             Self::Q5K => (Q5_K_VALUES_PER_BLOCK, Q5_K_BLOCK_BYTES),
             Self::Q6K => (Q6_K_VALUES_PER_BLOCK, Q6_K_BLOCK_BYTES),
             Self::Q8K => (256, 292),
-            Self::IQ4XS => (256, 136),
+            Self::IQ4XS => (quant::IQ4_XS_VALUES_PER_BLOCK, quant::IQ4_XS_BLOCK_BYTES),
             _ => return None,
         })
     }

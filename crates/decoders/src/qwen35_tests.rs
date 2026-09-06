@@ -487,7 +487,8 @@ fn projects_verified_multiblock_q8_rows() -> std::result::Result<(), String> {
 }
 
 #[test]
-fn projection_rejects_wrong_name_rank_dtype_and_width() -> std::result::Result<(), String> {
+fn projection_rejects_wrong_name_rank_and_width_but_executes_iq4_nl()
+-> std::result::Result<(), String> {
     let mut fixture = fixture_with_feed_forward(1, TEST_PROJECTION_INPUT_WIDTH)?;
     set_q8_payload(
         &mut fixture,
@@ -515,19 +516,22 @@ fn projection_rejects_wrong_name_rank_dtype_and_width() -> std::result::Result<(
         "recognized rank-one tensors must not be treated as matrices"
     );
 
-    let mut unsupported_fixture = fixture_with_feed_forward(1, TEST_PROJECTION_INPUT_WIDTH)?;
-    set_tensor_type(
-        &mut unsupported_fixture,
+    let mut iq4_fixture = fixture_with_feed_forward(1, TEST_PROJECTION_INPUT_WIDTH)?;
+    set_iq4_nl_payload(
+        &mut iq4_fixture,
         "blk.0.ffn_down.weight",
-        TEST_IQ4_NL_TYPE_ID,
+        iq4_nl_projection_payload(),
     )?;
-    let unsupported_payload = verify_fixture(&unsupported_fixture)?;
-    let unsupported_weights = Qwen35Weights::try_from_verified(&unsupported_payload)
+    let iq4_payload = verify_fixture(&iq4_fixture)?;
+    let iq4_weights =
+        Qwen35Weights::try_from_verified(&iq4_payload).map_err(|error| error.to_string())?;
+    let iq4_output = iq4_weights
+        .project("blk.0.ffn_down.weight", &activations)
         .map_err(|error| error.to_string())?;
-    let wrong_dtype = unsupported_weights.project("blk.0.ffn_down.weight", &activations);
-    assert!(
-        matches!(wrong_dtype, Err(crate::Error::ProjectionDtype { .. })),
-        "inspection-only IQ4 storage must remain refused by executable projection"
+    assert_eq!(
+        iq4_output,
+        vec![448.0, -4_064.0, 1_808.0],
+        "IQ4_NL projection must decode all nonzero synthetic rows before dotting activations"
     );
 
     let wrong_width = weights.project("blk.0.ffn_down.weight", &activations[..63]);
@@ -802,10 +806,10 @@ fn set_q8_payload(
     Ok(())
 }
 
-fn set_tensor_type(
+fn set_iq4_nl_payload(
     fixture: &mut Fixture,
     name: &str,
-    ggml_type: u32,
+    payload: Vec<u8>,
 ) -> std::result::Result<(), String> {
     let Some(tensor) = fixture
         .tensors
@@ -814,8 +818,8 @@ fn set_tensor_type(
     else {
         return Err(format!("fixture tensor `{name}` was not found"));
     };
-    tensor.ggml_type = ggml_type;
-    tensor.payload.clear();
+    tensor.ggml_type = TEST_IQ4_NL_TYPE_ID;
+    tensor.payload = payload;
     Ok(())
 }
 
@@ -1251,6 +1255,22 @@ fn projection_payload(late_nonfinite_row: bool) -> Vec<u8> {
     append_q8_block(&mut payload, TEST_Q8_SCALE_ONE_BITS, alternating);
     append_q8_block(&mut payload, TEST_Q8_SCALE_ONE_BITS, positive);
     payload
+}
+
+fn iq4_nl_projection_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    append_iq4_nl_block(&mut payload, 0x3c00, 0x88);
+    append_iq4_nl_block(&mut payload, 0x3c00, 0x99);
+    append_iq4_nl_block(&mut payload, 0x3800, 0x00);
+    append_iq4_nl_block(&mut payload, 0x3800, 0x00);
+    append_iq4_nl_block(&mut payload, 0x3400, 0xff);
+    append_iq4_nl_block(&mut payload, 0x3400, 0xff);
+    payload
+}
+
+fn append_iq4_nl_block(payload: &mut Vec<u8>, scale_bits: u16, packed_codepoints: u8) {
+    payload.extend_from_slice(&scale_bits.to_le_bytes());
+    payload.extend([packed_codepoints; quant::iq4_nl::IQ4_NL_QUANT_BYTES]);
 }
 
 fn append_q8_block(

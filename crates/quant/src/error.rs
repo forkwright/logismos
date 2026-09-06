@@ -165,6 +165,30 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// Allocating a decoded row could not reserve its checked logical width.
+    #[snafu(display("{format} row decode could not allocate {value_count} values"))]
+    RowDecodeAllocation {
+        /// Executable format selected for the row.
+        format: RowFormat,
+        /// Checked number of f32 values required in the output.
+        value_count: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A decoded row weight is NaN or infinite.
+    #[snafu(display("{format} row decode produced a non-finite weight at index {index}"))]
+    NonFiniteRowWeight {
+        /// Executable format selected for the row.
+        format: RowFormat,
+        /// Flat weight index in the row.
+        index: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// A row-dot activation is NaN or infinite.
     #[snafu(display("{format} row dot activation at index {index} is not finite"))]
     NonFiniteRowActivation {
@@ -213,6 +237,34 @@ pub enum Error {
     #[snafu(display("{format} block {field} has non-finite fp16 bits 0x{bits:04x}"))]
     NonFiniteKScale {
         /// K-quant format being parsed.
+        format: RowFormat,
+        /// Named fp16 field containing the invalid value.
+        field: &'static str,
+        /// Invalid fp16 bits in host byte order.
+        bits: u16,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// An IQ4 block has the wrong serialized length.
+    #[snafu(display("{format} block must be {expected} bytes, got {actual}"))]
+    InvalidIq4BlockLength {
+        /// IQ4 format being parsed.
+        format: RowFormat,
+        /// Supplied byte length.
+        actual: usize,
+        /// Required byte length.
+        expected: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// An IQ4 fp16 scale field is NaN or infinite.
+    #[snafu(display("{format} block {field} has non-finite fp16 bits 0x{bits:04x}"))]
+    NonFiniteIq4Scale {
+        /// IQ4 format being parsed.
         format: RowFormat,
         /// Named fp16 field containing the invalid value.
         field: &'static str,

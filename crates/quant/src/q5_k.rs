@@ -111,6 +111,12 @@ pub fn row_dot_f32(serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
     })
 }
 
+pub(crate) fn row_decode_f32(serialized_row: &[u8], value_count: usize) -> Result<Vec<f32>> {
+    row::decode(GEOMETRY, serialized_row, value_count, |block| {
+        Ok(Q5KBlock::parse(block)?.decode_f32())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

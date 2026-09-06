@@ -108,6 +108,12 @@ pub fn row_dot_f32(serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
     })
 }
 
+pub(crate) fn row_decode_f32(serialized_row: &[u8], value_count: usize) -> Result<Vec<f32>> {
+    row::decode(GEOMETRY, serialized_row, value_count, |block| {
+        Ok(Q8_0Block::parse(block)?.decode_f32())
+    })
+}
+
 /// Derive the exact serialized byte length for one complete `Q8_0` row.
 ///
 /// WHY: tensor projection adapters and row execution must use the same checked

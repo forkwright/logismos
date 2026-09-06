@@ -22,6 +22,9 @@ use half::f16;
 pub mod error;
 pub mod f32_row;
 pub mod format;
+mod iq4;
+pub mod iq4_nl;
+pub mod iq4_xs;
 mod k;
 pub mod q4_k;
 pub mod q5_k;
@@ -31,10 +34,15 @@ mod row;
 pub mod scheme;
 
 #[cfg(test)]
+mod iq4_tests;
+
+#[cfg(test)]
 mod row_tests;
 
 pub use crate::error::{Error, Result};
 pub use crate::format::RowFormat;
+pub use crate::iq4_nl::{IQ4_NL_BLOCK_BYTES, IQ4_NL_VALUES_PER_BLOCK, Iq4NlBlock};
+pub use crate::iq4_xs::{IQ4_XS_BLOCK_BYTES, IQ4_XS_VALUES_PER_BLOCK, Iq4XsBlock};
 pub use crate::q4_k::{Q4_K_BLOCK_BYTES, Q4_K_VALUES_PER_BLOCK, Q4KBlock};
 pub use crate::q5_k::{Q5_K_BLOCK_BYTES, Q5_K_VALUES_PER_BLOCK, Q5KBlock};
 pub use crate::q6_k::{Q6_K_BLOCK_BYTES, Q6_K_VALUES_PER_BLOCK, Q6KBlock};
@@ -60,6 +68,8 @@ pub fn row_dot_f32(format: RowFormat, serialized_row: &[u8], activations: &[f32]
         RowFormat::Q4K => q4_k::row_dot_f32(serialized_row, activations),
         RowFormat::Q5K => q5_k::row_dot_f32(serialized_row, activations),
         RowFormat::Q6K => q6_k::row_dot_f32(serialized_row, activations),
+        RowFormat::IQ4NL => iq4_nl::row_dot_f32(serialized_row, activations),
+        RowFormat::IQ4XS => iq4_xs::row_dot_f32(serialized_row, activations),
     }
 }
 
@@ -76,6 +86,34 @@ pub fn row_byte_len(format: RowFormat, value_count: usize) -> Result<usize> {
         RowFormat::Q4K => q4_k::row_byte_len(value_count),
         RowFormat::Q5K => q5_k::row_byte_len(value_count),
         RowFormat::Q6K => q6_k::row_byte_len(value_count),
+        RowFormat::IQ4NL => iq4_nl::row_byte_len(value_count),
+        RowFormat::IQ4XS => iq4_xs::row_byte_len(value_count),
+    }
+}
+
+/// Decode one complete checked serialized row into f32 values.
+///
+/// The caller supplies the logical row width so this function can refuse
+/// partial, excess, or empty serialized rows before allocation. Output values
+/// retain serialized block and lane order.
+///
+/// # Errors
+///
+/// Returns [`Error`] for invalid geometry, malformed or non-finite block
+/// data, a non-finite decoded value, or output-allocation failure.
+pub fn row_decode_f32(
+    format: RowFormat,
+    serialized_row: &[u8],
+    value_count: usize,
+) -> Result<Vec<f32>> {
+    match format {
+        RowFormat::F32 => f32_row::row_decode_f32(serialized_row, value_count),
+        RowFormat::Q8_0 => q8_0::row_decode_f32(serialized_row, value_count),
+        RowFormat::Q4K => q4_k::row_decode_f32(serialized_row, value_count),
+        RowFormat::Q5K => q5_k::row_decode_f32(serialized_row, value_count),
+        RowFormat::Q6K => q6_k::row_decode_f32(serialized_row, value_count),
+        RowFormat::IQ4NL => iq4_nl::row_decode_f32(serialized_row, value_count),
+        RowFormat::IQ4XS => iq4_xs::row_decode_f32(serialized_row, value_count),
     }
 }
 

@@ -20,6 +20,10 @@ pub enum RowFormat {
     Q5K,
     /// GGML `Q6_K` blocks.
     Q6K,
+    /// GGML `IQ4_NL` blocks.
+    IQ4NL,
+    /// GGML `IQ4_XS` blocks.
+    IQ4XS,
 }
 
 impl fmt::Display for RowFormat {
@@ -30,6 +34,8 @@ impl fmt::Display for RowFormat {
             Self::Q4K => "q4_k",
             Self::Q5K => "q5_k",
             Self::Q6K => "q6_k",
+            Self::IQ4NL => "iq4_nl",
+            Self::IQ4XS => "iq4_xs",
         };
         formatter.write_str(name)
     }

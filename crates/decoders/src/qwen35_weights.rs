@@ -180,6 +180,8 @@ fn row_format(ggml_type: GgmlType) -> Option<RowFormat> {
         GgmlType::Q4K => Some(RowFormat::Q4K),
         GgmlType::Q5K => Some(RowFormat::Q5K),
         GgmlType::Q6K => Some(RowFormat::Q6K),
+        GgmlType::IQ4NL => Some(RowFormat::IQ4NL),
+        GgmlType::IQ4XS => Some(RowFormat::IQ4XS),
         _ => None,
     }
 }
