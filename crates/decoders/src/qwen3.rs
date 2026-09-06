@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use loader::gguf::{GgmlType, MetaValue, MetaValueType, VerifiedArtifact};
+use num_traits::ToPrimitive;
 use snafu::ResultExt;
 
 use crate::Result;
@@ -27,7 +28,7 @@ const ROPE_DIMENSION: &str = "qwen3.rope.dimension_count";
 const ROPE_BASE: &str = "qwen3.rope.freq_base";
 const ROPE_SCALING_TYPE: &str = "qwen3.rope.scaling.type";
 const ROPE_SCALING_FACTOR: &str = "qwen3.rope.scaling.factor";
-const POOLING_TYPE: &str = "general.pooling_type";
+const POOLING_TYPE: &str = "qwen3.pooling_type";
 
 const TOKEN_EMBEDDING: &str = "token_embd.weight";
 const OUTPUT_NORM: &str = "output_norm.weight";
@@ -153,10 +154,16 @@ impl Qwen3Execution<'_, '_> {
             .build()
         })?;
         finite(result, "final RMS norm")?;
-        Ok(result.to_vec())
+        let mut output = reserve("final hidden row", result.len())?;
+        output.extend_from_slice(result);
+        Ok(output)
     }
 
-    fn run_block(&self, block: usize, hidden: &mut Vec<f32>) -> Result<()> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the checked causal-attention and FFN order is one source-defined transformer block"
+    )]
+    fn run_block(&self, block: usize, hidden: &mut [f32]) -> Result<()> {
         let layout = self.weights.layout;
         let tokens = hidden.len() / layout.hidden;
         let attn_norm = read_f32_vector(
@@ -355,8 +362,30 @@ impl Layout {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one role inventory defines the complete bounded Qwen3 embedding tensor contract"
+)]
 fn validate_inventory(tensors: &[loader::gguf::TensorDescriptor], layout: Layout) -> Result<()> {
-    let mut expected = HashMap::new();
+    let expected_count = layout
+        .blocks
+        .checked_mul(11)
+        .and_then(|count| count.checked_add(2))
+        .ok_or_else(|| {
+            Qwen3ExecutionSnafu {
+                requested: layout.blocks,
+                rule: "tensor inventory count overflowed",
+            }
+            .build()
+        })?;
+    if tensors.len() != expected_count {
+        return Qwen3TensorSnafu {
+            name: "inventory".to_string(),
+            rule: "must have exactly the metadata-derived bounded role count",
+        }
+        .fail();
+    }
+    let mut expected = HashMap::with_capacity(expected_count);
     expected.insert(
         TOKEN_EMBEDDING.to_string(),
         vec![u64_from(layout.hidden)?, u64_from(layout.vocabulary)?],
@@ -454,7 +483,14 @@ fn causal_attention(
 ) -> Result<Vec<f32>> {
     let mut output = reserve("causal attention output", layout.q_width)?;
     let group = layout.heads / layout.kv_heads;
-    let scale = 1.0_f32 / (layout.head_dim as f32).sqrt();
+    let head_dim = layout.head_dim.to_f32().ok_or_else(|| {
+        Qwen3ExecutionSnafu {
+            requested: layout.head_dim,
+            rule: "head dimension must convert to f32 for attention scaling",
+        }
+        .build()
+    })?;
+    let scale = head_dim.sqrt().recip();
     for head in 0..layout.heads {
         let q = row(query, head, layout.head_dim)?;
         let kv_head = head / group;
@@ -471,21 +507,23 @@ fn causal_attention(
             scores.push(score);
         }
         let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let exponents = scores
-            .iter()
-            .map(|score| (*score - max).exp())
-            .collect::<Vec<_>>();
+        let mut exponents = reserve("causal attention exponentials", tokens)?;
+        for score in &scores {
+            let exponent = (*score - max).exp();
+            finite_one(exponent, "attention exponential", exponents.len())?;
+            exponents.push(exponent);
+        }
         let total = exponents.iter().sum::<f32>();
         finite_one(total, "attention normalization", head)?;
         for lane in 0..layout.head_dim {
             let mut value = 0.0;
-            for token in 0..tokens {
+            for (token, exponent) in exponents.iter().enumerate() {
                 let v = row(
                     row(values, token, layout.kv_width)?,
                     kv_head,
                     layout.head_dim,
                 )?[lane];
-                value += exponents[token] / total * v;
+                value += exponent / total * v;
             }
             finite_one(value, "attention value", head * layout.head_dim + lane)?;
             output.push(value);
@@ -495,17 +533,47 @@ fn causal_attention(
 }
 
 fn apply_neox_rope(values: &mut [f32], position: usize, layout: Layout) -> Result<()> {
-    let position = position as f64;
+    let position = position.to_f64().ok_or_else(|| {
+        Qwen3ExecutionSnafu {
+            requested: position,
+            rule: "RoPE position must convert to f64",
+        }
+        .build()
+    })?;
+    let head_dim = layout.head_dim.to_f64().ok_or_else(|| {
+        Qwen3ExecutionSnafu {
+            requested: layout.head_dim,
+            rule: "RoPE head dimension must convert to f64",
+        }
+        .build()
+    })?;
     for head in values.chunks_exact_mut(layout.head_dim) {
-        for pair in 0..layout.head_dim / 2 {
-            let angle = position
-                / layout
-                    .rope_base
-                    .powf((2.0 * pair as f64) / layout.head_dim as f64);
-            let (cosine, sine) = (angle.cos() as f32, angle.sin() as f32);
-            let right = pair + layout.head_dim / 2;
-            let (left_value, right_value) = (head[pair], head[right]);
-            head[pair] = left_value * cosine - right_value * sine;
+        for pair_index in 0..layout.head_dim / 2 {
+            let pair = pair_index.to_f64().ok_or_else(|| {
+                Qwen3ExecutionSnafu {
+                    requested: layout.head_dim,
+                    rule: "RoPE pair index must convert to f64",
+                }
+                .build()
+            })?;
+            let angle = position / layout.rope_base.powf((2.0 * pair) / head_dim);
+            let cosine = angle.cos().to_f32().ok_or_else(|| {
+                Qwen3ArithmeticSnafu {
+                    stage: "NeoX RoPE cosine",
+                    index: pair_index,
+                }
+                .build()
+            })?;
+            let sine = angle.sin().to_f32().ok_or_else(|| {
+                Qwen3ArithmeticSnafu {
+                    stage: "NeoX RoPE sine",
+                    index: pair_index,
+                }
+                .build()
+            })?;
+            let right = pair_index + layout.head_dim / 2;
+            let (left_value, right_value) = (head[pair_index], head[right]);
+            head[pair_index] = left_value * cosine - right_value * sine;
             head[right] = left_value * sine + right_value * cosine;
         }
     }
@@ -602,23 +670,23 @@ fn vocabulary(metadata: &HashMap<String, MetaValue>) -> Result<usize> {
     }
 }
 fn require_neutral_rope_scaling(metadata: &HashMap<String, MetaValue>) -> Result<()> {
-    if let Some(value) = metadata.get(ROPE_SCALING_TYPE) {
-        if !matches!(value, MetaValue::String(value) if value == "linear") {
-            return Qwen3MetadataSnafu {
-                key: ROPE_SCALING_TYPE,
-                rule: "must be absent or exact neutral linear scaling",
-            }
-            .fail();
+    if let Some(value) = metadata.get(ROPE_SCALING_TYPE)
+        && !matches!(value, MetaValue::String(value) if value == "linear")
+    {
+        return Qwen3MetadataSnafu {
+            key: ROPE_SCALING_TYPE,
+            rule: "must be absent or exact neutral linear scaling",
         }
+        .fail();
     }
-    if let Some(value) = metadata.get(ROPE_SCALING_FACTOR) {
-        if !matches!(value, MetaValue::F32(value) if *value == 1.0) {
-            return Qwen3MetadataSnafu {
-                key: ROPE_SCALING_FACTOR,
-                rule: "must be absent or exact neutral factor 1",
-            }
-            .fail();
+    if let Some(value) = metadata.get(ROPE_SCALING_FACTOR)
+        && !matches!(value, MetaValue::F32(value) if value.to_bits() == 1.0_f32.to_bits())
+    {
+        return Qwen3MetadataSnafu {
+            key: ROPE_SCALING_FACTOR,
+            rule: "must be absent or exact neutral factor 1",
         }
+        .fail();
     }
     Ok(())
 }
@@ -755,7 +823,8 @@ mod tests {
     #[test]
     fn executes_an_asymmetric_causal_fixture_to_a_final_hidden_row()
     -> std::result::Result<(), String> {
-        let artifact = verify(fixture(false)?)?;
+        let raw = fixture()?;
+        let artifact = verify(&raw)?;
         let weights =
             Qwen3Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
         let execution = weights
@@ -781,7 +850,7 @@ mod tests {
 
     #[test]
     fn rejects_an_output_head_outside_the_embedding_profile() -> std::result::Result<(), String> {
-        let mut raw = fixture(true)?;
+        let mut raw = fixture()?;
         raw.tensors.push(tensor(
             "output.weight",
             vec![TEST_HIDDEN, TEST_VOCABULARY],
@@ -804,8 +873,26 @@ mod tests {
         Ok(())
     }
 
-    fn verify(raw: RawGguf) -> std::result::Result<VerifiedArtifact, String> {
-        let serialized = serialize_raw_gguf(&raw).map_err(|error| error.to_string())?;
+    #[test]
+    fn refuses_a_general_pooling_key_without_the_qwen3_contract_key()
+    -> std::result::Result<(), String> {
+        let mut raw = fixture()?;
+        raw.metadata.retain(|entry| entry.key != POOLING_TYPE);
+        raw.metadata.push(metadata_u32(
+            "general.pooling_type",
+            u32::try_from(LAST_POOLING_TYPE).map_err(|error| error.to_string())?,
+        ));
+        let artifact = verify(&raw)?;
+        if Qwen3Weights::try_from_verified(&artifact).is_ok() {
+            return Err(
+                "general pooling metadata substituted for qwen3 pooling metadata".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn verify(raw: &RawGguf) -> std::result::Result<VerifiedArtifact, String> {
+        let serialized = serialize_raw_gguf(raw).map_err(|error| error.to_string())?;
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let path = directory.path().join("qwen3.gguf");
         std::fs::write(&path, &serialized.bytes).map_err(|error| error.to_string())?;
@@ -818,7 +905,11 @@ mod tests {
         .map_err(|error| error.to_string())
     }
 
-    fn fixture(_extra_output: bool) -> std::result::Result<RawGguf, String> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fixture names every tensor in the one bounded Qwen3 profile"
+    )]
+    fn fixture() -> std::result::Result<RawGguf, String> {
         let mut tensors = vec![
             tensor(
                 "token_embd.weight",
@@ -952,7 +1043,10 @@ mod tests {
         })?;
         let mut payload = Vec::with_capacity(count * 4);
         for index in 0..count {
-            payload.extend_from_slice(&(seed + index as f32 * 0.0078125).to_le_bytes());
+            let index = index
+                .to_f32()
+                .ok_or("fixture element index cannot convert to f32")?;
+            payload.extend_from_slice(&(seed + index * 0.007_812_5).to_le_bytes());
         }
         Ok(RawTensor {
             name: name.to_string(),
