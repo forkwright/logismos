@@ -6,23 +6,24 @@ use tempfile::tempdir;
 use super::*;
 
 const TEST_ALIGNMENT: u32 = 32;
-const TEST_HIDDEN: u64 = 2;
-const TEST_FEED_FORWARD: u64 = 3;
-const TEST_HEADS: u64 = 1;
+const TEST_HIDDEN: u64 = 3;
+const TEST_FEED_FORWARD: u64 = 5;
+const TEST_HEADS: u64 = 2;
 const TEST_KEY_VALUE_HEADS: u64 = 1;
 const TEST_HEAD_WIDTH: u64 = 2;
 const TEST_CONV_KERNEL: u64 = 2;
-const TEST_INNER: u64 = 1;
-const TEST_STATE: u64 = 1;
-const TEST_TIME_STEP_RANK: u64 = 1;
-const TEST_GROUP_COUNT: u64 = 1;
+const TEST_INNER: u64 = 6;
+const TEST_STATE: u64 = 2;
+const TEST_TIME_STEP_RANK: u64 = 3;
+const TEST_GROUP_COUNT: u64 = 2;
 const TEST_VOCABULARY: u64 = 5;
 const TEST_MAIN_BLOCKS: u64 = 4;
 const TEST_FULL_ATTENTION_INTERVAL: u64 = 4;
 const TEST_F32_BYTES: u64 = 4;
-const TEST_Q_WIDTH: u64 = 4;
-const TEST_SSM_CONV_WIDTH: u64 = 3;
-const TEST_NEXTN_PROJECTION_WIDTH: u64 = 4;
+const TEST_Q_WIDTH: u64 = 8;
+const TEST_FULL_ATTENTION_OUTPUT_WIDTH: u64 = 4;
+const TEST_SSM_CONV_WIDTH: u64 = 14;
+const TEST_NEXTN_PROJECTION_WIDTH: u64 = 6;
 
 #[derive(Clone)]
 enum MetadataEntry {
@@ -176,7 +177,7 @@ fn rejects_extra_unclassified_role() -> std::result::Result<(), String> {
 #[test]
 fn rejects_inconsistent_ssm_dimensions() -> std::result::Result<(), String> {
     let mut fixture = fixture(1)?;
-    set_u32(&mut fixture, SSM_INNER_SIZE_KEY, 2)?;
+    set_u32(&mut fixture, SSM_INNER_SIZE_KEY, 3)?;
     let artifact = observe_fixture(&fixture)?;
 
     let error = preflight_error(&artifact)?;
@@ -214,6 +215,50 @@ fn rejects_checked_projection_overflow() -> std::result::Result<(), String> {
     assert!(
         error.to_string().contains("arithmetic overflow"),
         "overflow must remain a typed structural refusal"
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_huge_block_count_before_inventory_allocation() -> std::result::Result<(), String> {
+    let mut fixture = fixture(1)?;
+    set_u32(&mut fixture, BLOCK_COUNT_KEY, u32::MAX)?;
+    let artifact = observe_fixture(&fixture)?;
+
+    let error = preflight_error(&artifact)?;
+    assert!(
+        error.to_string().contains("tensor count"),
+        "inventory count must refuse before constructing an enormous role map"
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_more_than_one_nextn_block() -> std::result::Result<(), String> {
+    let mut fixture = fixture(1)?;
+    set_u32(&mut fixture, NEXTN_PREDICT_LAYERS_KEY, 2)?;
+    let artifact = observe_fixture(&fixture)?;
+
+    let error = preflight_error(&artifact)?;
+    assert!(
+        error.to_string().contains("zero or one NextN block"),
+        "bounded profile must refuse a second NextN block"
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_explicit_recurrent_layer_override() -> std::result::Result<(), String> {
+    let mut fixture = fixture(1)?;
+    fixture
+        .metadata
+        .push(MetadataEntry::U32(RECURRENT_LAYERS_KEY, 0));
+    let artifact = observe_fixture(&fixture)?;
+
+    let error = preflight_error(&artifact)?;
+    assert!(
+        error.to_string().contains(RECURRENT_LAYERS_KEY),
+        "interval-only profile must refuse an explicit recurrent-layer override"
     );
     Ok(())
 }
@@ -317,7 +362,7 @@ fn add_full_attention_block(tensors: &mut Vec<FixtureTensor>, block_index: u64) 
     add_tensor(
         tensors,
         &block_tensor_name(block_index, ATTN_OUTPUT_ROLE),
-        vec![TEST_HEAD_WIDTH, TEST_HIDDEN],
+        vec![TEST_FULL_ATTENTION_OUTPUT_WIDTH, TEST_HIDDEN],
     );
     add_tensor(
         tensors,

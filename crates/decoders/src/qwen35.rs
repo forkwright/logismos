@@ -26,6 +26,7 @@ const FEED_FORWARD_LENGTH_KEY: &str = "qwen35.feed_forward_length";
 const HEAD_COUNT_KEY: &str = "qwen35.attention.head_count";
 const KEY_VALUE_HEAD_COUNT_KEY: &str = "qwen35.attention.head_count_kv";
 const KEY_LENGTH_KEY: &str = "qwen35.attention.key_length";
+const RECURRENT_LAYERS_KEY: &str = "qwen35.attention.recurrent_layers";
 const VALUE_LENGTH_KEY: &str = "qwen35.attention.value_length";
 const SSM_CONV_KERNEL_KEY: &str = "qwen35.ssm.conv_kernel";
 const SSM_INNER_SIZE_KEY: &str = "qwen35.ssm.inner_size";
@@ -77,6 +78,10 @@ const Q_PROJECTION_MULTIPLIER: u64 = 2;
 /// digest. A successful preflight establishes only that the observed metadata
 /// and descriptors match this narrow structural domain; it is not artifact
 /// provenance, model admission, dequantization, execution, or residency proof.
+/// GGML storage tags remain loader-validated descriptor facts, not per-role
+/// execution admission in this preflight.
+/// An explicit `attention.recurrent_layers` override is outside this
+/// interval-derived domain and is refused rather than silently ignored.
 ///
 /// ```compile_fail
 /// use decoders::Qwen35StructuralProfile;
@@ -162,6 +167,13 @@ struct Dimensions {
 impl Dimensions {
     fn from_metadata(metadata: &HashMap<String, MetaValue>) -> Result<Self> {
         require_architecture(metadata)?;
+        if metadata.contains_key(RECURRENT_LAYERS_KEY) {
+            return MetadataRelationSnafu {
+                key: RECURRENT_LAYERS_KEY,
+                rule: "attention.recurrent_layers is outside the interval-derived structural domain",
+            }
+            .fail();
+        }
 
         let stored_block_count = required_u32(metadata, BLOCK_COUNT_KEY)?;
         let nextn_block_count = required_u32(metadata, NEXTN_PREDICT_LAYERS_KEY)?;
