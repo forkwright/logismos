@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn recurrence_state_crosses_chunk_boundary() -> GdnResult<()> {
+    fn recurrence_state_crosses_every_nonempty_chunk_boundary() -> GdnResult<()> {
         let q = [0.25, -0.5, 1.25, 0.75, -1.0, 0.125];
         let k = [0.5, 1.0, -0.75, 0.25, 1.5, -0.5];
         let v = [1.0, -2.0, 0.5, -0.25, 1.25, 2.0, 0.75, -1.5, 0.125];
@@ -711,43 +711,47 @@ mod tests {
             RecurrentInput::new(&q, &k, &v, &beta, &g, SCALE, &state, KEY_DIM, VALUE_DIM)?;
         let full = recurrent_fwd(&full_input)?;
 
-        let first_input = RecurrentInput::new(
-            &q[..KEY_DIM],
-            &k[..KEY_DIM],
-            &v[..VALUE_DIM],
-            &beta[..1],
-            &g[..1],
-            SCALE,
-            &state,
-            KEY_DIM,
-            VALUE_DIM,
-        )?;
-        let first = recurrent_fwd(&first_input)?;
-        let rest_input = RecurrentInput::new(
-            &q[KEY_DIM..],
-            &k[KEY_DIM..],
-            &v[VALUE_DIM..],
-            &beta[1..],
-            &g[1..],
-            SCALE,
-            first.state(),
-            KEY_DIM,
-            VALUE_DIM,
-        )?;
-        let rest = recurrent_fwd(&rest_input)?;
+        for first_token_count in 1..beta.len() {
+            let first_key_elements = first_token_count * KEY_DIM;
+            let first_value_elements = first_token_count * VALUE_DIM;
+            let first_input = RecurrentInput::new(
+                &q[..first_key_elements],
+                &k[..first_key_elements],
+                &v[..first_value_elements],
+                &beta[..first_token_count],
+                &g[..first_token_count],
+                SCALE,
+                &state,
+                KEY_DIM,
+                VALUE_DIM,
+            )?;
+            let first = recurrent_fwd(&first_input)?;
+            let rest_input = RecurrentInput::new(
+                &q[first_key_elements..],
+                &k[first_key_elements..],
+                &v[first_value_elements..],
+                &beta[first_token_count..],
+                &g[first_token_count..],
+                SCALE,
+                first.state(),
+                KEY_DIM,
+                VALUE_DIM,
+            )?;
+            let rest = recurrent_fwd(&rest_input)?;
 
-        let mut joined_output = first.output().to_vec();
-        joined_output.extend_from_slice(rest.output());
-        assert_eq!(
-            full.output(),
-            joined_output,
-            "chunked output must equal full recurrence"
-        );
-        assert_eq!(
-            full.state(),
-            rest.state(),
-            "chunked state must equal full recurrence"
-        );
+            let mut joined_output = first.output().to_vec();
+            joined_output.extend_from_slice(rest.output());
+            assert_eq!(
+                full.output(),
+                joined_output,
+                "split at token {first_token_count} must preserve every output"
+            );
+            assert_eq!(
+                full.state(),
+                rest.state(),
+                "split at token {first_token_count} must preserve final state"
+            );
+        }
         Ok(())
     }
 
@@ -844,6 +848,8 @@ mod tests {
 
     const KEY_HEAD_COUNT: usize = 2;
     const VALUE_HEAD_COUNT: usize = 4;
+    const THREE_TO_ONE_KEY_HEAD_COUNT: usize = 1;
+    const THREE_TO_ONE_VALUE_HEAD_COUNT: usize = 3;
     const TOKEN_COUNT: usize = 3;
     const MULTI_HEAD_VALUE_DIM: usize = 2;
 
@@ -858,181 +864,192 @@ mod tests {
 
     #[test]
     fn multi_head_recurrence_matches_independent_f64_gqa_oracle() -> GdnResult<()> {
-        let fixture = multi_head_fixture();
-        let input = multi_head_input(
-            &fixture.q,
-            &fixture.k,
-            &fixture.v,
-            &fixture.beta,
-            &fixture.g,
-            &fixture.state,
-            TOKEN_COUNT,
-            KEY_HEAD_COUNT,
-            VALUE_HEAD_COUNT,
-        )?;
-        let actual = multi_head_recurrent_fwd(&input)?;
-        let (expected_output, expected_state) = oracle_multi_head_recurrence(
-            &fixture.q,
-            &fixture.k,
-            &fixture.v,
-            &fixture.beta,
-            &fixture.g,
-            SCALE,
-            &fixture.state,
-            TOKEN_COUNT,
-            KEY_HEAD_COUNT,
-            VALUE_HEAD_COUNT,
-            KEY_DIM,
-            MULTI_HEAD_VALUE_DIM,
-        );
+        for (key_head_count, value_head_count) in [
+            (KEY_HEAD_COUNT, VALUE_HEAD_COUNT),
+            (THREE_TO_ONE_KEY_HEAD_COUNT, THREE_TO_ONE_VALUE_HEAD_COUNT),
+        ] {
+            let fixture = multi_head_fixture(key_head_count, value_head_count);
+            let input = multi_head_input(
+                &fixture.q,
+                &fixture.k,
+                &fixture.v,
+                &fixture.beta,
+                &fixture.g,
+                &fixture.state,
+                TOKEN_COUNT,
+                key_head_count,
+                value_head_count,
+            )?;
+            let actual = multi_head_recurrent_fwd(&input)?;
+            let (expected_output, expected_state) = oracle_multi_head_recurrence(
+                &fixture.q,
+                &fixture.k,
+                &fixture.v,
+                &fixture.beta,
+                &fixture.g,
+                SCALE,
+                &fixture.state,
+                TOKEN_COUNT,
+                key_head_count,
+                value_head_count,
+                KEY_DIM,
+                MULTI_HEAD_VALUE_DIM,
+            );
 
-        assert_close(actual.output(), &expected_output, "multi-head output");
-        assert_close(actual.state(), &expected_state, "multi-head state");
+            assert_close(actual.output(), &expected_output, "multi-head output");
+            assert_close(actual.state(), &expected_state, "multi-head state");
+        }
         Ok(())
     }
 
     #[test]
-    fn multi_head_recurrence_state_crosses_chunk_boundary() -> GdnResult<()> {
-        let fixture = multi_head_fixture();
-        let full_input = multi_head_input(
-            &fixture.q,
-            &fixture.k,
-            &fixture.v,
-            &fixture.beta,
-            &fixture.g,
-            &fixture.state,
-            TOKEN_COUNT,
-            KEY_HEAD_COUNT,
-            VALUE_HEAD_COUNT,
-        )?;
-        let full = multi_head_recurrent_fwd(&full_input)?;
+    fn multi_head_recurrence_state_crosses_every_nonempty_chunk_boundary() -> GdnResult<()> {
+        for (key_head_count, value_head_count) in [
+            (KEY_HEAD_COUNT, VALUE_HEAD_COUNT),
+            (THREE_TO_ONE_KEY_HEAD_COUNT, THREE_TO_ONE_VALUE_HEAD_COUNT),
+        ] {
+            let fixture = multi_head_fixture(key_head_count, value_head_count);
+            let full_input = multi_head_input(
+                &fixture.q,
+                &fixture.k,
+                &fixture.v,
+                &fixture.beta,
+                &fixture.g,
+                &fixture.state,
+                TOKEN_COUNT,
+                key_head_count,
+                value_head_count,
+            )?;
+            let full = multi_head_recurrent_fwd(&full_input)?;
 
-        const FIRST_CHUNK_TOKENS: usize = 1;
-        let first_q = head_major_token_window(
-            &fixture.q,
-            KEY_HEAD_COUNT,
-            TOKEN_COUNT,
-            KEY_DIM,
-            0,
-            FIRST_CHUNK_TOKENS,
-        );
-        let first_k = head_major_token_window(
-            &fixture.k,
-            KEY_HEAD_COUNT,
-            TOKEN_COUNT,
-            KEY_DIM,
-            0,
-            FIRST_CHUNK_TOKENS,
-        );
-        let first_v = head_major_token_window(
-            &fixture.v,
-            VALUE_HEAD_COUNT,
-            TOKEN_COUNT,
-            MULTI_HEAD_VALUE_DIM,
-            0,
-            FIRST_CHUNK_TOKENS,
-        );
-        let first_beta = head_major_token_window(
-            &fixture.beta,
-            VALUE_HEAD_COUNT,
-            TOKEN_COUNT,
-            1,
-            0,
-            FIRST_CHUNK_TOKENS,
-        );
-        let first_g = head_major_token_window(
-            &fixture.g,
-            VALUE_HEAD_COUNT,
-            TOKEN_COUNT,
-            1,
-            0,
-            FIRST_CHUNK_TOKENS,
-        );
-        let first_input = multi_head_input(
-            &first_q,
-            &first_k,
-            &first_v,
-            &first_beta,
-            &first_g,
-            &fixture.state,
-            FIRST_CHUNK_TOKENS,
-            KEY_HEAD_COUNT,
-            VALUE_HEAD_COUNT,
-        )?;
-        let first = multi_head_recurrent_fwd(&first_input)?;
+            for first_token_count in 1..TOKEN_COUNT {
+                let first_q = head_major_token_window(
+                    &fixture.q,
+                    key_head_count,
+                    TOKEN_COUNT,
+                    KEY_DIM,
+                    0,
+                    first_token_count,
+                );
+                let first_k = head_major_token_window(
+                    &fixture.k,
+                    key_head_count,
+                    TOKEN_COUNT,
+                    KEY_DIM,
+                    0,
+                    first_token_count,
+                );
+                let first_v = head_major_token_window(
+                    &fixture.v,
+                    value_head_count,
+                    TOKEN_COUNT,
+                    MULTI_HEAD_VALUE_DIM,
+                    0,
+                    first_token_count,
+                );
+                let first_beta = head_major_token_window(
+                    &fixture.beta,
+                    value_head_count,
+                    TOKEN_COUNT,
+                    1,
+                    0,
+                    first_token_count,
+                );
+                let first_g = head_major_token_window(
+                    &fixture.g,
+                    value_head_count,
+                    TOKEN_COUNT,
+                    1,
+                    0,
+                    first_token_count,
+                );
+                let first_input = multi_head_input(
+                    &first_q,
+                    &first_k,
+                    &first_v,
+                    &first_beta,
+                    &first_g,
+                    &fixture.state,
+                    first_token_count,
+                    key_head_count,
+                    value_head_count,
+                )?;
+                let first = multi_head_recurrent_fwd(&first_input)?;
 
-        let remaining_token_count = TOKEN_COUNT - FIRST_CHUNK_TOKENS;
-        let rest_q = head_major_token_window(
-            &fixture.q,
-            KEY_HEAD_COUNT,
-            TOKEN_COUNT,
-            KEY_DIM,
-            FIRST_CHUNK_TOKENS,
-            TOKEN_COUNT,
-        );
-        let rest_k = head_major_token_window(
-            &fixture.k,
-            KEY_HEAD_COUNT,
-            TOKEN_COUNT,
-            KEY_DIM,
-            FIRST_CHUNK_TOKENS,
-            TOKEN_COUNT,
-        );
-        let rest_v = head_major_token_window(
-            &fixture.v,
-            VALUE_HEAD_COUNT,
-            TOKEN_COUNT,
-            MULTI_HEAD_VALUE_DIM,
-            FIRST_CHUNK_TOKENS,
-            TOKEN_COUNT,
-        );
-        let rest_beta = head_major_token_window(
-            &fixture.beta,
-            VALUE_HEAD_COUNT,
-            TOKEN_COUNT,
-            1,
-            FIRST_CHUNK_TOKENS,
-            TOKEN_COUNT,
-        );
-        let rest_g = head_major_token_window(
-            &fixture.g,
-            VALUE_HEAD_COUNT,
-            TOKEN_COUNT,
-            1,
-            FIRST_CHUNK_TOKENS,
-            TOKEN_COUNT,
-        );
-        let rest_input = multi_head_input(
-            &rest_q,
-            &rest_k,
-            &rest_v,
-            &rest_beta,
-            &rest_g,
-            first.state(),
-            remaining_token_count,
-            KEY_HEAD_COUNT,
-            VALUE_HEAD_COUNT,
-        )?;
-        let rest = multi_head_recurrent_fwd(&rest_input)?;
-        let joined_output = join_head_major_outputs(
-            first.output(),
-            rest.output(),
-            VALUE_HEAD_COUNT,
-            FIRST_CHUNK_TOKENS,
-            remaining_token_count,
-            MULTI_HEAD_VALUE_DIM,
-        );
+                let remaining_token_count = TOKEN_COUNT - first_token_count;
+                let rest_q = head_major_token_window(
+                    &fixture.q,
+                    key_head_count,
+                    TOKEN_COUNT,
+                    KEY_DIM,
+                    first_token_count,
+                    TOKEN_COUNT,
+                );
+                let rest_k = head_major_token_window(
+                    &fixture.k,
+                    key_head_count,
+                    TOKEN_COUNT,
+                    KEY_DIM,
+                    first_token_count,
+                    TOKEN_COUNT,
+                );
+                let rest_v = head_major_token_window(
+                    &fixture.v,
+                    value_head_count,
+                    TOKEN_COUNT,
+                    MULTI_HEAD_VALUE_DIM,
+                    first_token_count,
+                    TOKEN_COUNT,
+                );
+                let rest_beta = head_major_token_window(
+                    &fixture.beta,
+                    value_head_count,
+                    TOKEN_COUNT,
+                    1,
+                    first_token_count,
+                    TOKEN_COUNT,
+                );
+                let rest_g = head_major_token_window(
+                    &fixture.g,
+                    value_head_count,
+                    TOKEN_COUNT,
+                    1,
+                    first_token_count,
+                    TOKEN_COUNT,
+                );
+                let rest_input = multi_head_input(
+                    &rest_q,
+                    &rest_k,
+                    &rest_v,
+                    &rest_beta,
+                    &rest_g,
+                    first.state(),
+                    remaining_token_count,
+                    key_head_count,
+                    value_head_count,
+                )?;
+                let rest = multi_head_recurrent_fwd(&rest_input)?;
+                let joined_output = join_head_major_outputs(
+                    first.output(),
+                    rest.output(),
+                    value_head_count,
+                    first_token_count,
+                    remaining_token_count,
+                    MULTI_HEAD_VALUE_DIM,
+                );
 
-        assert_eq!(
-            full.output(),
-            joined_output,
-            "chunked multi-head output must equal full recurrence"
-        );
-        assert_eq!(
-            full.state(),
-            rest.state(),
-            "chunked multi-head state must equal full recurrence"
-        );
+                assert_eq!(
+                    full.output(),
+                    joined_output,
+                    "split at token {first_token_count} must preserve every multi-head output"
+                );
+                assert_eq!(
+                    full.state(),
+                    rest.state(),
+                    "split at token {first_token_count} must preserve final multi-head state"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1087,7 +1104,7 @@ mod tests {
 
     #[test]
     fn multi_head_admission_rejects_invalid_grouping_and_inputs() -> GdnResult<()> {
-        let fixture = multi_head_fixture();
+        let fixture = multi_head_fixture(KEY_HEAD_COUNT, VALUE_HEAD_COUNT);
         let grouping = MultiHeadRecurrentInput::new(
             &fixture.q,
             &fixture.k,
@@ -1310,14 +1327,14 @@ mod tests {
         )
     }
 
-    fn multi_head_fixture() -> MultiHeadFixture {
+    fn multi_head_fixture(key_head_count: usize, value_head_count: usize) -> MultiHeadFixture {
         MultiHeadFixture {
-            q: fixture_values(KEY_HEAD_COUNT * TOKEN_COUNT * KEY_DIM, -0.5),
-            k: fixture_values(KEY_HEAD_COUNT * TOKEN_COUNT * KEY_DIM, 0.25),
-            v: fixture_values(VALUE_HEAD_COUNT * TOKEN_COUNT * MULTI_HEAD_VALUE_DIM, -0.75),
-            beta: beta_values(VALUE_HEAD_COUNT * TOKEN_COUNT),
-            g: gate_values(VALUE_HEAD_COUNT * TOKEN_COUNT),
-            state: fixture_values(VALUE_HEAD_COUNT * KEY_DIM * MULTI_HEAD_VALUE_DIM, 0.125),
+            q: fixture_values(key_head_count * TOKEN_COUNT * KEY_DIM, -0.5),
+            k: fixture_values(key_head_count * TOKEN_COUNT * KEY_DIM, 0.25),
+            v: fixture_values(value_head_count * TOKEN_COUNT * MULTI_HEAD_VALUE_DIM, -0.75),
+            beta: beta_values(value_head_count * TOKEN_COUNT),
+            g: gate_values(value_head_count * TOKEN_COUNT),
+            state: fixture_values(value_head_count * KEY_DIM * MULTI_HEAD_VALUE_DIM, 0.125),
         }
     }
 
