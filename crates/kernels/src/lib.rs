@@ -45,9 +45,13 @@ pub mod causal_conv;
 pub mod cpu_f32;
 pub mod error;
 pub mod gdn;
+#[cfg(feature = "gpu")]
 pub mod matmul;
+#[cfg(feature = "gpu")]
 pub mod rms_norm;
+#[cfg(feature = "gpu")]
 pub mod rope;
+#[cfg(feature = "gpu")]
 pub mod softmax;
 
 pub use crate::causal_conv::{

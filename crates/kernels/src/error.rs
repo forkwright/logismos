@@ -10,6 +10,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
+    #[cfg(feature = "gpu")]
     /// Propagated HIP failure.
     #[snafu(transparent)]
     Hip {
@@ -17,6 +18,7 @@ pub enum Error {
         source: hipcore::Error,
     },
 
+    #[cfg(feature = "gpu")]
     /// Propagated tensor failure.
     #[snafu(transparent)]
     Taxis {
@@ -24,6 +26,7 @@ pub enum Error {
         source: taxis::Error,
     },
 
+    #[cfg(feature = "gpu")]
     /// Kernel launch failed — HIP reported a non-success status after
     /// kernel submission.
     #[snafu(display("kernel {kernel}: launch failed: {kind:?} (code {code})"))]
@@ -52,6 +55,7 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    #[cfg(feature = "gpu")]
     /// Build was produced without the HIP kernel archive (e.g. `hipcc`
     /// was absent). CPU references still work; GPU paths return this.
     #[snafu(display("kernel {kernel}: no-GPU build (set HIPCC or install ROCm to enable)"))]
@@ -64,7 +68,7 @@ pub enum Error {
     },
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu"))]
 mod tests {
     use super::*;
 
