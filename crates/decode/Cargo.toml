@@ -8,7 +8,6 @@ description = "Logit processors + samplers (Phase 2: greedy, top-k, top-p, min-p
 publish = false
 
 [dependencies]
-taxis = { workspace = true }
 snafu = { workspace = true }
 rand = { workspace = true }
 

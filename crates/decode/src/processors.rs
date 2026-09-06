@@ -1,208 +1,328 @@
-//! Logit processors — mutate a `&mut [f32]` logits vector in place.
-//!
-//! Every processor is a small self-contained transform. Chains
-//! (`DecodeChain`) own the ordering; processors themselves are
-//! order-agnostic individually.
+//! Checked logit processors.
 
+use std::num::NonZeroUsize;
+
+use crate::Result;
 use crate::chain::TokenContext;
+use crate::error::{AllLogitsMaskedSnafu, NonFiniteLogitSnafu, UnsupportedProcessorSnafu};
 use crate::processor_trait::LogitProcessor;
+use crate::validation::{
+    reserve, validate_logits, validate_positive, validate_probability, validate_token,
+};
 
-/// Divide every logit by `temperature`. `temperature == 0.0` collapses
-/// to argmax (handled by `GreedySampler`). Temperatures below a
-/// positive epsilon floor are clamped — a zero-pass here would produce
-/// `inf` logits and poison downstream math.
 #[derive(Debug, Clone, Copy)]
-pub struct TemperatureScale(pub f32);
+struct Probability(f32);
 
-impl LogitProcessor for TemperatureScale {
-    fn process(&mut self, logits: &mut [f32], _ctx: &TokenContext<'_>) {
-        let t = self.0.max(1e-6);
-        if (t - 1.0).abs() < 1e-9 {
-            return;
-        }
-        for l in logits.iter_mut() {
-            *l /= t;
-        }
+impl Probability {
+    fn new(name: &'static str, value: f32) -> Result<Self> {
+        validate_probability(name, value)?;
+        Ok(Self(value))
+    }
+
+    const fn get(self) -> f32 {
+        self.0
     }
 }
 
-/// Keep the `k` highest-scoring tokens; mask the rest to `-inf`.
+/// Divide every finite logit by a positive temperature.
+#[derive(Debug, Clone, Copy)]
+pub struct TemperatureScale(f32);
+
+impl TemperatureScale {
+    /// Construct a finite, positive temperature scale.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when `temperature` is non-finite or not
+    /// positive.
+    pub fn new(temperature: f32) -> Result<Self> {
+        validate_positive("temperature", temperature)?;
+        Ok(Self(temperature))
+    }
+}
+
+impl LogitProcessor for TemperatureScale {
+    fn process(&mut self, logits: &mut [f32], _context: &TokenContext<'_>) -> Result<()> {
+        validate_logits(logits)?;
+        for (index, logit) in logits.iter().copied().enumerate() {
+            if logit.is_finite() && !(logit / self.0).is_finite() {
+                return NonFiniteLogitSnafu {
+                    index,
+                    kind: "a non-finite temperature-scaled value",
+                }
+                .fail();
+            }
+        }
+        for logit in logits {
+            *logit /= self.0;
+        }
+        Ok(())
+    }
+}
+
+/// Keep the `k` highest-scoring tokens; mask the rest to negative infinity.
 ///
 /// Owns a reusable scratch buffer so the per-step partial sort does not
-/// allocate a vocab-sized `Vec` on every decode step.
+/// allocate a vocabulary-sized vector on every decode step.
 #[derive(Debug, Clone)]
 pub struct TopK {
-    k: usize,
+    k: NonZeroUsize,
     scratch: Vec<f32>,
 }
 
 impl TopK {
-    /// New `TopK` processor keeping the `k` highest-scoring tokens.
-    #[must_use]
-    pub fn new(k: usize) -> Self {
-        Self {
+    /// Construct a top-k processor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when `k` is zero.
+    pub fn new(k: usize) -> Result<Self> {
+        let k = NonZeroUsize::new(k).ok_or_else(|| {
+            crate::error::InvalidParameterSnafu {
+                name: "top_k",
+                rule: "must be greater than zero",
+            }
+            .build()
+        })?;
+        Ok(Self {
             k,
             scratch: Vec::new(),
-        }
+        })
     }
 }
 
 impl LogitProcessor for TopK {
-    fn process(&mut self, logits: &mut [f32], _ctx: &TokenContext<'_>) {
-        let k = self.k;
-        if k == 0 || k >= logits.len() {
-            return;
+    fn process(&mut self, logits: &mut [f32], _context: &TokenContext<'_>) -> Result<()> {
+        validate_logits(logits)?;
+        let k = self.k.get();
+        if k >= logits.len() {
+            return Ok(());
         }
-        // Partial-sort: find the kth-largest score, mask everything below.
-        // WHY: NaN is folded to -inf before the sort rather than masked
-        // afterward — `*l < threshold` is always false when `l` is NaN, so a
-        // NaN masked only via that comparison would survive top-k untouched.
+
         self.scratch.clear();
-        self.scratch.extend(
-            logits
-                .iter()
-                .map(|&l| if l.is_nan() { f32::NEG_INFINITY } else { l }),
-        );
-        self.scratch
-            .sort_by(|a, b| b.partial_cmp(a).unwrap_or(core::cmp::Ordering::Equal));
-        // k >= 1 (the k==0 branch returned) and k < logits.len(),
-        // so the (k-1)th sorted entry exists. If the invariant ever
-        // breaks, fail open (leave logits untouched).
-        let Some(&threshold) = self.scratch.get(k.saturating_sub(1)) else {
-            return;
-        };
-        for l in logits.iter_mut() {
-            if l.is_nan() || *l < threshold {
-                *l = f32::NEG_INFINITY;
+        reserve(&mut self.scratch, "top-k scratch", logits.len())?;
+        self.scratch.extend_from_slice(logits);
+        self.scratch.sort_by(|left, right| right.total_cmp(left));
+        let threshold = self.scratch[k - 1];
+        for logit in logits {
+            if *logit < threshold {
+                *logit = f32::NEG_INFINITY;
             }
         }
+        Ok(())
     }
 }
 
-/// Nucleus sampling — keep the smallest prefix whose cumulative
-/// softmax probability ≥ `p`. Rest mask to `-inf`.
+/// Nucleus sampling — keep the smallest prefix whose cumulative probability
+/// meets the configured threshold, then mask the rest to negative infinity.
 #[derive(Debug, Clone, Copy)]
-pub struct TopP(pub f32);
+pub struct TopP(Probability);
+
+impl TopP {
+    /// Construct a nucleus-sampling processor with a bounded probability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when `probability` is non-finite or outside
+    /// `0.0..=1.0`.
+    pub fn new(probability: f32) -> Result<Self> {
+        Ok(Self(Probability::new("top_p", probability)?))
+    }
+}
 
 impl LogitProcessor for TopP {
-    fn process(&mut self, logits: &mut [f32], _ctx: &TokenContext<'_>) {
-        let p = self.0.clamp(0.0, 1.0);
-        if p >= 1.0 || logits.is_empty() {
-            return;
+    fn process(&mut self, logits: &mut [f32], _context: &TokenContext<'_>) -> Result<()> {
+        let probabilities = probabilities(logits)?;
+        if self.0.get() == 1.0 {
+            return Ok(());
         }
-        let probs = softmax(logits);
-        // Sort indices by descending prob. Indices are all in-bounds
-        // for `probs` by construction; `.get` keeps the invariant
-        // explicit.
-        let mut idx: Vec<usize> = (0..probs.len()).collect();
-        idx.sort_by(|&a, &b| {
-            let pb = probs.get(b).copied().unwrap_or(0.0);
-            let pa = probs.get(a).copied().unwrap_or(0.0);
-            pb.partial_cmp(&pa).unwrap_or(core::cmp::Ordering::Equal)
-        });
-        let mut cum = 0.0f32;
-        let mut keep = vec![false; logits.len()];
-        for &i in &idx {
-            if let Some(slot) = keep.get_mut(i) {
-                *slot = true;
-            }
-            cum += probs.get(i).copied().unwrap_or(0.0);
-            if cum >= p {
+
+        let mut indices = Vec::new();
+        reserve(&mut indices, "top-p indices", probabilities.len())?;
+        indices.extend(0..probabilities.len());
+        indices.sort_by(|left, right| probabilities[*right].total_cmp(&probabilities[*left]));
+
+        let mut keep = Vec::new();
+        reserve(&mut keep, "top-p keep mask", logits.len())?;
+        keep.resize(logits.len(), false);
+        let mut cumulative = 0.0f64;
+        for index in indices {
+            keep[index] = true;
+            cumulative += probabilities[index];
+            if cumulative >= f64::from(self.0.get()) {
                 break;
             }
         }
-        for (i, l) in logits.iter_mut().enumerate() {
-            if !keep.get(i).copied().unwrap_or(true) {
-                *l = f32::NEG_INFINITY;
+        for (index, logit) in logits.iter_mut().enumerate() {
+            if !keep[index] {
+                *logit = f32::NEG_INFINITY;
             }
         }
+        Ok(())
     }
 }
 
-/// Min-P filter — mask tokens whose probability is below
-/// `min_p × max_probability`.
+/// Min-p filter — mask tokens below `min_p × max_probability`.
 #[derive(Debug, Clone, Copy)]
-pub struct MinP(pub f32);
+pub struct MinP(Probability);
+
+impl MinP {
+    /// Construct a min-p processor with a bounded probability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when `probability` is non-finite or outside
+    /// `0.0..=1.0`.
+    pub fn new(probability: f32) -> Result<Self> {
+        Ok(Self(Probability::new("min_p", probability)?))
+    }
+}
 
 impl LogitProcessor for MinP {
-    fn process(&mut self, logits: &mut [f32], _ctx: &TokenContext<'_>) {
-        let p = self.0.clamp(0.0, 1.0);
-        if p <= 0.0 || logits.is_empty() {
-            return;
+    fn process(&mut self, logits: &mut [f32], _context: &TokenContext<'_>) -> Result<()> {
+        let probabilities = probabilities(logits)?;
+        if self.0.get() == 0.0 {
+            return Ok(());
         }
-        let probs = softmax(logits);
-        let max_p = probs.iter().copied().fold(0.0f32, f32::max);
-        let threshold = p * max_p;
-        for (i, l) in logits.iter_mut().enumerate() {
-            let pi = probs.get(i).copied().unwrap_or(0.0);
-            if pi < threshold {
-                *l = f32::NEG_INFINITY;
+        let max_probability = probabilities.iter().copied().fold(0.0f64, f64::max);
+        let threshold = f64::from(self.0.get()) * max_probability;
+        for (index, logit) in logits.iter_mut().enumerate() {
+            if probabilities[index] < threshold {
+                *logit = f32::NEG_INFINITY;
             }
         }
+        Ok(())
     }
 }
 
-/// Downweight recently seen tokens. `penalty > 1.0` suppresses;
-/// `penalty < 1.0` boosts. See Keskar et al. 2019 CTRL §4.1.
+/// Downweight recently seen tokens.
 #[derive(Debug, Clone)]
 pub struct RepetitionPenalty {
-    /// Recent token ids to penalise.
-    pub tokens: Vec<u32>,
-    /// Divide the logit by `penalty` when `logit > 0`; multiply when
-    /// `logit < 0`. Mirrors HF Transformers semantics.
-    pub penalty: f32,
+    tokens: Vec<u32>,
+    penalty: f32,
+}
+
+impl RepetitionPenalty {
+    /// Construct a finite, positive repetition penalty over explicit history.
+    ///
+    /// Values greater than one suppress positive logits and values below one
+    /// boost them, following the documented repetition-penalty policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when `penalty` is non-finite or not positive.
+    pub fn new(tokens: Vec<u32>, penalty: f32) -> Result<Self> {
+        validate_positive("repetition_penalty", penalty)?;
+        Ok(Self { tokens, penalty })
+    }
 }
 
 impl LogitProcessor for RepetitionPenalty {
-    fn process(&mut self, logits: &mut [f32], _ctx: &TokenContext<'_>) {
-        if (self.penalty - 1.0).abs() < 1e-9 {
-            return;
+    fn process(&mut self, logits: &mut [f32], _context: &TokenContext<'_>) -> Result<()> {
+        validate_logits(logits)?;
+        let mut indices = Vec::new();
+        reserve(
+            &mut indices,
+            "repetition-penalty indices",
+            self.tokens.len(),
+        )?;
+        for token_id in &self.tokens {
+            let index = validate_token(*token_id, logits.len())?;
+            indices.push(index);
         }
-        let penalty = self.penalty;
-        for &t in &self.tokens {
-            let Ok(i) = usize::try_from(t) else {
-                continue;
-            };
-            let Some(l) = logits.get_mut(i) else {
-                continue;
-            };
-            if *l > 0.0 {
-                *l /= penalty;
+        indices.sort_unstable();
+        indices.dedup();
+        for index in &indices {
+            let logit = logits[*index];
+            let adjusted = if logit > 0.0 {
+                logit / self.penalty
             } else {
-                *l *= penalty;
+                logit * self.penalty
+            };
+            if logit.is_finite() && !adjusted.is_finite() {
+                return NonFiniteLogitSnafu {
+                    index: *index,
+                    kind: "a non-finite repetition-penalty value",
+                }
+                .fail();
             }
         }
+        for index in indices {
+            let logit = &mut logits[index];
+            if *logit > 0.0 {
+                *logit /= self.penalty;
+            } else {
+                *logit *= self.penalty;
+            }
+        }
+        Ok(())
     }
 }
 
-/// Typical-sampling stub. No-op in Phase 2; the full impl lands in
-/// Phase 7 per the PLAN (Meister et al. 2022 typical-p sampling).
+/// Typical sampling configuration.
+///
+/// The type remains available for planned policy wiring, but execution refuses
+/// it until a real implementation is supplied.
 #[derive(Debug, Clone, Copy)]
-pub struct TypicalSampling(pub f32);
+pub struct TypicalSampling(Probability);
+
+impl TypicalSampling {
+    /// Construct a typical-sampling configuration with a bounded probability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when `probability` is non-finite or outside
+    /// `0.0..=1.0`.
+    pub fn new(probability: f32) -> Result<Self> {
+        Ok(Self(Probability::new("typical_p", probability)?))
+    }
+
+    /// Return the validated typical-sampling probability.
+    #[must_use]
+    pub const fn probability(&self) -> f32 {
+        self.0.get()
+    }
+}
 
 impl LogitProcessor for TypicalSampling {
-    fn process(&mut self, _logits: &mut [f32], _ctx: &TokenContext<'_>) {
-        // Intentional no-op — Phase-7 hook.
+    fn process(&mut self, logits: &mut [f32], _context: &TokenContext<'_>) -> Result<()> {
+        validate_logits(logits)?;
+        UnsupportedProcessorSnafu {
+            processor: "typical sampling",
+        }
+        .fail()
     }
 }
 
-fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut exps: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
-    let sum: f32 = exps.iter().sum();
-    if sum > 0.0 {
-        for e in &mut exps {
-            *e /= sum;
-        }
+fn probabilities(logits: &[f32]) -> Result<Vec<f64>> {
+    validate_logits(logits)?;
+    let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut probabilities = Vec::new();
+    reserve(&mut probabilities, "softmax probabilities", logits.len())?;
+    let mut sum = 0.0f64;
+    for logit in logits {
+        let probability = if logit.is_finite() {
+            f64::from((*logit - maximum).exp())
+        } else {
+            0.0
+        };
+        sum += probability;
+        probabilities.push(probability);
     }
-    exps
+    if sum <= 0.0 || !sum.is_finite() {
+        return AllLogitsMaskedSnafu.fail();
+    }
+    for probability in &mut probabilities {
+        *probability /= sum;
+    }
+    Ok(probabilities)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ctx() -> TokenContext<'static> {
+    fn context() -> TokenContext<'static> {
         TokenContext {
             prev_tokens: &[],
             step: 0,
@@ -210,144 +330,117 @@ mod tests {
     }
 
     #[test]
-    fn temperature_divides() {
+    fn temperature_divides() -> Result<()> {
         let mut logits = vec![1.0, 2.0, 3.0];
-        let mut t = TemperatureScale(2.0);
-        t.process(&mut logits, &ctx());
+        let mut processor = TemperatureScale::new(2.0)?;
+        processor.process(&mut logits, &context())?;
         assert_eq!(logits, vec![0.5, 1.0, 1.5]);
+        Ok(())
     }
 
     #[test]
-    fn temperature_one_is_identity() {
-        let mut logits = vec![1.0, 2.0, 3.0];
-        let mut t = TemperatureScale(1.0);
-        t.process(&mut logits, &ctx());
-        assert_eq!(logits, vec![1.0, 2.0, 3.0]);
-    }
-
-    #[test]
-    fn top_k_masks_below_kth() {
+    fn top_k_masks_below_threshold() -> Result<()> {
         let mut logits = vec![1.0, 3.0, 2.0, 5.0, 4.0];
-        let mut p = TopK::new(2);
-        p.process(&mut logits, &ctx());
-        // Top 2 are 5.0 and 4.0. Others -> -inf.
+        let mut processor = TopK::new(2)?;
+        processor.process(&mut logits, &context())?;
         assert_eq!(logits[3], 5.0);
         assert_eq!(logits[4], 4.0);
-        assert!(logits[0].is_infinite() && logits[0] < 0.0);
-        assert!(logits[1].is_infinite() && logits[1] < 0.0);
-        assert!(logits[2].is_infinite() && logits[2] < 0.0);
+        assert_eq!(logits[0], f32::NEG_INFINITY);
+        assert_eq!(logits[1], f32::NEG_INFINITY);
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+        Ok(())
     }
 
     #[test]
-    fn top_k_masks_nan_logit() {
-        // WHY: a NaN logit always fails `*l < threshold` (NaN
-        // comparisons are never true), so the old unmasked-comparison
-        // let it survive top-k untouched regardless of rank.
-        let mut logits = vec![1.0, f32::NAN, 5.0, 4.0, 3.0];
-        let mut p = TopK::new(2);
-        p.process(&mut logits, &ctx());
-        assert_eq!(logits[2], 5.0);
-        assert_eq!(logits[3], 4.0);
-        assert_eq!(
-            logits[1],
-            f32::NEG_INFINITY,
-            "NaN logit must be masked, not left to bypass the threshold comparison"
-        );
-        assert!(logits[0].is_infinite() && logits[0] < 0.0);
-        assert!(logits[4].is_infinite() && logits[4] < 0.0);
+    fn top_k_reuses_existing_scratch_capacity() -> Result<()> {
+        let mut processor = TopK::new(2)?;
+        processor.scratch.reserve(64);
+        let pointer = processor.scratch.as_ptr();
+        let capacity = processor.scratch.capacity();
+        let mut first = vec![1.0, 3.0, 2.0, 5.0, 4.0];
+        processor.process(&mut first, &context())?;
+        assert_eq!(processor.scratch.as_ptr(), pointer);
+        assert!(processor.scratch.capacity() >= capacity);
+
+        let mut second = vec![2.0, 1.0, 4.0, 3.0, 0.0];
+        processor.process(&mut second, &context())?;
+        assert_eq!(processor.scratch.as_ptr(), pointer);
+        Ok(())
     }
 
     #[test]
-    fn top_k_reuses_scratch_buffer_across_steps() {
-        let mut p = TopK::new(2);
-        // WHY: reserve well beyond what collecting a 5-element iterator
-        // into a fresh `Vec` would naturally allocate (capacity ~5).
-        // Two equal-length calls can't tell "reused" from "freshly
-        // reallocated to the same size" by capacity alone — a per-step
-        // `self.scratch = logits.iter()....collect()` reproduces the
-        // same post-call capacity as a reused buffer would. Pre-reserving
-        // past that coincidence range means a reallocation is forced to
-        // *drop* the reservation (capacity falls back to ~5) and move to
-        // a new allocation (a different `as_ptr()`), so either signal
-        // alone proves reuse; both are checked for redundancy.
-        p.scratch.reserve(64);
-        let ptr_before = p.scratch.as_ptr();
-        let cap_before = p.scratch.capacity();
-        assert!(cap_before >= 64);
-
-        let mut logits = vec![1.0, 3.0, 2.0, 5.0, 4.0];
-        p.process(&mut logits, &ctx());
-        assert_eq!(
-            p.scratch.as_ptr(),
-            ptr_before,
-            "scratch buffer must be reused, not reallocated, on the first step"
-        );
+    fn top_p_and_min_p_mask_tails() -> Result<()> {
+        let mut top_p_logits = vec![10.0, 0.0, 0.0, 0.0];
+        TopP::new(0.5)?.process(&mut top_p_logits, &context())?;
+        assert_eq!(top_p_logits[0], 10.0);
         assert!(
-            p.scratch.capacity() >= cap_before,
-            "reusing the buffer must not drop its reserved capacity"
+            top_p_logits[1..]
+                .iter()
+                .all(|value| *value == f32::NEG_INFINITY)
         );
 
-        let mut logits2 = vec![2.0, 1.0, 4.0, 3.0, 0.0];
-        p.process(&mut logits2, &ctx());
-        assert_eq!(
-            p.scratch.as_ptr(),
-            ptr_before,
-            "scratch buffer must be reused, not reallocated, across decode steps"
+        let mut min_p_logits = vec![5.0, 0.0, 0.0, 0.0];
+        MinP::new(0.5)?.process(&mut min_p_logits, &context())?;
+        assert_eq!(min_p_logits[0], 5.0);
+        assert!(
+            min_p_logits[1..]
+                .iter()
+                .all(|value| *value == f32::NEG_INFINITY)
         );
+        Ok(())
     }
 
     #[test]
-    fn top_p_nucleus_keeps_dominant_prefix() {
-        // Highly peaked distribution: logit 10.0 dominates.
-        let mut logits = vec![10.0, 0.0, 0.0, 0.0];
-        let mut p = TopP(0.5);
-        p.process(&mut logits, &ctx());
-        assert_eq!(logits[0], 10.0);
-        for v in &logits[1..] {
-            assert!(v.is_infinite() && *v < 0.0);
-        }
-    }
-
-    #[test]
-    fn min_p_masks_tails() {
-        // logit 5 dominates → its prob is near 1. With min_p = 0.5,
-        // only indices within 0.5× max probability survive.
-        let mut logits = vec![5.0, 0.0, 0.0, 0.0];
-        let mut p = MinP(0.5);
-        p.process(&mut logits, &ctx());
-        assert_eq!(logits[0], 5.0);
-        for v in &logits[1..] {
-            assert!(v.is_infinite() && *v < 0.0);
-        }
-    }
-
-    #[test]
-    fn repetition_penalty_suppresses_positive() {
+    fn repetition_penalty_rejects_unknown_token_without_mutation() -> Result<()> {
         let mut logits = vec![2.0, 4.0, 1.0];
-        let mut r = RepetitionPenalty {
-            tokens: vec![1],
-            penalty: 2.0,
-        };
-        r.process(&mut logits, &ctx());
+        let before = logits.clone();
+        let mut processor = RepetitionPenalty::new(vec![1, 9], 2.0)?;
+        assert!(processor.process(&mut logits, &context()).is_err());
+        assert_eq!(logits, before);
+        Ok(())
+    }
+
+    #[test]
+    fn repetition_penalty_applies_each_token_once() -> Result<()> {
+        let mut logits = vec![2.0, 4.0, 1.0];
+        let mut processor = RepetitionPenalty::new(vec![1, 1], 2.0)?;
+        processor.process(&mut logits, &context())?;
         assert_eq!(logits[1], 2.0);
+        Ok(())
     }
 
     #[test]
-    fn repetition_penalty_boosts_negative() {
-        let mut logits = vec![-2.0, -4.0, 1.0];
-        let mut r = RepetitionPenalty {
-            tokens: vec![1],
-            penalty: 2.0,
-        };
-        r.process(&mut logits, &ctx());
-        assert_eq!(logits[1], -8.0);
+    fn invalid_parameters_are_rejected() {
+        assert!(TemperatureScale::new(0.0).is_err());
+        assert!(TemperatureScale::new(f32::NAN).is_err());
+        assert!(TopK::new(0).is_err());
+        assert!(TopP::new(1.1).is_err());
+        assert!(MinP::new(f32::INFINITY).is_err());
+        assert!(RepetitionPenalty::new(vec![], -1.0).is_err());
     }
 
     #[test]
-    fn typical_sampling_is_noop_in_phase_2() {
-        let mut logits = vec![1.0, 2.0, 3.0];
-        let mut p = TypicalSampling(0.95);
-        p.process(&mut logits, &ctx());
-        assert_eq!(logits, vec![1.0, 2.0, 3.0]);
+    fn typical_sampling_refuses_without_mutation() -> Result<()> {
+        let mut logits = vec![1.0, 2.0];
+        let before = logits.clone();
+        let mut processor = TypicalSampling::new(0.95)?;
+        assert!(processor.process(&mut logits, &context()).is_err());
+        assert_eq!(logits, before);
+        Ok(())
+    }
+
+    #[test]
+    fn processors_reject_invalid_logits() -> Result<()> {
+        let mut processor = TemperatureScale::new(1.0)?;
+        for logits in [
+            Vec::new(),
+            vec![f32::NAN],
+            vec![f32::INFINITY],
+            vec![f32::NEG_INFINITY, f32::NEG_INFINITY],
+        ] {
+            let mut logits = logits;
+            assert!(processor.process(&mut logits, &context()).is_err());
+        }
+        Ok(())
     }
 }
