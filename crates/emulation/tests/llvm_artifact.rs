@@ -99,6 +99,66 @@ fn rebuilds_and_disassembles_gfx1100_copy_add_fixture() {
     clippy::expect_used,
     reason = "the explicit witness names unavailable external prerequisites"
 )]
+fn rebuilds_disassembles_and_admits_gfx1100_mul_f32_fixture() {
+    assert_pinned_version();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wave32_mul_f32.s");
+    let directory = tempfile::tempdir().expect("temporary artifact directory");
+    let object = directory.path().join("wave32_mul_f32.o");
+    let assembly = Command::new(LLVM_MC)
+        .args([
+            "-triple=amdgcn-amd-amdhsa",
+            "-mcpu=gfx1100",
+            "-filetype=obj",
+            "-o",
+        ])
+        .arg(&object)
+        .arg(&fixture)
+        .output()
+        .expect("llvm-mc must start");
+    assert!(
+        assembly.status.success(),
+        "llvm-mc failed: {}",
+        String::from_utf8_lossy(&assembly.stderr)
+    );
+
+    let disassembly = Command::new(LLVM_OBJDUMP)
+        .arg("-d")
+        .arg(&object)
+        .output()
+        .expect("llvm-objdump must start");
+    assert!(
+        disassembly.status.success(),
+        "llvm-objdump failed: {}",
+        String::from_utf8_lossy(&disassembly.stderr)
+    );
+    let text = String::from_utf8_lossy(&disassembly.stdout);
+    assert!(text.contains("10161703"));
+    assert!(text.contains("v_mul_f32_e32 v11, v3, v11"));
+
+    let bytes = std::fs::read(&object).expect("object readable");
+    let admitted = inspect_relocatable_text(&bytes).expect("relocatable multiply object admitted");
+    assert_eq!(
+        admitted.text(),
+        [0x03, 0x17, 0x16, 0x10, 0x00, 0x00, 0xb0, 0xbf]
+    );
+    let mut registers = vec![[1.0f32.to_bits(); 32]; 12];
+    registers[3] = [1.5f32.to_bits(); 32];
+    registers[11] = [(-2.0f32).to_bits(); 32];
+    let execution = admitted
+        .into_wave32_program(registers, 2)
+        .expect("admitted text meets raw dispatch bounds")
+        .execute()
+        .expect("admitted multiply uses only the implemented instruction form");
+    assert_eq!(execution.registers()[11], [(-3.0f32).to_bits(); 32]);
+    assert_eq!(execution.coverage().mul_f32_count(), 1);
+}
+
+#[test]
+#[ignore = "requires the explicitly pinned local AOMP llvm-mc/llvm-objdump witness"]
+#[expect(
+    clippy::expect_used,
+    reason = "the explicit witness names unavailable external prerequisites"
+)]
 fn rebuilds_disassembles_and_admits_gfx1100_wmma_fixture() {
     assert_pinned_version();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wave32_wmma.s");

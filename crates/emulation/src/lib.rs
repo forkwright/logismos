@@ -34,10 +34,11 @@ pub fn gfx1100_target() -> &'static str {
 }
 
 /// Exact instruction forms accepted by this executor.
-pub const SUPPORTED_INSTRUCTIONS: [&str; 5] = [
+pub const SUPPORTED_INSTRUCTIONS: [&str; 6] = [
     "v_mov_b32_e32",
     "v_add_nc_u32_e32",
     "v_add_f32_e32",
+    "v_mul_f32_e32 (VGPR-only, finite-normal subset)",
     "v_wmma_f32_16x16x16_f16 (exact-integer subset)",
     "s_endpgm",
 ];
@@ -99,9 +100,9 @@ impl Wave32Program {
 
     /// Executes the instruction stream from its supplied register state.
     ///
-    /// The f32 form admits only finite, normal inputs and a finite, normal host
-    /// result. It uses host IEEE-754 `f32` addition as a CPU oracle within that
-    /// narrow domain; it does not claim RDNA3 FP-mode, denormal, NaN, flag, or
+    /// The f32 forms admit only finite, normal inputs and a finite, normal host
+    /// result. They use host IEEE-754 `f32` arithmetic as a CPU oracle within that
+    /// narrow domain; they do not claim RDNA3 FP-mode, denormal, NaN, flag, or
     /// exception behavior. EXEC masking and source modifiers are also unsupported.
     ///
     /// # Errors
@@ -188,6 +189,7 @@ pub struct InstructionCoverage {
     moves: usize,
     add_u32: usize,
     add_f32: usize,
+    mul_f32: usize,
     wmma_f32: usize,
     end_program: usize,
     refusals: usize,
@@ -210,6 +212,12 @@ impl InstructionCoverage {
     #[must_use]
     pub const fn add_f32_count(self) -> usize {
         self.add_f32
+    }
+
+    /// Returns the number of executed finite-normal `v_mul_f32_e32` words.
+    #[must_use]
+    pub const fn mul_f32_count(self) -> usize {
+        self.mul_f32
     }
 
     /// Returns the number of executed exact-integer WMMA words.
@@ -494,6 +502,10 @@ const V_ADD_NC_U32_E32_MASK: u32 = 0xfe00_0000;
 const V_ADD_NC_U32_E32_BASE: u32 = 0x4a00_0000;
 const V_ADD_F32_E32_MASK: u32 = 0xfe00_0000;
 const V_ADD_F32_E32_BASE: u32 = 0x0600_0000;
+// WHY: RDNA3 assigns V_MUL_F32 VOP2 opcode eight; matching only that form keeps
+// VOP3 modifiers and other encodings outside this bounded executor.
+const V_MUL_F32_E32_MASK: u32 = 0xfe00_0000;
+const V_MUL_F32_E32_BASE: u32 = 0x1000_0000;
 const S_ENDPGM: u32 = 0xbfb0_0000;
 const V_WMMA_F32_WORD0_MASK: u32 = 0xffff_ff00;
 const V_WMMA_F32_WORD0_BASE: u32 = 0xcc40_4000;
@@ -516,6 +528,11 @@ enum Instruction {
         source0: u8,
         source1: u8,
     },
+    MulF32 {
+        destination: u8,
+        source0: u8,
+        source1: u8,
+    },
     WmmaF32 {
         destination: u8,
         a: u8,
@@ -529,9 +546,11 @@ impl Instruction {
     const fn width(self) -> usize {
         match self {
             Self::WmmaF32 { .. } => WMMA_BYTES,
-            Self::Move { .. } | Self::AddU32 { .. } | Self::AddF32 { .. } | Self::EndProgram => {
-                INSTRUCTION_BYTES
-            }
+            Self::Move { .. }
+            | Self::AddU32 { .. }
+            | Self::AddF32 { .. }
+            | Self::MulF32 { .. }
+            | Self::EndProgram => INSTRUCTION_BYTES,
         }
     }
 }
@@ -576,6 +595,13 @@ fn decode(word: u32, trailing: Option<u32>) -> core::result::Result<Instruction,
     }
     if word & V_ADD_F32_E32_MASK == V_ADD_F32_E32_BASE {
         return Ok(Instruction::AddF32 {
+            destination: byte_at(word, 17),
+            source0: decode_vgpr_source(source0(word))?,
+            source1: byte_at(word, 9),
+        });
+    }
+    if word & V_MUL_F32_E32_MASK == V_MUL_F32_E32_BASE {
+        return Ok(Instruction::MulF32 {
             destination: byte_at(word, 17),
             source0: decode_vgpr_source(source0(word))?,
             source1: byte_at(word, 9),
@@ -654,9 +680,20 @@ fn apply_instruction(
         } => {
             let left = read_register(registers, source0, pc, *coverage)?;
             let right = read_register(registers, source1, pc, *coverage)?;
-            let result = lane_f32_add(left, right, pc, *coverage)?;
+            let result = lane_f32_binary(left, right, pc, *coverage, |left, right| left + right)?;
             write_register(registers, destination, result, pc, *coverage)?;
             coverage.add_f32 = coverage.add_f32.saturating_add(1);
+        }
+        Instruction::MulF32 {
+            destination,
+            source0,
+            source1,
+        } => {
+            let left = read_register(registers, source0, pc, *coverage)?;
+            let right = read_register(registers, source1, pc, *coverage)?;
+            let result = lane_f32_binary(left, right, pc, *coverage, |left, right| left * right)?;
+            write_register(registers, destination, result, pc, *coverage)?;
+            coverage.mul_f32 = coverage.mul_f32.saturating_add(1);
         }
         Instruction::WmmaF32 {
             destination,
@@ -920,17 +957,18 @@ fn encode_f32_integer(value: i32) -> u32 {
     sign | (exponent << 23) | fraction
 }
 
-fn lane_f32_add(
+fn lane_f32_binary(
     left: [u32; WAVE32_LANES],
     right: [u32; WAVE32_LANES],
     pc: usize,
     coverage: InstructionCoverage,
+    operation: impl Fn(f32, f32) -> f32,
 ) -> Result<[u32; WAVE32_LANES]> {
     let mut output = [0u32; WAVE32_LANES];
     for ((destination, left), right) in output.iter_mut().zip(left).zip(right) {
         ensure_normal_f32(left, "source0", pc, coverage)?;
         ensure_normal_f32(right, "source1", pc, coverage)?;
-        let result = (f32::from_bits(left) + f32::from_bits(right)).to_bits();
+        let result = operation(f32::from_bits(left), f32::from_bits(right)).to_bits();
         ensure_normal_f32(result, "result", pc, coverage)?;
         *destination = result;
     }
@@ -1064,6 +1102,228 @@ mod tests {
             assert_eq!(*value, expected.to_bits());
         }
         assert_eq!(report.coverage().add_f32_count(), 1);
+    }
+
+    const MUL_F32: [u8; 8] = [
+        0x03, 0x17, 0x16, 0x10, // v_mul_f32_e32 v11, v3, v11
+        0x00, 0x00, 0xb0, 0xbf,
+    ];
+
+    fn multiply_registers(
+        source0: [u32; WAVE32_LANES],
+        source1: [u32; WAVE32_LANES],
+    ) -> Vec<[u32; WAVE32_LANES]> {
+        let mut registers = vec![[0; WAVE32_LANES]; 12];
+        registers[3] = source0;
+        registers[11] = source1;
+        registers
+    }
+
+    #[test]
+    fn executes_native_f32_multiply_in_every_wave32_lane() {
+        let source0 = [
+            1.5f32.to_bits(),
+            (-2.0f32).to_bits(),
+            0.75f32.to_bits(),
+            (-1.25f32).to_bits(),
+        ];
+        let source1 = [
+            (-2.0f32).to_bits(),
+            (-4.0f32).to_bits(),
+            0.5f32.to_bits(),
+            (-4.0f32).to_bits(),
+        ];
+        let expected = [
+            (-3.0f32).to_bits(),
+            8.0f32.to_bits(),
+            0.375f32.to_bits(),
+            5.0f32.to_bits(),
+        ];
+        let mut left = [0u32; WAVE32_LANES];
+        let mut right = [0u32; WAVE32_LANES];
+        for lane in 0..WAVE32_LANES {
+            left[lane] = source0[lane % source0.len()];
+            right[lane] = source1[lane % source1.len()];
+        }
+        let program = Wave32Program::new(MUL_F32.to_vec(), multiply_registers(left, right), 2)
+            .expect("fixture is bounded and aligned");
+
+        let report = program.execute().expect("native fixture is supported");
+        for (lane, value) in report.registers()[11].iter().enumerate() {
+            assert_eq!(*value, expected[lane % expected.len()]);
+        }
+        assert_eq!(report.coverage().mul_f32_count(), 1);
+        assert_eq!(report.coverage().end_program_count(), 1);
+    }
+
+    #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the independent f64 oracle intentionally rounds once into the declared f32 executor domain"
+    )]
+    fn f32_multiply_matches_the_single_rounded_f64_cpu_oracle() {
+        let left = f32::from_bits(0x3f80_0001);
+        let right = f32::from_bits(0x3f80_0001);
+        let expected = (f64::from(left) * f64::from(right)) as f32;
+        assert_eq!(expected.to_bits(), 0x3f80_0002);
+        let program = Wave32Program::new(
+            MUL_F32.to_vec(),
+            multiply_registers(
+                [left.to_bits(); WAVE32_LANES],
+                [right.to_bits(); WAVE32_LANES],
+            ),
+            2,
+        )
+        .expect("fixture is bounded and aligned");
+
+        let report = program
+            .execute()
+            .expect("normal inputs and result are supported");
+        // WHY: This is the executor's correctly rounded CPU oracle, not a hardware-parity assertion;
+        // the ISA permits 0.5-ULP arithmetic and this slice deliberately excludes FP-mode state.
+        assert_eq!(report.registers()[11], [expected.to_bits(); WAVE32_LANES]);
+    }
+
+    #[test]
+    fn multiply_refuses_non_normal_sources_and_results() {
+        for bits in [
+            0,
+            0x8000_0000,
+            1,
+            f32::INFINITY.to_bits(),
+            f32::NAN.to_bits(),
+        ] {
+            let error = Wave32Program::new(
+                MUL_F32.to_vec(),
+                multiply_registers([bits; WAVE32_LANES], [1.0f32.to_bits(); WAVE32_LANES]),
+                2,
+            )
+            .expect("fixture is bounded and aligned")
+            .execute()
+            .expect_err("non-normal source is outside the CPU oracle domain");
+            assert!(matches!(
+                error,
+                Error::UnsupportedF32Class {
+                    operand: "source0",
+                    ..
+                }
+            ));
+        }
+
+        let source1 = Wave32Program::new(
+            MUL_F32.to_vec(),
+            multiply_registers([1.0f32.to_bits(); WAVE32_LANES], [0; WAVE32_LANES]),
+            2,
+        )
+        .expect("fixture is bounded and aligned")
+        .execute()
+        .expect_err("zero source is outside the CPU oracle domain");
+        assert!(matches!(
+            source1,
+            Error::UnsupportedF32Class {
+                operand: "source1",
+                ..
+            }
+        ));
+
+        let error = Wave32Program::new(
+            MUL_F32.to_vec(),
+            multiply_registers(
+                [f32::MIN_POSITIVE.to_bits(); WAVE32_LANES],
+                [0.5f32.to_bits(); WAVE32_LANES],
+            ),
+            2,
+        )
+        .expect("fixture is bounded and aligned")
+        .execute()
+        .expect_err("subnormal result is outside the CPU oracle domain");
+        assert!(matches!(
+            error,
+            Error::UnsupportedF32Class {
+                operand: "result",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn multiply_refusals_preserve_program_state_and_coverage() {
+        let missing_register = Wave32Program::new(MUL_F32.to_vec(), vec![[0; WAVE32_LANES]; 11], 2)
+            .expect("fixture is bounded and aligned");
+        let before_missing_register = missing_register.clone();
+        let error = missing_register
+            .execute()
+            .expect_err("v11 is not supplied for the second source");
+        assert_eq!(missing_register, before_missing_register);
+        assert!(matches!(
+            error,
+            Error::RegisterOutOfBounds { register: 11, .. }
+        ));
+        let coverage = error.coverage().expect("execution error");
+        assert_eq!(coverage.mul_f32_count(), 0);
+        assert_eq!(coverage.refused_count(), 1);
+
+        let unsupported = Wave32Program::new(
+            [
+                0x00, 0x03, 0x02, 0x7e, // v_mov_b32_e32 v1, v0
+                // WHY: This literal VOP2 source is emitted by the current RMSNorm artifact.
+                0xff, 0x06, 0x06, 0x10, 0xfe, 0xff, 0x7f, 0x4f,
+            ]
+            .to_vec(),
+            vec![[1; WAVE32_LANES]; 12],
+            3,
+        )
+        .expect("fixture is bounded and aligned");
+        let before_unsupported = unsupported.clone();
+        let error = unsupported
+            .execute()
+            .expect_err("literal source is outside the VGPR-only slice");
+        assert_eq!(unsupported, before_unsupported);
+        assert!(matches!(
+            error,
+            Error::UnsupportedSourceOperand { encoded: 0xff, .. }
+        ));
+        let coverage = error.coverage().expect("execution error");
+        assert_eq!(coverage.move_count(), 1);
+        assert_eq!(coverage.mul_f32_count(), 0);
+        assert_eq!(coverage.refused_count(), 1);
+
+        for source in [0u16, 233u16] {
+            let word = V_MUL_F32_E32_BASE
+                | (u32::from(11u8) << 17)
+                | (u32::from(11u8) << 9)
+                | u32::from(source);
+            let error =
+                Wave32Program::new(word.to_le_bytes().to_vec(), vec![[1; WAVE32_LANES]; 12], 1)
+                    .expect("fixture is bounded and aligned")
+                    .execute()
+                    .expect_err("SGPR and DPP source forms are outside the VGPR-only slice");
+            assert!(matches!(
+                error,
+                Error::UnsupportedSourceOperand { encoded, .. } if encoded == source
+            ));
+        }
+
+        let unknown = Wave32Program::new(
+            [
+                0x00, 0x03, 0x02, 0x7e, // v_mov_b32_e32 v1, v0
+                0x00, 0x00, 0x00, 0x00,
+            ]
+            .to_vec(),
+            vec![[1; WAVE32_LANES]; 12],
+            2,
+        )
+        .expect("fixture is bounded and aligned");
+        let before_unknown = unknown.clone();
+        let error = unknown
+            .execute()
+            .expect_err("unknown encoding remains unsupported");
+        assert_eq!(unknown, before_unknown);
+        assert!(matches!(error, Error::UnsupportedEncoding { .. }));
+        let coverage = error.coverage().expect("execution error");
+        assert_eq!(coverage.move_count(), 1);
+        assert_eq!(coverage.mul_f32_count(), 0);
+        assert_eq!(coverage.refused_count(), 1);
     }
 
     #[test]
