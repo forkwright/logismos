@@ -7,7 +7,7 @@ use snafu::Snafu;
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Errors surfaced by `quant` preflight and block-decoding utilities.
-#[derive(Debug, Snafu)]
+#[derive(Debug, PartialEq, Eq, Snafu)]
 #[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
