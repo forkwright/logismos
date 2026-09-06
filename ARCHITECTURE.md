@@ -3,7 +3,7 @@
 ## Overview
 
 Logismos is a Rust workspace for loading, quantization, inference, and serving. Crates form a
-strict DAG - no cycles, no sideways dependencies. Each crate owns exactly one responsibility.
+strict DAG with no cycles and explicitly justified tier edges. Each crate owns one responsibility.
 
 The product direction is an agent-aware operating environment for local AI compute. Aletheia
 supplies intent; Logismos owns inference semantics and execution within granted resources;
@@ -37,6 +37,9 @@ semantically respects that boundary.
 - `placement` and `sched` have no HIP/device-runtime dependency. `bin` consumes
   `placement` for `plan` and metadata-only `loader` for `inspect` without
   linking the device runtime.
+- `decoders` consumes metadata-only `loader` for structural profiles, without
+  linking HIP. The lower-level `quant` crate owns Q8_0 block geometry; `loader`
+  reuses it for inspection instead of maintaining a second layout definition.
 - `emulation` is a CPU test aid, not a production device backend.
 - `taxis` depends locally on `hipcore`.
 - `kernels` depends locally on `hipcore` and `taxis`; it does not depend on `core`.

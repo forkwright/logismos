@@ -40,8 +40,9 @@ See [CLAUDE.md](CLAUDE.md) for how to resolve the kanon checkout root on this bo
 - `crates/encoders/` - encoder model impls (Stella, ModernBERT)
 - `crates/embed/` - embedding pipeline
 - `crates/rerank/` - `Reranker` trait and cross-encoder implementations (GteReranker, ModernBERT CPU)
-- `crates/quant/` - quantization schemes (TurboQuant 3-bit)
+- `crates/quant/` - quantization schemes and original CPU Q8_0 block decoding
 - `crates/loader/` - safetensors + bounded GGUF v3 observation
+- `crates/decoders/` - observation-bound Qwen3.5-family structural preflight, not a native forward path
 - `crates/bin/` - CPU-only `plan` and typed GGUF `inspect` commands
 - `crates/tokenize/` - tokenizer facade
 - `crates/logismos/` - top-level integration facade
