@@ -8,7 +8,7 @@ description = "Current stable public model trait surface, centered on EmbeddingM
 publish = false
 
 [lib]
-doctest = false
+name = "logismos_core"
 
 [dependencies]
 snafu = { workspace = true }
