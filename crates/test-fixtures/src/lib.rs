@@ -1,6 +1,9 @@
 //! Deterministic, dev-only GGUF fixtures shared by native execution tests.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use sha2::{Digest, Sha256};
+use snafu::Snafu;
 
 const ALIGNMENT: u64 = 32;
 const HIDDEN: u64 = 3;
@@ -14,6 +17,64 @@ const TIME_STEP_RANK: u64 = 4;
 const GROUP_COUNT: u64 = 2;
 const CONV_KERNEL: u64 = 2;
 const MAIN_BLOCKS: u64 = 4;
+const CONTEXT: u32 = 8;
+const GGML_TYPE_F32: u32 = 0;
+
+struct Location;
+
+impl Location {
+    #[track_caller]
+    fn caller() -> snafu::Location {
+        std::panic::Location::caller()
+    }
+}
+
+/// Errors while constructing a bounded synthetic fixture.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+#[non_exhaustive]
+pub enum FixtureError {
+    /// A supplied token id does not name the configured vocabulary.
+    #[snafu(display("{field} token id {token_id} is outside vocabulary length {vocabulary}"))]
+    InvalidTokenId {
+        /// Config field that contained the invalid id.
+        field: &'static str,
+        /// Caller-provided token id.
+        token_id: u32,
+        /// Number of configured tokens.
+        vocabulary: u32,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// A descriptor count or serialized extent cannot fit its GGUF field.
+    #[snafu(display("fixture {context} cannot be represented"))]
+    NotRepresentable {
+        /// What could not be represented.
+        context: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Checked layout arithmetic overflowed.
+    #[snafu(display("fixture {context} overflowed"))]
+    Overflow {
+        /// Arithmetic operation that overflowed.
+        context: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// The fixture factory's output tensor is structurally inconsistent.
+    #[snafu(display("fixture output tensor is malformed: {reason}"))]
+    InvalidOutput {
+        /// Structural invariant that was violated.
+        reason: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+}
 
 /// Exact token and template controls for one synthetic Qwen3.5 GGUF.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +93,26 @@ pub struct Qwen35FixtureConfig {
     pub chat_template: String,
     /// Output row made uniquely maximal by the fixture.
     pub greedy_token_id: u32,
+}
+
+impl Default for Qwen35FixtureConfig {
+    fn default() -> Self {
+        Self {
+            tokens: vec![
+                "[UNK]".to_string(),
+                "<bos>".to_string(),
+                "<eos>".to_string(),
+                "hello".to_string(),
+                "assistant".to_string(),
+            ],
+            bos_token_id: 1,
+            eos_token_id: 2,
+            add_bos: true,
+            add_eos: false,
+            chat_template: "{{ messages }}".to_string(),
+            greedy_token_id: 4,
+        }
+    }
 }
 
 /// Serialized synthetic GGUF plus its independently computed identity facts.
@@ -78,8 +159,8 @@ pub struct RawTensor {
     pub name: String,
     /// Logical GGUF dimensions.
     pub dims: Vec<u64>,
-    /// GGML dtype tag.
-    pub ggml_type: u32,
+    /// GGML format tag, for example `0` for F32 or a quantized type tag.
+    pub format: u32,
     /// Exact serialized bytes in tensor-offset order.
     pub payload: Vec<u8>,
 }
@@ -93,57 +174,57 @@ pub struct RawGguf {
     pub tensors: Vec<RawTensor>,
 }
 
-/// Serialize raw synthetic GGUF descriptors without decoding their payloads.
+/// Serialize mutable synthetic GGUF descriptors without decoding payloads.
+///
+/// This deliberately accepts arbitrary format tags and payload bytes: refusal
+/// tests can model malformed tensor data without a second serializer.
 ///
 /// # Errors
 ///
-/// Returns an error when a descriptor count, dimension, payload extent, or
-/// aligned offset cannot be represented.
-pub fn serialize_raw_gguf(raw: &RawGguf) -> Result<SyntheticGguf, String> {
+/// Returns an error when a descriptor count or aligned extent cannot be
+/// represented by GGUF's on-disk fields.
+pub fn serialize_raw_gguf(raw: &RawGguf) -> Result<SyntheticGguf, FixtureError> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"GGUF");
     bytes.extend_from_slice(&3_u32.to_le_bytes());
-    bytes.extend_from_slice(
-        &u64::try_from(raw.tensors.len())
-            .map_err(|error| error.to_string())?
-            .to_le_bytes(),
-    );
-    bytes.extend_from_slice(
-        &u64::try_from(raw.metadata.len())
-            .map_err(|error| error.to_string())?
-            .to_le_bytes(),
-    );
+    bytes.extend_from_slice(&u64_from_usize(raw.tensors.len(), "tensor count")?.to_le_bytes());
+    bytes.extend_from_slice(&u64_from_usize(raw.metadata.len(), "metadata count")?.to_le_bytes());
     for entry in &raw.metadata {
         append_raw_metadata(&mut bytes, entry)?;
     }
+
     let mut offsets = Vec::with_capacity(raw.tensors.len());
     let mut offset = 0_u64;
     for tensor in &raw.tensors {
         offset = align(offset)?;
         offsets.push(offset);
         offset = offset
-            .checked_add(u64::try_from(tensor.payload.len()).map_err(|error| error.to_string())?)
-            .ok_or_else(|| "raw tensor offset overflowed".to_string())?;
+            .checked_add(u64_from_usize(
+                tensor.payload.len(),
+                "tensor payload length",
+            )?)
+            .ok_or_else(|| FixtureError::Overflow {
+                context: "tensor offset",
+                location: Location::caller(),
+            })?;
     }
     for (tensor, offset) in raw.tensors.iter().zip(offsets) {
         string(&mut bytes, &tensor.name)?;
         bytes.extend_from_slice(
-            &u32::try_from(tensor.dims.len())
-                .map_err(|error| error.to_string())?
-                .to_le_bytes(),
+            &u32_from_usize(tensor.dims.len(), "tensor dimension count")?.to_le_bytes(),
         );
         for dimension in &tensor.dims {
-            bytes.extend_from_slice(&dimension.to_le_bytes())
+            bytes.extend_from_slice(&dimension.to_le_bytes());
         }
-        bytes.extend_from_slice(&tensor.ggml_type.to_le_bytes());
+        bytes.extend_from_slice(&tensor.format.to_le_bytes());
         bytes.extend_from_slice(&offset.to_le_bytes());
     }
     pad(&mut bytes)?;
     for tensor in &raw.tensors {
         pad(&mut bytes)?;
-        bytes.extend_from_slice(&tensor.payload)
+        bytes.extend_from_slice(&tensor.payload);
     }
-    let byte_len = u64::try_from(bytes.len()).map_err(|error| error.to_string())?;
+    let byte_len = u64_from_usize(bytes.len(), "serialized byte length")?;
     Ok(SyntheticGguf {
         sha256: Sha256::digest(&bytes).into(),
         byte_len,
@@ -157,259 +238,393 @@ pub fn serialize_raw_gguf(raw: &RawGguf) -> Result<SyntheticGguf, String> {
 ///
 /// Returns an error when token ids do not name the supplied vocabulary or a
 /// checked serialized size cannot be represented.
-pub fn build_qwen35_fixture(config: &Qwen35FixtureConfig) -> Result<SyntheticGguf, String> {
+pub fn build_qwen35_fixture(config: &Qwen35FixtureConfig) -> Result<SyntheticGguf, FixtureError> {
+    serialize_raw_gguf(&raw_qwen35_fixture(config)?)
+}
+
+/// Build mutable descriptors for the standard synthetic Qwen3.5 hybrid GGUF.
+///
+/// Consumers may alter metadata, shapes, format tags, or payload bytes before
+/// passing the result to [`serialize_raw_gguf`] for negative-path tests.
+///
+/// # Errors
+///
+/// Returns an error when token ids do not name the supplied vocabulary or a
+/// required F32 payload size cannot be represented.
+pub fn raw_qwen35_fixture(config: &Qwen35FixtureConfig) -> Result<RawGguf, FixtureError> {
     validate_config(config)?;
-    let vocabulary = u64::try_from(config.tokens.len()).map_err(|error| error.to_string())?;
-    let mut metadata = vec![
-        Meta::String("general.architecture", "qwen35".to_string()),
-        Meta::U32("qwen35.block_count", 4),
-        Meta::U32("qwen35.nextn_predict_layers", 0),
-        Meta::U32("qwen35.full_attention_interval", 4),
-        Meta::U32("qwen35.embedding_length", 3),
-        Meta::U32("qwen35.feed_forward_length", 5),
-        Meta::U32("qwen35.attention.head_count", 2),
-        Meta::U32("qwen35.attention.head_count_kv", 1),
-        Meta::U32("qwen35.attention.key_length", 2),
-        Meta::U32("qwen35.attention.value_length", 2),
-        Meta::U32("qwen35.ssm.conv_kernel", 2),
-        Meta::U32("qwen35.ssm.inner_size", 8),
-        Meta::U32("qwen35.ssm.state_size", 2),
-        Meta::U32("qwen35.ssm.time_step_rank", 4),
-        Meta::U32("qwen35.ssm.group_count", 2),
-        Meta::F32("qwen35.attention.layer_norm_rms_epsilon", 0.001),
-        Meta::StringArray("tokenizer.ggml.tokens", config.tokens.clone()),
-        Meta::U32("tokenizer.ggml.bos_token_id", config.bos_token_id),
-        Meta::U32("tokenizer.ggml.eos_token_id", config.eos_token_id),
-        Meta::Bool("tokenizer.ggml.add_bos_token", config.add_bos),
-        Meta::Bool("tokenizer.ggml.add_eos_token", config.add_eos),
-        Meta::String("tokenizer.chat_template", config.chat_template.clone()),
-        Meta::U32("general.alignment", 32),
-        Meta::U32("qwen35.context_length", 8),
-        Meta::I32Array("qwen35.rope.dimension_sections", vec![1, 0, 0, 0]),
-        Meta::F32("qwen35.rope.freq_base", 10_000.0),
-        Meta::String("qwen35.rope.scaling.type", "none".to_string()),
-    ];
-    metadata.shrink_to_fit();
-    let mut tensors = Vec::new();
-    tensor(
-        &mut tensors,
+    let vocabulary = u64_from_usize(config.tokens.len(), "vocabulary length")?;
+    let mut raw = RawGguf {
+        metadata: qwen35_metadata(config)?,
+        tensors: Vec::new(),
+    };
+
+    push_f32_tensor(
+        &mut raw.tensors,
         "token_embd.weight",
         vec![HIDDEN, vocabulary],
         1.0,
-    );
-    tensor(&mut tensors, "output_norm.weight", vec![HIDDEN], 1.0);
-    tensor(&mut tensors, "output.weight", vec![HIDDEN, vocabulary], 0.0);
+    )?;
+    push_f32_tensor(&mut raw.tensors, "output_norm.weight", vec![HIDDEN], 1.0)?;
+    push_f32_tensor(
+        &mut raw.tensors,
+        "output.weight",
+        vec![HIDDEN, vocabulary],
+        0.0,
+    )?;
     set_output_row(
-        &mut tensors,
-        usize::try_from(config.greedy_token_id).map_err(|error| error.to_string())?,
+        &mut raw.tensors,
+        usize_from_u32(config.greedy_token_id, "greedy token id")?,
     )?;
     for block in 0..MAIN_BLOCKS {
-        if block == 3 {
-            full_block(&mut tensors, block);
+        if block + 1 == MAIN_BLOCKS {
+            full_block(&mut raw.tensors, block)?;
         } else {
-            recurrent_block(&mut tensors, block);
+            recurrent_block(&mut raw.tensors, block)?;
         }
     }
-    let bytes = serialize(&metadata, &tensors)?;
-    let byte_len = u64::try_from(bytes.len()).map_err(|error| error.to_string())?;
-    Ok(SyntheticGguf {
-        sha256: Sha256::digest(&bytes).into(),
-        byte_len,
-        bytes,
-    })
+    Ok(raw)
 }
 
-fn validate_config(config: &Qwen35FixtureConfig) -> Result<(), String> {
-    let length = u32::try_from(config.tokens.len()).map_err(|error| error.to_string())?;
-    for (field, value) in [
+fn qwen35_metadata(config: &Qwen35FixtureConfig) -> Result<Vec<RawMetadata>, FixtureError> {
+    Ok(vec![
+        metadata_string("general.architecture", "qwen35"),
+        metadata_u32(
+            "qwen35.block_count",
+            u32_from_u64(MAIN_BLOCKS, "block count")?,
+        ),
+        metadata_u32("qwen35.nextn_predict_layers", 0),
+        metadata_u32(
+            "qwen35.full_attention_interval",
+            u32_from_u64(MAIN_BLOCKS, "attention interval")?,
+        ),
+        metadata_u32(
+            "qwen35.embedding_length",
+            u32_from_u64(HIDDEN, "hidden size")?,
+        ),
+        metadata_u32(
+            "qwen35.feed_forward_length",
+            u32_from_u64(FEED_FORWARD, "feed-forward size")?,
+        ),
+        metadata_u32(
+            "qwen35.attention.head_count",
+            u32_from_u64(HEADS, "head count")?,
+        ),
+        metadata_u32(
+            "qwen35.attention.head_count_kv",
+            u32_from_u64(KEY_VALUE_HEADS, "KV head count")?,
+        ),
+        metadata_u32(
+            "qwen35.attention.key_length",
+            u32_from_u64(HEAD_WIDTH, "key width")?,
+        ),
+        metadata_u32(
+            "qwen35.attention.value_length",
+            u32_from_u64(HEAD_WIDTH, "value width")?,
+        ),
+        metadata_u32(
+            "qwen35.ssm.conv_kernel",
+            u32_from_u64(CONV_KERNEL, "kernel")?,
+        ),
+        metadata_u32("qwen35.ssm.inner_size", u32_from_u64(INNER, "inner size")?),
+        metadata_u32("qwen35.ssm.state_size", u32_from_u64(STATE, "state size")?),
+        metadata_u32(
+            "qwen35.ssm.time_step_rank",
+            u32_from_u64(TIME_STEP_RANK, "time-step rank")?,
+        ),
+        metadata_u32(
+            "qwen35.ssm.group_count",
+            u32_from_u64(GROUP_COUNT, "group count")?,
+        ),
+        metadata_f32("qwen35.attention.layer_norm_rms_epsilon", 0.001),
+        RawMetadata {
+            key: "tokenizer.ggml.tokens".to_string(),
+            value: RawMetadataValue::StringArray(config.tokens.clone()),
+        },
+        metadata_u32("tokenizer.ggml.bos_token_id", config.bos_token_id),
+        metadata_u32("tokenizer.ggml.eos_token_id", config.eos_token_id),
+        metadata_bool("tokenizer.ggml.add_bos_token", config.add_bos),
+        metadata_bool("tokenizer.ggml.add_eos_token", config.add_eos),
+        metadata_string("tokenizer.chat_template", &config.chat_template),
+        metadata_u32("general.alignment", u32_from_u64(ALIGNMENT, "alignment")?),
+        metadata_u32("qwen35.context_length", CONTEXT),
+        RawMetadata {
+            key: "qwen35.rope.dimension_sections".to_string(),
+            value: RawMetadataValue::I32Array(vec![1, 0, 0, 0]),
+        },
+        metadata_f32("qwen35.rope.freq_base", 10_000.0),
+        metadata_string("qwen35.rope.scaling.type", "none"),
+    ])
+}
+
+fn validate_config(config: &Qwen35FixtureConfig) -> Result<(), FixtureError> {
+    let vocabulary = u32_from_usize(config.tokens.len(), "vocabulary length")?;
+    for (field, token_id) in [
         ("bos_token_id", config.bos_token_id),
         ("eos_token_id", config.eos_token_id),
         ("greedy_token_id", config.greedy_token_id),
     ] {
-        if value >= length {
-            return Err(format!("{field} must name one configured token"));
+        if token_id >= vocabulary {
+            return Err(FixtureError::InvalidTokenId {
+                field,
+                token_id,
+                vocabulary,
+                location: Location::caller(),
+            });
         }
     }
     Ok(())
 }
 
-#[derive(Clone)]
-enum Meta {
-    U32(&'static str, u32),
-    F32(&'static str, f32),
-    Bool(&'static str, bool),
-    String(&'static str, String),
-    StringArray(&'static str, Vec<String>),
-    I32Array(&'static str, Vec<i32>),
-}
-impl Meta {
-    fn key(&self) -> &'static str {
-        match self {
-            Self::U32(k, _)
-            | Self::F32(k, _)
-            | Self::Bool(k, _)
-            | Self::String(k, _)
-            | Self::StringArray(k, _)
-            | Self::I32Array(k, _) => k,
-        }
+fn metadata_u32(key: &str, value: u32) -> RawMetadata {
+    RawMetadata {
+        key: key.to_string(),
+        value: RawMetadataValue::U32(value),
     }
 }
-struct Tensor {
-    name: String,
+
+fn metadata_f32(key: &str, value: f32) -> RawMetadata {
+    RawMetadata {
+        key: key.to_string(),
+        value: RawMetadataValue::F32(value),
+    }
+}
+
+fn metadata_bool(key: &str, value: bool) -> RawMetadata {
+    RawMetadata {
+        key: key.to_string(),
+        value: RawMetadataValue::Bool(value),
+    }
+}
+
+fn metadata_string(key: &str, value: &str) -> RawMetadata {
+    RawMetadata {
+        key: key.to_string(),
+        value: RawMetadataValue::String(value.to_string()),
+    }
+}
+
+fn push_f32_tensor(
+    tensors: &mut Vec<RawTensor>,
+    name: &str,
     dims: Vec<u64>,
-    values: Vec<f32>,
-}
-fn tensor(tensors: &mut Vec<Tensor>, name: &str, dims: Vec<u64>, value: f32) {
-    let count = dims.iter().product::<u64>() as usize;
-    tensors.push(Tensor {
+    value: f32,
+) -> Result<(), FixtureError> {
+    tensors.push(RawTensor {
         name: name.to_string(),
+        payload: f32_payload(&dims, value)?,
         dims,
-        values: vec![value; count],
+        format: GGML_TYPE_F32,
     });
-}
-fn set_output_row(tensors: &mut [Tensor], row: usize) -> Result<(), String> {
-    let tensor = tensors
-        .iter_mut()
-        .find(|tensor| tensor.name == "output.weight")
-        .ok_or_else(|| "missing output".to_string())?;
-    let start = row * 3;
-    tensor.values[start..start + 3].copy_from_slice(&[1.0, 1.0, 1.0]);
     Ok(())
 }
+
+fn f32_payload(dims: &[u64], value: f32) -> Result<Vec<u8>, FixtureError> {
+    let values = dims.iter().try_fold(1_u64, |count, dimension| {
+        count
+            .checked_mul(*dimension)
+            .ok_or_else(|| FixtureError::Overflow {
+                context: "F32 tensor element count",
+                location: Location::caller(),
+            })
+    })?;
+    let bytes = values
+        .checked_mul(4)
+        .ok_or_else(|| FixtureError::Overflow {
+            context: "F32 tensor byte count",
+            location: Location::caller(),
+        })?;
+    let byte_len = usize_from_u64(bytes, "F32 tensor byte count")?;
+    let mut payload = Vec::with_capacity(byte_len);
+    for _ in 0..values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(payload)
+}
+
+fn set_output_row(tensors: &mut [RawTensor], row: usize) -> Result<(), FixtureError> {
+    let output = tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == "output.weight")
+        .ok_or_else(|| FixtureError::InvalidOutput {
+            reason: "output.weight is absent",
+            location: Location::caller(),
+        })?;
+    if output.format != GGML_TYPE_F32 || output.dims.len() != 2 || output.dims[0] != HIDDEN {
+        return Err(FixtureError::InvalidOutput {
+            reason: "output.weight is not an F32 hidden-by-vocabulary matrix",
+            location: Location::caller(),
+        });
+    }
+    let rows = usize_from_u64(output.dims[1], "output vocabulary")?;
+    if row >= rows {
+        return Err(FixtureError::InvalidOutput {
+            reason: "chosen output row is absent",
+            location: Location::caller(),
+        });
+    }
+    let width = usize_from_u64(HIDDEN, "output hidden width")?;
+    let start = row
+        .checked_mul(width)
+        .ok_or_else(|| FixtureError::Overflow {
+            context: "output row start",
+            location: Location::caller(),
+        })?;
+    let end = start
+        .checked_add(width)
+        .ok_or_else(|| FixtureError::Overflow {
+            context: "output row end",
+            location: Location::caller(),
+        })?;
+    let byte_start = start.checked_mul(4).ok_or_else(|| FixtureError::Overflow {
+        context: "output row byte start",
+        location: Location::caller(),
+    })?;
+    let byte_end = end.checked_mul(4).ok_or_else(|| FixtureError::Overflow {
+        context: "output row byte end",
+        location: Location::caller(),
+    })?;
+    let selected = output
+        .payload
+        .get_mut(byte_start..byte_end)
+        .ok_or_else(|| FixtureError::InvalidOutput {
+            reason: "output payload is shorter than its dimensions",
+            location: Location::caller(),
+        })?;
+    for cell in selected.chunks_exact_mut(4) {
+        cell.copy_from_slice(&1.0_f32.to_le_bytes());
+    }
+    Ok(())
+}
+
 fn name(block: u64, role: &str) -> String {
     format!("blk.{block}.{role}")
 }
-fn ffn(t: &mut Vec<Tensor>, b: u64) {
-    tensor(
-        t,
-        &name(b, "ffn_down.weight"),
+
+fn ffn(tensors: &mut Vec<RawTensor>, block: u64) -> Result<(), FixtureError> {
+    push_f32_tensor(
+        tensors,
+        &name(block, "ffn_down.weight"),
         vec![FEED_FORWARD, HIDDEN],
         0.0,
-    );
-    tensor(
-        t,
-        &name(b, "ffn_gate.weight"),
+    )?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "ffn_gate.weight"),
         vec![HIDDEN, FEED_FORWARD],
         0.0,
-    );
-    tensor(
-        t,
-        &name(b, "ffn_up.weight"),
+    )?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "ffn_up.weight"),
         vec![HIDDEN, FEED_FORWARD],
         0.0,
-    );
-}
-fn recurrent_block(t: &mut Vec<Tensor>, b: u64) {
-    tensor(t, &name(b, "attn_gate.weight"), vec![HIDDEN, INNER], 0.0);
-    tensor(t, &name(b, "attn_norm.weight"), vec![HIDDEN], 1.0);
-    tensor(t, &name(b, "attn_qkv.weight"), vec![HIDDEN, 16], 0.0);
-    ffn(t, b);
-    tensor(t, &name(b, "post_attention_norm.weight"), vec![HIDDEN], 1.0);
-    tensor(t, &name(b, "ssm_a"), vec![TIME_STEP_RANK], -1.0);
-    tensor(
-        t,
-        &name(b, "ssm_alpha.weight"),
-        vec![HIDDEN, TIME_STEP_RANK],
-        0.0,
-    );
-    tensor(
-        t,
-        &name(b, "ssm_beta.weight"),
-        vec![HIDDEN, TIME_STEP_RANK],
-        0.0,
-    );
-    tensor(t, &name(b, "ssm_conv1d.weight"), vec![CONV_KERNEL, 16], 0.0);
-    tensor(t, &name(b, "ssm_dt.bias"), vec![TIME_STEP_RANK], 0.0);
-    tensor(t, &name(b, "ssm_norm.weight"), vec![STATE], 1.0);
-    tensor(t, &name(b, "ssm_out.weight"), vec![INNER, HIDDEN], 0.0);
-}
-fn full_block(t: &mut Vec<Tensor>, b: u64) {
-    tensor(t, &name(b, "attn_k.weight"), vec![HIDDEN, HEAD_WIDTH], 0.0);
-    tensor(t, &name(b, "attn_k_norm.weight"), vec![HEAD_WIDTH], 1.0);
-    tensor(t, &name(b, "attn_norm.weight"), vec![HIDDEN], 1.0);
-    tensor(t, &name(b, "attn_output.weight"), vec![4, HIDDEN], 0.0);
-    tensor(t, &name(b, "attn_q.weight"), vec![HIDDEN, 8], 0.0);
-    tensor(t, &name(b, "attn_q_norm.weight"), vec![HEAD_WIDTH], 1.0);
-    tensor(t, &name(b, "attn_v.weight"), vec![HIDDEN, HEAD_WIDTH], 0.0);
-    ffn(t, b);
-    tensor(t, &name(b, "post_attention_norm.weight"), vec![HIDDEN], 1.0);
+    )
 }
 
-fn serialize(metadata: &[Meta], tensors: &[Tensor]) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"GGUF");
-    bytes.extend_from_slice(&3_u32.to_le_bytes());
-    bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
-    for meta in metadata {
-        string(&mut bytes, meta.key())?;
-        match meta {
-            Meta::U32(_, v) => {
-                bytes.extend_from_slice(&4_u32.to_le_bytes());
-                bytes.extend_from_slice(&v.to_le_bytes())
-            }
-            Meta::F32(_, v) => {
-                bytes.extend_from_slice(&6_u32.to_le_bytes());
-                bytes.extend_from_slice(&v.to_le_bytes())
-            }
-            Meta::Bool(_, v) => {
-                bytes.extend_from_slice(&7_u32.to_le_bytes());
-                bytes.push(u8::from(*v))
-            }
-            Meta::String(_, v) => {
-                bytes.extend_from_slice(&8_u32.to_le_bytes());
-                string(&mut bytes, v)?
-            }
-            Meta::StringArray(_, values) => {
-                bytes.extend_from_slice(&9_u32.to_le_bytes());
-                bytes.extend_from_slice(&8_u32.to_le_bytes());
-                bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
-                for value in values {
-                    string(&mut bytes, value)?
-                }
-            }
-            Meta::I32Array(_, values) => {
-                bytes.extend_from_slice(&9_u32.to_le_bytes());
-                bytes.extend_from_slice(&5_u32.to_le_bytes());
-                bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
-                for value in values {
-                    bytes.extend_from_slice(&value.to_le_bytes())
-                }
-            }
-        }
-    }
-    let mut offsets = Vec::new();
-    let mut offset = 0_u64;
-    for tensor in tensors {
-        offset = align(offset)?;
-        offsets.push(offset);
-        offset = offset
-            .checked_add(
-                (tensor.values.len() as u64)
-                    .checked_mul(4)
-                    .ok_or_else(|| "tensor bytes overflowed".to_string())?,
-            )
-            .ok_or_else(|| "tensor offset overflowed".to_string())?;
-    }
-    for (tensor, offset) in tensors.iter().zip(offsets) {
-        string(&mut bytes, &tensor.name)?;
-        bytes.extend_from_slice(&(tensor.dims.len() as u32).to_le_bytes());
-        for dim in &tensor.dims {
-            bytes.extend_from_slice(&dim.to_le_bytes())
-        }
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&offset.to_le_bytes())
-    }
-    pad(&mut bytes)?;
-    for tensor in tensors {
-        pad(&mut bytes)?;
-        for value in &tensor.values {
-            bytes.extend_from_slice(&value.to_le_bytes())
-        }
-    }
-    Ok(bytes)
+fn recurrent_block(tensors: &mut Vec<RawTensor>, block: u64) -> Result<(), FixtureError> {
+    push_f32_tensor(
+        tensors,
+        &name(block, "attn_gate.weight"),
+        vec![HIDDEN, INNER],
+        0.0,
+    )?;
+    push_f32_tensor(tensors, &name(block, "attn_norm.weight"), vec![HIDDEN], 1.0)?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "attn_qkv.weight"),
+        vec![HIDDEN, INNER * 2],
+        0.0,
+    )?;
+    ffn(tensors, block)?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "post_attention_norm.weight"),
+        vec![HIDDEN],
+        1.0,
+    )?;
+    push_f32_tensor(tensors, &name(block, "ssm_a"), vec![TIME_STEP_RANK], -1.0)?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "ssm_alpha.weight"),
+        vec![HIDDEN, TIME_STEP_RANK],
+        0.0,
+    )?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "ssm_beta.weight"),
+        vec![HIDDEN, TIME_STEP_RANK],
+        0.0,
+    )?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "ssm_conv1d.weight"),
+        vec![CONV_KERNEL, INNER * 2],
+        0.0,
+    )?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "ssm_dt.bias"),
+        vec![TIME_STEP_RANK],
+        0.0,
+    )?;
+    push_f32_tensor(tensors, &name(block, "ssm_norm.weight"), vec![STATE], 1.0)?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "ssm_out.weight"),
+        vec![INNER, HIDDEN],
+        0.0,
+    )
 }
-fn append_raw_metadata(bytes: &mut Vec<u8>, entry: &RawMetadata) -> Result<(), String> {
+
+fn full_block(tensors: &mut Vec<RawTensor>, block: u64) -> Result<(), FixtureError> {
+    push_f32_tensor(
+        tensors,
+        &name(block, "attn_k.weight"),
+        vec![HIDDEN, HEAD_WIDTH],
+        0.0,
+    )?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "attn_k_norm.weight"),
+        vec![HEAD_WIDTH],
+        1.0,
+    )?;
+    push_f32_tensor(tensors, &name(block, "attn_norm.weight"), vec![HIDDEN], 1.0)?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "attn_output.weight"),
+        vec![HEADS * HEAD_WIDTH, HIDDEN],
+        0.0,
+    )?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "attn_q.weight"),
+        vec![HIDDEN, HEADS * HEAD_WIDTH * 2],
+        0.0,
+    )?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "attn_q_norm.weight"),
+        vec![HEAD_WIDTH],
+        1.0,
+    )?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "attn_v.weight"),
+        vec![HIDDEN, HEAD_WIDTH],
+        0.0,
+    )?;
+    ffn(tensors, block)?;
+    push_f32_tensor(
+        tensors,
+        &name(block, "post_attention_norm.weight"),
+        vec![HIDDEN],
+        1.0,
+    )
+}
+
+fn append_raw_metadata(bytes: &mut Vec<u8>, entry: &RawMetadata) -> Result<(), FixtureError> {
     string(bytes, &entry.key)?;
     match &entry.value {
         RawMetadataValue::U32(value) => {
@@ -432,9 +647,7 @@ fn append_raw_metadata(bytes: &mut Vec<u8>, entry: &RawMetadata) -> Result<(), S
             bytes.extend_from_slice(&9_u32.to_le_bytes());
             bytes.extend_from_slice(&8_u32.to_le_bytes());
             bytes.extend_from_slice(
-                &u64::try_from(values.len())
-                    .map_err(|error| error.to_string())?
-                    .to_le_bytes(),
+                &u64_from_usize(values.len(), "string array length")?.to_le_bytes(),
             );
             for value in values {
                 string(bytes, value)?;
@@ -444,9 +657,7 @@ fn append_raw_metadata(bytes: &mut Vec<u8>, entry: &RawMetadata) -> Result<(), S
             bytes.extend_from_slice(&9_u32.to_le_bytes());
             bytes.extend_from_slice(&5_u32.to_le_bytes());
             bytes.extend_from_slice(
-                &u64::try_from(values.len())
-                    .map_err(|error| error.to_string())?
-                    .to_le_bytes(),
+                &u64_from_usize(values.len(), "I32 array length")?.to_le_bytes(),
             );
             for value in values {
                 bytes.extend_from_slice(&value.to_le_bytes());
@@ -455,24 +666,146 @@ fn append_raw_metadata(bytes: &mut Vec<u8>, entry: &RawMetadata) -> Result<(), S
     }
     Ok(())
 }
-fn string(bytes: &mut Vec<u8>, value: &str) -> Result<(), String> {
-    let length = u64::try_from(value.len()).map_err(|error| error.to_string())?;
-    bytes.extend_from_slice(&length.to_le_bytes());
+
+fn string(bytes: &mut Vec<u8>, value: &str) -> Result<(), FixtureError> {
+    bytes.extend_from_slice(&u64_from_usize(value.len(), "string length")?.to_le_bytes());
     bytes.extend_from_slice(value.as_bytes());
     Ok(())
 }
-fn align(value: u64) -> Result<u64, String> {
+
+fn align(value: u64) -> Result<u64, FixtureError> {
     value
         .checked_add(ALIGNMENT - 1)
         .map(|value| value / ALIGNMENT * ALIGNMENT)
-        .ok_or_else(|| "GGUF alignment overflowed".to_string())
+        .ok_or_else(|| FixtureError::Overflow {
+            context: "GGUF alignment",
+            location: Location::caller(),
+        })
 }
-fn pad(bytes: &mut Vec<u8>) -> Result<(), String> {
-    let length = u64::try_from(bytes.len()).map_err(|error| error.to_string())?;
+
+fn pad(bytes: &mut Vec<u8>) -> Result<(), FixtureError> {
+    let length = u64_from_usize(bytes.len(), "serialized byte length")?;
     let padded = align(length)?;
+    let padding = padded
+        .checked_sub(length)
+        .ok_or_else(|| FixtureError::Overflow {
+            context: "GGUF padding",
+            location: Location::caller(),
+        })?;
     bytes.extend(std::iter::repeat_n(
         0_u8,
-        usize::try_from(padded - length).map_err(|error| error.to_string())?,
+        usize_from_u64(padding, "GGUF padding length")?,
     ));
     Ok(())
+}
+
+fn u64_from_usize(value: usize, context: &'static str) -> Result<u64, FixtureError> {
+    u64::try_from(value).map_err(|_| FixtureError::NotRepresentable {
+        context,
+        location: Location::caller(),
+    })
+}
+fn u32_from_usize(value: usize, context: &'static str) -> Result<u32, FixtureError> {
+    u32::try_from(value).map_err(|_| FixtureError::NotRepresentable {
+        context,
+        location: Location::caller(),
+    })
+}
+fn u32_from_u64(value: u64, context: &'static str) -> Result<u32, FixtureError> {
+    u32::try_from(value).map_err(|_| FixtureError::NotRepresentable {
+        context,
+        location: Location::caller(),
+    })
+}
+fn usize_from_u64(value: u64, context: &'static str) -> Result<usize, FixtureError> {
+    usize::try_from(value).map_err(|_| FixtureError::NotRepresentable {
+        context,
+        location: Location::caller(),
+    })
+}
+fn usize_from_u32(value: u32, context: &'static str) -> Result<usize, FixtureError> {
+    usize::try_from(value).map_err(|_| FixtureError::NotRepresentable {
+        context,
+        location: Location::caller(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FixtureError, Qwen35FixtureConfig, RawGguf, RawMetadata, RawMetadataValue, RawTensor,
+        build_qwen35_fixture, raw_qwen35_fixture, serialize_raw_gguf,
+    };
+
+    #[test]
+    fn qwen_fixture_identity_is_deterministic() -> Result<(), Box<dyn std::error::Error>> {
+        let config = Qwen35FixtureConfig::default();
+        let first = build_qwen35_fixture(&config)?;
+        let second = build_qwen35_fixture(&config)?;
+        assert_eq!(first, second);
+        assert_eq!(first.byte_len, u64::try_from(first.bytes.len())?);
+        assert_eq!(first.bytes.get(..8), Some(&b"GGUF\x03\0\0\0"[..]));
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_fixture_rejects_out_of_range_token_ids() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = Qwen35FixtureConfig::default();
+        config.greedy_token_id = u32::try_from(config.tokens.len())?;
+        let error = raw_qwen35_fixture(&config)
+            .err()
+            .ok_or_else(|| std::io::Error::other("fixture unexpectedly accepted bad token id"))?;
+        assert!(matches!(
+            error,
+            FixtureError::InvalidTokenId {
+                field: "greedy_token_id",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_serializer_preserves_descriptor_layout_and_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let raw = RawGguf {
+            metadata: vec![RawMetadata {
+                key: "fixture.answer".to_string(),
+                value: RawMetadataValue::U32(42),
+            }],
+            tensors: vec![
+                RawTensor {
+                    name: "first".to_string(),
+                    dims: vec![3],
+                    format: 24,
+                    payload: vec![1, 2, 3],
+                },
+                RawTensor {
+                    name: "second".to_string(),
+                    dims: vec![1],
+                    format: 16,
+                    payload: vec![4, 5],
+                },
+            ],
+        };
+        let fixture = serialize_raw_gguf(&raw)?;
+        assert_eq!(fixture.bytes.get(..4), Some(&b"GGUF"[..]));
+        assert_eq!(u64_at(&fixture.bytes, 8)?, 2);
+        assert_eq!(u64_at(&fixture.bytes, 83)?, 0);
+        assert_eq!(u64_at(&fixture.bytes, 121)?, 32);
+        assert_eq!(fixture.bytes.get(160..163), Some(&[1, 2, 3][..]));
+        assert_eq!(fixture.bytes.get(192..194), Some(&[4, 5][..]));
+        Ok(())
+    }
+
+    fn u64_at(bytes: &[u8], offset: usize) -> Result<u64, Box<dyn std::error::Error>> {
+        let end = offset
+            .checked_add(8)
+            .ok_or_else(|| std::io::Error::other("test offset overflowed"))?;
+        let value: [u8; 8] = bytes
+            .get(offset..end)
+            .ok_or_else(|| std::io::Error::other("test layout ended early"))?
+            .try_into()?;
+        Ok(u64::from_le_bytes(value))
+    }
 }
