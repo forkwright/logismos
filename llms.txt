@@ -47,6 +47,8 @@ records implemented crate ownership; Kanon standards govern engineering practice
 - `crates/decode/` - checked CPU logit processing and token selection
 - `crates/bin/` - CPU-only `plan` and typed GGUF `inspect` commands
 - `crates/tokenize/` - tokenizer facade
+- `crates/text/` - artifact-bound text-only native CPU generation with checked greedy decoding
+- `crates/test-fixtures/` - dev-only original synthetic GGUF serialization and fixtures
 - `crates/logismos/` - top-level integration facade
 
 ## Research

@@ -626,6 +626,7 @@ dependencies = [
  "safetensors",
  "serde_json",
  "taxis",
+ "text",
  "thiserror",
  "tokenize",
  "transformers",
@@ -1214,6 +1215,7 @@ name = "test-fixtures"
 version = "1.0.11"
 dependencies = [
  "sha2",
+ "snafu",
 ]
 
 [[package]]

@@ -10,6 +10,8 @@
 //!
 //! Phase 2 surfaces: loader, tokenize, cache, decode, taxis.
 //! Phase 3 adds: core (trait surface), encoders, embed (StellaModel).
+//! Native text requests use [`text`]; consumers needing only that CPU path can
+//! depend directly on its supporting crate without this facade's device graph.
 //!
 //! ## Quick start (Phase 3 — Stella)
 //!
@@ -36,6 +38,7 @@ pub use encoders;
 pub use loader;
 pub use logismos_core as core;
 pub use taxis;
+pub use text;
 pub use tokenize;
 pub use transformers;
 

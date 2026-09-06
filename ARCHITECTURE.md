@@ -50,6 +50,11 @@ semantically respects that boundary.
   depending on a serving layer. Empty, NaN, positive-infinity and fully masked
   rows fail explicitly. Negative infinity is the masking representation, not
   an implicit fallback to token zero.
+- `text` is a CPU-only pipeline over `decoders`, `tokenize` and `decode`, with
+  metadata-only `loader` access and a restricted template substrate. It does
+  not depend on scheduling, a provider adapter, or a device runtime.
+- `test-fixtures` is dev-only shared synthetic GGUF support. It has no model
+  execution dependency and is never a production dependency of a pipeline.
 - `taxis` depends locally on `hipcore`.
 - `kernels/gpu` enables the local `hipcore` and `taxis` dependencies and GPU
   launcher modules, including their nested parity references. Standalone
@@ -120,8 +125,20 @@ limits. Whole-call staging is fallible and commits only after all token logits
 succeed. Its text-only interleaved RoPE supports checked full or partial rotary
 dimensions; unsupported effective scaling fails explicitly.
 
-Tokenizer/template handling, sampling, NextN, serving, exact-artifact quality,
-physical residency and admission integration remain separate requirements.
+`text::TextPipeline` binds an explicitly selected tokenizer identity to the
+verified model's vocabulary and special-token policy. The same model digest
+commits the embedded template; no second template identity authority exists.
+Its private template environment registers no named templates or loader and
+renders only the admitted source. It accepts typed text messages and uses
+checked greedy selection followed by collective sequence decoding. Requests
+have independent execution state, bounded context/output and cooperative
+cancellation checks; failures publish neither partial text nor resumable state.
+Completed internal decoder steps are discarded with that private session, not
+undone in a shared session. These limits do not bound total template/tokenizer
+heap use or authenticate the selected model/tokenizer's publisher.
+
+NextN, serving, exact-artifact quality, physical residency and admission
+integration remain separate requirements.
 Explicit CPU execution is not a fallback for a GPU operation.
 
 ## cfg flags
