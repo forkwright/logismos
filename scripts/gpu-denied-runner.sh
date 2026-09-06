@@ -5,8 +5,21 @@ set -euo pipefail
 PATH=/usr/bin:/bin
 unset CDPATH LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME PYTHONPATH
 
+usage() {
+    builtin printf 'usage: %s [--ro-input-file FILE] -- COMMAND [ARG...]\n' "$0" >&2
+}
+
+read_only_input=()
+if [[ "${1:-}" == '--ro-input-file' ]]; then
+    if [[ "$#" -lt 4 || -z "${2:-}" ]]; then
+        usage
+        exit 64
+    fi
+    read_only_input=(--ro-input-file "$2")
+    shift 2
+fi
 if [[ "${1:-}" != "--" || "$#" -eq 1 ]]; then
-    builtin printf 'usage: %s -- COMMAND [ARG...]\n' "$0" >&2
+    usage
     exit 64
 fi
 shift
@@ -41,4 +54,4 @@ if [[ ! -x /usr/bin/python3 || ! -f "$SUPERVISOR" ]]; then
     exit 69
 fi
 
-builtin exec /usr/bin/python3 -I "$SUPERVISOR" "$ROOT" -- "$@"
+builtin exec /usr/bin/python3 -I "$SUPERVISOR" "$ROOT" "${read_only_input[@]}" -- "$@"

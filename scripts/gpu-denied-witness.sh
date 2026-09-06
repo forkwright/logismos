@@ -145,6 +145,8 @@ if os.environ['CARGO_NET_OFFLINE'] != 'true':
     raise AssertionError('Cargo offline mode is missing')
 if os.environ['CARGO_TARGET_DIR'] != str(root / 'target'):
     raise AssertionError('Cargo target is not confined to the worktree target')
+if 'LOGISMOS_GPU_DENIED_INPUT' in os.environ:
+    raise AssertionError('read-only input path is set without an explicit input file')
 
 source_marker = root / 'gpu-denied-source-write'
 try:
@@ -203,6 +205,7 @@ if [[ -e "$TRAP_MARKER" ]]; then
 fi
 
 /usr/bin/python3 - "$RUNNER" "$ROOT" "$FIXTURE_DIR" "$LINK_FIXTURE_DIR" <<'PYTHON'
+import importlib.util
 import os
 import pty
 import resource
@@ -220,6 +223,122 @@ link_fixture = Path(sys.argv[4])
 
 def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(command, check=False, timeout=60, **kwargs)
+
+
+approved_input = fixture / 'approved-artifact'
+approved_input.write_bytes(b'synthetic artifact bytes')
+positive_input_result = run(
+    [
+        str(runner),
+        '--ro-input-file',
+        str(approved_input),
+        '--',
+        '/usr/bin/python3',
+        '-c',
+        '''import os
+import sys
+from pathlib import Path
+
+artifact = Path(os.environ['LOGISMOS_GPU_DENIED_INPUT'])
+assert artifact.read_bytes() == b'synthetic artifact bytes'
+assert list(artifact.parent.iterdir()) == [artifact]
+assert not Path(sys.argv[1]).exists()
+failed = 0
+actions = (
+    lambda: artifact.write_bytes(b'unexpected'),
+    lambda: artifact.unlink(),
+    lambda: os.chmod(artifact, 0o600),
+)
+for action in actions:
+    try:
+        action()
+    except OSError:
+        failed += 1
+assert failed == len(actions)
+''',
+        str(approved_input),
+    ],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+if positive_input_result.returncode != 0:
+    raise AssertionError(positive_input_result.stderr.decode(errors='replace'))
+
+
+def assert_rejected_read_only_input(label: str, input_path: Path) -> None:
+    result = run(
+        [
+            str(runner),
+            '--ro-input-file',
+            str(input_path),
+            '--',
+            '/usr/bin/true',
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 69 or str(input_path).encode() in result.stderr:
+        raise AssertionError(f'{label} read-only input was not rejected without path disclosure')
+
+
+noncanonical_parent = fixture / 'noncanonical-parent'
+noncanonical_parent.mkdir()
+symlink_input = fixture / 'symlink-input'
+symlink_input.symlink_to(approved_input)
+symlink_parent = fixture / 'symlink-parent'
+symlink_parent.symlink_to(fixture, target_is_directory=True)
+hardlink_source = fixture / 'hardlink-source'
+hardlink_alias = fixture / 'hardlink-alias'
+hardlink_source.write_bytes(b'synthetic hard link')
+hardlink_alias.hardlink_to(hardlink_source)
+special_directory = fixture / 'input-directory'
+special_directory.mkdir()
+fifo_input = fixture / 'input-fifo'
+os.mkfifo(fifo_input)
+socket_input = fixture / 'input.sock'
+input_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+input_socket.bind(str(socket_input))
+target_input = root / 'target/gpu-denied-input-alias'
+target_input.write_bytes(b'synthetic writable target alias')
+try:
+    for label, path in [
+        ('relative', Path('relative-input')),
+        ('noncanonical', noncanonical_parent / '..' / approved_input.name),
+        ('symlink', symlink_input),
+        ('symlink component', symlink_parent / approved_input.name),
+        ('hard link', hardlink_source),
+        ('directory', special_directory),
+        ('fifo', fifo_input),
+        ('socket', socket_input),
+        ('worktree source', root / 'Cargo.toml'),
+        ('writable target', target_input),
+        ('sensitive root', Path('/etc/hosts')),
+    ]:
+        assert_rejected_read_only_input(label, path)
+finally:
+    input_socket.close()
+    socket_input.unlink(missing_ok=True)
+    fifo_input.unlink(missing_ok=True)
+    target_input.unlink(missing_ok=True)
+
+
+supervisor_spec = importlib.util.spec_from_file_location(
+    'gpu_denied_exec', runner.parent / 'gpu-denied-exec.py'
+)
+if supervisor_spec is None or supervisor_spec.loader is None:
+    raise AssertionError('cannot load read-only input supervisor fixture')
+supervisor = importlib.util.module_from_spec(supervisor_spec)
+supervisor_spec.loader.exec_module(supervisor)
+supervisor._host_mount_points = lambda: [approved_input]
+try:
+    supervisor._prepare_read_only_input(str(approved_input), root, root / 'target')
+except supervisor.BoundaryError as error:
+    if 'host mount point' not in str(error):
+        raise AssertionError('read-only input mount-point rejection was not specific') from error
+else:
+    raise AssertionError('read-only input mount point was not rejected')
 
 
 read_descriptor, write_descriptor = os.pipe()
