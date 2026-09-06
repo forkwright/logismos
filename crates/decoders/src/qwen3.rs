@@ -1,6 +1,7 @@
 //! Bounded native CPU Qwen3 embedding execution over one verified GGUF payload.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 
 use loader::gguf::{GgmlType, MetaValue, MetaValueType, VerifiedArtifact};
 use num_traits::ToPrimitive;
@@ -28,11 +29,109 @@ const ROPE_DIMENSION: &str = "qwen3.rope.dimension_count";
 const ROPE_BASE: &str = "qwen3.rope.freq_base";
 const ROPE_SCALING_TYPE: &str = "qwen3.rope.scaling.type";
 const ROPE_SCALING_FACTOR: &str = "qwen3.rope.scaling.factor";
+const ROPE_SCALING_ATTENTION_FACTOR: &str = "qwen3.rope.scaling.attn_factor";
+const ROPE_LEGACY_LINEAR_SCALE: &str = "qwen3.rope.scale_linear";
 const POOLING_TYPE: &str = "qwen3.pooling_type";
 
 const TOKEN_EMBEDDING: &str = "token_embd.weight";
 const OUTPUT_NORM: &str = "output_norm.weight";
 const LAST_POOLING_TYPE: u64 = 3;
+
+#[derive(Clone, Copy)]
+enum Shape {
+    HiddenVocabulary,
+    Hidden,
+    Head,
+    HiddenQuery,
+    HiddenKeyValue,
+    QueryHidden,
+    HiddenFeedForward,
+    FeedForwardHidden,
+}
+
+#[derive(Clone, Copy)]
+enum Storage {
+    F32Vector,
+    F32OrQ8Matrix,
+}
+
+#[derive(Clone, Copy)]
+struct Role {
+    name: &'static str,
+    shape: Shape,
+    storage: Storage,
+}
+
+const GLOBAL_ROLES: &[Role] = &[
+    Role {
+        name: TOKEN_EMBEDDING,
+        shape: Shape::HiddenVocabulary,
+        storage: Storage::F32OrQ8Matrix,
+    },
+    Role {
+        name: OUTPUT_NORM,
+        shape: Shape::Hidden,
+        storage: Storage::F32Vector,
+    },
+];
+
+const BLOCK_ROLES: &[Role] = &[
+    Role {
+        name: "attn_norm.weight",
+        shape: Shape::Hidden,
+        storage: Storage::F32Vector,
+    },
+    Role {
+        name: "attn_q_norm.weight",
+        shape: Shape::Head,
+        storage: Storage::F32Vector,
+    },
+    Role {
+        name: "attn_k_norm.weight",
+        shape: Shape::Head,
+        storage: Storage::F32Vector,
+    },
+    Role {
+        name: "ffn_norm.weight",
+        shape: Shape::Hidden,
+        storage: Storage::F32Vector,
+    },
+    Role {
+        name: "attn_q.weight",
+        shape: Shape::HiddenQuery,
+        storage: Storage::F32OrQ8Matrix,
+    },
+    Role {
+        name: "attn_k.weight",
+        shape: Shape::HiddenKeyValue,
+        storage: Storage::F32OrQ8Matrix,
+    },
+    Role {
+        name: "attn_v.weight",
+        shape: Shape::HiddenKeyValue,
+        storage: Storage::F32OrQ8Matrix,
+    },
+    Role {
+        name: "attn_output.weight",
+        shape: Shape::QueryHidden,
+        storage: Storage::F32OrQ8Matrix,
+    },
+    Role {
+        name: "ffn_gate.weight",
+        shape: Shape::HiddenFeedForward,
+        storage: Storage::F32OrQ8Matrix,
+    },
+    Role {
+        name: "ffn_up.weight",
+        shape: Shape::HiddenFeedForward,
+        storage: Storage::F32OrQ8Matrix,
+    },
+    Role {
+        name: "ffn_down.weight",
+        shape: Shape::FeedForwardHidden,
+        storage: Storage::F32OrQ8Matrix,
+    },
+];
 
 /// One verified Qwen3 embedding payload with its checked causal geometry.
 #[derive(Debug)]
@@ -258,7 +357,8 @@ impl Qwen3Execution<'_, '_> {
             let activated =
                 kernels::cpu_f32::try_silu(&gate.project(&normalized)?).context(Qwen3CpuSnafu)?;
             let up = up.project(&normalized)?;
-            let fused = multiply(&activated, &up, "SwiGLU")?;
+            let fused = kernels::cpu_f32::try_hadamard(&activated, &up).context(Qwen3CpuSnafu)?;
+            finite(&fused, "SwiGLU")?;
             ffn.extend(down.project(&fused)?);
         }
         add_in_place(hidden, &ffn, "FFN residual")
@@ -282,6 +382,10 @@ struct Layout {
 }
 
 impl Layout {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "strict metadata parsing keeps Qwen3 profile relations in one auditable authority"
+    )]
     fn from_artifact(payload: &VerifiedArtifact) -> Result<Self> {
         let metadata = payload.observation().metadata();
         require_string(metadata, ARCHITECTURE, "qwen3")?;
@@ -324,14 +428,24 @@ impl Layout {
         let rope_dim = positive(metadata, ROPE_DIMENSION)?;
         let epsilon = require_f32(metadata, RMS_EPSILON)?;
         let rope_base = f64::from(require_f32(metadata, ROPE_BASE)?);
-        if value_dim != head_dim
-            || rope_dim != head_dim
-            || !head_dim.is_multiple_of(2)
-            || !heads.is_multiple_of(kv_heads)
-        {
+        if !heads.is_multiple_of(kv_heads) {
             return Qwen3MetadataSnafu {
                 key: HEADS,
-                rule: "requires divisible Q/KV heads plus equal even key/value/full rotary widths",
+                rule: "must divide evenly by Q/KV head count",
+            }
+            .fail();
+        }
+        if value_dim != head_dim {
+            return Qwen3MetadataSnafu {
+                key: VALUE_LENGTH,
+                rule: "must equal the key/head width in this bounded path",
+            }
+            .fail();
+        }
+        if rope_dim != head_dim || !rope_dim.is_multiple_of(2) {
+            return Qwen3MetadataSnafu {
+                key: ROPE_DIMENSION,
+                rule: "must equal the full even key/head width in this bounded path",
             }
             .fail();
         }
@@ -369,8 +483,8 @@ impl Layout {
 fn validate_inventory(tensors: &[loader::gguf::TensorDescriptor], layout: Layout) -> Result<()> {
     let expected_count = layout
         .blocks
-        .checked_mul(11)
-        .and_then(|count| count.checked_add(2))
+        .checked_mul(BLOCK_ROLES.len())
+        .and_then(|count| count.checked_add(GLOBAL_ROLES.len()))
         .ok_or_else(|| {
             Qwen3ExecutionSnafu {
                 requested: layout.blocks,
@@ -385,93 +499,111 @@ fn validate_inventory(tensors: &[loader::gguf::TensorDescriptor], layout: Layout
         }
         .fail();
     }
-    let mut expected = HashMap::with_capacity(expected_count);
-    expected.insert(
-        TOKEN_EMBEDDING.to_string(),
-        vec![u64_from(layout.hidden)?, u64_from(layout.vocabulary)?],
-    );
-    expected.insert(OUTPUT_NORM.to_string(), vec![u64_from(layout.hidden)?]);
-    for block in 0..layout.blocks {
-        let prefix = format!("blk.{block}.");
-        for (role, shape) in [
-            ("attn_norm.weight", vec![u64_from(layout.hidden)?]),
-            ("attn_q_norm.weight", vec![u64_from(layout.head_dim)?]),
-            ("attn_k_norm.weight", vec![u64_from(layout.head_dim)?]),
-            ("ffn_norm.weight", vec![u64_from(layout.hidden)?]),
-            (
-                "attn_q.weight",
-                vec![u64_from(layout.hidden)?, u64_from(layout.q_width)?],
-            ),
-            (
-                "attn_k.weight",
-                vec![u64_from(layout.hidden)?, u64_from(layout.kv_width)?],
-            ),
-            (
-                "attn_v.weight",
-                vec![u64_from(layout.hidden)?, u64_from(layout.kv_width)?],
-            ),
-            (
-                "attn_output.weight",
-                vec![u64_from(layout.q_width)?, u64_from(layout.hidden)?],
-            ),
-            (
-                "ffn_gate.weight",
-                vec![u64_from(layout.hidden)?, u64_from(layout.feed_forward)?],
-            ),
-            (
-                "ffn_up.weight",
-                vec![u64_from(layout.hidden)?, u64_from(layout.feed_forward)?],
-            ),
-            (
-                "ffn_down.weight",
-                vec![u64_from(layout.feed_forward)?, u64_from(layout.hidden)?],
-            ),
-        ] {
-            expected.insert(format!("{prefix}{role}"), shape);
-        }
-    }
     let mut found = HashSet::new();
+    found
+        .try_reserve(expected_count)
+        .context(Qwen3AllocationSnafu {
+            target: "Qwen3 tensor inventory",
+            length: expected_count,
+        })?;
     for tensor in tensors {
-        let Some(shape) = expected.get(&tensor.name) else {
+        let Some(role) = role_for_name(&tensor.name, layout.blocks) else {
             return Qwen3TensorSnafu {
                 name: tensor.name.clone(),
                 rule: "is outside the bounded embedding role inventory",
             }
             .fail();
         };
-        if !found.insert(&tensor.name) {
+        if !found.insert(tensor.name.clone()) {
             return Qwen3TensorSnafu {
                 name: tensor.name.clone(),
                 rule: "must not occur more than once",
             }
             .fail();
         }
-        if tensor.dims != *shape {
+        if tensor.dims != role.shape.dimensions(layout)? {
             return Qwen3TensorSnafu {
                 name: tensor.name.clone(),
                 rule: "shape must derive from checked architecture metadata",
             }
             .fail();
         }
-        let vector = tensor.name.ends_with("norm.weight") || tensor.name == OUTPUT_NORM;
-        if vector && tensor.ggml_type != GgmlType::F32 {
+        if matches!(role.storage, Storage::F32Vector) && tensor.ggml_type != GgmlType::F32 {
             return Qwen3TensorSnafu {
                 name: tensor.name.clone(),
                 rule: "normalization vectors must use F32",
             }
             .fail();
         }
-    }
-    for name in expected.keys() {
-        if !found.contains(name) {
+        if matches!(role.storage, Storage::F32OrQ8Matrix)
+            && !matches!(tensor.ggml_type, GgmlType::F32 | GgmlType::Q8_0)
+        {
             return Qwen3TensorSnafu {
-                name: name.clone(),
+                name: tensor.name.clone(),
+                rule: "matrices must use the bounded F32 or Q8_0 executable storage",
+            }
+            .fail();
+        }
+    }
+    for role in GLOBAL_ROLES {
+        if !found.contains(role.name) {
+            return Qwen3TensorSnafu {
+                name: role.name.to_string(),
                 rule: "is required by the bounded embedding profile",
             }
             .fail();
         }
     }
+    for block in 0..layout.blocks {
+        for role in BLOCK_ROLES {
+            let name = block_name(block, role.name);
+            if !found.contains(&name) {
+                return Qwen3TensorSnafu {
+                    name,
+                    rule: "is required by the bounded embedding profile",
+                }
+                .fail();
+            }
+        }
+    }
     Ok(())
+}
+
+impl Shape {
+    fn dimensions(self, layout: Layout) -> Result<Vec<u64>> {
+        let hidden = u64_from(layout.hidden)?;
+        let vocabulary = u64_from(layout.vocabulary)?;
+        let head = u64_from(layout.head_dim)?;
+        let query = u64_from(layout.q_width)?;
+        let key_value = u64_from(layout.kv_width)?;
+        let feed_forward = u64_from(layout.feed_forward)?;
+        Ok(match self {
+            Self::HiddenVocabulary => vec![hidden, vocabulary],
+            Self::Hidden => vec![hidden],
+            Self::Head => vec![head],
+            Self::HiddenQuery => vec![hidden, query],
+            Self::HiddenKeyValue => vec![hidden, key_value],
+            Self::QueryHidden => vec![query, hidden],
+            Self::HiddenFeedForward => vec![hidden, feed_forward],
+            Self::FeedForwardHidden => vec![feed_forward, hidden],
+        })
+    }
+}
+
+fn role_for_name(name: &str, blocks: usize) -> Option<Role> {
+    if let Some(role) = GLOBAL_ROLES.iter().copied().find(|role| role.name == name) {
+        return Some(role);
+    }
+    let remainder = name.strip_prefix("blk.")?;
+    let (block, role_name) = remainder.split_once('.')?;
+    let block = block.parse::<usize>().ok()?;
+    if block >= blocks {
+        return None;
+    }
+    BLOCK_ROLES
+        .iter()
+        .copied()
+        .find(|role| role.name == role_name)
 }
 
 fn causal_attention(
@@ -654,13 +786,15 @@ fn positive(metadata: &HashMap<String, MetaValue>, key: &'static str) -> Result<
 fn vocabulary(metadata: &HashMap<String, MetaValue>) -> Result<usize> {
     match metadata.get("tokenizer.ggml.tokens") {
         Some(MetaValue::Array(values)) if values.element_type() == MetaValueType::String => {
-            NonZero::from(values.values().len()).ok_or_else(|| {
-                Qwen3MetadataSnafu {
-                    key: "tokenizer.ggml.tokens",
-                    rule: "must be a nonempty string array",
-                }
-                .build()
-            })
+            NonZeroUsize::new(values.values().len())
+                .map(NonZeroUsize::get)
+                .ok_or_else(|| {
+                    Qwen3MetadataSnafu {
+                        key: "tokenizer.ggml.tokens",
+                        rule: "must be a nonempty string array",
+                    }
+                    .build()
+                })
         }
         _ => Qwen3MetadataSnafu {
             key: "tokenizer.ggml.tokens",
@@ -670,25 +804,57 @@ fn vocabulary(metadata: &HashMap<String, MetaValue>) -> Result<usize> {
     }
 }
 fn require_neutral_rope_scaling(metadata: &HashMap<String, MetaValue>) -> Result<()> {
-    if let Some(value) = metadata.get(ROPE_SCALING_TYPE)
-        && !matches!(value, MetaValue::String(value) if value == "linear")
-    {
-        return Qwen3MetadataSnafu {
-            key: ROPE_SCALING_TYPE,
-            rule: "must be absent or exact neutral linear scaling",
+    let scaling_none = match metadata.get(ROPE_SCALING_TYPE) {
+        None => false,
+        Some(MetaValue::String(value)) if value == "linear" => false,
+        Some(MetaValue::String(value)) if value == "none" => true,
+        _ => {
+            return Qwen3MetadataSnafu {
+                key: ROPE_SCALING_TYPE,
+                rule: "must be absent, linear, or source-neutral none scaling",
+            }
+            .fail();
         }
-        .fail();
+    };
+    let current = optional_finite_f32(metadata, ROPE_SCALING_FACTOR)?;
+    let legacy = optional_finite_f32(metadata, ROPE_LEGACY_LINEAR_SCALE)?;
+    if !scaling_none {
+        let (key, factor) = match current {
+            Some(factor) => (ROPE_SCALING_FACTOR, factor),
+            None => (ROPE_LEGACY_LINEAR_SCALE, legacy.unwrap_or(0.0)),
+        };
+        if factor.to_bits() != 0.0_f32.to_bits() && factor.to_bits() != 1.0_f32.to_bits() {
+            return Qwen3MetadataSnafu {
+                key,
+                rule: "must resolve to source-neutral linear factor 0 or 1",
+            }
+            .fail();
+        }
     }
-    if let Some(value) = metadata.get(ROPE_SCALING_FACTOR)
-        && !matches!(value, MetaValue::F32(value) if value.to_bits() == 1.0_f32.to_bits())
+    if let Some(attention) = optional_finite_f32(metadata, ROPE_SCALING_ATTENTION_FACTOR)?
+        && attention.to_bits() != 1.0_f32.to_bits()
     {
         return Qwen3MetadataSnafu {
-            key: ROPE_SCALING_FACTOR,
-            rule: "must be absent or exact neutral factor 1",
+            key: ROPE_SCALING_ATTENTION_FACTOR,
+            rule: "must be absent or exact neutral attention factor 1",
         }
         .fail();
     }
     Ok(())
+}
+fn optional_finite_f32(
+    metadata: &HashMap<String, MetaValue>,
+    key: &'static str,
+) -> Result<Option<f32>> {
+    match metadata.get(key) {
+        None => Ok(None),
+        Some(MetaValue::F32(value)) if value.is_finite() => Ok(Some(*value)),
+        _ => Qwen3MetadataSnafu {
+            key,
+            rule: "must be finite F32 when present",
+        }
+        .fail(),
+    }
 }
 fn block_name(block: usize, role: &str) -> String {
     format!("blk.{block}.{role}")
@@ -751,22 +917,6 @@ fn copy_into(
     slot.copy_from_slice(source);
     finite(slot, target)
 }
-fn multiply(left: &[f32], right: &[f32], stage: &'static str) -> Result<Vec<f32>> {
-    if left.len() != right.len() {
-        return Qwen3ExecutionSnafu {
-            requested: left.len(),
-            rule: "elementwise operands must have equal lengths",
-        }
-        .fail();
-    }
-    let mut output = reserve(stage, left.len())?;
-    for (index, (left, right)) in left.iter().zip(right).enumerate() {
-        let value = left * right;
-        finite_one(value, stage, index)?;
-        output.push(value);
-    }
-    Ok(output)
-}
 fn add_in_place(destination: &mut [f32], source: &[f32], stage: &'static str) -> Result<()> {
     if destination.len() != source.len() {
         return Qwen3ExecutionSnafu {
@@ -792,13 +942,6 @@ fn finite_one(value: f32, stage: &'static str, index: usize) -> Result<()> {
         Ok(())
     } else {
         Qwen3ArithmeticSnafu { stage, index }.fail()
-    }
-}
-
-struct NonZero;
-impl NonZero {
-    fn from(value: usize) -> Option<usize> {
-        (value != 0).then_some(value)
     }
 }
 
@@ -889,6 +1032,349 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn rejects_each_strict_metadata_contract_witness() -> std::result::Result<(), String> {
+        let cases = [
+            ProfileCase::metadata("missing required hidden width", remove_hidden, HIDDEN),
+            ProfileCase::metadata("mistyped hidden width", mistype_hidden, HIDDEN),
+            ProfileCase::metadata("explicit noncausal", causal_false, CAUSAL),
+            ProfileCase::metadata(
+                "unknown rope scaling",
+                unknown_rope_scaling,
+                ROPE_SCALING_TYPE,
+            ),
+            ProfileCase::metadata(
+                "nonneutral legacy rope scaling",
+                nonneutral_legacy_rope_scaling,
+                ROPE_LEGACY_LINEAR_SCALE,
+            ),
+            ProfileCase::metadata(
+                "nonneutral current rope scaling",
+                nonneutral_current_rope_scaling,
+                ROPE_SCALING_FACTOR,
+            ),
+            ProfileCase::metadata(
+                "nonneutral RoPE attention scaling",
+                nonneutral_rope_attention_scaling,
+                ROPE_SCALING_ATTENTION_FACTOR,
+            ),
+            ProfileCase::metadata("uneven Q/KV heads", uneven_heads, HEADS),
+            ProfileCase::metadata("unequal K/V widths", unequal_value_width, VALUE_LENGTH),
+            ProfileCase::metadata("partial rotary width", partial_rotary_width, ROPE_DIMENSION),
+        ];
+        for case in cases {
+            assert_profile_case(case)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_source_neutral_rope_scaling_precedence() -> std::result::Result<(), String> {
+        for mutate in [
+            source_neutral_none_scaling as fn(&mut RawGguf),
+            source_neutral_current_factor_precedes_legacy,
+            source_neutral_legacy_factor,
+        ] {
+            let mut raw = fixture()?;
+            mutate(&mut raw);
+            let artifact = verify(&raw)?;
+            Qwen3Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_each_strict_tensor_contract_witness() -> std::result::Result<(), String> {
+        let cases = [
+            ProfileCase::tensor("missing required tensor", remove_tensor, "inventory"),
+            ProfileCase::tensor("extra output tensor", extra_tensor, "inventory"),
+            ProfileCase::tensor(
+                "wrong matrix shape",
+                wrong_tensor_shape,
+                "blk.0.attn_q.weight",
+            ),
+            ProfileCase::tensor(
+                "wrong matrix dtype",
+                wrong_matrix_dtype,
+                "blk.0.attn_q.weight",
+            ),
+            ProfileCase::tensor("wrong norm dtype", wrong_norm_dtype, "output_norm.weight"),
+        ];
+        for case in cases {
+            assert_profile_case(case)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_execution_requests_and_token_ids() -> std::result::Result<(), String> {
+        let raw = fixture()?;
+        let artifact = verify(&raw)?;
+        let weights =
+            Qwen3Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        for requested in [
+            0,
+            usize::try_from(TEST_CONTEXT).map_err(|error| error.to_string())? + 1,
+        ] {
+            if !matches!(
+                weights.execution(requested),
+                Err(crate::Error::Qwen3Execution { .. })
+            ) {
+                return Err("invalid maximum context did not return Qwen3Execution".to_string());
+            }
+        }
+        let execution = weights
+            .execution(usize::try_from(TEST_CONTEXT).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        for tokens in [&[][..], &[0, 1, 2, 3, 0][..]] {
+            if !matches!(
+                execution.last_hidden(tokens),
+                Err(crate::Error::Qwen3Execution { .. })
+            ) {
+                return Err(
+                    "empty or over-context token IDs did not return Qwen3Execution".to_string(),
+                );
+            }
+        }
+        if !matches!(
+            execution
+                .last_hidden(&[u32::try_from(TEST_VOCABULARY).map_err(|error| error.to_string())?]),
+            Err(crate::Error::ProjectionInputWidth { .. })
+        ) {
+            return Err(
+                "out-of-vocabulary token ID did not preserve checked matrix bounds error"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_late_nonfinite_weights_without_poisoning_a_pristine_retry()
+    -> std::result::Result<(), String> {
+        let mut malformed = fixture()?;
+        let tensor = find_tensor_mut(&mut malformed, "blk.0.ffn_down.weight")?;
+        tensor.payload[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        let bad_artifact = verify(&malformed)?;
+        let bad_weights =
+            Qwen3Weights::try_from_verified(&bad_artifact).map_err(|error| error.to_string())?;
+        let bad_execution = bad_weights
+            .execution(usize::try_from(TEST_CONTEXT).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        if !matches!(
+            bad_execution.last_hidden(&[0]),
+            Err(crate::Error::ProjectionRow { .. })
+        ) {
+            return Err(
+                "late nonfinite FFN weight did not preserve checked-row refusal".to_string(),
+            );
+        }
+
+        let pristine = fixture()?;
+        let artifact = verify(&pristine)?;
+        let weights =
+            Qwen3Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let execution = weights
+            .execution(usize::try_from(TEST_CONTEXT).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        let result = execution
+            .last_hidden(&[0])
+            .map_err(|error| error.to_string())?;
+        if !result.iter().all(|value| value.is_finite()) {
+            return Err("pristine executor retry produced a nonfinite hidden row".to_string());
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExpectedProfileError {
+        Metadata(&'static str),
+        Tensor(&'static str),
+    }
+
+    #[derive(Clone, Copy)]
+    struct ProfileCase {
+        name: &'static str,
+        mutate: fn(&mut RawGguf),
+        expected: ExpectedProfileError,
+    }
+
+    impl ProfileCase {
+        const fn metadata(name: &'static str, mutate: fn(&mut RawGguf), key: &'static str) -> Self {
+            Self {
+                name,
+                mutate,
+                expected: ExpectedProfileError::Metadata(key),
+            }
+        }
+
+        const fn tensor(
+            name: &'static str,
+            mutate: fn(&mut RawGguf),
+            tensor: &'static str,
+        ) -> Self {
+            Self {
+                name,
+                mutate,
+                expected: ExpectedProfileError::Tensor(tensor),
+            }
+        }
+    }
+
+    fn assert_profile_case(case: ProfileCase) -> std::result::Result<(), String> {
+        let mut raw = fixture()?;
+        (case.mutate)(&mut raw);
+        let error = profile_error(&raw)?;
+        let accepted = match case.expected {
+            ExpectedProfileError::Metadata(key) => {
+                matches!(error, crate::Error::Qwen3Metadata { key: actual, .. } if actual == key)
+            }
+            ExpectedProfileError::Tensor(name) => {
+                matches!(error, crate::Error::Qwen3Tensor { name: ref actual, .. } if actual == name)
+            }
+        };
+        if accepted {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} returned the wrong typed profile error: {error}",
+                case.name
+            ))
+        }
+    }
+
+    fn profile_error(raw: &RawGguf) -> std::result::Result<crate::Error, String> {
+        let artifact = verify(raw)?;
+        Qwen3Weights::try_from_verified(&artifact)
+            .err()
+            .ok_or_else(|| "invalid profile fixture was accepted".to_string())
+    }
+
+    fn remove_hidden(raw: &mut RawGguf) {
+        raw.metadata.retain(|entry| entry.key != HIDDEN);
+    }
+
+    fn mistype_hidden(raw: &mut RawGguf) {
+        replace_metadata(raw, HIDDEN, &RawMetadataValue::F32(3.0));
+    }
+
+    fn causal_false(raw: &mut RawGguf) {
+        raw.metadata.push(metadata_bool(CAUSAL, false));
+    }
+
+    fn unknown_rope_scaling(raw: &mut RawGguf) {
+        raw.metadata
+            .push(metadata_string(ROPE_SCALING_TYPE, "dynamic"));
+    }
+
+    fn nonneutral_legacy_rope_scaling(raw: &mut RawGguf) {
+        raw.metadata
+            .push(metadata_f32(ROPE_LEGACY_LINEAR_SCALE, 2.0));
+    }
+
+    fn nonneutral_current_rope_scaling(raw: &mut RawGguf) {
+        raw.metadata.push(metadata_f32(ROPE_SCALING_FACTOR, 2.0));
+    }
+
+    fn nonneutral_rope_attention_scaling(raw: &mut RawGguf) {
+        raw.metadata
+            .push(metadata_f32(ROPE_SCALING_ATTENTION_FACTOR, 2.0));
+    }
+
+    fn source_neutral_none_scaling(raw: &mut RawGguf) {
+        raw.metadata
+            .push(metadata_string(ROPE_SCALING_TYPE, "none"));
+        raw.metadata.push(metadata_f32(ROPE_SCALING_FACTOR, 2.0));
+        raw.metadata
+            .push(metadata_f32(ROPE_LEGACY_LINEAR_SCALE, 2.0));
+    }
+
+    fn source_neutral_current_factor_precedes_legacy(raw: &mut RawGguf) {
+        raw.metadata.push(metadata_f32(ROPE_SCALING_FACTOR, 0.0));
+        raw.metadata
+            .push(metadata_f32(ROPE_LEGACY_LINEAR_SCALE, 2.0));
+    }
+
+    fn source_neutral_legacy_factor(raw: &mut RawGguf) {
+        raw.metadata
+            .push(metadata_f32(ROPE_LEGACY_LINEAR_SCALE, 1.0));
+    }
+
+    fn uneven_heads(raw: &mut RawGguf) {
+        replace_metadata(raw, HEADS, &RawMetadataValue::U32(3));
+        replace_metadata(raw, KV_HEADS, &RawMetadataValue::U32(2));
+    }
+
+    fn unequal_value_width(raw: &mut RawGguf) {
+        replace_metadata(raw, VALUE_LENGTH, &RawMetadataValue::U32(1));
+    }
+
+    fn partial_rotary_width(raw: &mut RawGguf) {
+        replace_metadata(raw, ROPE_DIMENSION, &RawMetadataValue::U32(1));
+    }
+
+    fn remove_tensor(raw: &mut RawGguf) {
+        raw.tensors
+            .retain(|tensor| tensor.name != "blk.0.ffn_down.weight");
+    }
+
+    fn extra_tensor(raw: &mut RawGguf) {
+        raw.tensors.push(RawTensor {
+            name: "output.weight".to_string(),
+            dims: vec![TEST_HIDDEN, TEST_VOCABULARY],
+            format: 0,
+            payload: vec![0; 48],
+        });
+    }
+
+    fn wrong_tensor_shape(raw: &mut RawGguf) {
+        replace_tensor_dimensions(raw, "blk.0.attn_q.weight", &[TEST_HIDDEN, TEST_HEAD_DIM]);
+    }
+
+    fn wrong_matrix_dtype(raw: &mut RawGguf) {
+        for tensor in &mut raw.tensors {
+            if tensor.name == "blk.0.attn_q.weight" {
+                tensor.format = 1;
+                tensor.payload = vec![0; 24];
+            }
+        }
+    }
+
+    fn wrong_norm_dtype(raw: &mut RawGguf) {
+        for tensor in &mut raw.tensors {
+            if tensor.name == OUTPUT_NORM {
+                tensor.format = 1;
+                tensor.payload = vec![0; 6];
+            }
+        }
+    }
+
+    fn replace_metadata(raw: &mut RawGguf, key: &str, value: &RawMetadataValue) {
+        for entry in &mut raw.metadata {
+            if entry.key == key {
+                entry.value = value.clone();
+            }
+        }
+    }
+
+    fn replace_tensor_dimensions(raw: &mut RawGguf, name: &str, dimensions: &[u64]) {
+        for tensor in &mut raw.tensors {
+            if tensor.name == name {
+                tensor.dims = dimensions.to_owned();
+            }
+        }
+    }
+
+    fn find_tensor_mut<'raw>(
+        raw: &'raw mut RawGguf,
+        name: &str,
+    ) -> std::result::Result<&'raw mut RawTensor, String> {
+        raw.tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == name)
+            .ok_or_else(|| format!("fixture tensor {name} was absent"))
     }
 
     fn verify(raw: &RawGguf) -> std::result::Result<VerifiedArtifact, String> {
@@ -1027,6 +1513,12 @@ mod tests {
         RawMetadata {
             key: key.to_string(),
             value: RawMetadataValue::F32(value),
+        }
+    }
+    fn metadata_bool(key: &str, value: bool) -> RawMetadata {
+        RawMetadata {
+            key: key.to_string(),
+            value: RawMetadataValue::Bool(value),
         }
     }
     fn metadata_string(key: &str, value: &str) -> RawMetadata {
