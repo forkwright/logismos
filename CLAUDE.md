@@ -53,11 +53,17 @@ Translated:
 
 ## Crate naming rule
 
-**No prefixes.** Each crate owns a distinctive single-word name.
-Pattern matches the ecosystem (basanos, archeion, stoa, mneme, nous,
-hermeneus - not kanon-X or aletheia-X). Where a role corresponds to
-an existing ecosystem-Greek name, logismos inherits that name and its
-original home eventually consolidates onto ours.
+Primary architectural crates own distinctive names that compose with the
+ecosystem (basanos, archeion, stoa, mneme, nous, hermeneus). Where a role
+corresponds to an existing ecosystem-Greek name, Logismos inherits that name
+and its original home eventually consolidates onto ours.
+
+Supporting libraries and implementation modules use conventional,
+role-revealing Rust names; Greek names and Gnomon approval are not required.
+A project-qualified library target is appropriate when it avoids a standard
+library collision and preserves the name consumers already use. Cargo package
+identity, Rust library target, and consumer dependency aliases are distinct;
+change only the identity whose contract needs correction.
 
 The current crate inventory is derived from Cargo workspace metadata. Do not maintain a second
 hand-written list here. [ARCHITECTURE.md](ARCHITECTURE.md) records the implemented role model;
@@ -65,8 +71,8 @@ the private planning corpus governs planned roles. Run
 `python3 scripts/check_runtime_scope.py` to verify concrete structural guardrails. The check does
 not replace semantic review of new behavior.
 
-New Greek names must pass the L1-L4 naming gate in the private planning corpus. No haste to
-invent decoration.
+New primary architectural names pass the L1-L4 naming gate in the private
+planning corpus. Do not invent Greek decoration for supporting implementation.
 
 ## What "done" looks like
 
@@ -82,6 +88,11 @@ invent decoration.
 - **Do not** add a dependency on another ML framework (no candle,
  torch, burn, tract, ort, llama.cpp, vLLM). Upstream runtime and emulator
  code is Read-only prior art: write original implementations, not renamed ports.
+  The operator-approved exception is the exact sixteen reconstruction constants
+  required by IQ4_NL and IQ4_XS interoperability, with pinned provenance and
+  independent conformance tests. It permits no upstream decoder expressions,
+  implementations, dependencies, or other tables; Turbo3 remains a separate
+  unresolved disposition under #47.
 - **Do not** add backends outside the accepted program. HIP is the production
  substrate; an original experimental HSA/ROCr provider is approved behind
  the hardware-access boundary. It preserves `amdgpu` and does not authorize

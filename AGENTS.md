@@ -32,7 +32,7 @@ the precise threat model. Ordinary compilation is not a hardware-test permit.
 - **No external ML frameworks.** HIP-first stack. Do not add dependencies on `candle`, `torch`, `burn`, `onnx`, or `llama.cpp`. Upstream runtime and emulator code is Read-only prior art; implement original code. The approved experimental HSA/ROCr provider preserves `amdgpu` and stays behind the hardware-access boundary.
 - **Errors:** `snafu` with `.context()` and `Location` tracking. Agents must not call `unwrap()` in library code. Use `#[expect(lint, reason = "...")]` over `#[allow]`.
 - **Time:** `jiff`. The fleet bans `chrono`.
-- **Crate naming:** standalone single-word names (no `logismos-X` prefixes). Greek when the role earns it; English mechanical otherwise. See `CLAUDE.md` § "Crate naming rule".
+- **Crate naming:** primary architectural crates use distinctive names and the Greek/Gnomon discipline. Supporting libraries use conventional, role-revealing Rust names; they do not need Greek naming approval. See `CLAUDE.md` § "Crate naming rule".
 - **Per-kernel CPU reference test.** Every GPU kernel has a CPU-side reference. Default tolerance is 1e-3 unless justified inline.
 - **No silent CPU fallbacks.** GPU unavailable means precise error, never silent degradation.
 - **Device-independent planning.** Capability checks target gfx1100, not a device name, ordinal, or fixed VRAM size. The W7900-only configuration remains supported; an absent optional XTX does not block it.

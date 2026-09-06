@@ -130,6 +130,16 @@ fn q8_0_descriptor_geometry_comes_from_quant() {
         Some((quant::Q6_K_VALUES_PER_BLOCK, quant::Q6_K_BLOCK_BYTES)),
         "loader Q6_K extents must use quant's canonical block geometry"
     );
+    assert_eq!(
+        GgmlType::IQ4NL.block_layout(),
+        Some((quant::IQ4_NL_VALUES_PER_BLOCK, quant::IQ4_NL_BLOCK_BYTES)),
+        "loader IQ4_NL extents must use quant's canonical block geometry"
+    );
+    assert_eq!(
+        GgmlType::IQ4XS.block_layout(),
+        Some((quant::IQ4_XS_VALUES_PER_BLOCK, quant::IQ4_XS_BLOCK_BYTES)),
+        "loader IQ4_XS extents must use quant's canonical block geometry"
+    );
 }
 
 #[test]

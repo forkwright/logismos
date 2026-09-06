@@ -187,6 +187,10 @@ impl<'artifact> Qwen35StructuralProfile<'artifact> {
     pub(crate) const fn recurrent_layout(&self) -> Qwen35RecurrentLayout {
         self.dimensions.recurrent_layout()
     }
+
+    pub(crate) const fn execution_dimensions(&self) -> Qwen35ExecutionDimensions {
+        self.dimensions.execution_dimensions()
+    }
 }
 
 #[derive(Debug)]
@@ -457,6 +461,19 @@ impl Dimensions {
             full_attention_interval: self.full_attention_interval,
         }
     }
+
+    const fn execution_dimensions(&self) -> Qwen35ExecutionDimensions {
+        Qwen35ExecutionDimensions {
+            hidden: self.hidden,
+            feed_forward: self.feed_forward,
+            heads: self.heads,
+            key_value_heads: self.key_value_heads,
+            key_width: self.key_width,
+            vocabulary: self.vocabulary,
+            main_block_count: self.main_block_count,
+            full_attention_interval: self.full_attention_interval,
+        }
+    }
 }
 
 /// Recurrent dimensions retained after the one authoritative metadata parse.
@@ -468,6 +485,19 @@ pub(crate) struct Qwen35RecurrentLayout {
     pub(crate) state: u64,
     pub(crate) time_step_rank: u64,
     pub(crate) group_count: u64,
+    pub(crate) main_block_count: u64,
+    pub(crate) full_attention_interval: u64,
+}
+
+/// Checked structural dimensions reused by payload-bound execution.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Qwen35ExecutionDimensions {
+    pub(crate) hidden: u64,
+    pub(crate) feed_forward: u64,
+    pub(crate) heads: u64,
+    pub(crate) key_value_heads: u64,
+    pub(crate) key_width: u64,
+    pub(crate) vocabulary: u64,
     pub(crate) main_block_count: u64,
     pub(crate) full_attention_interval: u64,
 }
@@ -835,4 +865,4 @@ fn checked_add(left: u64, right: u64, context: &'static str) -> Result<u64> {
 
 #[cfg(test)]
 #[path = "qwen35_tests.rs"]
-mod tests;
+pub(crate) mod tests;

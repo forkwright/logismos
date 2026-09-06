@@ -85,6 +85,13 @@ pub fn row_dot_f32(serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
     })
 }
 
+pub(crate) fn row_decode_f32(serialized_row: &[u8], value_count: usize) -> Result<Vec<f32>> {
+    F32Row::parse(serialized_row)?;
+    row::decode(GEOMETRY, serialized_row, value_count, |encoded| {
+        Ok([decode_one(encoded)])
+    })
+}
+
 fn decode_one(encoded: &[u8]) -> f32 {
     let mut bytes = [0; F32_ROW_VALUE_BYTES];
     bytes.copy_from_slice(encoded);

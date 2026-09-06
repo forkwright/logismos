@@ -2,8 +2,8 @@
 
 use crate::error::{
     EmptyRowInputSnafu, InvalidRowInputLengthSnafu, NonFiniteRowActivationSnafu,
-    NonFiniteRowArithmeticSnafu, RowArithmeticStage, RowByteLengthMismatchSnafu,
-    RowByteLengthOverflowSnafu,
+    NonFiniteRowArithmeticSnafu, NonFiniteRowWeightSnafu, RowArithmeticStage,
+    RowByteLengthMismatchSnafu, RowByteLengthOverflowSnafu, RowDecodeAllocationSnafu,
 };
 use crate::{Result, RowFormat};
 
@@ -101,4 +101,49 @@ where
         }
     }
     Ok(accumulator)
+}
+
+pub(crate) fn decode<const VALUES: usize, Decode>(
+    geometry: Geometry,
+    serialized_row: &[u8],
+    value_count: usize,
+    mut decode_block: Decode,
+) -> Result<Vec<f32>>
+where
+    Decode: FnMut(&[u8]) -> Result<[f32; VALUES]>,
+{
+    let expected_bytes = byte_len::<VALUES>(geometry, value_count)?;
+    if serialized_row.len() != expected_bytes {
+        return RowByteLengthMismatchSnafu {
+            format: geometry.format,
+            actual: serialized_row.len(),
+            expected: expected_bytes,
+        }
+        .fail();
+    }
+
+    let mut decoded = Vec::new();
+    decoded.try_reserve_exact(value_count).map_err(|_| {
+        RowDecodeAllocationSnafu {
+            format: geometry.format,
+            value_count,
+        }
+        .build()
+    })?;
+    for (block_index, serialized_block) in serialized_row
+        .chunks_exact(geometry.bytes_per_block)
+        .enumerate()
+    {
+        for (lane_index, weight) in decode_block(serialized_block)?.into_iter().enumerate() {
+            if !weight.is_finite() {
+                return NonFiniteRowWeightSnafu {
+                    format: geometry.format,
+                    index: block_index * VALUES + lane_index,
+                }
+                .fail();
+            }
+            decoded.push(weight);
+        }
+    }
+    Ok(decoded)
 }

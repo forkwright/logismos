@@ -32,6 +32,8 @@ semantically respects that boundary.
 - Lower tiers never depend on higher tiers.
 - `core` and `isa` have no Logismos-local dependencies. `isa` is
   pure parsing over the checked-in target token; it neither links nor probes HIP.
+  The `core` package exposes the Rust library target `logismos_core` to avoid
+  colliding with Rust's standard library; the facade remains `logismos::core`.
 - `hipcore`, `placement`, and `emulation` depend on `isa` so target-architecture
   identity and suffix syntax have one implementation.
 - `placement` and `sched` have no HIP/device-runtime dependency. `bin` consumes
@@ -95,8 +97,9 @@ does not establish publisher authenticity, a filesystem snapshot, or a total
 host-memory reservation. Existing observation receipts remain reporting data.
 
 `decoders::Qwen35Weights` binds the existing structural contract to that owner
-and executes named F32, Q8_0, Q4_K, Q5_K, and Q6_K matrix projections through
-`quant`. IQ4 and other unsupported formats are explicit refusals.
+and executes named F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS matrix
+projections through `quant`. Linear row decoding shares those checked block
+decoders and geometry; other unsupported formats are explicit refusals.
 `Qwen35RecurrentExecution` binds convolution history and GDN state to those
 weights and one recurrent layer; an unsuccessful step commits neither state.
 It adapts GGUF tiled heads to the generic grouped GDN contract explicitly.
@@ -104,10 +107,17 @@ Execution requires finite positive RMS epsilon; structural recognition does not.
 The shared CPU RMSNorm returns typed errors for malformed inputs and non-finite
 arithmetic instead of concealing overflow behind finite zero outputs.
 
-This is a recurrent-attention path, not a complete decoder block or model:
-residual/FFN composition, full attention, tokenizer/logits, NextN, artifact-level
-quality, and admission integration remain separate requirements. Explicit CPU
-execution is not a fallback for a GPU operation.
+`Qwen35Execution` composes the main recurrent/full-attention blocks, residuals,
+dense FFN, final normalization and vocabulary projection from token IDs. One
+ordered layer-state enum owns recurrent or KV history, never parallel optional
+states. Its caller-supplied context bound is capped by artifact and signed-position
+limits. Whole-call staging is fallible and commits only after all token logits
+succeed. Its text-only interleaved RoPE supports checked full or partial rotary
+dimensions; unsupported effective scaling fails explicitly.
+
+Tokenizer/template handling, sampling, NextN, serving, exact-artifact quality,
+physical residency and admission integration remain separate requirements.
+Explicit CPU execution is not a fallback for a GPU operation.
 
 ## cfg flags
 

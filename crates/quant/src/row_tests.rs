@@ -1,7 +1,7 @@
 use crate::error::RowArithmeticStage;
 use crate::{
     Error, Q4_K_BLOCK_BYTES, Q4KBlock, Q5_K_BLOCK_BYTES, Q5KBlock, Q6_K_BLOCK_BYTES, Q6KBlock,
-    RowFormat, row_byte_len, row_dot_f32,
+    Q8_0_BLOCK_BYTES, Q8_0_VALUES_PER_BLOCK, RowFormat, row_byte_len, row_decode_f32, row_dot_f32,
 };
 
 const VALUES_PER_BLOCK: usize = 256;
@@ -126,6 +126,42 @@ fn fixed_q6_k_witness_decodes_both_halves_signed_scales_and_lane_splits() -> cra
     let bytes = fixed_q6_witness();
     let decoded = Q6KBlock::parse(&bytes)?.decode_f32();
     assert_full_vector(&decoded, &fixed_q6_expected(), "fixed Q6_K witness");
+    Ok(())
+}
+
+#[test]
+fn row_decode_dispatches_all_preexisting_formats() -> crate::Result<()> {
+    let f32_bytes = [
+        0x00, 0x00, 0xa0, 0xbf, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x40,
+    ];
+    assert_eq!(
+        row_decode_f32(RowFormat::F32, &f32_bytes, 3)?,
+        vec![-1.25, 0.0, 2.25]
+    );
+
+    let mut q8_bytes = [0; Q8_0_BLOCK_BYTES];
+    q8_bytes[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    q8_bytes[2..].fill(1);
+    assert_eq!(
+        row_decode_f32(RowFormat::Q8_0, &q8_bytes, Q8_0_VALUES_PER_BLOCK)?,
+        vec![1.0; Q8_0_VALUES_PER_BLOCK]
+    );
+
+    let (q4_bytes, q4_expected) = q4_fixture(0);
+    assert_eq!(
+        row_decode_f32(RowFormat::Q4K, &q4_bytes, VALUES_PER_BLOCK)?,
+        q4_expected
+    );
+    let (q5_bytes, q5_expected) = q5_fixture(0);
+    assert_eq!(
+        row_decode_f32(RowFormat::Q5K, &q5_bytes, VALUES_PER_BLOCK)?,
+        q5_expected
+    );
+    let (q6_bytes, q6_expected) = q6_fixture(0);
+    assert_eq!(
+        row_decode_f32(RowFormat::Q6K, &q6_bytes, VALUES_PER_BLOCK)?,
+        q6_expected
+    );
     Ok(())
 }
 

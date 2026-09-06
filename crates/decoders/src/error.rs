@@ -252,6 +252,20 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// Native execution could not allocate an all-or-nothing local result.
+    #[snafu(display("qwen35 execution {target} could not reserve {length} elements: {source}"))]
+    ExecutionAllocation {
+        /// Named local buffer that could not be reserved.
+        target: &'static str,
+        /// Exact element capacity requested.
+        length: usize,
+        /// Allocation failure retained as the error source.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// Finite recurrent execution produced a non-finite intermediate.
     #[snafu(display(
         "qwen35 recurrent arithmetic became non-finite during {stage} at index {index}"
@@ -291,6 +305,44 @@ pub enum Error {
     RecurrentGdn {
         /// Checked grouped-GDN failure.
         source: kernels::GdnError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A bounded text-session context request is invalid for this artifact.
+    #[snafu(display("qwen35 execution context {requested} violates {rule}"))]
+    ExecutionContext {
+        /// Requested or reached token count.
+        requested: usize,
+        /// Execution invariant that refused the request.
+        rule: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A token identifier does not name one row of the artifact vocabulary.
+    #[snafu(display("qwen35 token id {token_id} is outside vocabulary {vocabulary}"))]
+    ExecutionToken {
+        /// Supplied token id.
+        token_id: u32,
+        /// Artifact-derived vocabulary count.
+        vocabulary: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU execution produced a non-finite scalar.
+    #[snafu(display(
+        "qwen35 execution arithmetic became non-finite during {stage} at index {index}"
+    ))]
+    ExecutionArithmetic {
+        /// Mathematical stage.
+        stage: &'static str,
+        /// Flat scalar index within that stage.
+        index: usize,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
