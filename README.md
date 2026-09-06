@@ -7,8 +7,8 @@ targeting AMD gfx1100, with owned HIP/WMMA kernels and progressively owned execu
 
 **Status:** HIP primitives, Stella CPU golden-fixture parity, action-free placement,
 process-local admission/residency coordination, and bounded instruction emulation exist.
-GGUF inspection, digest-bound mixed-weight CPU projections and a stateful recurrent-attention
-path are foundations, not native decoder serving or hardware qualification. The W7900
+GGUF inspection, digest-bound mixed-weight CPU projections and bounded hybrid CPU
+token-ID-to-logits execution are foundations, not native decoder serving or hardware qualification. The W7900
 is available; the RX 7900 XTX is a
 planned second device and requires its own qualification. The experimental below-HIP
 provider remains unimplemented.
@@ -59,11 +59,16 @@ owns one immutable byte backing under an explicit size limit and requires a matc
 expectation. `decoders::Qwen35Weights` binds that backing to the structural profile and executes
 named F32/Q8_0/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS matrix projections using
 [`quant`](crates/quant/src/lib.rs). The same checked block decoders support linear
-row decoding without repeated basis-vector projections.
+row decoding.
 Its recurrent-attention executor owns layer-bound convolution/GDN state and commits state
-only after a successful step. Other unsupported formats fail explicitly. This explicit CPU path does not
-implement full decoder blocks, tokenizer/logits, NextN, or a complete model; it does not
-authenticate a publisher or reserve device memory. The existing mmap tensor adapter is separate.
+only after a successful step. `Qwen35Weights::execution(max_context)` constructs a bounded
+text session over the main hybrid blocks, with causal grouped attention, full or partial
+interleaved RoPE, recurrent state, residual/FFN composition and token-major vocabulary logits.
+Each call commits all layer state only after every input token and output projection succeeds.
+Other unsupported formats or execution configurations fail explicitly. This CPU path does not
+provide tokenizer/template handling, sampling, NextN, serving, real-artifact quality or GPU
+qualification; it does not authenticate a publisher or reserve device memory. The existing
+mmap tensor adapter is separate.
 
 [`contracts/runtime-scope.toml`](contracts/runtime-scope.toml) records this product boundary.
 Bounded adaptation remains absent unless a named consumer contract supplies an output owner,

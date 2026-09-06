@@ -288,6 +288,7 @@ version = "1.0.11"
 dependencies = [
  "kernels",
  "loader",
+ "num-traits",
  "quant",
  "sha2",
  "snafu",

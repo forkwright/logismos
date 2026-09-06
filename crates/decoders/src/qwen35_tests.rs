@@ -44,6 +44,7 @@ enum MetadataEntry {
     F32(&'static str, f32),
     String(&'static str, String),
     StringArray(&'static str, Vec<String>),
+    I32Array(&'static str, Vec<i32>),
 }
 
 impl MetadataEntry {
@@ -52,7 +53,8 @@ impl MetadataEntry {
             Self::U32(key, _)
             | Self::F32(key, _)
             | Self::String(key, _)
-            | Self::StringArray(key, _) => key,
+            | Self::StringArray(key, _)
+            | Self::I32Array(key, _) => key,
         }
     }
 }
@@ -184,6 +186,72 @@ fn executes_a_nonzero_recurrent_trunk_with_artifact_owned_state() -> std::result
     assert_ne!(
         first, second,
         "the second token pass must observe the execution object's retained recurrent or convolution state"
+    );
+    Ok(())
+}
+
+#[test]
+fn executes_verified_token_ids_through_hybrid_main_blocks_transactionally()
+-> std::result::Result<(), String> {
+    let mut fixture = fixture(1)?;
+    let names = fixture
+        .tensors
+        .iter()
+        .map(|tensor| tensor.name.clone())
+        .collect::<Vec<_>>();
+    for name in names {
+        set_f32_repeated(&mut fixture, &name, 0.125)?;
+    }
+    set_f32_repeated(&mut fixture, "blk.0.ssm_a", -1.0)?;
+    set_f32_repeated(&mut fixture, "blk.1.ssm_a", -1.0)?;
+    set_f32_repeated(&mut fixture, "blk.2.ssm_a", -1.0)?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+
+    let mut batched = weights.execution(3).map_err(|error| error.to_string())?;
+    let batched_logits = batched.step(&[1, 2]).map_err(|error| error.to_string())?;
+    let mut sequential = weights.execution(3).map_err(|error| error.to_string())?;
+    let mut sequential_logits = sequential.step(&[1]).map_err(|error| error.to_string())?;
+    sequential_logits.extend(sequential.step(&[2]).map_err(|error| error.to_string())?);
+
+    assert_eq!(
+        batched_logits, sequential_logits,
+        "one batched call must preserve token state order"
+    );
+    assert_eq!(batched_logits.len(), 2 * test_dimension(TEST_VOCABULARY)?);
+    assert!(batched_logits.iter().all(|value| value.is_finite()));
+    assert_ne!(
+        &batched_logits[..test_dimension(TEST_VOCABULARY)?],
+        &batched_logits[test_dimension(TEST_VOCABULARY)?..],
+        "nonzero text positions and retained hybrid state must affect the next token logits"
+    );
+    Ok(())
+}
+
+#[test]
+fn execution_uses_source_defined_rope_defaults_and_refuses_effective_scaling()
+-> std::result::Result<(), String> {
+    let mut missing_scaling = fixture(1)?;
+    missing_scaling
+        .metadata
+        .retain(|entry| entry.key() != "qwen35.rope.scaling.type");
+    let payload = verify_fixture(&missing_scaling)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    assert!(
+        weights.execution(1).is_ok(),
+        "an absent optional scaling key has source-defined unscaled semantics"
+    );
+
+    let mut scaled = fixture(1)?;
+    replace_metadata(
+        &mut scaled,
+        MetadataEntry::String("qwen35.rope.scaling.type", "yarn".to_string()),
+    )?;
+    let payload = verify_fixture(&scaled)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    assert!(
+        weights.execution(1).is_err(),
+        "unsupported scaling must refuse rather than silently become unscaled"
     );
     Ok(())
 }
@@ -630,6 +698,10 @@ fn fixture_with_feed_forward(
                     .collect(),
             ),
             MetadataEntry::U32("general.alignment", TEST_ALIGNMENT),
+            MetadataEntry::U32("qwen35.context_length", 8),
+            MetadataEntry::I32Array("qwen35.rope.dimension_sections", vec![1, 0, 0, 0]),
+            MetadataEntry::F32("qwen35.rope.freq_base", 10_000.0),
+            MetadataEntry::String("qwen35.rope.scaling.type", "none".to_string()),
         ],
         tensors,
     })
@@ -1441,6 +1513,14 @@ fn append_metadata(bytes: &mut Vec<u8>, entry: &MetadataEntry) -> std::result::R
             bytes.extend_from_slice(&to_u64(values.len())?.to_le_bytes());
             for value in values {
                 append_string(bytes, value)?;
+            }
+        }
+        MetadataEntry::I32Array(_, values) => {
+            bytes.extend_from_slice(&9u32.to_le_bytes());
+            bytes.extend_from_slice(&5u32.to_le_bytes());
+            bytes.extend_from_slice(&to_u64(values.len())?.to_le_bytes());
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
             }
         }
     }

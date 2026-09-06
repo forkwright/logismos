@@ -141,6 +141,24 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         Ok(output)
     }
 
+    pub(crate) fn try_clone_for_transaction(&self) -> Result<Self> {
+        Ok(Self {
+            weights: self.weights,
+            block_index: self.block_index,
+            layout: self.layout,
+            attention_norm: clone_f32("transaction attention norm", &self.attention_norm)?,
+            ssm_a: clone_f32("transaction SSM A", &self.ssm_a)?,
+            ssm_conv: clone_f32("transaction convolution", &self.ssm_conv)?,
+            ssm_dt: clone_f32("transaction SSM dt", &self.ssm_dt)?,
+            ssm_norm: clone_f32("transaction SSM norm", &self.ssm_norm)?,
+            convolution_history: clone_f32(
+                "transaction convolution history",
+                &self.convolution_history,
+            )?,
+            recurrent_state: clone_f32("transaction GDN state", &self.recurrent_state)?,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn state_for_test(&self) -> &[f32] {
         &self.recurrent_state
@@ -785,6 +803,12 @@ fn product_dims(dimensions: &[u64]) -> Result<usize> {
 fn zeroed_f32(target: &'static str, length: usize) -> Result<Vec<f32>> {
     let mut values = reserve_f32(target, length)?;
     values.resize(length, 0.0);
+    Ok(values)
+}
+
+fn clone_f32(target: &'static str, source: &[f32]) -> Result<Vec<f32>> {
+    let mut values = reserve_f32(target, source.len())?;
+    values.extend_from_slice(source);
     Ok(values)
 }
 
