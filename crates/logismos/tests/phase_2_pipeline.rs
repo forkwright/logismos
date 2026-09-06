@@ -46,6 +46,8 @@ enum TestError {
     Taxis(#[from] taxis::Error),
     #[error("cache: {0}")]
     Cache(#[from] cache::Error),
+    #[error("decode: {0}")]
+    Decode(#[from] decode::Error),
     #[error("{0}")]
     Msg(String),
 }
@@ -115,7 +117,7 @@ fn phase_2_full_pipeline() -> Result<(), TestError> {
     exercise_kv_cache()?;
 
     // -- 6: greedy decode over a pre-set logits vector. --------------
-    exercise_decode();
+    exercise_decode()?;
 
     eprintln!("[phase-2] ALL STEPS GREEN — exit gate satisfied.");
     Ok(())
@@ -160,26 +162,27 @@ fn exercise_kv_cache() -> Result<(), TestError> {
 
 /// Step 6 of the pipeline: greedy argmax + a four-stage decode chain over
 /// a fixed-logits vector; both must pick index 3.
-fn exercise_decode() {
+fn exercise_decode() -> Result<(), TestError> {
     let logits = vec![0.1f32, 0.4, 0.2, 0.8, 0.3];
-    assert_eq!(decode::greedy(&logits), 3);
+    assert_eq!(decode::greedy(&logits)?, 3);
 
     // And through a chain for the fuller shape.
     let mut chain = DecodeChain::new(GreedySampler)
-        .push(TemperatureScale(0.7))
-        .push(TopK::new(3))
-        .push(TopP(0.95));
+        .push(TemperatureScale::new(0.7)?)
+        .push(TopK::new(3)?)
+        .push(TopP::new(0.95)?);
     let mut log_buf = logits.clone();
     let ctx = TokenContext {
         prev_tokens: &[],
         step: 0,
     };
-    let id = chain.step(&mut log_buf, &ctx);
+    let id = chain.step(&mut log_buf, &ctx)?;
     assert_eq!(
         id, 3,
         "chain's greedy pick on [0.1,0.4,0.2,0.8,0.3] is index 3"
     );
     eprintln!("[phase-2] decode: greedy + chain both picked token id 3");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------

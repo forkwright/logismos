@@ -15,10 +15,10 @@ must not initialize a GPU, start a process, or reserve physical memory merely by
 | Tier | Role |
 |------|------|
 | T0 Foundation | HIP FFI, errors, stable model API, and pure resource contracts |
-| T1 Infrastructure | Kernels, quantization, tokenization, loading, and caching |
+| T1 Infrastructure | Kernels, quantization, tokenization, loading, caching, and CPU decode policy |
 | T2 Model families | Transformer operations and encoder/decoder implementations |
 | T3 Pipelines | End-to-end inference pipelines |
-| T4 Serving | Scheduling, admission/residency coordination, sampling, and provider adapters |
+| T4 Serving | Scheduling, admission/residency coordination, and provider adapters |
 | T5 Entrypoint | Integration facade and binary |
 
 The exact crate inventory derives from `cargo metadata --format-version 1 --no-deps --locked`; it
@@ -45,6 +45,17 @@ semantically respects that boundary.
   distinct from payload-bound execution. The lower-level `quant` crate owns
   executable block and row geometry; inspection and projection reuse that owner.
 - `emulation` is a CPU test aid, not a production device backend.
+- `decode` owns checked logit processing and token selection over CPU slices.
+  It has no tensor/device-runtime dependency; a pipeline can consume it without
+  depending on a serving layer. Empty, NaN, positive-infinity and fully masked
+  rows fail explicitly. Negative infinity is the masking representation, not
+  an implicit fallback to token zero.
+- `text` is a CPU-only pipeline over `decoders`, `tokenize` and `decode`, with
+  `loader`'s verified-GGUF artifact surface, its optional tensor adapter
+  disabled, and a restricted template substrate. It does
+  not depend on scheduling, a provider adapter, or a device runtime.
+- `test-fixtures` is dev-only shared synthetic GGUF support. It has no model
+  execution dependency and is never a production dependency of a pipeline.
 - `taxis` depends locally on `hipcore`.
 - `kernels/gpu` enables the local `hipcore` and `taxis` dependencies and GPU
   launcher modules, including their nested parity references. Standalone
@@ -115,8 +126,37 @@ limits. Whole-call staging is fallible and commits only after all token logits
 succeed. Its text-only interleaved RoPE supports checked full or partial rotary
 dimensions; unsupported effective scaling fails explicitly.
 
-Tokenizer/template handling, sampling, NextN, serving, exact-artifact quality,
-physical residency and admission integration remain separate requirements.
+`Qwen35ExecutionPlan` validates caller context and step bounds and chooses
+all-token or last-token logits. Its precomputed `Qwen35CpuRequirements` derives
+logical `f32` backing from allocation owners, not a separate estimator.
+Causal-convolution and grouped-GDN plans are consumed by their kernels;
+recurrent, full-attention, FFN and LM-head owners compose named allocation
+phases. The report separates retained state, its transaction clone, transient
+workspace upper bound, and returned logits. Serialized verified backing is
+reported separately. Structure/stack storage, allocator overhead and capacity,
+template/tokenizer allocations, process RSS, physical residency and GPU memory
+are outside this report. It is neither an allocation guarantee nor device
+admission input.
+
+Independent synthetic f64 witnesses cover the composed mixed-quantized model,
+retained recurrent/KV/position state, continuation and rollback. Deliberately
+incorrect format/order/operator paths must be distinguishable at the same
+comparison tolerance; batch-versus-sequential agreement alone is insufficient.
+
+`text::TextPipeline` binds an explicitly selected tokenizer identity to the
+verified model's vocabulary and special-token policy. The same model digest
+commits the embedded template; no second template identity authority exists.
+Its private template environment registers no named templates or loader and
+renders only the admitted source. It accepts typed text messages and uses
+checked greedy selection followed by collective sequence decoding. Requests
+have independent execution state, bounded context/output and cooperative
+cancellation checks; failures publish neither partial text nor resumable state.
+Completed internal decoder steps are discarded with that private session, not
+undone in a shared session. These limits do not bound total template/tokenizer
+heap use or authenticate the selected model/tokenizer's publisher.
+
+NextN, serving, exact-artifact quality, physical residency and admission
+integration remain separate requirements.
 Explicit CPU execution is not a fallback for a GPU operation.
 
 ## cfg flags

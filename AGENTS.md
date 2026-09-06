@@ -59,6 +59,8 @@ the precise threat model. Ordinary compilation is not a hardware-test permit.
 | Provider adapter (HTTP/MCP) | `crates/hermeneus/` |
 | STT pipeline | `crates/ekphrasis/` |
 | Tokenizer | `crates/tokenize/` |
+| Native text request pipeline | `crates/text/` |
+| Shared synthetic GGUF test data | `crates/test-fixtures/` (dev-only) |
 
 The private planning corpus governs future scope and sequencing. This repository's
 [ARCHITECTURE.md](ARCHITECTURE.md) governs implemented crate ownership and dependency direction.

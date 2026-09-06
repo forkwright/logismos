@@ -8,7 +8,7 @@ targeting AMD gfx1100, with owned HIP/WMMA kernels and progressively owned execu
 **Status:** HIP primitives, Stella CPU golden-fixture parity, action-free placement,
 process-local admission/residency coordination, and bounded instruction emulation exist.
 GGUF inspection, digest-bound mixed-weight CPU projections and bounded hybrid CPU
-token-ID-to-logits execution are foundations, not native decoder serving or hardware qualification. The W7900
+text generation are foundations, not native decoder serving or hardware qualification. The W7900
 is available; the RX 7900 XTX is a
 planned second device and requires its own qualification. The experimental below-HIP
 provider remains unimplemented.
@@ -62,13 +62,33 @@ named F32/Q8_0/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS matrix projections using
 row decoding.
 Its recurrent-attention executor owns layer-bound convolution/GDN state and commits state
 only after a successful step. `Qwen35Weights::execution(max_context)` constructs a bounded
-text session over the main hybrid blocks, with causal grouped attention, full or partial
+token-ID session over the main hybrid blocks, with causal grouped attention, full or partial
 interleaved RoPE, recurrent state, residual/FFN composition and token-major vocabulary logits.
 Each call commits all layer state only after every input token and output projection succeeds.
-Other unsupported formats or execution configurations fail explicitly. This CPU path does not
-provide tokenizer/template handling, sampling, NextN, serving, real-artifact quality or GPU
+Other unsupported formats or execution configurations fail explicitly.
+`execution_plan` additionally bounds tokens per step and selects all-token or last-token
+logits; prefill for generation need not retain a vocabulary row for every prompt token.
+Its `cpu_requirements()` reports artifact-bound logical `f32` backing: retained state,
+transaction copies, a conservative workspace upper bound, and returned logits. The allocation
+owners consume the same named sizes. Serialized artifact bytes are separate; neither value is
+an allocation guarantee, whole-process memory estimate, GPU requirement or physical reservation.
+This CPU path does not provide NextN, serving, real-artifact quality or GPU
 qualification; it does not authenticate a publisher or reserve device memory. The existing
 mmap tensor adapter is separate.
+
+[`text`](crates/text/src/lib.rs) composes this native CPU path with the artifact's embedded
+chat template, an explicitly digest-selected tokenizer companion, and checked greedy decoding.
+Typed text-only requests have byte, context and output bounds. Each request owns fresh execution
+state and returns only a complete decoded result; cancellation or error exposes no partial text
+or resumable state. Model/tokenizer identity expectations belong to trusted setup, not individual
+untrusted requests, and are content binding rather than publisher authentication.
+
+The private template environment has no loader or registered templates. Named imports, includes
+and inheritance cannot resolve another source; missing includes explicitly marked optional are
+no-ops. Fuel, recursion and rendered-output limits are operational bounds, not a hostile-template
+or total-process-memory sandbox. Tokenizer parse/encode/decode intermediate allocations are not
+bounded by the returned-output byte limit. Direct `text` and `decode` consumers do not link HIP;
+CPU execution is explicit, never a fallback for a GPU operation.
 
 [`contracts/runtime-scope.toml`](contracts/runtime-scope.toml) records this product boundary.
 Bounded adaptation remains absent unless a named consumer contract supplies an output owner,

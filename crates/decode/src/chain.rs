@@ -6,15 +6,20 @@
 //!
 //! ```rust,no_run
 //! use decode::{DecodeChain, GreedySampler, TemperatureScale, TopK, TopP};
+//! # fn main() -> decode::Result<()> {
 //! let mut chain = DecodeChain::new(GreedySampler)
-//!     .push(TemperatureScale(0.8))
-//!     .push(TopK::new(50))
-//!     .push(TopP(0.95));
+//!     .push(TemperatureScale::new(0.8)?)
+//!     .push(TopK::new(50)?)
+//!     .push(TopP::new(0.95)?);
 //! # let _ = chain;
+//! # Ok(())
+//! # }
 //! ```
 
+use crate::Result;
 use crate::processor_trait::LogitProcessor;
 use crate::sampler_trait::Sampler;
+use crate::validation::validate_logits;
 
 /// Context passed to every processor in a chain.
 ///
@@ -51,13 +56,26 @@ impl<S: Sampler> DecodeChain<S> {
         self
     }
 
-    /// Run one decode step.
+    /// Run one checked decode step.
     ///
     /// Processors run in insertion order; the sampler runs last.
     /// `logits` is mutated in place and discarded after the call.
-    pub fn step(&mut self, logits: &mut [f32], ctx: &TokenContext<'_>) -> u32 {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when the initial logits, a processor, the
+    /// post-processor logits, or the sampler rejects the step.
+    ///
+    /// # Transactionality
+    ///
+    /// Processor chains are not transactional: mutations made by successfully
+    /// completed processors remain visible if a later processor or sampler
+    /// fails. Callers must not treat such a buffer as a completed decode step.
+    pub fn step(&mut self, logits: &mut [f32], ctx: &TokenContext<'_>) -> Result<u32> {
+        validate_logits(logits)?;
         for p in &mut self.processors {
-            p.process(logits, ctx);
+            p.process(logits, ctx)?;
+            validate_logits(logits)?;
         }
         self.sampler.sample(logits)
     }
@@ -89,14 +107,15 @@ mod tests {
     }
 
     #[test]
-    fn greedy_chain_picks_argmax() {
+    fn greedy_chain_picks_argmax() -> Result<()> {
         let mut chain = DecodeChain::new(GreedySampler);
         let mut logits = vec![1.0, 5.0, 2.0];
-        assert_eq!(chain.step(&mut logits, &ctx()), 1);
+        assert_eq!(chain.step(&mut logits, &ctx())?, 1);
+        Ok(())
     }
 
     #[test]
-    fn ordering_matters_top_p_then_temp_vs_temp_then_top_p() {
+    fn ordering_matters_top_p_then_temp_vs_temp_then_top_p() -> Result<()> {
         // Construct a distribution where temperature + top-p chosen in
         // different orders land on different tokens. Peak at index 0,
         // flat tail at 1..4.
@@ -105,10 +124,10 @@ mod tests {
         // Order A: temperature (cool) first → peak sharpens → top-p 0.5
         // keeps only index 0.
         let mut chain_a = DecodeChain::new(GreedySampler)
-            .push(TemperatureScale(0.1))
-            .push(TopP(0.5));
+            .push(TemperatureScale::new(0.1)?)
+            .push(TopP::new(0.5)?);
         let mut la = base_logits.clone();
-        let a = chain_a.step(&mut la, &ctx());
+        let a = chain_a.step(&mut la, &ctx())?;
 
         // Order B: top-p 0.5 first on the flat original distribution.
         // After softmax the four probs are nearly equal (~0.27, 0.25,
@@ -117,23 +136,25 @@ mod tests {
         // greedy sampler still picks index 0 because index 1's logit
         // is 2.9 vs 3.0.
         let mut chain_b = DecodeChain::new(GreedySampler)
-            .push(TopP(0.5))
-            .push(TemperatureScale(0.1));
+            .push(TopP::new(0.5)?)
+            .push(TemperatureScale::new(0.1)?);
         let mut lb = base_logits;
-        let b = chain_b.step(&mut lb, &ctx());
+        let b = chain_b.step(&mut lb, &ctx())?;
 
         // Argmax under both orderings is the same token here; the test
         // verifies that the chain exposes ordering control at all, not
         // that every ordering diverges.
         assert_eq!(a, b);
+        Ok(())
     }
 
     #[test]
-    fn chain_length_tracks_push_calls() {
+    fn chain_length_tracks_push_calls() -> Result<()> {
         let chain = DecodeChain::new(GreedySampler)
-            .push(TemperatureScale(0.8))
-            .push(TopK::new(50));
+            .push(TemperatureScale::new(0.8)?)
+            .push(TopK::new(50)?);
         assert_eq!(chain.len(), 2);
         assert!(!chain.is_empty());
+        Ok(())
     }
 }

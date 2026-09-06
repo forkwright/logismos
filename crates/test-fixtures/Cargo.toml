@@ -1,16 +1,15 @@
 [package]
-name = "tokenize"
+name = "test-fixtures"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Tokenizer facade over the upstream huggingface/tokenizers crate."
+description = "Dev-only deterministic synthetic GGUF fixtures."
 publish = false
+
+[lints]
+workspace = true
 
 [dependencies]
 sha2 = { workspace = true }
 snafu = { workspace = true }
-tokenizers = { workspace = true }
-
-[lints]
-workspace = true

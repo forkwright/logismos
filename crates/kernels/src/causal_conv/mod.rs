@@ -12,6 +12,57 @@ const CAUSAL_CONVOLUTION: &str = "causal_conv_fwd";
 /// Result alias for the bounded causal-convolution reference.
 pub type CausalConvResult<T> = core::result::Result<T, CausalConvError>;
 
+/// Exact logical `f32` capacities owned by one causal-convolution evaluation.
+///
+/// WHY: model executors can compose the kernel's checked allocation requests
+/// without duplicating its shape arithmetic or mistaking requested capacity for
+/// allocator capacity or resident memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CausalConvAllocationPlan {
+    output: usize,
+    weights: usize,
+    history: usize,
+}
+
+impl CausalConvAllocationPlan {
+    /// Derive the allocation requests for one admitted convolution shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CausalConvError`] when a required dimension is zero or a
+    /// declared-shape calculation overflows.
+    pub fn try_from_dimensions(
+        token_count: usize,
+        channel_count: usize,
+        width: usize,
+    ) -> CausalConvResult<Self> {
+        validate_nonzero_dimension("channel_count", channel_count)?;
+        validate_nonzero_dimension("width", width)?;
+        let history_width = checked_subtract(width, 1, "width - 1")?;
+        Ok(Self {
+            output: checked_product(token_count, channel_count, "token_count * channel_count")?,
+            weights: checked_product(channel_count, width, "channel_count * width")?,
+            history: checked_product(channel_count, history_width, "channel_count * (width - 1)")?,
+        })
+    }
+
+    /// Return the exact requested output capacity.
+    #[must_use]
+    pub const fn output_elements(self) -> usize {
+        self.output
+    }
+
+    /// Return the exact requested final-history capacity.
+    #[must_use]
+    pub const fn history_elements(self) -> usize {
+        self.history
+    }
+
+    const fn weight_elements(self) -> usize {
+        self.weights
+    }
+}
+
 /// Failures while admitting or evaluating the bounded causal-convolution reference.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -107,6 +158,7 @@ pub struct CausalConvInput<'a> {
     token_count: usize,
     channel_count: usize,
     width: usize,
+    allocations: CausalConvAllocationPlan,
 }
 
 impl<'a> CausalConvInput<'a> {
@@ -125,18 +177,12 @@ impl<'a> CausalConvInput<'a> {
         channel_count: usize,
         width: usize,
     ) -> CausalConvResult<Self> {
-        validate_nonzero_dimension("channel_count", channel_count)?;
-        validate_nonzero_dimension("width", width)?;
+        let allocations =
+            CausalConvAllocationPlan::try_from_dimensions(token_count, channel_count, width)?;
 
-        let history_width = checked_subtract(width, 1, "width - 1")?;
-        let input_len = checked_product(token_count, channel_count, "token_count * channel_count")?;
-        let weight_len = checked_product(channel_count, width, "channel_count * width")?;
-        let history_len =
-            checked_product(channel_count, history_width, "channel_count * (width - 1)")?;
-
-        validate_length("input", input.len(), input_len)?;
-        validate_length("weights", weights.len(), weight_len)?;
-        validate_length("history", history.len(), history_len)?;
+        validate_length("input", input.len(), allocations.output_elements())?;
+        validate_length("weights", weights.len(), allocations.weight_elements())?;
+        validate_length("history", history.len(), allocations.history_elements())?;
         validate_scalars("input", input)?;
         validate_scalars("weights", weights)?;
         validate_scalars("history", history)?;
@@ -148,6 +194,7 @@ impl<'a> CausalConvInput<'a> {
             token_count,
             channel_count,
             width,
+            allocations,
         })
     }
 
@@ -222,18 +269,8 @@ impl CausalConvOutput {
 /// product or accumulation exceeds the `f32` domain, or
 /// [`CausalConvError::Allocation`] if an output reservation fails.
 pub fn causal_conv_fwd(input: &CausalConvInput<'_>) -> CausalConvResult<CausalConvOutput> {
-    let output_len = checked_product(
-        input.token_count,
-        input.channel_count,
-        "token_count * channel_count",
-    )?;
     let history_width = input.history_width()?;
-    let history_len = checked_product(
-        input.channel_count,
-        history_width,
-        "channel_count * (width - 1)",
-    )?;
-    let mut output = reserve_f32("output", output_len)?;
+    let mut output = reserve_f32("output", input.allocations.output_elements())?;
 
     for token_index in 0..input.token_count {
         for channel_index in 0..input.channel_count {
@@ -260,7 +297,7 @@ pub fn causal_conv_fwd(input: &CausalConvInput<'_>) -> CausalConvResult<CausalCo
         }
     }
 
-    let mut final_history = reserve_f32("final history", history_len)?;
+    let mut final_history = reserve_f32("final history", input.allocations.history_elements())?;
     for channel_index in 0..input.channel_count {
         for history_index in 0..history_width {
             let window_position = checked_add(

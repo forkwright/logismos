@@ -44,6 +44,15 @@ safetensors = "0.8"
 # the HTTP hub client, progressbar, and C++ esaxx dep; we keep only the
 # onig regex engine (required by BPE pre-tokenizers).
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+# WHY: interpret artifact-owned Jinja templates through a maintained format
+# runtime. MiniJinja 2.24 fuel+macros also requires multi_template to compile;
+# the text owner uses a private empty template store, never a loader or named
+# registration. Syntax support grants no external template-resolution authority.
+# Explicit fuel/recursion/output limits do not imply total-memory isolation.
+minijinja = { version = "2.24", default-features = false, features = ["builtins", "macros", "multi_template", "serde", "fuel", "json", "adjacent_loop_items", "std_collections"] }
+# WHY: artifact templates use Python-style primitive string methods; the
+# maintained compatibility adapter supplies those semantics without host I/O.
+minijinja-contrib = { version = "2.24", default-features = false, features = ["pycompat"] }
 # memmap2: read-only mmap for bulk-tensor files. No alternatives in the
 # Rust ecosystem; used only inside loader's safetensors path.
 memmap2 = "0.9"
@@ -85,6 +94,7 @@ loader = { path = "crates/loader" }
 tokenize = { path = "crates/tokenize" }
 cache = { path = "crates/cache" }
 decode = { path = "crates/decode" }
+text = { path = "crates/text" }
 core = { path = "crates/core" }
 transformers = { path = "crates/transformers" }
 encoders = { path = "crates/encoders" }

@@ -27,6 +27,7 @@ loader = { workspace = true }
 tokenize = { workspace = true }
 cache = { workspace = true }
 decode = { workspace = true }
+text = { workspace = true }
 logismos_core = { path = "../core", package = "core" }
 transformers = { path = "../transformers" }
 encoders = { path = "../encoders" }

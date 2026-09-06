@@ -163,6 +163,34 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// A checked CPU elementwise reference could not reserve its result.
+    #[snafu(display("CPU {operation} allocation for {requested_len} elements failed"))]
+    CpuF32Allocation {
+        /// Elementwise operation requesting output storage.
+        operation: &'static str,
+        /// Exact output element count.
+        requested_len: usize,
+        /// Allocation failure.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU elementwise operands did not share one exact extent.
+    #[snafu(display("CPU {operation} operand lengths differ: {left} versus {right}"))]
+    CpuF32Shape {
+        /// Elementwise operation rejecting the input lengths.
+        operation: &'static str,
+        /// Left operand length.
+        left: usize,
+        /// Right operand length.
+        right: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     #[cfg(feature = "gpu")]
     /// Build was produced without the HIP kernel archive (e.g. `hipcc`
     /// was absent). CPU references still work; GPU paths return this.

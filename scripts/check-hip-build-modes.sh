@@ -126,16 +126,16 @@ OUT="$ROOT/target/hip-build-mode-witness"
             echo "GPU dependency witness failed to observe its forbidden case" >&2
             exit 1
         fi
-        cargo tree --offline --locked --no-default-features \
-            -p kernels -p transformers -p decoders \
+        # WHY: One package selection owns both graph and compiler witnesses.
+        set -- -p kernels -p transformers -p decoders -p text -p decode
+        cargo tree --offline --locked --no-default-features "$@" \
             --edges normal,build --prefix none --format "{p}" >"$out/cpu-dependencies.log"
         if grep -Eq "^(hipcore|taxis) " "$out/cpu-dependencies.log"; then
             echo "CPU consumers acquired a GPU runtime dependency" >&2
             exit 1
         fi
         env -u LOGISMOS_HIP_BUILD HIPCC=/not-a-hipcc \
-            cargo check --offline --locked --no-default-features \
-                -p kernels -p transformers -p decoders --lib
+            cargo check --offline --locked --no-default-features "$@" --lib --jobs 4
     ' /bin/sh "$ROOT" "$OUT" </dev/null
 } 2>&1 | /usr/bin/cat
 

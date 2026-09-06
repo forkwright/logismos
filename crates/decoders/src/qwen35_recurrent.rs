@@ -14,9 +14,9 @@ use snafu::ResultExt;
 use crate::Result;
 use crate::error::{
     ArithmeticOverflowSnafu, PayloadTensorSnafu, ProjectionBytesSnafu, ProjectionDtypeSnafu,
-    ProjectionRowSnafu, RecurrentAllocationSnafu, RecurrentArithmeticSnafu,
-    RecurrentConvolutionSnafu, RecurrentGdnSnafu, RecurrentInputSnafu, RecurrentLayerSnafu,
-    RecurrentRmsNormSnafu, TensorShapeSnafu,
+    ProjectionRowSnafu, RecurrentAllocationPlanSnafu, RecurrentAllocationSnafu,
+    RecurrentArithmeticSnafu, RecurrentConvolutionSnafu, RecurrentCpuSnafu, RecurrentGdnSnafu,
+    RecurrentInputSnafu, RecurrentLayerSnafu, RecurrentRmsNormSnafu, TensorShapeSnafu,
 };
 use crate::qwen35::{Qwen35RecurrentLayout, recurrent_layernorm_rms_epsilon};
 use crate::qwen35_weights::Qwen35Weights;
@@ -52,42 +52,26 @@ pub struct Qwen35RecurrentExecution<'weights, 'artifact> {
     recurrent_state: Vec<f32>,
 }
 
-impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
-    pub(crate) fn try_from_weights(
-        weights: &'weights Qwen35Weights<'artifact>,
-        block_index: u64,
-    ) -> Result<Self> {
-        let epsilon = recurrent_layernorm_rms_epsilon(weights.payload().observation().metadata())?;
-        let layout = ExecutionLayout::try_from_profile(weights.recurrent_layout(), epsilon)?;
-        layout.validate_recurrent_block(block_index)?;
-        let attention_norm = read_f32_tensor(
-            weights,
-            &block_tensor_name(block_index, ATTN_NORM_ROLE),
-            &[layout.hidden_u64],
-        )?;
-        let ssm_a = read_f32_tensor(
-            weights,
-            &block_tensor_name(block_index, SSM_A_ROLE),
-            &[layout.value_head_count_u64],
-        )?;
-        let ssm_dt = read_f32_tensor(
-            weights,
-            &block_tensor_name(block_index, SSM_DT_ROLE),
-            &[layout.value_head_count_u64],
-        )?;
-        let ssm_norm = read_f32_tensor(
-            weights,
-            &block_tensor_name(block_index, SSM_NORM_ROLE),
-            &[layout.value_dim_u64],
-        )?;
-        let ssm_conv = read_f32_tensor(
-            weights,
-            &block_tensor_name(block_index, SSM_CONV1D_ROLE),
-            &[layout.conv_kernel_u64, layout.conv_width_u64],
-        )?;
-        let convolution_history = zeroed_f32(
-            "convolution history",
-            checked_product(
+#[derive(Debug, Clone, Copy)]
+struct RecurrentRetainedAllocations {
+    attention_norm: usize,
+    ssm_a: usize,
+    ssm_conv: usize,
+    ssm_dt: usize,
+    ssm_norm: usize,
+    convolution_history: usize,
+    recurrent_state: usize,
+}
+
+impl RecurrentRetainedAllocations {
+    fn try_from_layout(layout: ExecutionLayout) -> Result<Self> {
+        Ok(Self {
+            attention_norm: product_dims(&[layout.hidden_u64])?,
+            ssm_a: product_dims(&[layout.value_head_count_u64])?,
+            ssm_conv: product_dims(&[layout.conv_kernel_u64, layout.conv_width_u64])?,
+            ssm_dt: product_dims(&[layout.value_head_count_u64])?,
+            ssm_norm: product_dims(&[layout.value_dim_u64])?,
+            convolution_history: checked_product(
                 layout.conv_width,
                 layout.conv_kernel.checked_sub(1).ok_or_else(|| {
                     ArithmeticOverflowSnafu {
@@ -97,15 +81,86 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
                 })?,
                 "recurrent convolution history",
             )?,
-        )?;
-        let recurrent_state = zeroed_f32(
-            "GDN state",
-            checked_product(
+            recurrent_state: checked_product(
                 layout.value_head_count,
                 checked_product(layout.key_dim, layout.value_dim, "recurrent GDN state head")?,
                 "recurrent GDN state",
             )?,
+        })
+    }
+
+    fn total_elements(self) -> Result<usize> {
+        [
+            self.attention_norm,
+            self.ssm_a,
+            self.ssm_conv,
+            self.ssm_dt,
+            self.ssm_norm,
+            self.convolution_history,
+            self.recurrent_state,
+        ]
+        .into_iter()
+        .try_fold(0_usize, |sum, elements| {
+            checked_add(sum, elements, "recurrent retained elements")
+        })
+    }
+}
+
+impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
+    pub(crate) fn retained_elements(layout: Qwen35RecurrentLayout, epsilon: f32) -> Result<usize> {
+        let layout = ExecutionLayout::try_from_profile(layout, epsilon)?;
+        RecurrentRetainedAllocations::try_from_layout(layout)?.total_elements()
+    }
+
+    pub(crate) fn workspace_elements(
+        layout: Qwen35RecurrentLayout,
+        epsilon: f32,
+        token_count: usize,
+    ) -> Result<usize> {
+        let layout = ExecutionLayout::try_from_profile(layout, epsilon)?;
+        Ok(RecurrentStepAllocations::try_from_layout(layout, token_count)?.workspace_elements())
+    }
+    pub(crate) fn try_from_weights(
+        weights: &'weights Qwen35Weights<'artifact>,
+        block_index: u64,
+    ) -> Result<Self> {
+        let epsilon = recurrent_layernorm_rms_epsilon(weights.payload().observation().metadata())?;
+        let layout = ExecutionLayout::try_from_profile(weights.recurrent_layout(), epsilon)?;
+        layout.validate_recurrent_block(block_index)?;
+        let allocations = RecurrentRetainedAllocations::try_from_layout(layout)?;
+        let attention_norm = read_f32_tensor(
+            weights,
+            &block_tensor_name(block_index, ATTN_NORM_ROLE),
+            &[layout.hidden_u64],
+            allocations.attention_norm,
         )?;
+        let ssm_a = read_f32_tensor(
+            weights,
+            &block_tensor_name(block_index, SSM_A_ROLE),
+            &[layout.value_head_count_u64],
+            allocations.ssm_a,
+        )?;
+        let ssm_dt = read_f32_tensor(
+            weights,
+            &block_tensor_name(block_index, SSM_DT_ROLE),
+            &[layout.value_head_count_u64],
+            allocations.ssm_dt,
+        )?;
+        let ssm_norm = read_f32_tensor(
+            weights,
+            &block_tensor_name(block_index, SSM_NORM_ROLE),
+            &[layout.value_dim_u64],
+            allocations.ssm_norm,
+        )?;
+        let ssm_conv = read_f32_tensor(
+            weights,
+            &block_tensor_name(block_index, SSM_CONV1D_ROLE),
+            &[layout.conv_kernel_u64, layout.conv_width_u64],
+            allocations.ssm_conv,
+        )?;
+        let convolution_history =
+            zeroed_f32("convolution history", allocations.convolution_history)?;
+        let recurrent_state = zeroed_f32("GDN state", allocations.recurrent_state)?;
 
         Ok(Self {
             weights,
@@ -131,10 +186,14 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
     /// Returns [`crate::Error`] when input, payload rows, finite arithmetic, or
     /// one of the bounded CPU reference operators rejects the step.
     pub fn step(&mut self, hidden_tokens: &[f32]) -> Result<Vec<f32>> {
-        let (token_count, normalized) = self.normalize_input(hidden_tokens)?;
-        let projected = self.project_inputs(token_count, &normalized)?;
-        let recurrent = self.run_recurrence(token_count, projected)?;
-        let output = self.project_output(token_count, &recurrent.output, &recurrent.z)?;
+        let token_count = self.token_count(hidden_tokens)?;
+        let allocations = RecurrentStepAllocations::try_from_layout(self.layout, token_count)?;
+        let normalized = self.normalize_input(hidden_tokens, token_count)?;
+        let projected = self.project_inputs(token_count, &normalized, &allocations)?;
+        drop(normalized);
+        let recurrent = self.run_recurrence(token_count, projected, &allocations)?;
+        let output =
+            self.project_output(token_count, &recurrent.output, &recurrent.z, &allocations)?;
 
         self.convolution_history = recurrent.convolution_history;
         self.recurrent_state = recurrent.state;
@@ -142,20 +201,34 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
     }
 
     pub(crate) fn try_clone_for_transaction(&self) -> Result<Self> {
+        let allocations = RecurrentRetainedAllocations::try_from_layout(self.layout)?;
         Ok(Self {
             weights: self.weights,
             block_index: self.block_index,
             layout: self.layout,
-            attention_norm: clone_f32("transaction attention norm", &self.attention_norm)?,
-            ssm_a: clone_f32("transaction SSM A", &self.ssm_a)?,
-            ssm_conv: clone_f32("transaction convolution", &self.ssm_conv)?,
-            ssm_dt: clone_f32("transaction SSM dt", &self.ssm_dt)?,
-            ssm_norm: clone_f32("transaction SSM norm", &self.ssm_norm)?,
+            attention_norm: clone_f32(
+                "transaction attention norm",
+                &self.attention_norm,
+                allocations.attention_norm,
+            )?,
+            ssm_a: clone_f32("transaction SSM A", &self.ssm_a, allocations.ssm_a)?,
+            ssm_conv: clone_f32(
+                "transaction convolution",
+                &self.ssm_conv,
+                allocations.ssm_conv,
+            )?,
+            ssm_dt: clone_f32("transaction SSM dt", &self.ssm_dt, allocations.ssm_dt)?,
+            ssm_norm: clone_f32("transaction SSM norm", &self.ssm_norm, allocations.ssm_norm)?,
             convolution_history: clone_f32(
                 "transaction convolution history",
                 &self.convolution_history,
+                allocations.convolution_history,
             )?,
-            recurrent_state: clone_f32("transaction GDN state", &self.recurrent_state)?,
+            recurrent_state: clone_f32(
+                "transaction GDN state",
+                &self.recurrent_state,
+                allocations.recurrent_state,
+            )?,
         })
     }
 
@@ -169,7 +242,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         (&self.convolution_history, &self.recurrent_state)
     }
 
-    fn normalize_input(&self, hidden_tokens: &[f32]) -> Result<(usize, Vec<f32>)> {
+    fn token_count(&self, hidden_tokens: &[f32]) -> Result<usize> {
         if hidden_tokens.is_empty() || !hidden_tokens.len().is_multiple_of(self.layout.hidden) {
             return RecurrentInputSnafu {
                 hidden: self.layout.hidden,
@@ -178,7 +251,10 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             .fail();
         }
         ensure_finite(hidden_tokens, "input", 0)?;
-        let token_count = hidden_tokens.len() / self.layout.hidden;
+        Ok(hidden_tokens.len() / self.layout.hidden)
+    }
+
+    fn normalize_input(&self, hidden_tokens: &[f32], token_count: usize) -> Result<Vec<f32>> {
         let normalized = kernels::cpu_f32::rms_norm(
             hidden_tokens,
             &self.attention_norm,
@@ -188,10 +264,15 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         )
         .context(RecurrentRmsNormSnafu)?;
         ensure_finite(&normalized, "attention RMSNorm", 0)?;
-        Ok((token_count, normalized))
+        Ok(normalized)
     }
 
-    fn project_inputs(&self, token_count: usize, normalized: &[f32]) -> Result<ProjectedInputs> {
+    fn project_inputs(
+        &self,
+        token_count: usize,
+        normalized: &[f32],
+        allocations: &RecurrentStepAllocations,
+    ) -> Result<ProjectedInputs> {
         let qkv = project_tokens(
             self.weights,
             &block_tensor_name(self.block_index, ATTN_QKV_ROLE),
@@ -199,6 +280,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             token_count,
             self.layout.hidden,
             self.layout.conv_width,
+            allocations.qkv_projection,
         )?;
         let z = project_tokens(
             self.weights,
@@ -207,6 +289,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             token_count,
             self.layout.hidden,
             self.layout.inner,
+            allocations.gate_projection,
         )?;
         let alpha = project_tokens(
             self.weights,
@@ -215,6 +298,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             token_count,
             self.layout.hidden,
             self.layout.value_head_count,
+            allocations.alpha_projection,
         )?;
         let beta_projection = project_tokens(
             self.weights,
@@ -223,6 +307,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             token_count,
             self.layout.hidden,
             self.layout.value_head_count,
+            allocations.beta_projection,
         )?;
         Ok(ProjectedInputs {
             qkv,
@@ -236,10 +321,11 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         &self,
         token_count: usize,
         projected: ProjectedInputs,
+        allocations: &RecurrentStepAllocations,
     ) -> Result<RecurrentOutput> {
-        let scalars = self.recurrence_scalars(token_count, &projected)?;
+        let scalars = self.recurrence_scalars(token_count, &projected, allocations)?;
         let convolution = self.convolve(token_count, &projected.qkv)?;
-        let inputs = self.arrange_recurrence(token_count, convolution.output())?;
+        let inputs = self.arrange_recurrence(token_count, convolution.output(), allocations)?;
         let recurrence = MultiHeadRecurrentInput::new(
             &inputs.q,
             &inputs.k,
@@ -262,10 +348,19 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
                 token_count,
                 self.layout.value_head_count,
                 self.layout.value_dim,
+                allocations.token_major_output,
             )?,
             z: projected.z,
-            convolution_history: convolution.history().to_vec(),
-            state: recurrence.state().to_vec(),
+            convolution_history: clone_f32(
+                "next convolution history",
+                convolution.history(),
+                allocations.next_convolution_history,
+            )?,
+            state: clone_f32(
+                "next GDN state",
+                recurrence.state(),
+                allocations.next_recurrent_state,
+            )?,
         })
     }
 
@@ -273,8 +368,9 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         &self,
         token_count: usize,
         projected: &ProjectedInputs,
+        allocations: &RecurrentStepAllocations,
     ) -> Result<RecurrenceScalars> {
-        let beta_tokens = sigmoid(&projected.beta_projection)?;
+        let beta_tokens = sigmoid(&projected.beta_projection, allocations.sigmoid_beta)?;
         let beta = heads_from_tokens(
             &beta_tokens,
             token_count,
@@ -282,6 +378,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             0,
             self.layout.value_head_count,
             1,
+            allocations.beta_heads,
         )?;
         let gate_tokens = recurrent_gate(
             &projected.alpha,
@@ -289,6 +386,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             &self.ssm_a,
             token_count,
             self.layout.value_head_count,
+            allocations.log_decay,
         )?;
         let gate = heads_from_tokens(
             &gate_tokens,
@@ -297,6 +395,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             0,
             self.layout.value_head_count,
             1,
+            allocations.gate_heads,
         )?;
         Ok(RecurrenceScalars { beta, gate })
     }
@@ -318,11 +417,26 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         &self,
         token_count: usize,
         convolution: &[f32],
+        allocations: &RecurrentStepAllocations,
     ) -> Result<ArrangedRecurrence> {
-        let convolved = kernels::cpu_f32::silu(convolution);
+        let convolved = kernels::cpu_f32::try_silu(convolution).context(RecurrentCpuSnafu)?;
         ensure_finite(&convolved, "convolution SiLU", 0)?;
-        let q = l2_heads(&convolved, token_count, 0, self.layout)?;
-        let k = l2_heads(&convolved, token_count, self.layout.key_width, self.layout)?;
+        let q = l2_heads(
+            &convolved,
+            token_count,
+            0,
+            self.layout,
+            allocations.grouped_query,
+            allocations.normalized_query,
+        )?;
+        let k = l2_heads(
+            &convolved,
+            token_count,
+            self.layout.key_width,
+            self.layout,
+            allocations.grouped_key,
+            allocations.normalized_key,
+        )?;
         let v = heads_from_tokens(
             &convolved,
             token_count,
@@ -335,6 +449,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             })?,
             self.layout.value_head_count,
             self.layout.value_dim,
+            allocations.value_heads,
         )?;
         let q_tiled = tile_key_heads(
             &q,
@@ -342,6 +457,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             self.layout.key_head_count,
             self.layout.value_head_count,
             self.layout.key_dim,
+            allocations.tiled_query,
         )?;
         let k_tiled = tile_key_heads(
             &k,
@@ -349,6 +465,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             self.layout.key_head_count,
             self.layout.value_head_count,
             self.layout.key_dim,
+            allocations.tiled_key,
         )?;
         Ok(ArrangedRecurrence {
             q: q_tiled,
@@ -362,6 +479,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         token_count: usize,
         recurrence_tokens: &[f32],
         z: &[f32],
+        allocations: &RecurrentStepAllocations,
     ) -> Result<Vec<f32>> {
         let output_rows = checked_product(
             token_count,
@@ -377,8 +495,9 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         )
         .context(RecurrentRmsNormSnafu)?;
         ensure_finite(&normalized_output, "recurrent RMSNorm", 0)?;
+        let gate = kernels::cpu_f32::try_silu(z).context(RecurrentCpuSnafu)?;
         let gated_output =
-            kernels::cpu_f32::hadamard(&normalized_output, &kernels::cpu_f32::silu(z));
+            kernels::cpu_f32::try_hadamard(&normalized_output, &gate).context(RecurrentCpuSnafu)?;
         ensure_finite(&gated_output, "recurrent output gate", 0)?;
         project_tokens(
             self.weights,
@@ -387,6 +506,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             token_count,
             self.layout.inner,
             self.layout.hidden,
+            allocations.output_projection,
         )
     }
 }
@@ -522,10 +642,300 @@ impl ExecutionLayout {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TokenProjectionAllocations {
+    aggregate_output: usize,
+    row_output: usize,
+}
+
+impl TokenProjectionAllocations {
+    fn try_from_dimensions(
+        token_count: usize,
+        output_width: usize,
+        context: &'static str,
+    ) -> Result<Self> {
+        Ok(Self {
+            aggregate_output: checked_product(token_count, output_width, context)?,
+            row_output: Qwen35Weights::projection_output_elements(output_width),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecurrentStepAllocations {
+    normalized_input: usize,
+    qkv_projection: TokenProjectionAllocations,
+    gate_projection: TokenProjectionAllocations,
+    alpha_projection: TokenProjectionAllocations,
+    beta_projection: TokenProjectionAllocations,
+    sigmoid_beta: usize,
+    beta_heads: usize,
+    log_decay: usize,
+    gate_heads: usize,
+    causal_convolution: kernels::CausalConvAllocationPlan,
+    convolution_silu: usize,
+    grouped_query: usize,
+    normalized_query: usize,
+    grouped_key: usize,
+    normalized_key: usize,
+    value_heads: usize,
+    tiled_query: usize,
+    tiled_key: usize,
+    gdn: kernels::MultiHeadRecurrentAllocationPlan,
+    token_major_output: usize,
+    next_convolution_history: usize,
+    next_recurrent_state: usize,
+    normalized_output: usize,
+    output_gate: usize,
+    gated_output: usize,
+    output_projection: TokenProjectionAllocations,
+    workspace_elements: usize,
+}
+
+impl RecurrentStepAllocations {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the owner inventory names every recurrent f32 allocation before composing live phases"
+    )]
+    fn try_from_layout(layout: ExecutionLayout, token_count: usize) -> Result<Self> {
+        let normalized_input =
+            kernels::cpu_f32::rms_norm_output_elements(token_count, layout.hidden)
+                .context(RecurrentRmsNormSnafu)?;
+        let qkv_projection = TokenProjectionAllocations::try_from_dimensions(
+            token_count,
+            layout.conv_width,
+            "recurrent QKV projection",
+        )?;
+        let gate_projection = TokenProjectionAllocations::try_from_dimensions(
+            token_count,
+            layout.inner,
+            "recurrent gate projection",
+        )?;
+        let alpha_projection = TokenProjectionAllocations::try_from_dimensions(
+            token_count,
+            layout.value_head_count,
+            "recurrent alpha projection",
+        )?;
+        let beta_projection = TokenProjectionAllocations::try_from_dimensions(
+            token_count,
+            layout.value_head_count,
+            "recurrent beta projection",
+        )?;
+        let scalar_elements = checked_product(
+            token_count,
+            layout.value_head_count,
+            "recurrent per-head scalars",
+        )?;
+        let causal_convolution = kernels::CausalConvAllocationPlan::try_from_dimensions(
+            token_count,
+            layout.conv_width,
+            layout.conv_kernel,
+        )
+        .context(RecurrentConvolutionSnafu)?;
+        let convolution_silu =
+            kernels::cpu_f32::unary_output_elements(causal_convolution.output_elements());
+        let grouped_key_elements = checked_product(
+            token_count,
+            layout.key_width,
+            "recurrent grouped Q/K values",
+        )?;
+        let tiled_key_elements = checked_product(
+            checked_product(
+                token_count,
+                layout.value_head_count,
+                "recurrent tiled Q/K heads",
+            )?,
+            layout.key_dim,
+            "recurrent tiled Q/K values",
+        )?;
+        let value_elements =
+            checked_product(token_count, layout.inner, "recurrent head-major values")?;
+        let gdn = kernels::MultiHeadRecurrentAllocationPlan::try_from_dimensions(
+            token_count,
+            layout.value_head_count,
+            layout.value_head_count,
+            layout.key_dim,
+            layout.value_dim,
+        )
+        .context(RecurrentGdnSnafu)?;
+        let normalized_output = kernels::cpu_f32::rms_norm_output_elements(
+            checked_product(
+                token_count,
+                layout.value_head_count,
+                "recurrent output RMSNorm rows",
+            )?,
+            layout.value_dim,
+        )
+        .context(RecurrentRmsNormSnafu)?;
+        let output_gate = kernels::cpu_f32::unary_output_elements(gate_projection.aggregate_output);
+        let gated_output = kernels::cpu_f32::binary_output_elements(normalized_output);
+        let output_projection = TokenProjectionAllocations::try_from_dimensions(
+            token_count,
+            layout.hidden,
+            "recurrent output projection",
+        )?;
+        let mut allocations = Self {
+            normalized_input,
+            qkv_projection,
+            gate_projection,
+            alpha_projection,
+            beta_projection,
+            sigmoid_beta: kernels::cpu_f32::unary_output_elements(beta_projection.aggregate_output),
+            beta_heads: scalar_elements,
+            log_decay: scalar_elements,
+            gate_heads: scalar_elements,
+            causal_convolution,
+            convolution_silu,
+            grouped_query: grouped_key_elements,
+            normalized_query: grouped_key_elements,
+            grouped_key: grouped_key_elements,
+            normalized_key: grouped_key_elements,
+            value_heads: value_elements,
+            tiled_query: tiled_key_elements,
+            tiled_key: tiled_key_elements,
+            gdn,
+            token_major_output: value_elements,
+            next_convolution_history: causal_convolution.history_elements(),
+            next_recurrent_state: gdn.state_elements(),
+            normalized_output,
+            output_gate,
+            gated_output,
+            output_projection,
+            workspace_elements: 0,
+        };
+        allocations.workspace_elements = allocations.derive_workspace_elements()?;
+        Ok(allocations)
+    }
+
+    fn workspace_elements(self) -> usize {
+        self.workspace_elements
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the explicit phase live sets are the proof that every named owner request is bounded"
+    )]
+    fn derive_workspace_elements(self) -> Result<usize> {
+        let projected = sum_elements(
+            &[
+                self.qkv_projection.aggregate_output,
+                self.gate_projection.aggregate_output,
+                self.alpha_projection.aggregate_output,
+                self.beta_projection.aggregate_output,
+            ],
+            "recurrent projected inputs",
+        )?;
+        let projection_row_peak = [
+            self.qkv_projection.row_output,
+            self.gate_projection.row_output,
+            self.alpha_projection.row_output,
+            self.beta_projection.row_output,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        let input_projection_phase = sum_elements(
+            &[self.normalized_input, projected, projection_row_peak],
+            "recurrent input projection phase",
+        )?;
+        let scalar_phase = sum_elements(
+            &[
+                projected,
+                self.sigmoid_beta,
+                self.beta_heads,
+                self.log_decay,
+                self.gate_heads,
+            ],
+            "recurrent scalar phase",
+        )?;
+        let retained_scalars = sum_elements(
+            &[self.beta_heads, self.gate_heads],
+            "recurrent retained scalars",
+        )?;
+        let causal_phase = sum_elements(
+            &[
+                projected,
+                retained_scalars,
+                self.causal_convolution.output_elements(),
+                self.causal_convolution.history_elements(),
+            ],
+            "recurrent causal-convolution phase",
+        )?;
+        let arrangement_phase = sum_elements(
+            &[
+                causal_phase,
+                self.convolution_silu,
+                self.grouped_query,
+                self.normalized_query,
+                self.grouped_key,
+                self.normalized_key,
+                self.value_heads,
+                self.tiled_query,
+                self.tiled_key,
+            ],
+            "recurrent arrangement phase",
+        )?;
+        let arranged = sum_elements(
+            &[self.value_heads, self.tiled_query, self.tiled_key],
+            "recurrent arranged inputs",
+        )?;
+        let recurrence_base = checked_add(causal_phase, arranged, "recurrent GDN base")?;
+        let gdn_phase = checked_add(
+            recurrence_base,
+            self.gdn.workspace_elements(),
+            "recurrent GDN phase",
+        )?;
+        let adapter_phase = sum_elements(
+            &[
+                recurrence_base,
+                self.gdn.output_elements(),
+                self.gdn.state_elements(),
+                self.token_major_output,
+                self.next_convolution_history,
+                self.next_recurrent_state,
+            ],
+            "recurrent adapter phase",
+        )?;
+        let recurrent_result = sum_elements(
+            &[
+                self.token_major_output,
+                self.gate_projection.aggregate_output,
+                self.next_convolution_history,
+                self.next_recurrent_state,
+            ],
+            "recurrent result",
+        )?;
+        let output_phase = sum_elements(
+            &[
+                recurrent_result,
+                self.normalized_output,
+                self.output_gate,
+                self.gated_output,
+                self.output_projection.aggregate_output,
+                self.output_projection.row_output,
+            ],
+            "recurrent output phase",
+        )?;
+        Ok([
+            input_projection_phase,
+            scalar_phase,
+            causal_phase,
+            arrangement_phase,
+            gdn_phase,
+            adapter_phase,
+            output_phase,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0))
+    }
+}
+
 fn read_f32_tensor(
     weights: &Qwen35Weights<'_>,
     name: &str,
     expected_dims: &[u64],
+    planned_values: usize,
 ) -> Result<Vec<f32>> {
     let tensor = weights.payload().tensor(name).context(PayloadTensorSnafu {
         name: name.to_string(),
@@ -546,6 +956,7 @@ fn read_f32_tensor(
         .fail();
     }
     let expected_values = product_dims(expected_dims)?;
+    ensure_planned_elements("recurrent F32 parameter", expected_values, planned_values)?;
     let row = F32Row::parse(tensor.bytes()).with_context(|_| ProjectionRowSnafu {
         name: tensor.name().to_string(),
         row: 0_usize,
@@ -563,8 +974,8 @@ fn read_f32_tensor(
         }
         .fail();
     }
-    let mut values = reserve_f32("F32 parameter", expected_values)?;
-    for value_index in 0..expected_values {
+    let mut values = reserve_f32("F32 parameter", planned_values)?;
+    for value_index in 0..planned_values {
         let Some(value) = row.value(value_index) else {
             return ProjectionBytesSnafu {
                 name: tensor.name().to_string(),
@@ -588,6 +999,8 @@ fn l2_heads(
     token_count: usize,
     channel_offset: usize,
     layout: ExecutionLayout,
+    grouped_elements: usize,
+    normalized_elements: usize,
 ) -> Result<Vec<f32>> {
     let heads = heads_from_tokens(
         values,
@@ -596,8 +1009,10 @@ fn l2_heads(
         channel_offset,
         layout.key_head_count,
         layout.key_dim,
+        grouped_elements,
     )?;
-    let mut normalized = reserve_f32("L2-normalized Q/K", heads.len())?;
+    ensure_planned_elements("L2-normalized Q/K", heads.len(), normalized_elements)?;
+    let mut normalized = reserve_f32("L2-normalized Q/K", normalized_elements)?;
     for head_tokens in heads.chunks_exact(layout.key_dim) {
         let mut sum_squares = 0.0_f32;
         for value in head_tokens {
@@ -615,6 +1030,10 @@ fn l2_heads(
     Ok(normalized)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the source layout and owner-planned output jointly define this head-major adapter"
+)]
 fn heads_from_tokens(
     values: &[f32],
     token_count: usize,
@@ -622,13 +1041,19 @@ fn heads_from_tokens(
     channel_offset: usize,
     head_count: usize,
     head_width: usize,
+    planned_output_len: usize,
 ) -> Result<Vec<f32>> {
     let output_len = checked_product(
         checked_product(token_count, head_count, "recurrent head tokens")?,
         head_width,
         "recurrent head values",
     )?;
-    let mut output = reserve_f32("head-major recurrence input", output_len)?;
+    ensure_planned_elements(
+        "head-major recurrence input",
+        output_len,
+        planned_output_len,
+    )?;
+    let mut output = reserve_f32("head-major recurrence input", planned_output_len)?;
     for head_index in 0..head_count {
         let head_offset = checked_add(
             channel_offset,
@@ -656,13 +1081,15 @@ fn tile_key_heads(
     key_head_count: usize,
     value_head_count: usize,
     key_dim: usize,
+    planned_output_len: usize,
 ) -> Result<Vec<f32>> {
     let output_len = checked_product(
         checked_product(value_head_count, token_count, "tiled Q/K heads")?,
         key_dim,
         "tiled Q/K values",
     )?;
-    let mut tiled = reserve_f32("tiled Q/K heads", output_len)?;
+    ensure_planned_elements("tiled Q/K heads", output_len, planned_output_len)?;
+    let mut tiled = reserve_f32("tiled Q/K heads", planned_output_len)?;
     let source_head_len = checked_product(token_count, key_dim, "source Q/K head")?;
     for value_head in 0..value_head_count {
         let source_head = value_head % key_head_count;
@@ -685,13 +1112,19 @@ fn heads_to_tokens(
     token_count: usize,
     head_count: usize,
     head_width: usize,
+    planned_output_len: usize,
 ) -> Result<Vec<f32>> {
     let output_len = checked_product(
         checked_product(token_count, head_count, "recurrent output token heads")?,
         head_width,
         "recurrent output token values",
     )?;
-    let mut output = reserve_f32("token-major recurrent output", output_len)?;
+    ensure_planned_elements(
+        "token-major recurrent output",
+        output_len,
+        planned_output_len,
+    )?;
+    let mut output = reserve_f32("token-major recurrent output", planned_output_len)?;
     let head_len = checked_product(token_count, head_width, "recurrent output head")?;
     for token_index in 0..token_count {
         for head_index in 0..head_count {
@@ -720,11 +1153,11 @@ fn recurrent_gate(
     a: &[f32],
     token_count: usize,
     value_head_count: usize,
+    planned_output_len: usize,
 ) -> Result<Vec<f32>> {
-    let mut output = reserve_f32(
-        "recurrent log decay",
-        checked_product(token_count, value_head_count, "recurrent log decay")?,
-    )?;
+    let output_len = checked_product(token_count, value_head_count, "recurrent log decay")?;
+    ensure_planned_elements("recurrent log decay", output_len, planned_output_len)?;
+    let mut output = reserve_f32("recurrent log decay", planned_output_len)?;
     for alpha_row in alpha.chunks_exact(value_head_count).take(token_count) {
         for (head_index, alpha_value) in alpha_row.iter().copied().enumerate() {
             let dt_value = dt.get(head_index).copied().ok_or_else(|| {
@@ -757,8 +1190,9 @@ fn recurrent_gate(
     Ok(output)
 }
 
-fn sigmoid(values: &[f32]) -> Result<Vec<f32>> {
-    let mut output = reserve_f32("sigmoid beta", values.len())?;
+fn sigmoid(values: &[f32], planned_output_len: usize) -> Result<Vec<f32>> {
+    ensure_planned_elements("sigmoid beta", values.len(), planned_output_len)?;
+    let mut output = reserve_f32("sigmoid beta", planned_output_len)?;
     for value in values {
         let sigmoid = if *value >= 0.0 {
             1.0 / (1.0 + (-*value).exp())
@@ -776,6 +1210,10 @@ fn softplus(value: f32) -> f32 {
     value.max(0.0) + (-value.abs()).exp().ln_1p()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the checked token matrix shape and its owner plan are one projection contract"
+)]
 fn project_tokens(
     weights: &Qwen35Weights<'_>,
     name: &str,
@@ -783,11 +1221,23 @@ fn project_tokens(
     token_count: usize,
     input_width: usize,
     output_width: usize,
+    allocations: TokenProjectionAllocations,
 ) -> Result<Vec<f32>> {
     let output_len = checked_product(token_count, output_width, "recurrent projected output")?;
-    let mut output = reserve_f32("recurrent projected output", output_len)?;
+    ensure_planned_elements(
+        "recurrent projected output",
+        output_len,
+        allocations.aggregate_output,
+    )?;
+    let mut output = reserve_f32("recurrent projected output", allocations.aggregate_output)?;
     for token in values.chunks_exact(input_width).take(token_count) {
-        output.extend(weights.project(name, token)?);
+        let projected = weights.project(name, token)?;
+        ensure_planned_elements(
+            "recurrent projection row",
+            projected.len(),
+            allocations.row_output,
+        )?;
+        output.extend(projected);
     }
     Ok(output)
 }
@@ -811,8 +1261,9 @@ fn zeroed_f32(target: &'static str, length: usize) -> Result<Vec<f32>> {
     Ok(values)
 }
 
-fn clone_f32(target: &'static str, source: &[f32]) -> Result<Vec<f32>> {
-    let mut values = reserve_f32(target, source.len())?;
+fn clone_f32(target: &'static str, source: &[f32], planned_values: usize) -> Result<Vec<f32>> {
+    ensure_planned_elements(target, source.len(), planned_values)?;
+    let mut values = reserve_f32(target, planned_values)?;
     values.extend_from_slice(source);
     Ok(values)
 }
@@ -853,6 +1304,25 @@ fn checked_add(left: usize, right: usize, context: &'static str) -> Result<usize
         .ok_or_else(|| ArithmeticOverflowSnafu { context }.build())
 }
 
+fn sum_elements(elements: &[usize], context: &'static str) -> Result<usize> {
+    elements
+        .iter()
+        .copied()
+        .try_fold(0_usize, |sum, value| checked_add(sum, value, context))
+}
+
+fn ensure_planned_elements(target: &'static str, derived: usize, planned: usize) -> Result<()> {
+    if derived != planned {
+        return RecurrentAllocationPlanSnafu {
+            target,
+            planned,
+            derived,
+        }
+        .fail();
+    }
+    Ok(())
+}
+
 fn usize_dimension(value: u64, context: &'static str) -> Result<usize> {
     usize::try_from(value).map_err(|_| ArithmeticOverflowSnafu { context }.build())
 }
@@ -872,7 +1342,14 @@ mod tests {
         let key_dim = 2;
         let grouped_q = [1.0_f32, 2.0, 10.0, 20.0];
 
-        let tiled = tile_key_heads(&grouped_q, 1, key_head_count, value_head_count, key_dim)?;
+        let tiled = tile_key_heads(
+            &grouped_q,
+            1,
+            key_head_count,
+            value_head_count,
+            key_dim,
+            value_head_count * key_dim,
+        )?;
         let contiguous_grouped = [1.0_f32, 2.0, 1.0, 2.0, 10.0, 20.0, 10.0, 20.0];
 
         assert_eq!(
@@ -912,7 +1389,7 @@ mod tests {
             epsilon,
             gdn_scale: 1.0,
         };
-        let normalized = l2_heads(&values, 1, 0, layout)?;
+        let normalized = l2_heads(&values, 1, 0, layout, layout.key_dim, layout.key_dim)?;
         let oracle = [
             f64::from(values[0]) / f64::from(epsilon),
             f64::from(values[1]) / f64::from(epsilon),
@@ -929,7 +1406,7 @@ mod tests {
 
     #[test]
     fn softplus_saturates_negative_finite_overflow_in_log_decay() -> Result<()> {
-        let gates = recurrent_gate(&[-f32::MAX], &[-f32::MAX], &[-1.0], 1, 1)?;
+        let gates = recurrent_gate(&[-f32::MAX], &[-f32::MAX], &[-1.0], 1, 1, 1)?;
         assert_eq!(
             gates,
             vec![0.0],

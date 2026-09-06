@@ -17,7 +17,7 @@ use crate::error::{
     ProjectionRowSnafu,
 };
 use crate::qwen35::{Qwen35ExecutionDimensions, Qwen35RecurrentLayout, Qwen35StructuralProfile};
-use crate::qwen35_execution::Qwen35Execution;
+use crate::qwen35_execution::{Qwen35Execution, Qwen35ExecutionPlan, Qwen35LogitSelection};
 use crate::qwen35_recurrent::Qwen35RecurrentExecution;
 
 /// One payload-verified Qwen3.5 structural profile with a narrow CPU projection.
@@ -48,6 +48,14 @@ pub struct Qwen35Weights<'artifact> {
 }
 
 impl<'artifact> Qwen35Weights<'artifact> {
+    pub(crate) const fn projection_output_elements(output_width: usize) -> usize {
+        output_width
+    }
+
+    pub(crate) const fn decoded_row_elements(input_width: usize) -> usize {
+        input_width
+    }
+
     /// Bind one verified payload to the existing Qwen3.5 structural preflight.
     ///
     /// # Errors
@@ -97,12 +105,13 @@ impl<'artifact> Qwen35Weights<'artifact> {
             }
             .fail();
         }
+        let output_elements = Self::projection_output_elements(matrix.output_width);
         let mut output = Vec::new();
         output
-            .try_reserve_exact(matrix.output_width)
+            .try_reserve_exact(output_elements)
             .with_context(|_| ProjectionAllocationSnafu {
                 name: matrix.name.clone(),
-                output_width: matrix.output_width,
+                output_width: output_elements,
             })?;
         for (row, row_bytes) in matrix
             .tensor
@@ -131,10 +140,12 @@ impl<'artifact> Qwen35Weights<'artifact> {
         let input_width = matrix.input_width;
         let matrix_name = matrix.name.clone();
         let row_bytes = matrix.row(row)?;
-        row_decode_f32(format, row_bytes, input_width).with_context(|_| ProjectionRowSnafu {
-            name: matrix_name,
-            row,
-        })
+        row_decode_f32(format, row_bytes, Self::decoded_row_elements(input_width)).with_context(
+            |_| ProjectionRowSnafu {
+                name: matrix_name,
+                row,
+            },
+        )
     }
 
     fn matrix(&self, name: &str) -> Result<CheckedMatrix<'_>> {
@@ -169,6 +180,21 @@ impl<'artifact> Qwen35Weights<'artifact> {
     /// incomplete, unsupported, or the requested context is out of range.
     pub fn execution(&self, max_context: usize) -> Result<Qwen35Execution<'_, 'artifact>> {
         Qwen35Execution::try_from_weights(self, max_context)
+    }
+
+    /// Derive one artifact-bound CPU execution plan before allocating session state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when the requested context or step bound cannot
+    /// be admitted from this verified artifact's execution metadata.
+    pub fn execution_plan(
+        &self,
+        max_context: usize,
+        max_step_tokens: usize,
+        selection: Qwen35LogitSelection,
+    ) -> Result<Qwen35ExecutionPlan<'_, 'artifact>> {
+        Qwen35ExecutionPlan::try_from_weights(self, max_context, max_step_tokens, selection)
     }
 }
 
