@@ -13,6 +13,36 @@ The runner is intentionally non-interactive. Its standard descriptors must be
 pipes, `/dev/null`, or safe regular files as described below; redirect through
 a pipe when launching it from a terminal.
 
+## Exact artifact inspection
+
+`--ro-input-file` admits one exact artifact as an explicit, read-only host
+input. It is for an invoker already authorized to disclose that file's contents
+to the requested command; standard output and error remain deliberate egress
+channels. It never mounts a model directory or makes the host source pathname
+an accessible sandbox file path.
+
+```bash
+scripts/gpu-denied-runner.sh --ro-input-file /canonical/path/to/model.gguf -- \
+  /bin/sh -ceu 'exec target/debug/logismos inspect --input "$LOGISMOS_GPU_DENIED_INPUT"'
+```
+
+The option accepts only a canonical absolute, readable, single-link regular
+file outside the worktree and writable `target/`. Symlinked or noncanonical
+paths, special files, hard links, host mount points, and paths under `/dev`,
+`/etc`, `/proc`, `/run`, or `/sys` fail closed. The supervisor creates the
+synthetic input path and sets `LOGISMOS_GPU_DENIED_INPUT` from the same internal
+constant, so callers and receipts never need the private host path. The
+`inspect` JSON receipts intentionally expose selected parsed model facts and a
+digest, but no input path.
+
+This is not host-path confidentiality. The exact-file bind can expose source
+root/name metadata in `/proc/self/mountinfo`, and the Bubblewrap PID-1 command
+line currently retains its host source argument. Those details, and arbitrary
+child or Bubblewrap diagnostics, are outside the runner's path-free guarantee.
+Only supervisor validation errors and the `inspect` JSON receipt are specified
+to omit the host input path; the selected artifact contents are intentional
+invoker-authorized egress.
+
 ## Enforced boundary
 
 The runner requires the fixed system paths `/usr/bin/bash`, `/usr/bin/bwrap`,
@@ -77,6 +107,8 @@ The mount namespace contains:
 - the host `/usr` and an optional system `/opt/rocm`, read-only;
 - the worktree read-only, with only its real, non-mounted `target/` directory
   rebound writable; and
+- when explicitly requested, one validated regular artifact file read-only at
+  a synthetic path, without its host parent directory; and
 - optional account Rust toolchain, registry, and Git caches read-only at fixed
   sandbox paths.
 
@@ -166,6 +198,13 @@ host process racing trusted inputs before Bubblewrap enters the namespaces.
 It does not provide CPU, memory, process-count, wall-time, or target-disk
 quotas. The writable `target/` remains on the host and must be treated as
 untrusted build output after a run. Source confidentiality is not a goal: the
-command can read the worktree and mounted toolchain. Tests that require host
-networking, arbitrary host files, service sockets, interactive socket-based
-standard I/O, or real hardware belong in a separately authorized lane.
+command can read the worktree and mounted toolchain. The explicit single-file
+input is not a snapshot or source-provenance feature. A same-UID host writer
+can replace or rewrite the artifact after validation or while it is observed.
+The GGUF inspector's digest describes its observed byte stream, including its
+bounded owned prefix and streamed tail; it is not proof of an atomic artifact
+version. Use an externally immutable snapshot when that identity is required.
+
+Tests that require host networking, broad arbitrary host paths, service
+sockets, interactive socket-based standard I/O, or real hardware belong in a
+separately authorized lane.

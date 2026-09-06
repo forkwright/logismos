@@ -987,6 +987,10 @@ dependencies = [
 [[package]]
 name = "sched"
 version = "1.0.11"
+dependencies = [
+ "placement",
+ "snafu",
+]
 
 [[package]]
 name = "serde"

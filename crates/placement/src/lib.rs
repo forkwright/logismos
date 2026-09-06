@@ -8,6 +8,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use isa::matches_configured_architecture;
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,7 @@ pub struct PlanRequest {
 }
 
 /// A declared accelerator available to the planner.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Device {
     id: String,
     gfx_isa: String,
@@ -54,14 +55,14 @@ pub enum Availability {
 }
 
 /// One immutable artifact identity in the declared catalogue.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Artifact {
     artifact_id: String,
     digest: String,
 }
 
 /// One ordered workload profile that refers to an immutable artifact.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Workload {
     profile_id: String,
     artifact_id: String,
@@ -73,7 +74,7 @@ pub struct Workload {
 ///
 /// These values are estimates supplied by the profile author, not measured
 /// VRAM use and not a physical reservation claim.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MemoryEstimate {
     #[serde(rename = "weights_bytes")]
     weights: u64,
@@ -86,7 +87,7 @@ pub struct MemoryEstimate {
 }
 
 /// Requested placement policy for a workload profile.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlacementRequest {
     /// The workload requires this exact declared device.
@@ -102,7 +103,7 @@ pub enum PlacementRequest {
 }
 
 /// Existing estimated budget already committed on one declared device.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeviceCommitment {
     device_id: String,
     estimated_bytes: u64,
@@ -144,6 +145,73 @@ pub struct AdmittedPlacement {
     pub memory_estimate: MemoryEstimate,
     /// Checked sum of the estimate breakdown.
     pub total_estimated_bytes: u64,
+}
+
+/// Mutable accounting authority for one immutable declared resource grant.
+///
+/// A ledger pins devices, capacities, availability, and static commitments at
+/// construction. Later requests may change only their requested artifacts and
+/// workloads; they cannot inflate or replace resource facts.
+///
+/// This is process-local accounting, not exclusive host ownership. The future
+/// service owner must create exactly one ledger for each granted resource set
+/// and reconcile it during shutdown or restart.
+#[derive(Debug)]
+pub struct ReservationLedger {
+    brand: Arc<LedgerBrand>,
+    snapshot: ResourceSnapshot,
+    dynamic_reserved: BTreeMap<String, u64>,
+    active_leases: BTreeMap<u64, LeaseRecord>,
+    revision: u64,
+    next_lease_id: u64,
+}
+
+/// A prepared batch that only its originating [`ReservationLedger`] can commit.
+///
+/// This is intentionally not serializable or deserializable: it is an
+/// in-process capability, not a planning report.
+#[derive(Debug)]
+pub struct PreparedPlan {
+    brand: Arc<LedgerBrand>,
+    revision: u64,
+    schema_version: u32,
+    placements: Vec<AdmittedPlacement>,
+}
+
+/// One committed workload reservation.
+///
+/// This capability is consumed by [`ReservationLedger::release`], preventing
+/// a caller from releasing the same reservation twice.
+#[derive(Debug)]
+pub struct ReservationLease {
+    brand: Arc<LedgerBrand>,
+    lease_id: u64,
+    placement: AdmittedPlacement,
+}
+
+/// A failed lease release that returns the unconsumed capability to its owner.
+///
+/// Retaining the lease on failure lets a higher-level transaction restore its
+/// own state without inventing a replacement reservation token.
+#[derive(Debug)]
+pub struct LeaseReleaseFailure {
+    reason: PlacementRefusal,
+    lease: ReservationLease,
+}
+
+#[derive(Debug)]
+struct LedgerBrand;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResourceSnapshot {
+    devices: Vec<Device>,
+    commitments: Vec<DeviceCommitment>,
+}
+
+#[derive(Debug, Clone)]
+struct LeaseRecord {
+    device_id: String,
+    reserved_bytes: u64,
 }
 
 /// Typed reason a request cannot yield a plan.
@@ -272,6 +340,21 @@ pub enum PlacementRefusal {
         /// Calculation that overflowed.
         scope: &'static str,
     },
+    /// A later request attempted to replace the ledger's resource-grant facts.
+    #[snafu(display("request resource snapshot differs from the ledger grant"))]
+    ResourceSnapshotMismatch,
+    /// A prepared batch belongs to a different ledger instance.
+    #[snafu(display("prepared plan belongs to another reservation ledger"))]
+    ForeignPreparedPlan,
+    /// A prepared batch no longer reflects this ledger's current reservations.
+    #[snafu(display("prepared plan is stale for the current reservation ledger"))]
+    StalePreparedPlan,
+    /// A lease belongs to a different ledger instance.
+    #[snafu(display("reservation lease belongs to another reservation ledger"))]
+    ForeignReservationLease,
+    /// A lease is absent or does not match this ledger's active reservation.
+    #[snafu(display("reservation lease is not active in this ledger"))]
+    UnknownReservationLease,
 }
 
 /// Deserialize JSON and return a typed plan or refusal.
@@ -296,38 +379,289 @@ pub fn plan_json(input: &str) -> PlanOutcome {
 /// policy may refuse a batch that a global packing solver could place.
 #[must_use]
 pub fn plan(request: &PlanRequest) -> PlanOutcome {
+    match ReservationLedger::new(request).and_then(|ledger| ledger.prepare(request)) {
+        Ok(prepared) => prepared.into_outcome(),
+        Err(reason) => refusal(reason),
+    }
+}
+
+impl PlanRequest {
+    /// Return the bounded request workload count without planning it.
+    #[must_use]
+    pub fn workload_count(&self) -> usize {
+        self.workloads.len()
+    }
+
+    /// Parse and validate a v1 planning request without producing a report.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal when the input is malformed or violates the
+    /// placement contract.
+    pub fn from_json(input: &str) -> Result<Self, PlacementRefusal> {
+        let raw = serde_json::from_str::<RawPlanRequest>(input)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        Self::try_from(raw)
+    }
+}
+
+impl ReservationLedger {
+    /// Create process-local accounting for one validated declared resource grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when static reserved or committed bytes already
+    /// exceed a declared device capacity.
+    pub fn new(request: &PlanRequest) -> Result<Self, PlacementRefusal> {
+        let snapshot = ResourceSnapshot::from_request(request);
+        let _remaining = remaining_after_reservations(&snapshot, &BTreeMap::new())?;
+        Ok(Self {
+            brand: Arc::new(LedgerBrand),
+            snapshot,
+            dynamic_reserved: BTreeMap::new(),
+            active_leases: BTreeMap::new(),
+            revision: 0,
+            next_lease_id: 1,
+        })
+    }
+
+    /// Prepare a transactional batch against this ledger's current revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal if the request changes resource-grant facts or if its
+    /// requested work cannot fit beside current reservations.
+    pub fn prepare(&self, request: &PlanRequest) -> Result<PreparedPlan, PlacementRefusal> {
+        if self.snapshot != ResourceSnapshot::from_request(request) {
+            return Err(PlacementRefusal::ResourceSnapshotMismatch);
+        }
+        let remaining = remaining_after_reservations(&self.snapshot, &self.dynamic_reserved)?;
+        let placements = prepare_placements(request, remaining)?;
+        Ok(PreparedPlan {
+            brand: Arc::clone(&self.brand),
+            revision: self.revision,
+            schema_version: request.schema_version,
+            placements,
+        })
+    }
+
+    /// Atomically reserve every placement in a prepared batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal without mutating this ledger if the prepared batch
+    /// belongs to another ledger, is stale, overflows an identifier, or no
+    /// longer fits current reservations.
+    pub fn commit(
+        &mut self,
+        prepared: PreparedPlan,
+    ) -> Result<Vec<ReservationLease>, PlacementRefusal> {
+        if !Arc::ptr_eq(&self.brand, &prepared.brand) {
+            return Err(PlacementRefusal::ForeignPreparedPlan);
+        }
+        if self.revision != prepared.revision {
+            return Err(PlacementRefusal::StalePreparedPlan);
+        }
+
+        let lease_count = u64::try_from(prepared.placements.len()).map_err(|_| {
+            PlacementRefusal::ArithmeticOverflow {
+                scope: "prepared placement count",
+            }
+        })?;
+        let _next_lease_id = self.next_lease_id.checked_add(lease_count).ok_or(
+            PlacementRefusal::ArithmeticOverflow {
+                scope: "reservation lease identifier",
+            },
+        )?;
+        let next_revision =
+            self.revision
+                .checked_add(1)
+                .ok_or(PlacementRefusal::ArithmeticOverflow {
+                    scope: "reservation ledger revision",
+                })?;
+
+        let mut candidate_reserved = self.dynamic_reserved.clone();
+        for placement in &prepared.placements {
+            let reserved = candidate_reserved
+                .entry(placement.device_id.clone())
+                .or_default();
+            *reserved = reserved
+                .checked_add(placement.total_estimated_bytes)
+                .ok_or(PlacementRefusal::ArithmeticOverflow {
+                    scope: "dynamic device reservation",
+                })?;
+        }
+        let _remaining = remaining_after_reservations(&self.snapshot, &candidate_reserved)?;
+
+        let mut leases = Vec::with_capacity(prepared.placements.len());
+        let mut next_lease_id = self.next_lease_id;
+        for placement in prepared.placements {
+            let lease_id = next_lease_id;
+            next_lease_id =
+                next_lease_id
+                    .checked_add(1)
+                    .ok_or(PlacementRefusal::ArithmeticOverflow {
+                        scope: "reservation lease identifier",
+                    })?;
+            self.active_leases.insert(
+                lease_id,
+                LeaseRecord {
+                    device_id: placement.device_id.clone(),
+                    reserved_bytes: placement.total_estimated_bytes,
+                },
+            );
+            leases.push(ReservationLease {
+                brand: Arc::clone(&self.brand),
+                lease_id,
+                placement,
+            });
+        }
+        self.dynamic_reserved = candidate_reserved;
+        self.next_lease_id = next_lease_id;
+        self.revision = next_revision;
+        Ok(leases)
+    }
+
+    /// Release one committed reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed refusal and original lease without mutation when the
+    /// lease belongs to another ledger or was not active in this ledger.
+    pub fn release(&mut self, lease: ReservationLease) -> Result<(), Box<LeaseReleaseFailure>> {
+        if !Arc::ptr_eq(&self.brand, &lease.brand) {
+            return Err(Box::new(LeaseReleaseFailure::new(
+                PlacementRefusal::ForeignReservationLease,
+                lease,
+            )));
+        }
+        let Some(record) = self.active_leases.get(&lease.lease_id) else {
+            return Err(Box::new(LeaseReleaseFailure::new(
+                PlacementRefusal::UnknownReservationLease,
+                lease,
+            )));
+        };
+        if record.device_id != lease.placement.device_id
+            || record.reserved_bytes != lease.placement.total_estimated_bytes
+        {
+            return Err(Box::new(LeaseReleaseFailure::new(
+                PlacementRefusal::UnknownReservationLease,
+                lease,
+            )));
+        }
+
+        let Some(current_reserved) = self.dynamic_reserved.get(record.device_id.as_str()) else {
+            return Err(Box::new(LeaseReleaseFailure::new(
+                PlacementRefusal::UnknownReservationLease,
+                lease,
+            )));
+        };
+        let Some(next_reserved) = current_reserved.checked_sub(record.reserved_bytes) else {
+            return Err(Box::new(LeaseReleaseFailure::new(
+                PlacementRefusal::ArithmeticOverflow {
+                    scope: "dynamic device release",
+                },
+                lease,
+            )));
+        };
+        let Some(next_revision) = self.revision.checked_add(1) else {
+            return Err(Box::new(LeaseReleaseFailure::new(
+                PlacementRefusal::ArithmeticOverflow {
+                    scope: "reservation ledger revision",
+                },
+                lease,
+            )));
+        };
+
+        let device_id = record.device_id.clone();
+        self.active_leases.remove(&lease.lease_id);
+        if next_reserved == 0 {
+            self.dynamic_reserved.remove(&device_id);
+        } else {
+            self.dynamic_reserved.insert(device_id, next_reserved);
+        }
+        self.revision = next_revision;
+        Ok(())
+    }
+}
+
+impl LeaseReleaseFailure {
+    fn new(reason: PlacementRefusal, lease: ReservationLease) -> Self {
+        Self { reason, lease }
+    }
+
+    /// Return the typed reason and the still-live lease capability.
+    #[must_use]
+    pub fn into_parts(self) -> (PlacementRefusal, ReservationLease) {
+        (self.reason, self.lease)
+    }
+}
+
+impl PreparedPlan {
+    /// Return how many individual workload reservations this batch contains.
+    #[must_use]
+    pub fn placement_count(&self) -> usize {
+        self.placements.len()
+    }
+
+    /// Convert this prepared batch into the stable v1 planning report.
+    #[must_use]
+    pub fn into_outcome(self) -> PlanOutcome {
+        PlanOutcome::Plan {
+            schema_version: self.schema_version,
+            admitted_placements: self.placements,
+        }
+    }
+}
+
+impl ReservationLease {
+    /// Return the validated profile ID this lease reserves.
+    #[must_use]
+    pub fn profile_id(&self) -> &str {
+        &self.placement.profile_id
+    }
+
+    /// Return the immutable artifact ID this lease reserves.
+    #[must_use]
+    pub fn artifact_id(&self) -> &str {
+        &self.placement.artifact_id
+    }
+
+    /// Return the immutable artifact digest this lease reserves.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.placement.digest
+    }
+
+    /// Return the declared device ID this lease reserves.
+    #[must_use]
+    pub fn device_id(&self) -> &str {
+        &self.placement.device_id
+    }
+
+    /// Return the checked estimate that was reserved for this lease.
+    #[must_use]
+    pub fn total_estimated_bytes(&self) -> u64 {
+        self.placement.total_estimated_bytes
+    }
+}
+
+impl ResourceSnapshot {
+    fn from_request(request: &PlanRequest) -> Self {
+        Self {
+            devices: request.devices.clone(),
+            commitments: request.commitments.clone(),
+        }
+    }
+}
+
+fn prepare_placements(
+    request: &PlanRequest,
+    mut remaining: Vec<u64>,
+) -> Result<Vec<AdmittedPlacement>, PlacementRefusal> {
     let mut device_indices = BTreeMap::new();
     for (index, device) in request.devices.iter().enumerate() {
         let _previous = device_indices.insert(device.id.as_str(), index);
-    }
-
-    let mut remaining = Vec::with_capacity(request.devices.len());
-    for device in &request.devices {
-        let Some(after_reserved) = device.total_bytes.checked_sub(device.reserved_bytes) else {
-            return refusal(PlacementRefusal::CapacityExhausted {
-                device_id: device.id.clone(),
-                required_bytes: device.reserved_bytes,
-                available_bytes: device.total_bytes,
-            });
-        };
-        remaining.push(after_reserved);
-    }
-
-    for commitment in &request.commitments {
-        let Some(&index) = device_indices.get(commitment.device_id.as_str()) else {
-            return refusal(PlacementRefusal::CommitmentForMissingDevice {
-                device_id: commitment.device_id.clone(),
-            });
-        };
-        let Some(after_commitment) = remaining[index].checked_sub(commitment.estimated_bytes)
-        else {
-            return refusal(PlacementRefusal::CapacityExhausted {
-                device_id: commitment.device_id.clone(),
-                required_bytes: commitment.estimated_bytes,
-                available_bytes: remaining[index],
-            });
-        };
-        remaining[index] = after_commitment;
     }
 
     let mut admitted_placements = Vec::with_capacity(request.workloads.len());
@@ -338,25 +672,19 @@ pub fn plan(request: &PlanRequest) -> PlanOutcome {
         .collect::<BTreeMap<_, _>>();
     for workload in &request.workloads {
         let Some(artifact) = artifacts.get(workload.artifact_id.as_str()) else {
-            return refusal(PlacementRefusal::MissingArtifact {
+            return Err(PlacementRefusal::MissingArtifact {
                 profile_id: workload.profile_id.clone(),
                 artifact_id: workload.artifact_id.clone(),
             });
         };
-        let required_bytes = match workload.memory_estimate.total() {
-            Ok(bytes) => bytes,
-            Err(refusal_reason) => return refusal(refusal_reason),
-        };
-        let device_index = match select_device(
+        let required_bytes = workload.memory_estimate.total()?;
+        let device_index = select_device(
             workload,
             &request.devices,
             &device_indices,
             &remaining,
             required_bytes,
-        ) {
-            Ok(index) => index,
-            Err(refusal_reason) => return refusal(refusal_reason),
-        };
+        )?;
         remaining[device_index] -= required_bytes;
         admitted_placements.push(AdmittedPlacement {
             profile_id: workload.profile_id.clone(),
@@ -368,10 +696,61 @@ pub fn plan(request: &PlanRequest) -> PlanOutcome {
         });
     }
 
-    PlanOutcome::Plan {
-        schema_version: request.schema_version,
-        admitted_placements,
+    Ok(admitted_placements)
+}
+
+fn remaining_after_reservations(
+    snapshot: &ResourceSnapshot,
+    dynamic_reserved: &BTreeMap<String, u64>,
+) -> Result<Vec<u64>, PlacementRefusal> {
+    let mut device_indices = BTreeMap::new();
+    for (index, device) in snapshot.devices.iter().enumerate() {
+        let _previous = device_indices.insert(device.id.as_str(), index);
     }
+
+    let mut remaining = Vec::with_capacity(snapshot.devices.len());
+    for device in &snapshot.devices {
+        let Some(after_reserved) = device.total_bytes.checked_sub(device.reserved_bytes) else {
+            return Err(PlacementRefusal::CapacityExhausted {
+                device_id: device.id.clone(),
+                required_bytes: device.reserved_bytes,
+                available_bytes: device.total_bytes,
+            });
+        };
+        remaining.push(after_reserved);
+    }
+    for commitment in &snapshot.commitments {
+        let Some(&index) = device_indices.get(commitment.device_id.as_str()) else {
+            return Err(PlacementRefusal::CommitmentForMissingDevice {
+                device_id: commitment.device_id.clone(),
+            });
+        };
+        let Some(after_commitment) = remaining[index].checked_sub(commitment.estimated_bytes)
+        else {
+            return Err(PlacementRefusal::CapacityExhausted {
+                device_id: commitment.device_id.clone(),
+                required_bytes: commitment.estimated_bytes,
+                available_bytes: remaining[index],
+            });
+        };
+        remaining[index] = after_commitment;
+    }
+    for (device_id, reserved_bytes) in dynamic_reserved {
+        let Some(&index) = device_indices.get(device_id.as_str()) else {
+            return Err(PlacementRefusal::CommitmentForMissingDevice {
+                device_id: device_id.clone(),
+            });
+        };
+        let Some(after_dynamic) = remaining[index].checked_sub(*reserved_bytes) else {
+            return Err(PlacementRefusal::CapacityExhausted {
+                device_id: device_id.clone(),
+                required_bytes: *reserved_bytes,
+                available_bytes: remaining[index],
+            });
+        };
+        remaining[index] = after_dynamic;
+    }
+    Ok(remaining)
 }
 
 fn select_device(
@@ -932,5 +1311,79 @@ mod contract_tests {
             ),
             "overflowing estimates are typed refusals"
         );
+    }
+
+    #[test]
+    fn release_revision_overflow_returns_lease_without_mutating_accounting()
+    -> Result<(), PlacementRefusal> {
+        let input = plan_input(
+            r#"[{"id":"w7900","gfx_isa":"gfx1100","total_bytes":10,"reserved_bytes":0,"availability":"available"}]"#,
+            &format!(r#"[{{"artifact_id":"model","digest":"{DIGEST_A}"}}]"#),
+            r#"[{"profile_id":"main","artifact_id":"model","memory_estimate":{"weights_bytes":4,"kv_cache_bytes":0,"workspace_bytes":0,"headroom_bytes":0},"placement":{"kind":"requested_device","device_id":"w7900"}}]"#,
+        );
+        let request = PlanRequest::from_json(&input)?;
+        let mut ledger = ReservationLedger::new(&request)?;
+        let prepared = ledger.prepare(&request)?;
+        let mut leases = ledger.commit(prepared)?;
+        let lease = leases
+            .pop()
+            .ok_or(PlacementRefusal::UnknownReservationLease)?;
+        ledger.revision = u64::MAX;
+        let failure = match ledger.release(lease) {
+            Ok(()) => return Err(PlacementRefusal::UnknownReservationLease),
+            Err(failure) => failure,
+        };
+        let (reason, lease) = failure.into_parts();
+        assert!(
+            matches!(reason, PlacementRefusal::ArithmeticOverflow { .. }),
+            "counter exhaustion is a typed refusal"
+        );
+        assert_eq!(
+            ledger.active_leases.len(),
+            1,
+            "failed release keeps the active lease"
+        );
+        assert_eq!(
+            ledger.dynamic_reserved.get("w7900"),
+            Some(&4),
+            "failed release keeps reserved bytes unchanged"
+        );
+        drop(lease);
+        Ok(())
+    }
+
+    #[test]
+    fn ledger_rejects_later_resource_capacity_or_commitment_replacement()
+    -> Result<(), PlacementRefusal> {
+        let devices = r#"[{"id":"w7900","gfx_isa":"gfx1100","total_bytes":10,"reserved_bytes":0,"availability":"available"}]"#;
+        let artifacts = format!(r#"[{{"artifact_id":"model","digest":"{DIGEST_A}"}}]"#);
+        let workloads = r#"[{"profile_id":"main","artifact_id":"model","memory_estimate":{"weights_bytes":4,"kv_cache_bytes":0,"workspace_bytes":0,"headroom_bytes":0},"placement":{"kind":"requested_device","device_id":"w7900"}}]"#;
+        let request = PlanRequest::from_json(&plan_input(devices, &artifacts, workloads))?;
+        let ledger = ReservationLedger::new(&request)?;
+        let altered_capacity = PlanRequest::from_json(&plan_input(
+            r#"[{"id":"w7900","gfx_isa":"gfx1100","total_bytes":11,"reserved_bytes":0,"availability":"available"}]"#,
+            &artifacts,
+            workloads,
+        ))?;
+        assert!(
+            matches!(
+                ledger.prepare(&altered_capacity),
+                Err(PlacementRefusal::ResourceSnapshotMismatch)
+            ),
+            "a later request cannot inflate the ledger's declared capacity"
+        );
+        let commitment_input = plan_input(devices, &artifacts, workloads).replace(
+            "\"commitments\":[]",
+            "\"commitments\":[{\"device_id\":\"w7900\",\"estimated_bytes\":1}]",
+        );
+        let altered_commitment = PlanRequest::from_json(&commitment_input)?;
+        assert!(
+            matches!(
+                ledger.prepare(&altered_commitment),
+                Err(PlacementRefusal::ResourceSnapshotMismatch)
+            ),
+            "a later request cannot replace static commitments"
+        );
+        Ok(())
     }
 }

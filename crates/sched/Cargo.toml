@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Phase 0 scaffold - not implemented. Intended for batching, admission control, preemption, and priority queueing."
+description = "Pure deterministic admission and residency coordination for logismos."
 publish = false
+
+[dependencies]
+placement.workspace = true
+snafu.workspace = true
 
 [lints]
 workspace = true

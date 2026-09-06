@@ -136,6 +136,105 @@ fn whole_file_inspection_returns_known_observed_sha256() -> Result<()> {
 }
 
 #[test]
+fn observed_artifact_preserves_exact_typed_metadata_and_tensor_descriptors() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("typed-observation.gguf");
+    std::fs::write(&path, hybrid_profile_fixture_bytes()?)?;
+
+    let artifact = observe_gguf_with_sha256(&path)?;
+    assert!(
+        matches!(
+            artifact.metadata().get("general.architecture"),
+            Some(MetaValue::String(value)) if value == "qwen3"
+        ),
+        "observation must retain the architecture as a GGUF string"
+    );
+    assert!(
+        matches!(
+            artifact.metadata().get("general.file_type"),
+            Some(MetaValue::U32(12))
+        ),
+        "observation must retain general.file_type as U32 rather than a widened number"
+    );
+    let descriptors = artifact.tensor_descriptors();
+    assert_eq!(
+        descriptors.len(),
+        2,
+        "source-order descriptor count must survive observation"
+    );
+    assert_eq!(descriptors[0].name, "blk.0.attn_q.weight");
+    assert_eq!(descriptors[0].dims, vec![2]);
+    assert_eq!(descriptors[0].ggml_type, GgmlType::F16);
+    assert_eq!(descriptors[1].name, "blk.0.gdn_a.weight");
+    assert_eq!(descriptors[1].dims, vec![256]);
+    assert_eq!(descriptors[1].ggml_type, GgmlType::Q4K);
+    Ok(())
+}
+
+#[test]
+fn observed_artifact_keeps_legacy_inspection_receipt_compatible() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("compatible-receipt.gguf");
+    std::fs::write(&path, fixture_bytes())?;
+
+    let artifact = observe_gguf_with_sha256(&path)?;
+    let receipt = inspect_gguf_with_sha256(&path)?;
+    assert_eq!(
+        artifact.inspection(),
+        &receipt,
+        "legacy receipt must remain a copy of the retained-file observation"
+    );
+    Ok(())
+}
+
+#[test]
+fn observed_artifact_rejects_malformed_and_unknown_storage_layouts() -> Result<()> {
+    let dir = tempdir_for_test();
+    let malformed = dir.join("observed-bad-magic.gguf");
+    std::fs::write(&malformed, b"not-a-gguf")?;
+    assert!(
+        matches!(
+            observe_gguf_with_sha256(&malformed),
+            Err(Error::Gguf { .. })
+        ),
+        "observation must not create an artifact for malformed GGUF"
+    );
+
+    let unknown = dir.join("observed-unknown-ggml-type.gguf");
+    std::fs::write(&unknown, one_tensor_fixture(999, &[1], 0, 0)?)?;
+    assert!(
+        matches!(observe_gguf_with_sha256(&unknown), Err(Error::Gguf { .. })),
+        "observation must refuse an unknown GGML storage layout"
+    );
+    Ok(())
+}
+
+#[test]
+fn observed_artifact_preserves_split_hints_without_binding_companion_files() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("split-00001-of-00002.gguf");
+    std::fs::write(&path, split_metadata_fixture_bytes()?)?;
+
+    let artifact = observe_gguf_with_sha256(&path)?;
+    assert!(
+        matches!(
+            artifact.metadata().get("split.count"),
+            Some(MetaValue::U32(2))
+        ),
+        "split count remains typed metadata, not a multi-file admission result"
+    );
+    assert!(
+        matches!(artifact.metadata().get("split.no"), Some(MetaValue::U32(0))),
+        "split index remains typed metadata, not evidence that a companion was read"
+    );
+    assert!(
+        !dir.join("split-00002-of-00002.gguf").exists(),
+        "fixture must prove observation does not discover or bind absent companions"
+    );
+    Ok(())
+}
+
+#[test]
 fn concurrent_whole_file_inspections_use_independent_retained_handles() -> Result<()> {
     let dir = tempdir_for_test();
     let path = dir.join("concurrent-sha256.gguf");
@@ -191,8 +290,8 @@ fn whole_file_hash_retains_opened_file_identity_after_path_replacement() -> Resu
     std::fs::rename(&path, &moved_original)?;
     std::fs::write(&path, vec![0u8; original.len()])?;
 
-    let inspection = inspect_open_file_with_sha256(&file, &path)?;
-    let digest = sha256_text(&inspection)?;
+    let observed = observe_open_file_with_sha256(&file, &path)?;
+    let digest = sha256_text(observed.inspection())?;
     assert_eq!(
         digest,
         "623d94e17734e71bc68433a1f9121ae9b59f4aabc33fdf74f7b5cc62b61c3980"
@@ -225,10 +324,13 @@ fn receipt_hash_matches_owned_prefix_and_tail_observed_after_same_length_rewrite
     replacement[split..].fill(0x5a);
     std::fs::write(&path, &replacement)?;
 
-    let inspection = finish_observation(&file, &path, observation)?;
+    let artifact = finish_observation(&file, &path, observation)?;
     let mut observed = original[..split].to_vec();
     observed.extend_from_slice(&replacement[split..]);
-    assert_eq!(sha256_text(&inspection)?, expected_sha256_text(&observed));
+    assert_eq!(
+        sha256_text(artifact.inspection())?,
+        expected_sha256_text(&observed)
+    );
     let observed_len = u64::try_from(observed.len()).map_err(|_| {
         GgufSnafu {
             offset: 0u64,
@@ -236,9 +338,9 @@ fn receipt_hash_matches_owned_prefix_and_tail_observed_after_same_length_rewrite
         }
         .build()
     })?;
-    assert_eq!(inspection.file_len, observed_len);
-    assert_eq!(inspection.tensors.len(), 1);
-    assert_eq!(inspection.tensors[0].name, "one");
+    assert_eq!(artifact.inspection().file_len, observed_len);
+    assert_eq!(artifact.inspection().tensors.len(), 1);
+    assert_eq!(artifact.inspection().tensors[0].name, "one");
     Ok(())
 }
 
@@ -277,7 +379,7 @@ fn array_metadata_type_parses_elements() -> Result<()> {
         buf.extend_from_slice(&v.to_le_bytes());
     }
     let mut cur = Cursor::new(&buf);
-    let value = cur.read_meta_value_typed(9)?;
+    let value = cur.read_meta_value_typed(MetaValueType::Array)?;
     let MetaValue::Array(items) = value else {
         return GgufSnafu {
             offset: 0u64,
@@ -285,10 +387,53 @@ fn array_metadata_type_parses_elements() -> Result<()> {
         }
         .fail();
     };
-    assert_eq!(items.len(), 3);
-    assert!(matches!(items[0], MetaValue::U32(10)));
-    assert!(matches!(items[1], MetaValue::U32(20)));
-    assert!(matches!(items[2], MetaValue::U32(30)));
+    assert_eq!(items.element_type(), MetaValueType::U32);
+    assert_eq!(items.values().len(), 3);
+    assert!(matches!(items.values()[0], MetaValue::U32(10)));
+    assert!(matches!(items.values()[1], MetaValue::U32(20)));
+    assert!(matches!(items.values()[2], MetaValue::U32(30)));
+    Ok(())
+}
+
+#[test]
+fn empty_metadata_arrays_preserve_each_declared_scalar_type() -> Result<()> {
+    let scalar_types = [
+        (0u32, MetaValueType::U8),
+        (1u32, MetaValueType::I8),
+        (2u32, MetaValueType::U16),
+        (3u32, MetaValueType::I16),
+        (4u32, MetaValueType::U32),
+        (5u32, MetaValueType::I32),
+        (6u32, MetaValueType::F32),
+        (7u32, MetaValueType::Bool),
+        (8u32, MetaValueType::String),
+        (10u32, MetaValueType::U64),
+        (11u32, MetaValueType::I64),
+        (12u32, MetaValueType::F64),
+    ];
+    for (declared_id, expected_type) in scalar_types {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&declared_id.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let mut cursor = Cursor::new(&bytes);
+        let value = cursor.read_meta_value_typed(MetaValueType::Array)?;
+        let MetaValue::Array(array) = value else {
+            return GgufSnafu {
+                offset: 0u64,
+                msg: "expected empty GGUF array metadata".to_string(),
+            }
+            .fail();
+        };
+        assert_eq!(
+            array.element_type(),
+            expected_type,
+            "GGUF inner type id {declared_id} must survive an empty array"
+        );
+        assert!(
+            array.values().is_empty(),
+            "empty array with declared id {declared_id} must not gain values"
+        );
+    }
     Ok(())
 }
 
@@ -343,10 +488,11 @@ fn array_metadata_round_trips_through_reader_open() -> Result<()> {
         }
         .fail();
     };
-    assert_eq!(items.len(), 3);
-    assert!(matches!(items[0], MetaValue::U32(1)));
-    assert!(matches!(items[1], MetaValue::U32(2)));
-    assert!(matches!(items[2], MetaValue::U32(3)));
+    assert_eq!(items.element_type(), MetaValueType::U32);
+    assert_eq!(items.values().len(), 3);
+    assert!(matches!(items.values()[0], MetaValue::U32(1)));
+    assert!(matches!(items.values()[1], MetaValue::U32(2)));
+    assert!(matches!(items.values()[2], MetaValue::U32(3)));
     Ok(())
 }
 
@@ -360,8 +506,21 @@ fn nested_array_inner_type_is_rejected() {
     // return `Err`.
     let inner_type_bytes = 9u32.to_le_bytes();
     let mut cur = Cursor::new(&inner_type_bytes);
-    let result = cur.read_meta_value_typed(9);
+    let result = cur.read_meta_value_typed(MetaValueType::Array);
     assert!(matches!(result, Err(Error::Gguf { .. })));
+}
+
+#[test]
+fn unknown_metadata_array_element_type_is_rejected() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&999u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    let mut cursor = Cursor::new(&bytes);
+
+    assert!(matches!(
+        cursor.read_meta_value_typed(MetaValueType::Array),
+        Err(Error::Gguf { .. })
+    ));
 }
 
 #[test]
@@ -372,7 +531,7 @@ fn metadata_arrays_have_a_cumulative_element_limit() {
     let mut cur = Cursor::new(&buf);
     cur.total_metadata_array_elements = MAX_TOTAL_METADATA_ARRAY_ELEMENTS;
 
-    let result = cur.read_meta_value_typed(9);
+    let result = cur.read_meta_value_typed(MetaValueType::Array);
     assert!(matches!(result, Err(Error::Gguf { .. })));
 }
 
@@ -832,6 +991,20 @@ fn hybrid_profile_fixture_bytes() -> Result<Vec<u8>> {
     buf.extend_from_slice(&[0u8; 4]);
     buf.extend_from_slice(&[0u8; 28]);
     buf.extend_from_slice(&[0u8; 144]);
+    Ok(buf)
+}
+
+fn split_metadata_fixture_bytes() -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(GGUF_MAGIC);
+    buf.extend_from_slice(&GGUF_V3.to_le_bytes());
+    buf.extend_from_slice(&1u64.to_le_bytes());
+    buf.extend_from_slice(&2u64.to_le_bytes());
+    append_u32_metadata(&mut buf, "split.count", 2)?;
+    append_u32_metadata(&mut buf, "split.no", 0)?;
+    append_tensor_descriptor(&mut buf, "first-part", &[1], 0, 0)?;
+    pad_to_data_region(&mut buf)?;
+    buf.extend_from_slice(&0f32.to_le_bytes());
     Ok(buf)
 }
 

@@ -5,10 +5,12 @@
 An agent-aware operating environment for local AI compute: a Rust-native inference stack
 targeting AMD gfx1100, with owned HIP/WMMA kernels and progressively owned execution policy.
 
-**Status:** HIP primitives, kernels, and Stella CPU end-to-end golden-fixture parity exist.
-Native decoder serving, agent-aware placement, instruction emulation, and the experimental
-below-HIP provider are under development, not qualified capabilities. The W7900 is available;
-the RX 7900 XTX is a planned second device and requires its own qualification.
+**Status:** HIP primitives, Stella CPU golden-fixture parity, action-free placement,
+process-local admission/residency coordination, and bounded instruction emulation exist.
+GGUF inspection and generic GDN/convolution CPU references are foundations, not native
+decoder serving or hardware qualification. The W7900 is available; the RX 7900 XTX is a
+planned second device and requires its own qualification. The experimental below-HIP
+provider remains unimplemented.
 
 ## Why
 
@@ -31,9 +33,22 @@ take over gaming, display ownership, firmware, or the fleet's development-work s
 - Out: general model formation, training authority, and model release. Automatic fleet cutover,
   direct PCI takeover, firmware changes, and unqualified hardware/performance claims.
 
-Upstream projects are reference corpora for original implementations, including the planned
-bounded gfx1100 functional emulator. HIP remains the production substrate; an original
-HSA/ROCr provider is an explicitly scoped experiment, not a production backend claim.
+Upstream projects are reference corpora for original implementations. The bounded gfx1100
+functional emulator is original; full-kernel coverage remains planned. HIP remains the
+production substrate; an original HSA/ROCr provider is an explicitly scoped experiment,
+not a production backend claim.
+
+The [`placement`](crates/placement/src/lib.rs) ledger owns per-device reservation accounting;
+[`sched`](crates/sched/src/lib.rs) coordinates admission, use, revocation, and confirmed release.
+These are deterministic process-local contracts, not physical reservations or a running executor.
+A service owner must use one controller per resource grant and drain or reconcile on restart.
+Supplied memory estimates are not yet artifact-derived requirements or measured residency.
+
+`logismos inspect --input PATH` retains its v1 digest/census receipt. Explicit `--metadata`
+adds typed metadata (including empty-array element types and float bits) and source-order
+tensor extents from the same observation. Inspection does not prove conversion provenance,
+payload decoding, model support, or an atomic filesystem snapshot. The
+[GPU-denied runner](docs/gpu-denied-runner.md) can admit one exact read-only input for this work.
 
 [`contracts/runtime-scope.toml`](contracts/runtime-scope.toml) records this product boundary.
 Bounded adaptation remains absent unless a named consumer contract supplies an output owner,

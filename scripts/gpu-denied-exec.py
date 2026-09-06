@@ -16,6 +16,8 @@ UNSHARE = Path('/usr/bin/unshare')
 SANDBOX_CARGO_HOME = Path('/tmp/cargo')
 SANDBOX_HOME = Path('/tmp/home')
 SANDBOX_RUST_ROOT = Path('/opt/gpu-denied')
+SANDBOX_READ_ONLY_INPUT = Path('/mnt/gpu-denied-input/artifact')
+READ_ONLY_INPUT_ENVIRONMENT = 'LOGISMOS_GPU_DENIED_INPUT'
 SYSTEM_PATH = '/opt/rocm/bin:/opt/gpu-denied/cargo/bin:/usr/local/bin:/usr/bin:/bin'
 BLOCKED_MOUNT_ROOTS = (
     Path('/dev'),
@@ -41,16 +43,22 @@ def _decode_mount_path(value: str) -> Path:
     return Path(MOUNT_ESCAPE.sub(lambda match: chr(int(match.group(1), 8)), value))
 
 
-def _reject_nested_mounts(source: Path) -> None:
+def _host_mount_points() -> list[Path]:
     try:
         records = Path('/proc/self/mountinfo').read_text(encoding='utf-8').splitlines()
     except OSError as error:
         raise BoundaryError(f'cannot inspect host mount topology: {error}') from error
+    mount_points: list[Path] = []
     for record in records:
         fields = record.split()
         if len(fields) < 5:
             raise BoundaryError('host mount topology contains a malformed record')
-        mount_point = _decode_mount_path(fields[4])
+        mount_points.append(_decode_mount_path(fields[4]))
+    return mount_points
+
+
+def _reject_nested_mounts(source: Path) -> None:
+    for mount_point in _host_mount_points():
         if mount_point != source and mount_point.is_relative_to(source):
             raise BoundaryError('worktree contains a nested host mount')
 
@@ -223,6 +231,68 @@ def _prepare_worktree(root_argument: str) -> tuple[Path, Path]:
     return root, target
 
 
+def _prepare_read_only_input(
+    input_argument: str, root: Path, target: Path
+) -> Path:
+    input_path = Path(input_argument)
+    if not input_path.is_absolute():
+        raise BoundaryError('read-only input path must be canonical and absolute')
+    try:
+        resolved = input_path.resolve(strict=True)
+    except OSError as error:
+        raise BoundaryError('cannot resolve read-only input path') from error
+    # `Path` deliberately normalizes `.` and repeated separators.  Compare the
+    # original argv spelling too: otherwise `/file//name` would pass despite
+    # not being the one canonical pathname the caller supplied for review.
+    if input_argument != str(resolved):
+        raise BoundaryError('read-only input path must be canonical and contain no symlinks')
+    if resolved == root or resolved.is_relative_to(root):
+        raise BoundaryError('read-only input must be outside the worktree and writable target')
+    if any(
+        resolved == blocked or resolved.is_relative_to(blocked)
+        for blocked in BLOCKED_MOUNT_ROOTS
+    ):
+        raise BoundaryError('read-only input is under a sensitive host root')
+    try:
+        metadata = resolved.lstat()
+    except OSError as error:
+        raise BoundaryError('cannot inspect read-only input') from error
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise BoundaryError('read-only input must be a single-link regular file')
+    _reject_read_only_input_tree_alias(metadata, root)
+    if resolved in _host_mount_points():
+        raise BoundaryError('read-only input must not be a host mount point')
+    if not os.access(resolved, os.R_OK):
+        raise BoundaryError('read-only input is not readable by the runner account')
+    return resolved
+
+
+def _reject_read_only_input_tree_alias(input_metadata: os.stat_result, root: Path) -> None:
+    """Reject a bind-directory spelling of an inode in the protected worktree.
+
+    A file bind mount does not increment `st_nlink`; an external pathname can
+    therefore name a writable `target/` inode despite the input's single-link
+    requirement.  Compare inode identity while walking the already protected
+    tree without following any symlinks.
+    """
+
+    def reject_walk_error(error: OSError) -> None:
+        raise BoundaryError('cannot inspect worktree for a read-only input alias') from error
+
+    identity = (input_metadata.st_dev, input_metadata.st_ino)
+    for current, directories, files in os.walk(
+        root, topdown=True, onerror=reject_walk_error, followlinks=False
+    ):
+        current_path = Path(current)
+        for name in (*directories, *files):
+            try:
+                candidate = (current_path / name).lstat()
+            except OSError as error:
+                raise BoundaryError('cannot inspect worktree for a read-only input alias') from error
+            if stat.S_ISREG(candidate.st_mode) and (candidate.st_dev, candidate.st_ino) == identity:
+                raise BoundaryError('read-only input aliases the protected worktree')
+
+
 def _validate_standard_descriptors(root: Path) -> None:
     try:
         null_device = Path('/dev/null').stat().st_rdev
@@ -316,7 +386,9 @@ def _compiler_alias_mount_args() -> list[str]:
     ]
 
 
-def _sandbox_args(root: Path, target: Path, command: list[str]) -> list[str]:
+def _sandbox_args(
+    root: Path, target: Path, read_only_input: Path | None, command: list[str]
+) -> list[str]:
     toolchain_args, toolchain_environment = _toolchain_mount_args()
     compiler_alias_args = _compiler_alias_mount_args()
     environment = [
@@ -332,6 +404,20 @@ def _sandbox_args(root: Path, target: Path, command: list[str]) -> list[str]:
         *toolchain_environment,
         *_clang_environment(),
     ]
+    input_mount_args: list[str] = []
+    if read_only_input is not None:
+        environment.append((READ_ONLY_INPUT_ENVIRONMENT, str(SANDBOX_READ_ONLY_INPUT)))
+        input_mount_args.extend(
+            (
+                '--dir',
+                str(SANDBOX_READ_ONLY_INPUT.parent.parent),
+                '--dir',
+                str(SANDBOX_READ_ONLY_INPUT.parent),
+                '--ro-bind',
+                str(read_only_input),
+                str(SANDBOX_READ_ONLY_INPUT),
+            )
+        )
     mounts = ['--tmpfs', '/', '--ro-bind', '/usr', '/usr']
     rocm_root = Path('/opt/rocm')
     if rocm_root.exists():
@@ -378,6 +464,7 @@ def _sandbox_args(root: Path, target: Path, command: list[str]) -> list[str]:
             '--dir',
             str(SANDBOX_CARGO_HOME),
             *toolchain_args,
+            *input_mount_args,
             '--ro-bind',
             str(root),
             str(root),
@@ -430,8 +517,29 @@ def _namespace_launcher_args(sandbox_args: list[str]) -> list[str]:
 
 
 def main() -> int:
-    if len(sys.argv) < 4 or sys.argv[2] != '--':
-        print('usage: gpu-denied-exec.py ROOT -- COMMAND [ARG...]', file=sys.stderr)
+    if len(sys.argv) < 4:
+        print(
+            'usage: gpu-denied-exec.py ROOT [--ro-input-file FILE] -- COMMAND [ARG...]',
+            file=sys.stderr,
+        )
+        return 64
+    root_argument = sys.argv[1]
+    next_argument = 2
+    input_argument: str | None = None
+    if sys.argv[next_argument] == '--ro-input-file':
+        if len(sys.argv) < 6:
+            print(
+                'usage: gpu-denied-exec.py ROOT [--ro-input-file FILE] -- COMMAND [ARG...]',
+                file=sys.stderr,
+            )
+            return 64
+        input_argument = sys.argv[next_argument + 1]
+        next_argument += 2
+    if sys.argv[next_argument] != '--' or next_argument + 1 == len(sys.argv):
+        print(
+            'usage: gpu-denied-exec.py ROOT [--ro-input-file FILE] -- COMMAND [ARG...]',
+            file=sys.stderr,
+        )
         return 64
     if not BWRAP.is_file() or not os.access(BWRAP, os.X_OK):
         print('gpu-denied runner requires /usr/bin/bwrap; refusing to execute', file=sys.stderr)
@@ -449,10 +557,20 @@ def main() -> int:
         )
         return 69
     try:
-        root, target = _prepare_worktree(sys.argv[1])
+        root, target = _prepare_worktree(root_argument)
+        read_only_input = (
+            _prepare_read_only_input(input_argument, root, target)
+            if input_argument is not None
+            else None
+        )
         _validate_standard_descriptors(root)
         _close_inherited_descriptors()
-        os.execv(UNSHARE, _namespace_launcher_args(_sandbox_args(root, target, sys.argv[3:])))
+        os.execv(
+            UNSHARE,
+            _namespace_launcher_args(
+                _sandbox_args(root, target, read_only_input, sys.argv[next_argument + 1:])
+            ),
+        )
     except BoundaryError as error:
         print(f'gpu-denied runner: {error}', file=sys.stderr)
         return 69

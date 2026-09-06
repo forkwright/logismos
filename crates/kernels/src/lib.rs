@@ -41,6 +41,7 @@
     clippy::missing_safety_doc
 )]
 
+pub mod causal_conv;
 pub mod cpu_f32;
 pub mod error;
 pub mod gdn;
@@ -49,5 +50,11 @@ pub mod rms_norm;
 pub mod rope;
 pub mod softmax;
 
+pub use crate::causal_conv::{
+    CausalConvError, CausalConvInput, CausalConvOutput, CausalConvResult, causal_conv_fwd,
+};
 pub use crate::error::{Error, Result};
-pub use crate::gdn::{GdnError, GdnResult, RecurrentInput, RecurrentOutput, recurrent_fwd};
+pub use crate::gdn::{
+    GdnError, GdnResult, MultiHeadRecurrentInput, MultiHeadRecurrentOutput, RecurrentInput,
+    RecurrentOutput, multi_head_recurrent_fwd, recurrent_fwd,
+};
