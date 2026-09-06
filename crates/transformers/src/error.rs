@@ -16,11 +16,11 @@ pub enum Error {
         #[snafu(implicit)]
         location: snafu::Location,
     },
-    /// Downstream kernel failure (unused in Phase 3; reserved for Phase 6).
-    #[snafu(display("kernel: {message}"))]
+    /// Propagated CPU-reference or GPU-launch kernel failure.
+    #[snafu(display("kernel: {source}"))]
     Kernel {
-        /// Free-form description.
-        message: String,
+        /// Source kernel error.
+        source: kernels::Error,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,

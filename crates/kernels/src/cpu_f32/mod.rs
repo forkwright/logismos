@@ -19,6 +19,12 @@
 use std::f32;
 
 use num_traits::ToPrimitive;
+use snafu::ResultExt;
+
+use crate::error::{
+    Result, RmsNormAllocationSnafu, RmsNormInvalidDimensionSnafu, RmsNormInvalidParameterSnafu,
+    RmsNormNonFiniteSnafu, RmsNormShapeSnafu, RmsNormSizeOverflowSnafu, RmsNormStage,
+};
 
 fn usize_to_f32(value: usize) -> f32 {
     value.to_f32().unwrap_or(f32::INFINITY)
@@ -133,29 +139,163 @@ pub fn embed_lookup(weight: &[f32], hidden: usize, vocab: usize, ids: &[u32]) ->
 /// - `x`: `[rows, n]`
 /// - `weight`: `[n]`
 /// - returns: `[rows, n]`
-#[must_use]
-pub fn rms_norm(x: &[f32], weight: &[f32], rows: usize, n: usize, eps: f32) -> Vec<f32> {
-    debug_assert_eq!(x.len(), rows * n);
-    debug_assert_eq!(weight.len(), n);
-    let mut y = vec![0.0f32; rows * n];
-    for r in 0..rows {
-        let row_start = r * n;
-        let row_end = (r + 1) * n;
-        let Some(row) = x.get(row_start..row_end) else {
-            continue;
-        };
-        let mut sum_sq = 0.0f32;
-        for &v in row {
-            sum_sq += v * v;
+///
+/// # Errors
+///
+/// Returns a typed [`crate::Error`] when dimensions or slice lengths are
+/// inconsistent, parameters or inputs are non-finite, a numerical
+/// intermediate overflows, or output allocation fails.
+pub fn rms_norm(x: &[f32], weight: &[f32], rows: usize, n: usize, eps: f32) -> Result<Vec<f32>> {
+    if n == 0 {
+        return RmsNormInvalidDimensionSnafu { rows, width: n }.fail();
+    }
+
+    let Some(expected_len) = rows.checked_mul(n) else {
+        return RmsNormSizeOverflowSnafu { rows, width: n }.fail();
+    };
+    if x.len() != expected_len {
+        return RmsNormShapeSnafu {
+            stage: RmsNormStage::Input,
+            rows,
+            width: n,
+            expected_len,
+            actual_len: x.len(),
         }
-        let inv = ((sum_sq / usize_to_f32(n)) + eps).sqrt().recip();
-        if let Some(y_row) = y.get_mut(row_start..row_end) {
-            for ((dst, &xv), &wv) in y_row.iter_mut().zip(row.iter()).zip(weight.iter()) {
-                *dst = xv * inv * wv;
+        .fail();
+    }
+    if weight.len() != n {
+        return RmsNormShapeSnafu {
+            stage: RmsNormStage::Weight,
+            rows,
+            width: n,
+            expected_len: n,
+            actual_len: weight.len(),
+        }
+        .fail();
+    }
+    if !eps.is_finite() || eps <= 0.0 {
+        return RmsNormInvalidParameterSnafu { epsilon: eps }.fail();
+    }
+
+    for (index, &value) in x.iter().enumerate() {
+        if !value.is_finite() {
+            return RmsNormNonFiniteSnafu {
+                stage: RmsNormStage::Input,
+                row: index / n,
+                column: index % n,
+                value,
             }
+            .fail();
         }
     }
-    y
+    for (column, &value) in weight.iter().enumerate() {
+        if !value.is_finite() {
+            return RmsNormNonFiniteSnafu {
+                stage: RmsNormStage::Weight,
+                row: 0usize,
+                column,
+                value,
+            }
+            .fail();
+        }
+    }
+
+    let mut y = Vec::new();
+    y.try_reserve_exact(expected_len)
+        .context(RmsNormAllocationSnafu {
+            requested_len: expected_len,
+        })?;
+    y.resize(expected_len, 0.0);
+
+    let width = usize_to_f32(n);
+    for (row_index, (input_row, output_row)) in
+        x.chunks_exact(n).zip(y.chunks_exact_mut(n)).enumerate()
+    {
+        let mut sum_sq = 0.0f32;
+        for (column, &value) in input_row.iter().enumerate() {
+            let squared = value * value;
+            if !squared.is_finite() {
+                return RmsNormNonFiniteSnafu {
+                    stage: RmsNormStage::Square,
+                    row: row_index,
+                    column,
+                    value: squared,
+                }
+                .fail();
+            }
+            sum_sq += squared;
+            if !sum_sq.is_finite() {
+                return RmsNormNonFiniteSnafu {
+                    stage: RmsNormStage::Sum,
+                    row: row_index,
+                    column,
+                    value: sum_sq,
+                }
+                .fail();
+            }
+        }
+
+        let mean_sq = sum_sq / width;
+        if !mean_sq.is_finite() {
+            return RmsNormNonFiniteSnafu {
+                stage: RmsNormStage::Mean,
+                row: row_index,
+                column: 0usize,
+                value: mean_sq,
+            }
+            .fail();
+        }
+        let variance = mean_sq + eps;
+        if !variance.is_finite() {
+            return RmsNormNonFiniteSnafu {
+                stage: RmsNormStage::Epsilon,
+                row: row_index,
+                column: 0usize,
+                value: variance,
+            }
+            .fail();
+        }
+        let inverse = variance.sqrt().recip();
+        if !inverse.is_finite() {
+            return RmsNormNonFiniteSnafu {
+                stage: RmsNormStage::Inverse,
+                row: row_index,
+                column: 0usize,
+                value: inverse,
+            }
+            .fail();
+        }
+        for (column, ((slot, &value), &scale)) in output_row
+            .iter_mut()
+            .zip(input_row.iter())
+            .zip(weight.iter())
+            .enumerate()
+        {
+            let normalized = value * inverse;
+            if !normalized.is_finite() {
+                return RmsNormNonFiniteSnafu {
+                    stage: RmsNormStage::Scale,
+                    row: row_index,
+                    column,
+                    value: normalized,
+                }
+                .fail();
+            }
+            let output = normalized * scale;
+            if !output.is_finite() {
+                return RmsNormNonFiniteSnafu {
+                    stage: RmsNormStage::Output,
+                    row: row_index,
+                    column,
+                    value: output,
+                }
+                .fail();
+            }
+            *slot = output;
+        }
+    }
+
+    Ok(y)
 }
 
 /// `C = A @ B` plus optional bias, all fp32.
