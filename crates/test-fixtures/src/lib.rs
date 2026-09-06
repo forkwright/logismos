@@ -45,6 +45,112 @@ pub struct SyntheticGguf {
     pub byte_len: u64,
 }
 
+/// Raw GGUF metadata value for intentionally varied synthetic artifacts.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RawMetadataValue {
+    /// Unsigned 32-bit scalar.
+    U32(u32),
+    /// Single-precision scalar.
+    F32(f32),
+    /// Boolean scalar.
+    Bool(bool),
+    /// UTF-8 string.
+    String(String),
+    /// UTF-8 string array.
+    StringArray(Vec<String>),
+    /// Signed 32-bit array.
+    I32Array(Vec<i32>),
+}
+
+/// One raw metadata descriptor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawMetadata {
+    /// GGUF key.
+    pub key: String,
+    /// Serialized value.
+    pub value: RawMetadataValue,
+}
+
+/// One raw tensor descriptor and its complete serialized payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawTensor {
+    /// GGUF tensor name.
+    pub name: String,
+    /// Logical GGUF dimensions.
+    pub dims: Vec<u64>,
+    /// GGML dtype tag.
+    pub ggml_type: u32,
+    /// Exact serialized bytes in tensor-offset order.
+    pub payload: Vec<u8>,
+}
+
+/// Mutable synthetic GGUF source before one canonical serialization pass.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawGguf {
+    /// Metadata descriptors in serialized order.
+    pub metadata: Vec<RawMetadata>,
+    /// Tensor descriptors in serialized order.
+    pub tensors: Vec<RawTensor>,
+}
+
+/// Serialize raw synthetic GGUF descriptors without decoding their payloads.
+///
+/// # Errors
+///
+/// Returns an error when a descriptor count, dimension, payload extent, or
+/// aligned offset cannot be represented.
+pub fn serialize_raw_gguf(raw: &RawGguf) -> Result<SyntheticGguf, String> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    bytes.extend_from_slice(&3_u32.to_le_bytes());
+    bytes.extend_from_slice(
+        &u64::try_from(raw.tensors.len())
+            .map_err(|error| error.to_string())?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u64::try_from(raw.metadata.len())
+            .map_err(|error| error.to_string())?
+            .to_le_bytes(),
+    );
+    for entry in &raw.metadata {
+        append_raw_metadata(&mut bytes, entry)?;
+    }
+    let mut offsets = Vec::with_capacity(raw.tensors.len());
+    let mut offset = 0_u64;
+    for tensor in &raw.tensors {
+        offset = align(offset)?;
+        offsets.push(offset);
+        offset = offset
+            .checked_add(u64::try_from(tensor.payload.len()).map_err(|error| error.to_string())?)
+            .ok_or_else(|| "raw tensor offset overflowed".to_string())?;
+    }
+    for (tensor, offset) in raw.tensors.iter().zip(offsets) {
+        string(&mut bytes, &tensor.name)?;
+        bytes.extend_from_slice(
+            &u32::try_from(tensor.dims.len())
+                .map_err(|error| error.to_string())?
+                .to_le_bytes(),
+        );
+        for dimension in &tensor.dims {
+            bytes.extend_from_slice(&dimension.to_le_bytes())
+        }
+        bytes.extend_from_slice(&tensor.ggml_type.to_le_bytes());
+        bytes.extend_from_slice(&offset.to_le_bytes());
+    }
+    pad(&mut bytes)?;
+    for tensor in &raw.tensors {
+        pad(&mut bytes)?;
+        bytes.extend_from_slice(&tensor.payload)
+    }
+    let byte_len = u64::try_from(bytes.len()).map_err(|error| error.to_string())?;
+    Ok(SyntheticGguf {
+        sha256: Sha256::digest(&bytes).into(),
+        byte_len,
+        bytes,
+    })
+}
+
 /// Build a structurally valid, all-F32 Qwen3.5 hybrid GGUF for test use.
 ///
 /// # Errors
@@ -302,6 +408,52 @@ fn serialize(metadata: &[Meta], tensors: &[Tensor]) -> Result<Vec<u8>, String> {
         }
     }
     Ok(bytes)
+}
+fn append_raw_metadata(bytes: &mut Vec<u8>, entry: &RawMetadata) -> Result<(), String> {
+    string(bytes, &entry.key)?;
+    match &entry.value {
+        RawMetadataValue::U32(value) => {
+            bytes.extend_from_slice(&4_u32.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        RawMetadataValue::F32(value) => {
+            bytes.extend_from_slice(&6_u32.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        RawMetadataValue::Bool(value) => {
+            bytes.extend_from_slice(&7_u32.to_le_bytes());
+            bytes.push(u8::from(*value));
+        }
+        RawMetadataValue::String(value) => {
+            bytes.extend_from_slice(&8_u32.to_le_bytes());
+            string(bytes, value)?;
+        }
+        RawMetadataValue::StringArray(values) => {
+            bytes.extend_from_slice(&9_u32.to_le_bytes());
+            bytes.extend_from_slice(&8_u32.to_le_bytes());
+            bytes.extend_from_slice(
+                &u64::try_from(values.len())
+                    .map_err(|error| error.to_string())?
+                    .to_le_bytes(),
+            );
+            for value in values {
+                string(bytes, value)?;
+            }
+        }
+        RawMetadataValue::I32Array(values) => {
+            bytes.extend_from_slice(&9_u32.to_le_bytes());
+            bytes.extend_from_slice(&5_u32.to_le_bytes());
+            bytes.extend_from_slice(
+                &u64::try_from(values.len())
+                    .map_err(|error| error.to_string())?
+                    .to_le_bytes(),
+            );
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    Ok(())
 }
 fn string(bytes: &mut Vec<u8>, value: &str) -> Result<(), String> {
     let length = u64::try_from(value.len()).map_err(|error| error.to_string())?;
