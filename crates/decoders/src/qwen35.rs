@@ -28,6 +28,7 @@ const KEY_VALUE_HEAD_COUNT_KEY: &str = "qwen35.attention.head_count_kv";
 const KEY_LENGTH_KEY: &str = "qwen35.attention.key_length";
 const RECURRENT_LAYERS_KEY: &str = "qwen35.attention.recurrent_layers";
 const VALUE_LENGTH_KEY: &str = "qwen35.attention.value_length";
+const LAYERNORM_RMS_EPSILON_KEY: &str = "qwen35.attention.layer_norm_rms_epsilon";
 const SSM_CONV_KERNEL_KEY: &str = "qwen35.ssm.conv_kernel";
 const SSM_INNER_SIZE_KEY: &str = "qwen35.ssm.inner_size";
 const SSM_STATE_SIZE_KEY: &str = "qwen35.ssm.state_size";
@@ -138,9 +139,7 @@ const NEXTN_EXTENSION_TEMPLATES: &[TensorTemplate] = &[
 #[derive(Debug)]
 pub struct Qwen35StructuralProfile<'artifact> {
     observed: &'artifact ObservedArtifact,
-    stored_block_count: u64,
-    main_block_count: u64,
-    nextn_block_count: u64,
+    dimensions: Dimensions,
 }
 
 impl<'artifact> Qwen35StructuralProfile<'artifact> {
@@ -157,9 +156,7 @@ impl<'artifact> Qwen35StructuralProfile<'artifact> {
 
         Ok(Self {
             observed,
-            stored_block_count: dimensions.stored_block_count,
-            main_block_count: dimensions.main_block_count,
-            nextn_block_count: dimensions.nextn_block_count,
+            dimensions,
         })
     }
 
@@ -172,19 +169,23 @@ impl<'artifact> Qwen35StructuralProfile<'artifact> {
     /// Return the number of stored `blk.N` groups, including an optional `NextN` block.
     #[must_use]
     pub const fn stored_block_count(&self) -> u64 {
-        self.stored_block_count
+        self.dimensions.stored_block_count
     }
 
     /// Return the number of main decoder block groups, excluding `NextN`.
     #[must_use]
     pub const fn main_block_count(&self) -> u64 {
-        self.main_block_count
+        self.dimensions.main_block_count
     }
 
     /// Return the number of terminal `NextN` block groups in this narrow domain.
     #[must_use]
     pub const fn nextn_block_count(&self) -> u64 {
-        self.nextn_block_count
+        self.dimensions.nextn_block_count
+    }
+
+    pub(crate) const fn recurrent_layout(&self) -> Qwen35RecurrentLayout {
+        self.dimensions.recurrent_layout()
     }
 }
 
@@ -334,6 +335,13 @@ impl Dimensions {
             }
             .fail();
         }
+        if !self.time_step_rank.is_multiple_of(self.group_count) {
+            return MetadataRelationSnafu {
+                key: SSM_TIME_STEP_RANK_KEY,
+                rule: "ssm.time_step_rank must be divisible by ssm.group_count",
+            }
+            .fail();
+        }
         Ok(())
     }
 
@@ -436,6 +444,46 @@ impl Dimensions {
             head_width: self.inner / self.time_step_rank,
         })
     }
+
+    const fn recurrent_layout(&self) -> Qwen35RecurrentLayout {
+        Qwen35RecurrentLayout {
+            hidden: self.hidden,
+            conv_kernel: self.conv_kernel,
+            inner: self.inner,
+            state: self.state,
+            time_step_rank: self.time_step_rank,
+            group_count: self.group_count,
+            main_block_count: self.main_block_count,
+            full_attention_interval: self.full_attention_interval,
+        }
+    }
+}
+
+/// Recurrent dimensions retained after the one authoritative metadata parse.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Qwen35RecurrentLayout {
+    pub(crate) hidden: u64,
+    pub(crate) conv_kernel: u64,
+    pub(crate) inner: u64,
+    pub(crate) state: u64,
+    pub(crate) time_step_rank: u64,
+    pub(crate) group_count: u64,
+    pub(crate) main_block_count: u64,
+    pub(crate) full_attention_interval: u64,
+}
+
+pub(crate) fn recurrent_layernorm_rms_epsilon(
+    metadata: &HashMap<String, MetaValue>,
+) -> Result<f32> {
+    let epsilon = required_f32(metadata, LAYERNORM_RMS_EPSILON_KEY)?;
+    if !epsilon.is_finite() || epsilon <= 0.0 {
+        return MetadataRelationSnafu {
+            key: LAYERNORM_RMS_EPSILON_KEY,
+            rule: "attention.layer_norm_rms_epsilon must be finite and positive for recurrent execution",
+        }
+        .fail();
+    }
+    Ok(epsilon)
 }
 
 #[derive(Debug)]
@@ -722,6 +770,21 @@ fn required_u32(metadata: &HashMap<String, MetaValue>, key: &'static str) -> Res
         .fail();
     };
     Ok(u64::from(*value))
+}
+
+fn required_f32(metadata: &HashMap<String, MetaValue>, key: &'static str) -> Result<f32> {
+    let Some(value) = metadata.get(key) else {
+        return MissingMetadataSnafu { key }.fail();
+    };
+    let MetaValue::F32(value) = value else {
+        return MetadataTypeSnafu {
+            key,
+            expected: "f32",
+            actual: value.value_type(),
+        }
+        .fail();
+    };
+    Ok(*value)
 }
 
 fn required_vocabulary(metadata: &HashMap<String, MetaValue>) -> Result<u64> {

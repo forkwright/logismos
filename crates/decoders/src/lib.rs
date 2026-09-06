@@ -3,9 +3,9 @@
 //! Decoder-only LLM family: Qwen2 / 3 (including GDN hybrid), Llama.
 //!
 //! The current implementation is limited to Qwen3.5 GGUF structural preflight
-//! over an opaque loader observation plus one verified-payload CPU `Q8_0`
-//! projection. It provides neither a forward model, tokenizer execution, cache,
-//! nor runtime admission.
+//! over an opaque loader observation, verified serialized-row projection, and
+//! one stateful Qwen3.5 recurrent-attention trunk. It provides neither a full
+//! forward model, tokenizer execution, cache, nor runtime admission.
 //!
 //! ## Responsibility
 //!
@@ -22,10 +22,12 @@
 
 pub mod error;
 pub mod qwen35;
+pub mod qwen35_recurrent;
 pub mod qwen35_weights;
 
 pub use crate::error::{Error, Result};
 pub use crate::qwen35::Qwen35StructuralProfile;
+pub use crate::qwen35_recurrent::Qwen35RecurrentExecution;
 pub use crate::qwen35_weights::Qwen35Weights;
 
 #[cfg(test)]
