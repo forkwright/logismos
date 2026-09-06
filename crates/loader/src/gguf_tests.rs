@@ -1,6 +1,8 @@
 //! `gguf.rs` tests, `#[path]`-included as a sibling file per `RUST/file-too-long`.
 
 use super::*;
+use std::io::{self, Read};
+use std::num::NonZeroU64;
 use std::sync::{Arc, Barrier};
 // WHY not via `use super::*`: the parent's `Error` import is declared
 // `#[expect(unused_imports)]` for intra-doc links; resolving these
@@ -65,7 +67,36 @@ fn sha256_text(inspection: &Inspection) -> Result<String> {
 }
 
 fn expected_sha256_text(bytes: &[u8]) -> String {
-    Sha256Digest(Sha256::digest(bytes).into()).to_string()
+    digest_for_bytes(bytes).to_string()
+}
+
+fn digest_for_bytes(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest::from_bytes(Sha256::digest(bytes).into())
+}
+
+fn fixture_backing_limit(bytes: &[u8]) -> Result<ArtifactByteLimit> {
+    let serialized_bytes = u64::try_from(bytes.len()).map_err(|_| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: format!("fixture length {} exceeds u64::MAX", bytes.len()),
+        }
+        .build()
+    })?;
+    let limit = serialized_bytes.checked_add(1).ok_or_else(|| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: "fixture backing limit overflows u64".to_string(),
+        }
+        .build()
+    })?;
+    let limit = NonZeroU64::new(limit).ok_or_else(|| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: "fixture backing limit must be non-zero".to_string(),
+        }
+        .build()
+    })?;
+    Ok(ArtifactByteLimit::new(limit))
 }
 
 #[test]
@@ -178,6 +209,240 @@ fn observed_artifact_preserves_exact_typed_metadata_and_tensor_descriptors() -> 
     assert_eq!(descriptors[1].dims, vec![256]);
     assert_eq!(descriptors[1].ggml_type, GgmlType::Q4K);
     Ok(())
+}
+
+#[test]
+fn verified_artifact_borrows_checked_f32_payload_from_its_immutable_backing() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("verified-f32.gguf");
+    let bytes = fixture_bytes();
+    std::fs::write(&path, &bytes)?;
+
+    let artifact = VerifiedArtifact::load(
+        &path,
+        digest_for_bytes(&bytes),
+        fixture_backing_limit(&bytes)?,
+    )?;
+    let tensor = artifact.tensor("one")?;
+    assert_eq!(
+        tensor.name(),
+        "one",
+        "verified name must come from the owned parse"
+    );
+    assert_eq!(
+        tensor.ggml_type(),
+        GgmlType::F32,
+        "verified tensor must retain its checked storage type"
+    );
+    assert_eq!(
+        tensor.dims(),
+        [3],
+        "verified tensor must retain the checked descriptor dimensions"
+    );
+    let f32_values = tensor
+        .bytes()
+        .chunks_exact(4)
+        .map(|chunk| {
+            let mut encoded = [0u8; 4];
+            encoded.copy_from_slice(chunk);
+            f32::from_le_bytes(encoded)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        f32_values,
+        [1.0_f32, 2.0, 3.0],
+        "F32 consumers must read the verified serialized bytes directly"
+    );
+    assert_eq!(
+        artifact.observation().inspection().digest,
+        ArtifactDigest::Sha256(digest_for_bytes(&bytes)),
+        "reported identity must be derived from the same owned bytes"
+    );
+    assert!(
+        matches!(artifact.tensor("absent"), Err(Error::TensorNotFound { .. })),
+        "verified artifact lookup must refuse tensor names absent from its own index"
+    );
+    Ok(())
+}
+
+#[test]
+fn verified_artifact_borrows_checked_q8_payload_without_copying_a_model() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("verified-q8.gguf");
+    let mut bytes = one_tensor_fixture(8, &[32], 0, quant::Q8_0_BLOCK_BYTES)?;
+    let payload_offset = bytes.len() - quant::Q8_0_BLOCK_BYTES;
+    let payload = bytes.get_mut(payload_offset..).ok_or_else(|| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: "Q8 fixture payload range is outside fixture bytes".to_string(),
+        }
+        .build()
+    })?;
+    let scale = 0x3800u16.to_le_bytes();
+    payload
+        .get_mut(..2)
+        .ok_or_else(|| {
+            GgufSnafu {
+                offset: 0u64,
+                msg: "Q8 fixture scale range is outside Q8 block".to_string(),
+            }
+            .build()
+        })?
+        .copy_from_slice(&scale);
+    let values = payload.get_mut(2..).ok_or_else(|| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: "Q8 fixture values range is outside Q8 block".to_string(),
+        }
+        .build()
+    })?;
+    values.fill(2u8);
+    std::fs::write(&path, &bytes)?;
+
+    let artifact = VerifiedArtifact::load(
+        &path,
+        digest_for_bytes(&bytes),
+        fixture_backing_limit(&bytes)?,
+    )?;
+    let tensor = artifact.tensor("tensor")?;
+    assert_eq!(
+        tensor.ggml_type(),
+        GgmlType::Q8_0,
+        "verified tensor must preserve Q8_0 format identity"
+    );
+    let block = quant::Q8_0Block::parse(tensor.bytes()).map_err(|error| {
+        GgufSnafu {
+            offset: 0u64,
+            msg: format!("verified Q8 block was rejected by quant: {error}"),
+        }
+        .build()
+    })?;
+    assert!(
+        block
+            .decode_f32()
+            .iter()
+            .all(|value| value.to_bits() == 1.0_f32.to_bits()),
+        "Q8 decoding must consume the artifact-owned bytes directly"
+    );
+    Ok(())
+}
+
+#[test]
+fn verified_artifact_refuses_wrong_expected_digest() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("wrong-digest.gguf");
+    let bytes = fixture_bytes();
+    let other_bytes = one_tensor_fixture(0, &[1], 0, 4)?;
+    std::fs::write(&path, &bytes)?;
+
+    assert!(
+        matches!(
+            VerifiedArtifact::load(
+                &path,
+                digest_for_bytes(&other_bytes),
+                fixture_backing_limit(&bytes)?
+            ),
+            Err(Error::ArtifactDigestMismatch { .. })
+        ),
+        "a valid but different artifact identity must not be admitted"
+    );
+    Ok(())
+}
+
+#[test]
+fn verified_artifact_refuses_malformed_bytes_even_when_digest_matches() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("matching-malformed-digest.gguf");
+    let bytes = b"not-a-gguf";
+    std::fs::write(&path, bytes)?;
+
+    assert!(
+        matches!(
+            VerifiedArtifact::load(
+                &path,
+                digest_for_bytes(bytes),
+                fixture_backing_limit(bytes)?
+            ),
+            Err(Error::Gguf { .. })
+        ),
+        "digest equality must not bypass GGUF validation"
+    );
+    Ok(())
+}
+
+#[test]
+fn verified_artifact_refuses_non_regular_input() {
+    let dir = tempdir_for_test();
+    let expected = digest_for_bytes(b"not-read");
+    let limit = ArtifactByteLimit::new(NonZeroU64::MIN);
+
+    assert!(
+        matches!(
+            VerifiedArtifact::load(&dir, expected, limit),
+            Err(Error::ArtifactInputNotRegular { .. })
+        ),
+        "a directory must not be treated as an empty verified artifact"
+    );
+}
+
+#[test]
+fn verified_artifact_limit_refuses_before_reading_payload() {
+    let mut reader = RefusingReader;
+    let serialized_bytes = 2u64;
+    let limit = ArtifactByteLimit::new(NonZeroU64::MIN);
+    assert!(
+        matches!(
+            payload::read_backing(&mut reader, serialized_bytes, limit),
+            Err(Error::ArtifactExceedsByteLimit {
+                serialized_bytes: 2,
+                ..
+            })
+        ),
+        "backing limit must be checked before the reader can observe payload bytes"
+    );
+}
+
+#[test]
+fn verified_artifact_survives_same_length_overwrite_truncate_and_path_replacement() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("stable-owned-backing.gguf");
+    let replacement_path = dir.join("replacement.gguf");
+    let bytes = fixture_bytes();
+    std::fs::write(&path, &bytes)?;
+
+    let artifact = VerifiedArtifact::load(
+        &path,
+        digest_for_bytes(&bytes),
+        fixture_backing_limit(&bytes)?,
+    )?;
+    std::fs::write(&path, vec![0u8; bytes.len()])?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)?
+        .set_len(0)?;
+    std::fs::write(&replacement_path, fixture_bytes())?;
+    std::fs::rename(&replacement_path, &path)?;
+
+    let tensor = artifact.tensor("one")?;
+    assert_eq!(
+        tensor.bytes(),
+        [1.0_f32, 2.0, 3.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>(),
+        "verified access must remain bound to copied bytes after all path mutations"
+    );
+    Ok(())
+}
+
+struct RefusingReader;
+
+impl Read for RefusingReader {
+    fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::other(
+            "limit test reader must not be read after a limit refusal",
+        ))
+    }
 }
 
 #[test]
