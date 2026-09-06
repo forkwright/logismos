@@ -753,6 +753,7 @@ impl RecurrentStepAllocations {
         let gdn = kernels::MultiHeadRecurrentAllocationPlan::try_from_dimensions(
             token_count,
             layout.value_head_count,
+            layout.value_head_count,
             layout.key_dim,
             layout.value_dim,
         )

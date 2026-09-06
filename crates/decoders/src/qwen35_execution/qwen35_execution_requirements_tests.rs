@@ -16,7 +16,7 @@ fn named_owners_reconcile_a_large_nondegenerate_shape() -> std::result::Result<(
     assert_eq!(convolution.output_elements(), 110);
     assert_eq!(convolution.history_elements(), 330);
 
-    let gdn = kernels::MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 6, 17, 7)
+    let gdn = kernels::MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 6, 6, 17, 7)
         .map_err(|error| error.to_string())?;
     assert_eq!(gdn.output_elements(), 42);
     assert_eq!(gdn.state_elements(), 714);
@@ -236,7 +236,7 @@ fn artifact_plan_report_and_all_last_execution_agree() -> std::result::Result<()
 fn owner_arithmetic_overflow_is_rejected_before_execution() -> std::result::Result<(), String> {
     assert!(kernels::CausalConvAllocationPlan::try_from_dimensions(usize::MAX, 2, 4).is_err());
     assert!(
-        kernels::MultiHeadRecurrentAllocationPlan::try_from_dimensions(usize::MAX, 2, 2, 2,)
+        kernels::MultiHeadRecurrentAllocationPlan::try_from_dimensions(usize::MAX, 2, 2, 2, 2,)
             .is_err()
     );
 

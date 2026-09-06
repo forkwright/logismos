@@ -19,8 +19,9 @@ pub type CausalConvResult<T> = core::result::Result<T, CausalConvError>;
 /// allocator capacity or resident memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CausalConvAllocationPlan {
-    output_elements: usize,
-    history_elements: usize,
+    output: usize,
+    weights: usize,
+    history: usize,
 }
 
 impl CausalConvAllocationPlan {
@@ -39,29 +40,26 @@ impl CausalConvAllocationPlan {
         validate_nonzero_dimension("width", width)?;
         let history_width = checked_subtract(width, 1, "width - 1")?;
         Ok(Self {
-            output_elements: checked_product(
-                token_count,
-                channel_count,
-                "token_count * channel_count",
-            )?,
-            history_elements: checked_product(
-                channel_count,
-                history_width,
-                "channel_count * (width - 1)",
-            )?,
+            output: checked_product(token_count, channel_count, "token_count * channel_count")?,
+            weights: checked_product(channel_count, width, "channel_count * width")?,
+            history: checked_product(channel_count, history_width, "channel_count * (width - 1)")?,
         })
     }
 
     /// Return the exact requested output capacity.
     #[must_use]
     pub const fn output_elements(self) -> usize {
-        self.output_elements
+        self.output
     }
 
     /// Return the exact requested final-history capacity.
     #[must_use]
     pub const fn history_elements(self) -> usize {
-        self.history_elements
+        self.history
+    }
+
+    const fn weight_elements(self) -> usize {
+        self.weights
     }
 }
 
@@ -181,10 +179,9 @@ impl<'a> CausalConvInput<'a> {
     ) -> CausalConvResult<Self> {
         let allocations =
             CausalConvAllocationPlan::try_from_dimensions(token_count, channel_count, width)?;
-        let weight_len = checked_product(channel_count, width, "channel_count * width")?;
 
         validate_length("input", input.len(), allocations.output_elements())?;
-        validate_length("weights", weights.len(), weight_len)?;
+        validate_length("weights", weights.len(), allocations.weight_elements())?;
         validate_length("history", history.len(), allocations.history_elements())?;
         validate_scalars("input", input)?;
         validate_scalars("weights", weights)?;

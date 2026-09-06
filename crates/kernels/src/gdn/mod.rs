@@ -24,7 +24,9 @@ pub type GdnResult<T> = core::result::Result<T, GdnError>;
 /// its dimension arithmetic or inventing model-level coefficients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MultiHeadRecurrentAllocationPlan {
+    query_and_key_elements: usize,
     output_elements: usize,
+    scalar_elements: usize,
     state_elements: usize,
     head: RecurrentAllocationPlan,
     workspace_elements: usize,
@@ -35,23 +37,43 @@ impl MultiHeadRecurrentAllocationPlan {
     ///
     /// # Errors
     ///
-    /// Returns [`GdnError`] when a required dimension is zero or an element
-    /// product or allocation-envelope sum overflows.
+    /// Returns [`GdnError`] when a required dimension is zero, value heads do
+    /// not divide evenly across key heads, or an element product or
+    /// allocation-envelope sum overflows.
     pub fn try_from_dimensions(
         token_count: usize,
+        key_head_count: usize,
         value_head_count: usize,
         key_dim: usize,
         value_dim: usize,
     ) -> GdnResult<Self> {
         validate_nonzero_dimension("token_count", token_count)?;
+        validate_nonzero_dimension("key_head_count", key_head_count)?;
         validate_nonzero_dimension("value_head_count", value_head_count)?;
         validate_nonzero_dimension("key_dim", key_dim)?;
         validate_nonzero_dimension("value_dim", value_dim)?;
+        if !value_head_count.is_multiple_of(key_head_count) {
+            return HeadGroupingMismatchSnafu {
+                key_head_count,
+                value_head_count,
+            }
+            .fail();
+        }
         let head = RecurrentAllocationPlan::try_from_dimensions(token_count, key_dim, value_dim)?;
+        let query_and_key_elements = checked_product(
+            key_head_count,
+            head.query_and_key,
+            "key_head_count * token_count * key_dim",
+        )?;
         let output_elements = checked_product(
             value_head_count,
             head.output,
             "value_head_count * token_count * value_dim",
+        )?;
+        let scalar_elements = checked_product(
+            value_head_count,
+            token_count,
+            "value_head_count * token_count",
         )?;
         let state_elements = checked_product(
             value_head_count,
@@ -69,7 +91,9 @@ impl MultiHeadRecurrentAllocationPlan {
         .into_iter()
         .try_fold(0_usize, checked_allocation_sum)?;
         Ok(Self {
+            query_and_key_elements,
             output_elements,
+            scalar_elements,
             state_elements,
             head,
             workspace_elements,
@@ -120,6 +144,14 @@ impl MultiHeadRecurrentAllocationPlan {
 
     const fn head_allocations(self) -> RecurrentAllocationPlan {
         self.head
+    }
+
+    const fn query_and_key_elements(self) -> usize {
+        self.query_and_key_elements
+    }
+
+    const fn scalar_elements(self) -> usize {
+        self.scalar_elements
     }
 }
 
@@ -301,31 +333,10 @@ impl<'a> RecurrentInput<'a> {
         value_dim: usize,
         allocations: RecurrentAllocationPlan,
     ) -> GdnResult<Self> {
-        if key_dim == 0 {
-            return ZeroDimensionSnafu {
-                dimension: "key_dim",
-            }
-            .fail();
-        }
-        if value_dim == 0 {
-            return ZeroDimensionSnafu {
-                dimension: "value_dim",
-            }
-            .fail();
-        }
-
         let token_count = beta.len();
-        if token_count == 0 {
-            return ZeroDimensionSnafu {
-                dimension: "token_count",
-            }
-            .fail();
-        }
 
-        let query_and_key_len = checked_product(token_count, key_dim, "token_count * key_dim")?;
-
-        validate_length("q", q.len(), query_and_key_len)?;
-        validate_length("k", k.len(), query_and_key_len)?;
+        validate_length("q", q.len(), allocations.query_and_key)?;
+        validate_length("k", k.len(), allocations.query_and_key)?;
         validate_length("v", v.len(), allocations.output)?;
         validate_length("g", g.len(), token_count)?;
         validate_length("state", state.len(), allocations.state)?;
@@ -434,73 +445,19 @@ impl<'a> MultiHeadRecurrentInput<'a> {
         key_dim: usize,
         value_dim: usize,
     ) -> GdnResult<Self> {
-        validate_nonzero_dimension("token_count", token_count)?;
-        validate_nonzero_dimension("key_head_count", key_head_count)?;
-        validate_nonzero_dimension("value_head_count", value_head_count)?;
-        validate_nonzero_dimension("key_dim", key_dim)?;
-        validate_nonzero_dimension("value_dim", value_dim)?;
-        if !value_head_count.is_multiple_of(key_head_count) {
-            return HeadGroupingMismatchSnafu {
-                key_head_count,
-                value_head_count,
-            }
-            .fail();
-        }
-
         let allocations = MultiHeadRecurrentAllocationPlan::try_from_dimensions(
             token_count,
+            key_head_count,
             value_head_count,
             key_dim,
             value_dim,
         )?;
 
-        let key_head_width = checked_product(token_count, key_dim, "token_count * key_dim")?;
-        let value_head_width = checked_product(token_count, value_dim, "token_count * value_dim")?;
-        validate_length(
-            "q",
-            q.len(),
-            checked_product(
-                key_head_count,
-                key_head_width,
-                "key_head_count * token_count * key_dim",
-            )?,
-        )?;
-        validate_length(
-            "k",
-            k.len(),
-            checked_product(
-                key_head_count,
-                key_head_width,
-                "key_head_count * token_count * key_dim",
-            )?,
-        )?;
-        validate_length(
-            "v",
-            v.len(),
-            checked_product(
-                value_head_count,
-                value_head_width,
-                "value_head_count * token_count * value_dim",
-            )?,
-        )?;
-        validate_length(
-            "beta",
-            beta.len(),
-            checked_product(
-                value_head_count,
-                token_count,
-                "value_head_count * token_count",
-            )?,
-        )?;
-        validate_length(
-            "g",
-            g.len(),
-            checked_product(
-                value_head_count,
-                token_count,
-                "value_head_count * token_count",
-            )?,
-        )?;
+        validate_length("q", q.len(), allocations.query_and_key_elements())?;
+        validate_length("k", k.len(), allocations.query_and_key_elements())?;
+        validate_length("v", v.len(), allocations.output_elements())?;
+        validate_length("beta", beta.len(), allocations.scalar_elements())?;
+        validate_length("g", g.len(), allocations.scalar_elements())?;
         validate_length("state", state.len(), allocations.state_elements())?;
 
         let input = Self {
@@ -532,23 +489,18 @@ impl<'a> MultiHeadRecurrentInput<'a> {
     fn head_input(&self, value_head_index: usize) -> GdnResult<RecurrentInput<'a>> {
         let heads_per_key = self.value_head_count / self.key_head_count;
         let key_head_index = value_head_index / heads_per_key;
-        let key_head_width =
-            checked_product(self.token_count, self.key_dim, "token_count * key_dim")?;
-        let value_head_width =
-            checked_product(self.token_count, self.value_dim, "token_count * value_dim")?;
-        let state_head_width =
-            checked_product(self.key_dim, self.value_dim, "key_dim * value_dim")?;
+        let head = self.allocations.head_allocations();
         RecurrentInput::new_with_allocations(
-            head_slice(self.q, key_head_index, key_head_width, "q")?,
-            head_slice(self.k, key_head_index, key_head_width, "k")?,
-            head_slice(self.v, value_head_index, value_head_width, "v")?,
+            head_slice(self.q, key_head_index, head.query_and_key, "q")?,
+            head_slice(self.k, key_head_index, head.query_and_key, "k")?,
+            head_slice(self.v, value_head_index, head.output, "v")?,
             head_slice(self.beta, value_head_index, self.token_count, "beta")?,
             head_slice(self.g, value_head_index, self.token_count, "g")?,
             self.scale,
-            head_slice(self.state, value_head_index, state_head_width, "state")?,
+            head_slice(self.state, value_head_index, head.state, "state")?,
             self.key_dim,
             self.value_dim,
-            self.allocations.head_allocations(),
+            head,
         )
     }
 }
@@ -707,6 +659,7 @@ fn checked_product(left: usize, right: usize, dimensions: &'static str) -> GdnRe
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecurrentAllocationPlan {
+    query_and_key: usize,
     output: usize,
     state: usize,
     state_times_key: usize,
@@ -719,7 +672,11 @@ impl RecurrentAllocationPlan {
         key_dim: usize,
         value_dim: usize,
     ) -> GdnResult<Self> {
+        validate_nonzero_dimension("key_dim", key_dim)?;
+        validate_nonzero_dimension("value_dim", value_dim)?;
+        validate_nonzero_dimension("token_count", token_count)?;
         Ok(Self {
+            query_and_key: checked_product(token_count, key_dim, "token_count * key_dim")?,
             output: checked_product(token_count, value_dim, "token_count * value_dim")?,
             state: checked_product(key_dim, value_dim, "key_dim * value_dim")?,
             state_times_key: value_dim,
