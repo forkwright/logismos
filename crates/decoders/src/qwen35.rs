@@ -63,12 +63,56 @@ const SSM_DT_ROLE: &str = "ssm_dt.bias";
 const SSM_NORM_ROLE: &str = "ssm_norm.weight";
 const SSM_OUT_ROLE: &str = "ssm_out.weight";
 
-const GLOBAL_TENSOR_COUNT: u64 = 3;
-const FULL_ATTENTION_ROLE_COUNT: u64 = 11;
-const RECURRENT_ROLE_COUNT: u64 = 14;
-const NEXTN_ROLE_COUNT: u64 = 15;
 const MAX_NEXTN_LAYERS: u64 = 1;
 const Q_PROJECTION_MULTIPLIER: u64 = 2;
+
+/// The sole structural role inventory. Counts and the expected-name/shape map
+/// both derive from these templates. Every main block receives the common
+/// attention/FFN/norm slice; its kind contributes exactly one specific slice.
+/// `NEXTN_EXTENSION_TEMPLATES` deliberately extends the full-attention
+/// composition, because a `NextN` block has every full-attention role plus its
+/// four terminal roles.
+const GLOBAL_TEMPLATES: &[TensorTemplate] = &[
+    TensorTemplate::new(TOKEN_EMBEDDING_TENSOR, TemplateShape::HiddenVocabulary),
+    TensorTemplate::new(OUTPUT_NORM_TENSOR, TemplateShape::Hidden),
+    TensorTemplate::new(OUTPUT_TENSOR, TemplateShape::HiddenVocabulary),
+];
+
+const COMMON_BLOCK_TEMPLATES: &[TensorTemplate] = &[
+    TensorTemplate::new(ATTN_NORM_ROLE, TemplateShape::Hidden),
+    TensorTemplate::new(FFN_DOWN_ROLE, TemplateShape::FeedForwardDown),
+    TensorTemplate::new(FFN_GATE_ROLE, TemplateShape::FeedForwardUp),
+    TensorTemplate::new(FFN_UP_ROLE, TemplateShape::FeedForwardUp),
+    TensorTemplate::new(POST_ATTENTION_NORM_ROLE, TemplateShape::Hidden),
+];
+
+const FULL_ATTENTION_TEMPLATES: &[TensorTemplate] = &[
+    TensorTemplate::new(ATTN_K_ROLE, TemplateShape::FullAttentionKey),
+    TensorTemplate::new(ATTN_K_NORM_ROLE, TemplateShape::KeyWidth),
+    TensorTemplate::new(ATTN_OUTPUT_ROLE, TemplateShape::FullAttentionOutput),
+    TensorTemplate::new(ATTN_Q_ROLE, TemplateShape::FullAttentionQuery),
+    TensorTemplate::new(ATTN_Q_NORM_ROLE, TemplateShape::KeyWidth),
+    TensorTemplate::new(ATTN_V_ROLE, TemplateShape::FullAttentionValue),
+];
+
+const RECURRENT_TEMPLATES: &[TensorTemplate] = &[
+    TensorTemplate::new(ATTN_GATE_ROLE, TemplateShape::RecurrentGate),
+    TensorTemplate::new(ATTN_QKV_ROLE, TemplateShape::RecurrentQkv),
+    TensorTemplate::new(SSM_A_ROLE, TemplateShape::TimeStepRank),
+    TensorTemplate::new(SSM_ALPHA_ROLE, TemplateShape::HiddenTimeStepRank),
+    TensorTemplate::new(SSM_BETA_ROLE, TemplateShape::HiddenTimeStepRank),
+    TensorTemplate::new(SSM_CONV1D_ROLE, TemplateShape::RecurrentConvolution),
+    TensorTemplate::new(SSM_DT_ROLE, TemplateShape::TimeStepRank),
+    TensorTemplate::new(SSM_NORM_ROLE, TemplateShape::RecurrentHead),
+    TensorTemplate::new(SSM_OUT_ROLE, TemplateShape::RecurrentOutput),
+];
+
+const NEXTN_EXTENSION_TEMPLATES: &[TensorTemplate] = &[
+    TensorTemplate::new(NEXTN_EH_PROJ_ROLE, TemplateShape::NextNProjection),
+    TensorTemplate::new(NEXTN_ENORM_ROLE, TemplateShape::Hidden),
+    TensorTemplate::new(NEXTN_HNORM_ROLE, TemplateShape::Hidden),
+    TensorTemplate::new(NEXTN_SHARED_HEAD_NORM_ROLE, TemplateShape::Hidden),
+];
 
 /// A source-derived Qwen3.5 tensor topology bound to one opaque observation.
 ///
@@ -302,28 +346,37 @@ impl Dimensions {
     }
 
     fn expected_tensor_count(&self) -> Result<u64> {
+        let global = template_count(GLOBAL_TEMPLATES, "global tensor inventory")?;
+        let full_attention_roles =
+            block_template_count(FULL_ATTENTION_TEMPLATES, "full-attention tensor inventory")?;
+        let recurrent_roles =
+            block_template_count(RECURRENT_TEMPLATES, "recurrent tensor inventory")?;
+        let nextn_roles = checked_add(
+            full_attention_roles,
+            template_count(
+                NEXTN_EXTENSION_TEMPLATES,
+                "NextN extension tensor inventory",
+            )?,
+            "NextN tensor inventory",
+        )?;
         let recurrent = checked_mul(
             self.recurrent_count(),
-            RECURRENT_ROLE_COUNT,
+            recurrent_roles,
             "recurrent tensor inventory",
         )?;
         let full_attention = checked_mul(
             self.full_attention_count(),
-            FULL_ATTENTION_ROLE_COUNT,
+            full_attention_roles,
             "full-attention tensor inventory",
         )?;
         let nextn = checked_mul(
             self.nextn_block_count,
-            NEXTN_ROLE_COUNT,
+            nextn_roles,
             "NextN tensor inventory",
         )?;
         checked_add(
             checked_add(
-                checked_add(
-                    GLOBAL_TENSOR_COUNT,
-                    recurrent,
-                    "global plus recurrent tensor inventory",
-                )?,
+                checked_add(global, recurrent, "global plus recurrent tensor inventory")?,
                 full_attention,
                 "full structural tensor inventory",
             )?,
@@ -399,6 +452,106 @@ struct RecurrentShapes {
     head_width: u64,
 }
 
+#[derive(Clone, Copy)]
+struct TensorTemplate {
+    role: &'static str,
+    shape: TemplateShape,
+}
+
+impl TensorTemplate {
+    const fn new(role: &'static str, shape: TemplateShape) -> Self {
+        Self { role, shape }
+    }
+
+    fn shape(self, dimensions: &Dimensions) -> Result<Vec<u64>> {
+        match self.shape {
+            TemplateShape::HiddenVocabulary => Ok(vec![dimensions.hidden, dimensions.vocabulary]),
+            TemplateShape::Hidden => Ok(vec![dimensions.hidden]),
+            TemplateShape::KeyWidth => Ok(vec![dimensions.key_width]),
+            TemplateShape::FullAttentionKey => {
+                let shapes = dimensions.full_attention_shapes()?;
+                Ok(vec![dimensions.hidden, shapes.key])
+            }
+            TemplateShape::FullAttentionOutput => {
+                let shapes = dimensions.full_attention_shapes()?;
+                Ok(vec![shapes.output, dimensions.hidden])
+            }
+            TemplateShape::FullAttentionQuery => {
+                let shapes = dimensions.full_attention_shapes()?;
+                Ok(vec![dimensions.hidden, shapes.query])
+            }
+            TemplateShape::FullAttentionValue => {
+                let shapes = dimensions.full_attention_shapes()?;
+                Ok(vec![dimensions.hidden, shapes.value])
+            }
+            TemplateShape::FeedForwardDown => Ok(vec![dimensions.feed_forward, dimensions.hidden]),
+            TemplateShape::FeedForwardUp => Ok(vec![dimensions.hidden, dimensions.feed_forward]),
+            TemplateShape::RecurrentGate => Ok(vec![dimensions.hidden, dimensions.inner]),
+            TemplateShape::RecurrentQkv => {
+                let shapes = dimensions.recurrent_shapes()?;
+                Ok(vec![dimensions.hidden, shapes.conv_width])
+            }
+            TemplateShape::TimeStepRank => Ok(vec![dimensions.time_step_rank]),
+            TemplateShape::HiddenTimeStepRank => {
+                Ok(vec![dimensions.hidden, dimensions.time_step_rank])
+            }
+            TemplateShape::RecurrentConvolution => {
+                let shapes = dimensions.recurrent_shapes()?;
+                Ok(vec![dimensions.conv_kernel, shapes.conv_width])
+            }
+            TemplateShape::RecurrentHead => {
+                let shapes = dimensions.recurrent_shapes()?;
+                Ok(vec![shapes.head_width])
+            }
+            TemplateShape::RecurrentOutput => Ok(vec![dimensions.inner, dimensions.hidden]),
+            TemplateShape::NextNProjection => Ok(vec![
+                checked_mul(
+                    dimensions.hidden,
+                    Q_PROJECTION_MULTIPLIER,
+                    "NextN hidden projection width",
+                )?,
+                dimensions.hidden,
+            ]),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TemplateShape {
+    HiddenVocabulary,
+    Hidden,
+    KeyWidth,
+    FullAttentionKey,
+    FullAttentionOutput,
+    FullAttentionQuery,
+    FullAttentionValue,
+    FeedForwardDown,
+    FeedForwardUp,
+    RecurrentGate,
+    RecurrentQkv,
+    TimeStepRank,
+    HiddenTimeStepRank,
+    RecurrentConvolution,
+    RecurrentHead,
+    RecurrentOutput,
+    NextNProjection,
+}
+
+fn template_count(templates: &[TensorTemplate], context: &'static str) -> Result<u64> {
+    u64::try_from(templates.len()).map_err(|_| ArithmeticOverflowSnafu { context }.build())
+}
+
+fn block_template_count(
+    specific_templates: &[TensorTemplate],
+    context: &'static str,
+) -> Result<u64> {
+    checked_add(
+        template_count(COMMON_BLOCK_TEMPLATES, context)?,
+        template_count(specific_templates, context)?,
+        context,
+    )
+}
+
 fn validate_tensor_inventory(dimensions: &Dimensions, tensors: &[TensorDescriptor]) -> Result<()> {
     let expected_count = dimensions.expected_tensor_count()?;
     let actual_count = u64::try_from(tensors.len()).map_err(|_| {
@@ -455,27 +608,18 @@ fn expected_tensors(dimensions: &Dimensions) -> Result<HashMap<String, Vec<u64>>
         .build()
     })?;
     let mut tensors = HashMap::with_capacity(capacity);
-    add_tensor(
-        &mut tensors,
-        TOKEN_EMBEDDING_TENSOR.to_string(),
-        vec![dimensions.hidden, dimensions.vocabulary],
-    );
-    add_tensor(
-        &mut tensors,
-        OUTPUT_NORM_TENSOR.to_string(),
-        vec![dimensions.hidden],
-    );
-    add_tensor(
-        &mut tensors,
-        OUTPUT_TENSOR.to_string(),
-        vec![dimensions.hidden, dimensions.vocabulary],
-    );
+    add_templates(&mut tensors, dimensions, None, GLOBAL_TEMPLATES)?;
 
     for block_index in 0..dimensions.main_block_count {
         if dimensions.full_attention_block(block_index) {
-            add_full_attention_block(&mut tensors, block_index, dimensions)?;
+            add_block_templates(
+                &mut tensors,
+                dimensions,
+                block_index,
+                FULL_ATTENTION_TEMPLATES,
+            )?;
         } else {
-            add_recurrent_block(&mut tensors, block_index, dimensions)?;
+            add_block_templates(&mut tensors, dimensions, block_index, RECURRENT_TEMPLATES)?;
         }
     }
     for nextn_offset in 0..dimensions.nextn_block_count {
@@ -484,180 +628,51 @@ fn expected_tensors(dimensions: &Dimensions) -> Result<HashMap<String, Vec<u64>>
             nextn_offset,
             "NextN block index",
         )?;
-        add_nextn_block(&mut tensors, block_index, dimensions)?;
+        add_block_templates(
+            &mut tensors,
+            dimensions,
+            block_index,
+            FULL_ATTENTION_TEMPLATES,
+        )?;
+        add_templates(
+            &mut tensors,
+            dimensions,
+            Some(block_index),
+            NEXTN_EXTENSION_TEMPLATES,
+        )?;
     }
     Ok(tensors)
 }
 
-fn add_full_attention_block(
+fn add_block_templates(
     tensors: &mut HashMap<String, Vec<u64>>,
-    block_index: u64,
     dimensions: &Dimensions,
-) -> Result<()> {
-    let shapes = dimensions.full_attention_shapes()?;
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, ATTN_K_ROLE),
-        vec![dimensions.hidden, shapes.key],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, ATTN_K_NORM_ROLE),
-        vec![dimensions.key_width],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, ATTN_NORM_ROLE),
-        vec![dimensions.hidden],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, ATTN_OUTPUT_ROLE),
-        vec![shapes.output, dimensions.hidden],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, ATTN_Q_ROLE),
-        vec![dimensions.hidden, shapes.query],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, ATTN_Q_NORM_ROLE),
-        vec![dimensions.key_width],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, ATTN_V_ROLE),
-        vec![dimensions.hidden, shapes.value],
-    );
-    add_ffn_tensors(tensors, block_index, dimensions);
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, POST_ATTENTION_NORM_ROLE),
-        vec![dimensions.hidden],
-    );
-    Ok(())
-}
-
-fn add_recurrent_block(
-    tensors: &mut HashMap<String, Vec<u64>>,
     block_index: u64,
-    dimensions: &Dimensions,
+    specific_templates: &[TensorTemplate],
 ) -> Result<()> {
-    let shapes = dimensions.recurrent_shapes()?;
-    add_tensor(
+    add_templates(
         tensors,
-        block_tensor_name(block_index, ATTN_GATE_ROLE),
-        vec![dimensions.hidden, dimensions.inner],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, ATTN_NORM_ROLE),
-        vec![dimensions.hidden],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, ATTN_QKV_ROLE),
-        vec![dimensions.hidden, shapes.conv_width],
-    );
-    add_ffn_tensors(tensors, block_index, dimensions);
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, POST_ATTENTION_NORM_ROLE),
-        vec![dimensions.hidden],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, SSM_A_ROLE),
-        vec![dimensions.time_step_rank],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, SSM_ALPHA_ROLE),
-        vec![dimensions.hidden, dimensions.time_step_rank],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, SSM_BETA_ROLE),
-        vec![dimensions.hidden, dimensions.time_step_rank],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, SSM_CONV1D_ROLE),
-        vec![dimensions.conv_kernel, shapes.conv_width],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, SSM_DT_ROLE),
-        vec![dimensions.time_step_rank],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, SSM_NORM_ROLE),
-        vec![shapes.head_width],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, SSM_OUT_ROLE),
-        vec![dimensions.inner, dimensions.hidden],
-    );
-    Ok(())
-}
-
-fn add_nextn_block(
-    tensors: &mut HashMap<String, Vec<u64>>,
-    block_index: u64,
-    dimensions: &Dimensions,
-) -> Result<()> {
-    add_full_attention_block(tensors, block_index, dimensions)?;
-    let double_hidden = checked_mul(
-        dimensions.hidden,
-        Q_PROJECTION_MULTIPLIER,
-        "NextN hidden projection width",
+        dimensions,
+        Some(block_index),
+        COMMON_BLOCK_TEMPLATES,
     )?;
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, NEXTN_EH_PROJ_ROLE),
-        vec![double_hidden, dimensions.hidden],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, NEXTN_ENORM_ROLE),
-        vec![dimensions.hidden],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, NEXTN_HNORM_ROLE),
-        vec![dimensions.hidden],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, NEXTN_SHARED_HEAD_NORM_ROLE),
-        vec![dimensions.hidden],
-    );
-    Ok(())
+    add_templates(tensors, dimensions, Some(block_index), specific_templates)
 }
 
-fn add_ffn_tensors(
+fn add_templates(
     tensors: &mut HashMap<String, Vec<u64>>,
-    block_index: u64,
     dimensions: &Dimensions,
-) {
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, FFN_DOWN_ROLE),
-        vec![dimensions.feed_forward, dimensions.hidden],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, FFN_GATE_ROLE),
-        vec![dimensions.hidden, dimensions.feed_forward],
-    );
-    add_tensor(
-        tensors,
-        block_tensor_name(block_index, FFN_UP_ROLE),
-        vec![dimensions.hidden, dimensions.feed_forward],
-    );
+    block_index: Option<u64>,
+    templates: &[TensorTemplate],
+) -> Result<()> {
+    for template in templates {
+        let name = match block_index {
+            Some(index) => block_tensor_name(index, template.role),
+            None => template.role.to_string(),
+        };
+        add_tensor(tensors, name, template.shape(dimensions)?);
+    }
+    Ok(())
 }
 
 fn add_tensor(tensors: &mut HashMap<String, Vec<u64>>, name: String, shape: Vec<u64>) {
