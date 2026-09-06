@@ -203,7 +203,13 @@ fn observed_artifact_rejects_malformed_and_unknown_storage_layouts() -> Result<(
     let unknown = dir.join("observed-unknown-ggml-type.gguf");
     std::fs::write(&unknown, one_tensor_fixture(u32::MAX, &[1], 0, 0)?)?;
     assert!(
-        matches!(observe_gguf_with_sha256(&unknown), Err(Error::Gguf { .. })),
+        matches!(
+            observe_gguf_with_sha256(&unknown),
+            Err(Error::UnknownGgmlType {
+                type_id: u32::MAX,
+                ..
+            })
+        ),
         "observation must refuse an unknown GGML storage layout"
     );
     Ok(())
@@ -886,7 +892,13 @@ fn reader_rejects_truly_unknown_ggml_type_before_profile_creation() -> Result<()
     let path = dir.join("unknown-ggml-type.gguf");
     std::fs::write(&path, one_tensor_fixture(u32::MAX, &[1], 0, 0)?)?;
 
-    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    assert!(matches!(
+        Reader::open(&path),
+        Err(Error::UnknownGgmlType {
+            type_id: u32::MAX,
+            ..
+        })
+    ));
     Ok(())
 }
 

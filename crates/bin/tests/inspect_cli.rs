@@ -31,6 +31,8 @@ fn v1_receipt() -> String {
     receipt
 }
 
+const V1_INVALID_GGUF_RECEIPT: &str = "{\"schema_version\":1,\"outcome\":\"error\",\"command\":\"inspect\",\"kind\":\"invalid_gguf\"}\n";
+
 fn command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_logismos"))
 }
@@ -72,6 +74,20 @@ fn fixture_bytes() -> Vec<u8> {
     for value in [1.0_f32, 2.0, 3.0] {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
+    bytes
+}
+
+fn unknown_ggml_type_fixture_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    append_string(&mut bytes, "unknown-type");
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
     bytes
 }
 
@@ -397,20 +413,6 @@ fn inspect_fails_closed_for_malformed_and_over_limit_metadata() {
     let bounded_output = run(&["inspect", "--input", as_utf8_path(&bounded)]);
     assert_typed_error(&bounded_output, "invalid_gguf");
 
-    let mut unsupported_type = Vec::new();
-    unsupported_type.extend_from_slice(b"GGUF");
-    unsupported_type.extend_from_slice(&3u32.to_le_bytes());
-    unsupported_type.extend_from_slice(&1u64.to_le_bytes());
-    unsupported_type.extend_from_slice(&0u64.to_le_bytes());
-    append_string(&mut unsupported_type, "unknown-type");
-    unsupported_type.extend_from_slice(&1u32.to_le_bytes());
-    unsupported_type.extend_from_slice(&1u64.to_le_bytes());
-    unsupported_type.extend_from_slice(&999u32.to_le_bytes());
-    unsupported_type.extend_from_slice(&0u64.to_le_bytes());
-    let unsupported = write_fixture(&directory, "unsupported-type.data", &unsupported_type);
-    let unsupported_output = run(&["inspect", "--input", as_utf8_path(&unsupported)]);
-    assert_typed_error(&unsupported_output, "invalid_gguf");
-
     let missing = directory.path().join("does-not-exist.gguf");
     let missing_output = run(&["inspect", "--input", as_utf8_path(&missing)]);
     assert_typed_error(&missing_output, "unreadable_input");
@@ -418,5 +420,32 @@ fn inspect_fails_closed_for_malformed_and_over_limit_metadata() {
     assert!(
         !missing_json.contains(as_utf8_path(&missing)),
         "error receipt must not leak the host input path"
+    );
+}
+
+#[test]
+fn inspect_unknown_ggml_type_keeps_v1_stdout_and_emits_typed_stderr() {
+    let directory = tempfile::tempdir().expect("temporary directory must be created");
+    let path = write_fixture(
+        &directory,
+        "unknown-storage-type.gguf",
+        &unknown_ggml_type_fixture_bytes(),
+    );
+
+    let output = run(&["inspect", "--input", as_utf8_path(&path)]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout must be UTF-8"),
+        V1_INVALID_GGUF_RECEIPT,
+        "unknown storage types retain the v1 invalid-GGUF receipt"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
+    assert_eq!(
+        stderr,
+        "GGUF inspection refused unknown GGML storage type id 4294967295 at descriptor offset 60\n"
+    );
+    assert!(
+        !stderr.contains(as_utf8_path(&path)),
+        "typed diagnostic must not leak the host input path"
     );
 }

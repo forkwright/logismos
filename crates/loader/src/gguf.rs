@@ -39,7 +39,7 @@ use sha2::{Digest, Sha256};
 
 #[cfg(feature = "tensor")]
 use crate::error::TensorNotFoundSnafu;
-use crate::error::{GgufSnafu, MmapStaleSnafu, Result};
+use crate::error::{GgufSnafu, MmapStaleSnafu, Result, UnknownGgmlTypeSnafu};
 // WHY imported without a code reference: the `# Errors` sections below link to
 // `Error` variants by intra-doc path, which rustdoc resolves only against items
 // in scope. Split from the group above so the expectation covers this import
@@ -148,9 +148,9 @@ impl GgmlType {
             28 => Self::F64,
             30 => Self::BF16,
             other => {
-                return GgufSnafu {
+                return UnknownGgmlTypeSnafu {
                     offset,
-                    msg: format!("unknown ggml type id {other}"),
+                    type_id: other,
                 }
                 .fail();
             }

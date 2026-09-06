@@ -218,17 +218,22 @@ fn write_inspection_metadata_report(
 }
 
 fn write_inspection_error(error: InspectionError) -> ExitCode {
+    let diagnostic = error.diagnostic();
     let receipt = InspectionErrorReceipt {
         schema_version: INSPECTION_SCHEMA_VERSION,
         outcome: "error",
         command: "inspect",
         kind: error.kind(),
     };
-    write_inspection_json(
+    let exit_code = write_inspection_json(
         &receipt,
         "unable to serialize inspection error",
         ExitCode::from(2),
-    )
+    );
+    if let Some(diagnostic) = diagnostic {
+        eprintln!("{diagnostic}");
+    }
+    exit_code
 }
 
 fn write_inspection_json(
@@ -251,6 +256,12 @@ fn map_inspection_error(error: &loader::Error) -> CliError {
     let kind = match error {
         loader::Error::Io { .. } => InspectionError::UnreadableInput,
         loader::Error::MmapStale { .. } => InspectionError::ConcurrentMutation,
+        loader::Error::UnknownGgmlType {
+            type_id, offset, ..
+        } => InspectionError::UnknownGgmlType {
+            type_id: *type_id,
+            offset: *offset,
+        },
         loader::Error::Gguf { .. } | loader::Error::Msg { .. } | _ => InspectionError::InvalidGguf,
     };
     CliError::Inspection(kind)
@@ -261,6 +272,7 @@ enum InspectionError {
     InvalidArguments,
     UnreadableInput,
     InvalidGguf,
+    UnknownGgmlType { type_id: u32, offset: u64 },
     ConcurrentMutation,
     Internal,
 }
@@ -270,10 +282,38 @@ impl InspectionError {
         match self {
             Self::InvalidArguments => "invalid_arguments",
             Self::UnreadableInput => "unreadable_input",
-            Self::InvalidGguf => "invalid_gguf",
+            Self::InvalidGguf | Self::UnknownGgmlType { .. } => "invalid_gguf",
             Self::ConcurrentMutation => "concurrent_mutation",
             Self::Internal => "internal",
         }
+    }
+
+    const fn diagnostic(self) -> Option<UnknownGgmlTypeDiagnostic> {
+        match self {
+            Self::UnknownGgmlType { type_id, offset } => {
+                Some(UnknownGgmlTypeDiagnostic { type_id, offset })
+            }
+            Self::InvalidArguments
+            | Self::UnreadableInput
+            | Self::InvalidGguf
+            | Self::ConcurrentMutation
+            | Self::Internal => None,
+        }
+    }
+}
+
+struct UnknownGgmlTypeDiagnostic {
+    type_id: u32,
+    offset: u64,
+}
+
+impl fmt::Display for UnknownGgmlTypeDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "GGUF inspection refused unknown GGML storage type id {} at descriptor offset {}",
+            self.type_id, self.offset
+        )
     }
 }
 
