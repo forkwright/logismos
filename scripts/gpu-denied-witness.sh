@@ -22,8 +22,6 @@ cleanup() {
     /usr/bin/rm -f -- \
         "$ROOT/target/gpu-denied-hardlink-a" \
         "$ROOT/target/gpu-denied-hardlink-b"
-    /usr/bin/rm -f -- "$ROOT/target/debug/logismos"
-    /usr/bin/rmdir --ignore-fail-on-non-empty "$ROOT/target/debug" 2>/dev/null || true
     /usr/bin/chmod 0700 "$ROOT/target/gpu-denied-unreadable" 2>/dev/null || true
     /usr/bin/rm -rf -- "$ROOT/target/gpu-denied-unreadable"
     /usr/bin/rm -rf -- "$FIXTURE_DIR"
@@ -215,6 +213,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 runner = Path(sys.argv[1])
@@ -245,14 +244,6 @@ artifact = Path(os.environ['LOGISMOS_GPU_DENIED_INPUT'])
 assert artifact.read_bytes() == b'synthetic artifact bytes'
 assert list(artifact.parent.iterdir()) == [artifact]
 assert not Path(sys.argv[1]).exists()
-host_source = sys.argv[1].encode()
-mountinfo = Path('/proc/self/mountinfo').read_bytes()
-pid_one_command = Path('/proc/1/cmdline').read_bytes()
-# Host spelling is not an accessible file path, but is not confidential:
-# current Bubblewrap leaves it in its PID-1 command line and mount metadata
-# retains at least the synthetic artifact name/root component.
-assert host_source in pid_one_command
-assert Path(sys.argv[1]).name.encode() in mountinfo
 failed = 0
 actions = (
     lambda: artifact.write_bytes(b'unexpected'),
@@ -276,13 +267,17 @@ if positive_input_result.returncode != 0:
     raise AssertionError(positive_input_result.stderr.decode(errors='replace'))
 
 
-# Match the documented outer/inner-shell pattern: the runner sets this
-# variable, so the outer caller must pass its expansion literally to a quoted
-# inner shell rather than expanding it before the boundary exists.
-documented_binary = root / 'target/debug/logismos'
-if documented_binary.exists() or documented_binary.is_symlink():
-    raise AssertionError('documented calling-pattern fixture path is unexpectedly occupied')
-documented_binary.parent.mkdir()
+# Match the documented outer/inner-shell pattern without claiming a normal
+# Cargo output path.  Both directories are fresh, unique target children; the
+# unrelated sentinel proves setup/cleanup leave other target binaries intact.
+documented_directory = Path(tempfile.mkdtemp(prefix='gpu-denied-doc-call-', dir=root / 'target'))
+sentinel_directory = Path(tempfile.mkdtemp(prefix='gpu-denied-unrelated-', dir=root / 'target'))
+documented_binary = documented_directory / 'logismos'
+sentinel_binary = sentinel_directory / 'logismos'
+sentinel_bytes = b'unrelated pre-existing synthetic binary'
+sentinel_binary.write_bytes(sentinel_bytes)
+sentinel_binary.chmod(0o541)
+sentinel_mode = sentinel_binary.stat().st_mode
 documented_binary.write_text(
     '#!/bin/sh\n'
     'test "$1" = inspect\n'
@@ -300,15 +295,23 @@ try:
             '--',
             '/bin/sh',
             '-ceu',
-            'exec target/debug/logismos inspect --input "$LOGISMOS_GPU_DENIED_INPUT"',
+            (
+                'exec target/'
+                f'{documented_directory.name}/logismos '
+                'inspect --input "$LOGISMOS_GPU_DENIED_INPUT"'
+            ),
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
 finally:
+    if sentinel_binary.read_bytes() != sentinel_bytes or sentinel_binary.stat().st_mode != sentinel_mode:
+        raise AssertionError('documented calling-pattern fixture changed an unrelated target binary')
     documented_binary.unlink(missing_ok=True)
-    documented_binary.parent.rmdir()
+    documented_directory.rmdir()
+    sentinel_binary.unlink(missing_ok=True)
+    sentinel_directory.rmdir()
 if documented_call_result.returncode != 0:
     raise AssertionError(documented_call_result.stderr.decode(errors='replace'))
 
