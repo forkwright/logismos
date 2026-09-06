@@ -44,6 +44,10 @@ safetensors = "0.8"
 # the HTTP hub client, progressbar, and C++ esaxx dep; we keep only the
 # onig regex engine (required by BPE pre-tokenizers).
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+# WHY: interpret artifact-owned Jinja templates through a maintained format
+# runtime. No loader, multi-template imports, debug source dumps, or host I/O;
+# explicit fuel/recursion/output limits do not imply total-memory isolation.
+minijinja = { version = "2.24", default-features = false, features = ["builtins", "macros", "serde", "fuel", "json", "adjacent_loop_items", "std_collections"] }
 # memmap2: read-only mmap for bulk-tensor files. No alternatives in the
 # Rust ecosystem; used only inside loader's safetensors path.
 memmap2 = "0.9"
