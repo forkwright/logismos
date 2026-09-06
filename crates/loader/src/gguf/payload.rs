@@ -6,6 +6,7 @@ use std::io::Read;
 use std::num::NonZeroU64;
 use std::path::Path;
 
+use rustix::fs::{Mode, OFlags};
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 
@@ -81,15 +82,7 @@ impl VerifiedArtifact {
     /// not match `expected`; or [`crate::Error::Gguf`] for malformed or
     /// overflowed GGUF content whose digest did match.
     pub fn load(path: &Path, expected: Sha256Digest, limit: ArtifactByteLimit) -> Result<Self> {
-        let mut file = File::open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return ArtifactInputNotRegularSnafu {
-                path: path.to_path_buf(),
-            }
-            .fail();
-        }
-        let serialized_bytes = metadata.len();
+        let (mut file, serialized_bytes) = open_regular_file(path)?;
         let backing = read_backing(&mut file, serialized_bytes, limit)?;
         let actual = Sha256Digest::from_bytes(Sha256::digest(&backing).into());
         if actual != expected {
@@ -170,6 +163,31 @@ impl VerifiedArtifact {
         })?;
         Ok(VerifiedTensor { descriptor, bytes })
     }
+}
+
+/// Open and inspect exactly the descriptor that will provide artifact bytes.
+///
+/// `NONBLOCK` prevents a FIFO endpoint from making the verification path wait
+/// for a writer. `NOFOLLOW` rejects a final-component symlink instead of
+/// resolving it between a pathname check and open. Metadata is then queried on
+/// the returned descriptor, so a pathname replacement cannot change its type
+/// or length after this check.
+fn open_regular_file(path: &Path) -> Result<(File, u64)> {
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return ArtifactInputNotRegularSnafu {
+            path: path.to_path_buf(),
+        }
+        .fail();
+    }
+    Ok((file, metadata.len()))
 }
 
 impl fmt::Debug for VerifiedArtifact {

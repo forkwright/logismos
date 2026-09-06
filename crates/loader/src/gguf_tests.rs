@@ -386,6 +386,55 @@ fn verified_artifact_refuses_non_regular_input() {
 }
 
 #[test]
+fn verified_artifact_refuses_fifo_without_waiting_for_a_writer() -> Result<()> {
+    let dir = tempdir_for_test();
+    let fifo = dir.join("artifact.gguf.fifo");
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .map_err(std::io::Error::from)?;
+
+    assert!(
+        matches!(
+            VerifiedArtifact::load(
+                &fifo,
+                digest_for_bytes(b"not-read"),
+                ArtifactByteLimit::new(NonZeroU64::MIN),
+            ),
+            Err(Error::ArtifactInputNotRegular { .. })
+        ),
+        "a FIFO must be rejected from a nonblocking descriptor without a writer"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_artifact_refuses_symlink_input() -> Result<()> {
+    let dir = tempdir_for_test();
+    let target = dir.join("artifact.gguf");
+    let link = dir.join("artifact-link.gguf");
+    let bytes = fixture_bytes();
+    std::fs::write(&target, &bytes)?;
+    std::os::unix::fs::symlink(&target, &link)?;
+
+    assert!(
+        matches!(
+            VerifiedArtifact::load(
+                &link,
+                digest_for_bytes(&bytes),
+                fixture_backing_limit(&bytes)?
+            ),
+            Err(Error::Io { .. })
+        ),
+        "a final-component symlink must be refused rather than resolved"
+    );
+    Ok(())
+}
+
+#[test]
 fn verified_artifact_limit_refuses_before_reading_payload() {
     let mut reader = RefusingReader;
     let serialized_bytes = 2u64;

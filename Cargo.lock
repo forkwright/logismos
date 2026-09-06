@@ -585,6 +585,7 @@ dependencies = [
  "half",
  "memmap2",
  "quant",
+ "rustix",
  "safetensors",
  "sha2",
  "snafu",
