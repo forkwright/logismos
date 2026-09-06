@@ -4,8 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Phase 0 scaffold - not implemented. Intended for decoder-only model families such as Qwen and Llama."
+description = "Decoder-only family boundaries, including inspection-only Qwen3.5 structural preflight."
 publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+# Metadata-only observation keeps structural preflight independent of HIP/tensor decoding.
+loader = { path = "../loader", default-features = false }
+snafu = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

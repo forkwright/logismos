@@ -2,7 +2,9 @@
 //!
 //! Decoder-only LLM family: Qwen2 / 3 (including GDN hybrid), Llama.
 //!
-//! Phase 0 scaffold. No functional code yet.
+//! The current implementation is limited to Qwen3.5 GGUF structural preflight
+//! over an opaque loader observation. It neither decodes weights nor provides a
+//! forward model, tokenizer execution, cache, or runtime admission.
 //!
 //! ## Responsibility
 //!
@@ -11,10 +13,17 @@
 //! - Qwen3 GDN hybrid (48 GDN + 16 full attention) — gnomon target
 //! - Llama family
 //!
-//! Lands in Phase 6 alongside paged cache + speculative decoding.
+//! Forward execution lands in Phase 6 alongside paged cache + speculative decoding.
 //! Consumers: `hermeneus` for serving, `bin` for CLI, downstream
 //! repos via `core::DecoderModel`.
 #![deny(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+pub mod error;
+pub mod qwen35;
+
+pub use crate::error::{Error, Result};
+pub use crate::qwen35::Qwen35StructuralProfile;
 
 #[cfg(test)]
 const CRATE_NAME: &str = "decoders";
