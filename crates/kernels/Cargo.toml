@@ -6,8 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 description = "HIP kernel launchers + CPU reference implementations used to gate correctness at 1e-3 tolerance."
 publish = false
-autoexamples = false
-autotests = false
 
 [features]
 # Preserve the established launcher API for direct/default `kernels` users.

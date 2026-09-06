@@ -84,6 +84,14 @@ OUT="$ROOT/target/hip-build-mode-witness"
             exit 1
         fi
 
+        mkdir -p "$out/no-gpu-default"
+        env -u CARGO_FEATURE_GPU -u LOGISMOS_HIP_BUILD HIPCC=/not-a-hipcc \
+            OUT_DIR="$out/no-gpu-default" "$out/kernels-build" >"$out/no-gpu-default.log" 2>&1
+        if grep -Eq "cargo:rustc-(cfg=logismos_no_gpu_kernels|link-lib=)" "$out/no-gpu-default.log"; then
+            echo "GPU-disabled default build emitted GPU compilation or linkage" >&2
+            exit 1
+        fi
+
         mkdir -p "$out/no-gpu-required"
         if env -u CARGO_FEATURE_GPU LOGISMOS_HIP_BUILD=required OUT_DIR="$out/no-gpu-required" \
             "$out/kernels-build" >"$out/no-gpu-required.log" 2>&1; then

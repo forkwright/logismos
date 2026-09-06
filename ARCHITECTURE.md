@@ -43,7 +43,11 @@ semantically respects that boundary.
   owns Q8_0 block and row geometry; inspection and projection reuse that owner.
 - `emulation` is a CPU test aid, not a production device backend.
 - `taxis` depends locally on `hipcore`.
-- `kernels` depends locally on `hipcore` and `taxis`; it does not depend on `core`.
+- `kernels/gpu` enables the local `hipcore` and `taxis` dependencies and GPU
+  launcher modules. Its CPU references remain available without that feature;
+  `transformers` selects that CPU-only graph, while `praxis` explicitly enables
+  GPU launchers. Direct `kernels` users retain the default GPU feature. The
+  crate does not depend on `core`.
 - Cross-tier deps must be justified. Within-tier deps are code smell.
 
 ## Key invariants

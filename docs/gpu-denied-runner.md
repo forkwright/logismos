@@ -141,18 +141,27 @@ fail closed.
 ## Build modes and Clang discovery
 
 `contracts/gpu-target.txt` is the canonical HIP target (`gfx1100`). The kernel
-build script reads it for every `--offload-arch` flag. Build mode is selected
-with `LOGISMOS_HIP_BUILD`:
+build script reads it for every `--offload-arch` flag. With `kernels/gpu`
+enabled, build mode is selected with `LOGISMOS_HIP_BUILD`:
 
 - `cpu-only` emits `logismos_no_gpu_kernels` and omits the HIP archive.
 - `required` invokes `hipcc`; a missing compiler, compiler error, or empty
   HIP/CPP source discovery fails the build. Only `cpu-only` may omit the
   kernel archive.
 
-An unset mode selects `required`. `LOGISMOS_SKIP_HIP_BUILD` is retired and
-fails with its explicit replacement. The build-mode witness proves CPU mode
-and required-mode missing-compiler failure inside the boundary. It does not
-invoke a HIP compiler or device runtime.
+An unset mode selects `required` when the GPU feature is enabled. Without
+that feature, only the CPU modules compile and the HIP archive is absent;
+an explicit `required` mode is a contradictory request and fails. Invalid
+modes and the retired `LOGISMOS_SKIP_HIP_BUILD` variable fail in either
+feature set. The build-mode witness proves those refusals and CPU-only
+execution inside the boundary without invoking a HIP compiler or device
+runtime.
+
+Direct `kernels` users retain the default GPU feature. Workspace consumers
+select GPU launchers explicitly; CPU consumers disable default features.
+Cargo unifies features within a dependency graph, so mixing a GPU consumer
+with a CPU consumer can enable HIP for both. A minimal-graph check and the
+OS-enforced runner prove different properties; neither replaces the other.
 
 The runner discovers libclang without executing an ambient program. It checks
 the fixed system layouts `/usr/lib64/rocm/llvm/lib` and
