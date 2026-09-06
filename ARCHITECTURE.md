@@ -51,7 +51,8 @@ semantically respects that boundary.
   rows fail explicitly. Negative infinity is the masking representation, not
   an implicit fallback to token zero.
 - `text` is a CPU-only pipeline over `decoders`, `tokenize` and `decode`, with
-  metadata-only `loader` access and a restricted template substrate. It does
+  `loader`'s verified-GGUF artifact surface, its optional tensor adapter
+  disabled, and a restricted template substrate. It does
   not depend on scheduling, a provider adapter, or a device runtime.
 - `test-fixtures` is dev-only shared synthetic GGUF support. It has no model
   execution dependency and is never a production dependency of a pipeline.
