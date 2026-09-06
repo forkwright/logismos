@@ -733,3 +733,232 @@ impl NonZero {
         (value != 0).then_some(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use loader::gguf::{ArtifactByteLimit, Sha256Digest, VerifiedArtifact};
+    use test_fixtures::{RawGguf, RawMetadata, RawMetadataValue, RawTensor, serialize_raw_gguf};
+
+    use super::*;
+
+    const TEST_HIDDEN: u64 = 3;
+    const TEST_HEADS: u64 = 2;
+    const TEST_KV_HEADS: u64 = 1;
+    const TEST_HEAD_DIM: u64 = 2;
+    const TEST_FEED_FORWARD: u64 = 4;
+    const TEST_VOCABULARY: u64 = 4;
+    const TEST_BLOCKS: u64 = 1;
+    const TEST_CONTEXT: u32 = 4;
+
+    #[test]
+    fn executes_an_asymmetric_causal_fixture_to_a_final_hidden_row()
+    -> std::result::Result<(), String> {
+        let artifact = verify(fixture(false)?)?;
+        let weights =
+            Qwen3Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let execution = weights
+            .execution(usize::try_from(TEST_CONTEXT).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        let one = execution
+            .last_hidden(&[0])
+            .map_err(|error| error.to_string())?;
+        let two = execution
+            .last_hidden(&[0, 1])
+            .map_err(|error| error.to_string())?;
+        if one.len() != usize::try_from(TEST_HIDDEN).map_err(|error| error.to_string())? {
+            return Err("one-token result did not retain the hidden width".to_string());
+        }
+        if !two.iter().all(|value| value.is_finite()) {
+            return Err("final hidden row was not finite".to_string());
+        }
+        if one == two {
+            return Err("causal fixture did not distinguish its final token row".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_an_output_head_outside_the_embedding_profile() -> std::result::Result<(), String> {
+        let mut raw = fixture(true)?;
+        raw.tensors.push(tensor(
+            "output.weight",
+            vec![TEST_HIDDEN, TEST_VOCABULARY],
+            0.5,
+        )?);
+        let serialized = serialize_raw_gguf(&raw).map_err(|error| error.to_string())?;
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("qwen3-extra-output.gguf");
+        std::fs::write(&path, serialized.bytes).map_err(|error| error.to_string())?;
+        let limit = NonZeroU64::new(serialized.byte_len + 1).ok_or("invalid fixture limit")?;
+        let artifact = VerifiedArtifact::load(
+            &path,
+            Sha256Digest::from_bytes(serialized.sha256),
+            ArtifactByteLimit::new(limit),
+        )
+        .map_err(|error| error.to_string())?;
+        if Qwen3Weights::try_from_verified(&artifact).is_ok() {
+            return Err("bounded embedding profile accepted output.weight".to_string());
+        }
+        Ok(())
+    }
+
+    fn verify(raw: RawGguf) -> std::result::Result<VerifiedArtifact, String> {
+        let serialized = serialize_raw_gguf(&raw).map_err(|error| error.to_string())?;
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("qwen3.gguf");
+        std::fs::write(&path, &serialized.bytes).map_err(|error| error.to_string())?;
+        let limit = NonZeroU64::new(serialized.byte_len + 1).ok_or("invalid fixture limit")?;
+        VerifiedArtifact::load(
+            &path,
+            Sha256Digest::from_bytes(serialized.sha256),
+            ArtifactByteLimit::new(limit),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn fixture(_extra_output: bool) -> std::result::Result<RawGguf, String> {
+        let mut tensors = vec![
+            tensor(
+                "token_embd.weight",
+                vec![TEST_HIDDEN, TEST_VOCABULARY],
+                0.125,
+            )?,
+            tensor("output_norm.weight", vec![TEST_HIDDEN], 1.0)?,
+        ];
+        for (role, dimensions, seed) in [
+            ("attn_norm.weight", vec![TEST_HIDDEN], 1.0),
+            ("attn_q_norm.weight", vec![TEST_HEAD_DIM], 1.0),
+            ("attn_k_norm.weight", vec![TEST_HEAD_DIM], 1.0),
+            ("ffn_norm.weight", vec![TEST_HIDDEN], 1.0),
+            (
+                "attn_q.weight",
+                vec![TEST_HIDDEN, TEST_HEADS * TEST_HEAD_DIM],
+                0.0625,
+            ),
+            (
+                "attn_k.weight",
+                vec![TEST_HIDDEN, TEST_KV_HEADS * TEST_HEAD_DIM],
+                0.09375,
+            ),
+            (
+                "attn_v.weight",
+                vec![TEST_HIDDEN, TEST_KV_HEADS * TEST_HEAD_DIM],
+                0.125,
+            ),
+            (
+                "attn_output.weight",
+                vec![TEST_HEADS * TEST_HEAD_DIM, TEST_HIDDEN],
+                0.15625,
+            ),
+            (
+                "ffn_gate.weight",
+                vec![TEST_HIDDEN, TEST_FEED_FORWARD],
+                0.1875,
+            ),
+            (
+                "ffn_up.weight",
+                vec![TEST_HIDDEN, TEST_FEED_FORWARD],
+                0.21875,
+            ),
+            (
+                "ffn_down.weight",
+                vec![TEST_FEED_FORWARD, TEST_HIDDEN],
+                0.25,
+            ),
+        ] {
+            tensors.push(tensor(&format!("blk.0.{role}"), dimensions, seed)?);
+        }
+        Ok(RawGguf {
+            metadata: vec![
+                metadata_string(ARCHITECTURE, "qwen3"),
+                metadata_u32(
+                    BLOCK_COUNT,
+                    u32::try_from(TEST_BLOCKS).map_err(|error| error.to_string())?,
+                ),
+                metadata_u32(CONTEXT_LENGTH, TEST_CONTEXT),
+                metadata_u32(
+                    HIDDEN,
+                    u32::try_from(TEST_HIDDEN).map_err(|error| error.to_string())?,
+                ),
+                metadata_u32(
+                    FEED_FORWARD,
+                    u32::try_from(TEST_FEED_FORWARD).map_err(|error| error.to_string())?,
+                ),
+                metadata_u32(
+                    HEADS,
+                    u32::try_from(TEST_HEADS).map_err(|error| error.to_string())?,
+                ),
+                metadata_u32(
+                    KV_HEADS,
+                    u32::try_from(TEST_KV_HEADS).map_err(|error| error.to_string())?,
+                ),
+                metadata_u32(
+                    KEY_LENGTH,
+                    u32::try_from(TEST_HEAD_DIM).map_err(|error| error.to_string())?,
+                ),
+                metadata_u32(
+                    VALUE_LENGTH,
+                    u32::try_from(TEST_HEAD_DIM).map_err(|error| error.to_string())?,
+                ),
+                metadata_f32(RMS_EPSILON, 0.001),
+                metadata_u32(
+                    ROPE_DIMENSION,
+                    u32::try_from(TEST_HEAD_DIM).map_err(|error| error.to_string())?,
+                ),
+                metadata_f32(ROPE_BASE, 10_000.0),
+                metadata_u32(
+                    POOLING_TYPE,
+                    u32::try_from(LAST_POOLING_TYPE).map_err(|error| error.to_string())?,
+                ),
+                RawMetadata {
+                    key: "tokenizer.ggml.tokens".to_string(),
+                    value: RawMetadataValue::StringArray(vec![
+                        "alice".to_string(),
+                        "bob".to_string(),
+                        "acme".to_string(),
+                        "corp".to_string(),
+                    ]),
+                },
+            ],
+            tensors,
+        })
+    }
+
+    fn metadata_u32(key: &str, value: u32) -> RawMetadata {
+        RawMetadata {
+            key: key.to_string(),
+            value: RawMetadataValue::U32(value),
+        }
+    }
+    fn metadata_f32(key: &str, value: f32) -> RawMetadata {
+        RawMetadata {
+            key: key.to_string(),
+            value: RawMetadataValue::F32(value),
+        }
+    }
+    fn metadata_string(key: &str, value: &str) -> RawMetadata {
+        RawMetadata {
+            key: key.to_string(),
+            value: RawMetadataValue::String(value.to_string()),
+        }
+    }
+    fn tensor(name: &str, dims: Vec<u64>, seed: f32) -> std::result::Result<RawTensor, String> {
+        let count = dims.iter().try_fold(1_usize, |count, dimension| {
+            count
+                .checked_mul(usize::try_from(*dimension).map_err(|error| error.to_string())?)
+                .ok_or("fixture element count overflow".to_string())
+        })?;
+        let mut payload = Vec::with_capacity(count * 4);
+        for index in 0..count {
+            payload.extend_from_slice(&(seed + index as f32 * 0.0078125).to_le_bytes());
+        }
+        Ok(RawTensor {
+            name: name.to_string(),
+            dims,
+            format: 0,
+            payload,
+        })
+    }
+}
