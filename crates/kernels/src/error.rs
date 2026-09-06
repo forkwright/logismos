@@ -5,11 +5,36 @@ use snafu::Snafu;
 /// Result alias.
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// The checked step of the CPU RMSNorm reference that rejected an input or result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RmsNormStage {
+    /// Input activation values or their declared extent.
+    Input,
+    /// Learned scale values or their declared extent.
+    Weight,
+    /// Squaring an input activation.
+    Square,
+    /// Accumulating squared activations.
+    Sum,
+    /// Dividing the squared sum by the row width.
+    Mean,
+    /// Adding the numerical epsilon.
+    Epsilon,
+    /// Taking the reciprocal root mean square.
+    Inverse,
+    /// Scaling an activation by the reciprocal root mean square.
+    Scale,
+    /// Scaling the normalized activation by its learned weight.
+    Output,
+}
+
 /// Errors surfaced by the kernel launchers and CPU references.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
+    #[cfg(feature = "gpu")]
     /// Propagated HIP failure.
     #[snafu(transparent)]
     Hip {
@@ -17,6 +42,7 @@ pub enum Error {
         source: hipcore::Error,
     },
 
+    #[cfg(feature = "gpu")]
     /// Propagated tensor failure.
     #[snafu(transparent)]
     Taxis {
@@ -24,6 +50,7 @@ pub enum Error {
         source: taxis::Error,
     },
 
+    #[cfg(feature = "gpu")]
     /// Kernel launch failed — HIP reported a non-success status after
     /// kernel submission.
     #[snafu(display("kernel {kernel}: launch failed: {kind:?} (code {code})"))]
@@ -52,6 +79,91 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// CPU RMSNorm received a zero-width tensor dimension.
+    #[snafu(display("RMSNorm rejects rows={rows}, width={width}"))]
+    RmsNormInvalidDimension {
+        /// Declared row count.
+        rows: usize,
+        /// Declared row width.
+        width: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU RMSNorm's declared element count overflowed `usize`.
+    #[snafu(display("RMSNorm element count overflows for rows={rows}, width={width}"))]
+    RmsNormSizeOverflow {
+        /// Declared row count.
+        rows: usize,
+        /// Declared row width.
+        width: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU RMSNorm's supplied slice length did not match its declared shape.
+    #[snafu(display(
+        "RMSNorm {stage:?} length {actual_len} does not equal expected {expected_len} for rows={rows}, width={width}"
+    ))]
+    RmsNormShape {
+        /// Input or weight extent that failed validation.
+        stage: RmsNormStage,
+        /// Declared row count.
+        rows: usize,
+        /// Declared row width.
+        width: usize,
+        /// Computed required length.
+        expected_len: usize,
+        /// Supplied slice length.
+        actual_len: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU RMSNorm received an invalid scalar parameter.
+    #[snafu(display("RMSNorm rejects epsilon {epsilon}"))]
+    RmsNormInvalidParameter {
+        /// Rejected parameter value.
+        epsilon: f32,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU RMSNorm observed a non-finite input or intermediate value.
+    #[snafu(display(
+        "RMSNorm {stage:?} produced or received non-finite value {value} at row {row}, column {column}"
+    ))]
+    RmsNormNonFinite {
+        /// Checked RMSNorm stage.
+        stage: RmsNormStage,
+        /// Row containing the rejected value.
+        row: usize,
+        /// Column containing the rejected value.
+        column: usize,
+        /// Rejected non-finite value.
+        value: f32,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU RMSNorm could not reserve its output backing.
+    #[snafu(display("RMSNorm output allocation for {requested_len} elements failed"))]
+    RmsNormAllocation {
+        /// Requested output element count.
+        requested_len: usize,
+        /// Allocation failure.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    #[cfg(feature = "gpu")]
     /// Build was produced without the HIP kernel archive (e.g. `hipcc`
     /// was absent). CPU references still work; GPU paths return this.
     #[snafu(display("kernel {kernel}: no-GPU build (set HIPCC or install ROCm to enable)"))]
@@ -64,7 +176,7 @@ pub enum Error {
     },
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu"))]
 mod tests {
     use super::*;
 

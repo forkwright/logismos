@@ -29,6 +29,11 @@ enum HipBuildMode {
     CpuOnly,
 }
 
+struct HipBuildConfiguration {
+    mode: HipBuildMode,
+    explicitly_set: bool,
+}
+
 fn main() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(logismos_no_gpu_kernels)");
     println!("cargo:rerun-if-changed=build.rs");
@@ -48,7 +53,18 @@ fn main() -> Result<(), String> {
         );
     }
 
-    if matches!(hip_build_mode()?, HipBuildMode::CpuOnly) {
+    let hip_build = hip_build_mode()?;
+    if !gpu_feature_enabled() {
+        if hip_build.explicitly_set && matches!(hip_build.mode, HipBuildMode::Required) {
+            return Err(
+                "kernels/gpu is disabled but LOGISMOS_HIP_BUILD=required explicitly requests HIP compilation; enable the gpu feature or set LOGISMOS_HIP_BUILD=cpu-only"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+
+    if matches!(hip_build.mode, HipBuildMode::CpuOnly) {
         println!("cargo:warning=HIP kernel compile disabled (LOGISMOS_HIP_BUILD=cpu-only)");
         println!("cargo:rustc-cfg=logismos_no_gpu_kernels");
         return Ok(());
@@ -150,14 +166,27 @@ fn compile_sources(
     Ok(())
 }
 
-fn hip_build_mode() -> Result<HipBuildMode, String> {
+fn gpu_feature_enabled() -> bool {
+    env::var_os("CARGO_FEATURE_GPU").is_some()
+}
+
+fn hip_build_mode() -> Result<HipBuildConfiguration, String> {
     match env::var(HIP_BUILD_MODE_ENV) {
-        Ok(value) if value == HIP_BUILD_REQUIRED => Ok(HipBuildMode::Required),
-        Ok(value) if value == HIP_BUILD_CPU_ONLY => Ok(HipBuildMode::CpuOnly),
+        Ok(value) if value == HIP_BUILD_REQUIRED => Ok(HipBuildConfiguration {
+            mode: HipBuildMode::Required,
+            explicitly_set: true,
+        }),
+        Ok(value) if value == HIP_BUILD_CPU_ONLY => Ok(HipBuildConfiguration {
+            mode: HipBuildMode::CpuOnly,
+            explicitly_set: true,
+        }),
         Ok(value) => Err(format!(
             "invalid {HIP_BUILD_MODE_ENV}={value:?}; expected {HIP_BUILD_REQUIRED} or {HIP_BUILD_CPU_ONLY}"
         )),
-        Err(env::VarError::NotPresent) => Ok(HipBuildMode::Required),
+        Err(env::VarError::NotPresent) => Ok(HipBuildConfiguration {
+            mode: HipBuildMode::Required,
+            explicitly_set: false,
+        }),
         Err(error) => Err(format!("read {HIP_BUILD_MODE_ENV}: {error}")),
     }
 }

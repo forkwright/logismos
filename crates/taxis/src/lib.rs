@@ -4,14 +4,9 @@
 //! vessel of the platform.
 //!
 //! Runtime dtype + runtime rank, cheap `Arc` clone, `Arc<Storage>`
-//! backing. No const generics, no backend trait. Two storage variants
-//! in Phase 1 — CPU and HIP. Every HIP storage-backed tensor pins a
+//! backing. No const generics, no backend trait. Two storage variants:
+//! CPU and HIP. Every HIP storage-backed tensor pins a
 //! `hipcore::Device` for kernel dispatch.
-//!
-//! Design source: kanon's `projects/logismos/research/02-rust-frameworks.md`
-//! §3 (candle-shaped tensor) + `projects/logismos/phases/01-foundation/PLAN.md`
-//! §6.2. (See this repo's `CLAUDE.md` for how to resolve the kanon
-//! checkout root on this box.)
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]

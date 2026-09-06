@@ -80,7 +80,7 @@ verify_syntax_rejection() {
 
     if (
         cd "$fixture_root"
-        LOGISMOS_HIP_BUILD=required HIPCC="$hipcc" OUT_DIR="$fixture_root/out" "$build_script"
+        CARGO_FEATURE_GPU=1 LOGISMOS_HIP_BUILD=required HIPCC="$hipcc" OUT_DIR="$fixture_root/out" "$build_script"
     ) >"$fixture_log" 2>&1; then
         fail "syntax-error fixture unexpectedly compiled: $relative_source"
     fi
@@ -132,7 +132,7 @@ main() {
         HIPCC="$hipcc" \
         CARGO_TARGET_DIR="$cargo_target" \
         BINDGEN_EXTRA_CLANG_ARGS="-resource-dir $resource_dir" \
-        cargo build --offline --locked -p kernels --jobs 8
+        cargo build --offline --locked -p kernels --features gpu --jobs 8
 
     mapfile -t archives < <(find "$cargo_target/debug/build" -type f -path '*/out/liblogismos_kernels.a')
     if [[ "${#archives[@]}" -ne 1 ]]; then

@@ -16,9 +16,9 @@ const TEST_HEADS: u64 = 2;
 const TEST_KEY_VALUE_HEADS: u64 = 1;
 const TEST_HEAD_WIDTH: u64 = 2;
 const TEST_CONV_KERNEL: u64 = 2;
-const TEST_INNER: u64 = 6;
+const TEST_INNER: u64 = 8;
 const TEST_STATE: u64 = 2;
-const TEST_TIME_STEP_RANK: u64 = 3;
+const TEST_TIME_STEP_RANK: u64 = 4;
 const TEST_GROUP_COUNT: u64 = 2;
 const TEST_VOCABULARY: u64 = 5;
 const TEST_MAIN_BLOCKS: u64 = 4;
@@ -26,15 +26,17 @@ const TEST_FULL_ATTENTION_INTERVAL: u64 = 4;
 const TEST_F32_BYTES: u64 = 4;
 const TEST_F32_TYPE_ID: u32 = 0;
 const TEST_Q8_0_TYPE_ID: u32 = 8;
+const TEST_IQ4_NL_TYPE_ID: u32 = 20;
 const TEST_Q_WIDTH: u64 = 8;
 const TEST_FULL_ATTENTION_OUTPUT_WIDTH: u64 = 4;
-const TEST_SSM_CONV_WIDTH: u64 = 14;
+const TEST_SSM_CONV_WIDTH: u64 = 16;
 const TEST_NEXTN_PROJECTION_WIDTH: u64 = 6;
 const TEST_PROJECTION_INPUT_WIDTH: u64 = 64;
 const TEST_PROJECTION_OUTPUT_WIDTH: usize = 3;
 const TEST_Q8_SCALE_ONE_BITS: u16 = 0x3c00;
 const TEST_Q8_SCALE_NONFINITE_BITS: u16 = 0x7c00;
 const TEST_ALTERNATING_PERIOD: usize = 2;
+const TEST_RMS_EPSILON: f32 = 0.001;
 
 #[derive(Clone)]
 enum MetadataEntry {
@@ -122,6 +124,147 @@ fn accepts_small_all_f32_observation_without_nextn() -> std::result::Result<(), 
 }
 
 #[test]
+fn keeps_execution_epsilon_outside_structural_admission() -> std::result::Result<(), String> {
+    let mut fixture = fixture(1)?;
+    fixture
+        .metadata
+        .retain(|entry| entry.key() != LAYERNORM_RMS_EPSILON_KEY);
+    let artifact = observe_fixture(&fixture)?;
+    let structural = Qwen35StructuralProfile::try_from_observed(&artifact);
+    assert!(
+        structural.is_ok(),
+        "a structurally recognizable artifact need not carry a field used only by recurrent execution"
+    );
+
+    let epsilon = recurrent_layernorm_rms_epsilon(artifact.metadata());
+    assert!(
+        matches!(
+            epsilon,
+            Err(crate::Error::MissingMetadata {
+                key: LAYERNORM_RMS_EPSILON_KEY,
+                ..
+            })
+        ),
+        "recurrent execution must refuse rather than default a missing RMS epsilon"
+    );
+    Ok(())
+}
+
+#[test]
+fn executes_a_nonzero_recurrent_trunk_with_artifact_owned_state() -> std::result::Result<(), String>
+{
+    let mut fixture = fixture(1)?;
+    for name in [
+        "blk.0.attn_norm.weight",
+        "blk.0.attn_qkv.weight",
+        "blk.0.attn_gate.weight",
+        "blk.0.ssm_alpha.weight",
+        "blk.0.ssm_beta.weight",
+        "blk.0.ssm_conv1d.weight",
+        "blk.0.ssm_norm.weight",
+        "blk.0.ssm_out.weight",
+    ] {
+        set_f32_repeated(&mut fixture, name, 1.0)?;
+    }
+    set_f32_repeated(&mut fixture, "blk.0.ssm_a", -1.0)?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let mut execution = weights
+        .recurrent_execution(0)
+        .map_err(|error| error.to_string())?;
+    let input = [1.0_f32, -2.0, 3.0];
+
+    let first = execution.step(&input).map_err(|error| error.to_string())?;
+    let second = execution.step(&input).map_err(|error| error.to_string())?;
+
+    assert!(
+        first.iter().all(|value| value.is_finite()) && first.iter().any(|value| *value != 0.0),
+        "nonzero verified parameters must produce a finite nonzero recurrent output"
+    );
+    assert_ne!(
+        first, second,
+        "the second token pass must observe the execution object's retained recurrent or convolution state"
+    );
+    Ok(())
+}
+
+#[test]
+fn recurrent_step_does_not_commit_state_when_late_output_row_refuses()
+-> std::result::Result<(), String> {
+    let mut fixture = fixture(1)?;
+    for name in [
+        "blk.0.attn_norm.weight",
+        "blk.0.attn_qkv.weight",
+        "blk.0.attn_gate.weight",
+        "blk.0.ssm_alpha.weight",
+        "blk.0.ssm_beta.weight",
+        "blk.0.ssm_conv1d.weight",
+        "blk.0.ssm_norm.weight",
+        "blk.0.ssm_out.weight",
+    ] {
+        set_f32_repeated(&mut fixture, name, 1.0)?;
+    }
+    set_f32_repeated(&mut fixture, "blk.0.ssm_a", -1.0)?;
+    set_f32_value(
+        &mut fixture,
+        "blk.0.ssm_out.weight",
+        usize::from(8_u8),
+        f32::NAN,
+    )?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let mut execution = weights
+        .recurrent_execution(0)
+        .map_err(|error| error.to_string())?;
+
+    let error = execution.step(&[1.0_f32, -2.0, 3.0]);
+    assert!(error.is_err(), "a late non-finite output row must refuse");
+    assert!(
+        execution.state_for_test().iter().all(|value| *value == 0.0),
+        "the output projection failed after local recurrence, so caller-owned state must remain unchanged"
+    );
+    Ok(())
+}
+
+#[test]
+fn recurrent_trunk_matches_independent_asymmetric_f64_oracle() -> std::result::Result<(), String> {
+    let mut fixture = fixture(1)?;
+    configure_asymmetric_recurrent_payload(&mut fixture)?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let inputs = [1.0_f32, -2.0, 0.5, -1.5, 0.25, 2.0];
+    let (expected_output, expected_state) = recurrent_oracle(&inputs)?;
+
+    let mut batched = weights
+        .recurrent_execution(0)
+        .map_err(|error| error.to_string())?;
+    let actual_output = batched.step(&inputs).map_err(|error| error.to_string())?;
+    assert_f32_matches_f64(&actual_output, &expected_output, "batched recurrent output")?;
+    assert_f32_matches_f64(
+        batched.state_for_test(),
+        &expected_state,
+        "batched recurrent state",
+    )?;
+
+    let mut sequential = weights
+        .recurrent_execution(0)
+        .map_err(|error| error.to_string())?;
+    let mut sequential_output = sequential
+        .step(&inputs[..usize::from(3_u8)])
+        .map_err(|error| error.to_string())?;
+    sequential_output.extend(
+        sequential
+            .step(&inputs[usize::from(3_u8)..])
+            .map_err(|error| error.to_string())?,
+    );
+    assert_eq!(
+        actual_output, sequential_output,
+        "a two-token step must preserve the same state transition order as two one-token steps"
+    );
+    Ok(())
+}
+
+#[test]
 fn rejects_wrong_full_attention_query_shape() -> std::result::Result<(), String> {
     let mut fixture = fixture(1)?;
     mutate_tensor_shape(
@@ -135,6 +278,23 @@ fn rejects_wrong_full_attention_query_shape() -> std::result::Result<(), String>
     assert!(
         error.to_string().contains("blk.3.attn_q.weight"),
         "shape refusal must identify the mutated Q role"
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_ungroupable_recurrent_value_heads() -> std::result::Result<(), String> {
+    let mut fixture = fixture(1)?;
+    set_u32(&mut fixture, SSM_INNER_SIZE_KEY, 6)?;
+    set_u32(&mut fixture, SSM_TIME_STEP_RANK_KEY, 3)?;
+    let artifact = observe_fixture(&fixture)?;
+
+    let error = preflight_error(&artifact)?;
+    assert!(
+        error
+            .to_string()
+            .contains("ssm.time_step_rank must be divisible by ssm.group_count"),
+        "Qwen tiled V-head layouts require a whole number of values per key-head group"
     );
     Ok(())
 }
@@ -190,7 +350,7 @@ fn rejects_extra_unclassified_role() -> std::result::Result<(), String> {
 #[test]
 fn rejects_inconsistent_ssm_dimensions() -> std::result::Result<(), String> {
     let mut fixture = fixture(1)?;
-    set_u32(&mut fixture, SSM_INNER_SIZE_KEY, 3)?;
+    set_u32(&mut fixture, SSM_INNER_SIZE_KEY, 12)?;
     let artifact = observe_fixture(&fixture)?;
 
     let error = preflight_error(&artifact)?;
@@ -310,7 +470,7 @@ fn projects_verified_multiblock_q8_rows() -> std::result::Result<(), String> {
     let activations = ordered_projection_activations()?;
 
     let output = weights
-        .project_q8_0("blk.0.ffn_down.weight", &activations)
+        .project("blk.0.ffn_down.weight", &activations)
         .map_err(|error| error.to_string())?;
 
     assert_eq!(
@@ -343,25 +503,34 @@ fn projection_rejects_wrong_name_rank_dtype_and_width() -> std::result::Result<(
         })?
     ];
 
-    let wrong_name = weights.project_q8_0("blk.0.not_a_role.weight", &activations);
+    let wrong_name = weights.project("blk.0.not_a_role.weight", &activations);
     assert!(
         matches!(wrong_name, Err(crate::Error::PayloadTensor { .. })),
         "unknown tensor names must not create a projection"
     );
 
-    let wrong_rank = weights.project_q8_0(OUTPUT_NORM_TENSOR, &activations);
+    let wrong_rank = weights.project(OUTPUT_NORM_TENSOR, &activations);
     assert!(
         matches!(wrong_rank, Err(crate::Error::ProjectionRank { .. })),
         "recognized rank-one tensors must not be treated as matrices"
     );
 
-    let wrong_dtype = weights.project_q8_0(OUTPUT_TENSOR, &activations);
+    let mut unsupported_fixture = fixture_with_feed_forward(1, TEST_PROJECTION_INPUT_WIDTH)?;
+    set_tensor_type(
+        &mut unsupported_fixture,
+        "blk.0.ffn_down.weight",
+        TEST_IQ4_NL_TYPE_ID,
+    )?;
+    let unsupported_payload = verify_fixture(&unsupported_fixture)?;
+    let unsupported_weights = Qwen35Weights::try_from_verified(&unsupported_payload)
+        .map_err(|error| error.to_string())?;
+    let wrong_dtype = unsupported_weights.project("blk.0.ffn_down.weight", &activations);
     assert!(
         matches!(wrong_dtype, Err(crate::Error::ProjectionDtype { .. })),
-        "rank-two non-Q8 tensors must not be decoded by the Q8 path"
+        "inspection-only IQ4 storage must remain refused by executable projection"
     );
 
-    let wrong_width = weights.project_q8_0("blk.0.ffn_down.weight", &activations[..63]);
+    let wrong_width = weights.project("blk.0.ffn_down.weight", &activations[..63]);
     assert!(
         matches!(wrong_width, Err(crate::Error::ProjectionInputWidth { .. })),
         "activation width must exactly match the first GGUF matrix dimension"
@@ -387,7 +556,7 @@ fn projection_drops_local_output_when_a_late_q8_row_is_nonfinite() -> std::resul
         })?
     ];
 
-    let result = weights.project_q8_0("blk.0.ffn_down.weight", &activations);
+    let result = weights.project("blk.0.ffn_down.weight", &activations);
     assert!(
         matches!(result, Err(crate::Error::ProjectionRow { row: 1, .. })),
         "the second output row's non-finite serialized scale must refuse without returning row zero"
@@ -449,6 +618,7 @@ fn fixture_with_feed_forward(
             MetadataEntry::U32(SSM_STATE_SIZE_KEY, to_u32(TEST_STATE)?),
             MetadataEntry::U32(SSM_TIME_STEP_RANK_KEY, to_u32(TEST_TIME_STEP_RANK)?),
             MetadataEntry::U32(SSM_GROUP_COUNT_KEY, to_u32(TEST_GROUP_COUNT)?),
+            MetadataEntry::F32(LAYERNORM_RMS_EPSILON_KEY, TEST_RMS_EPSILON),
             MetadataEntry::StringArray(
                 TOKENS_KEY,
                 (0..TEST_VOCABULARY)
@@ -629,6 +799,428 @@ fn set_q8_payload(
     };
     tensor.ggml_type = TEST_Q8_0_TYPE_ID;
     tensor.payload = payload;
+    Ok(())
+}
+
+fn set_tensor_type(
+    fixture: &mut Fixture,
+    name: &str,
+    ggml_type: u32,
+) -> std::result::Result<(), String> {
+    let Some(tensor) = fixture
+        .tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == name)
+    else {
+        return Err(format!("fixture tensor `{name}` was not found"));
+    };
+    tensor.ggml_type = ggml_type;
+    tensor.payload.clear();
+    Ok(())
+}
+
+fn set_f32_repeated(
+    fixture: &mut Fixture,
+    name: &str,
+    value: f32,
+) -> std::result::Result<(), String> {
+    let Some(tensor) = fixture
+        .tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == name)
+    else {
+        return Err(format!("fixture tensor `{name}` was not found"));
+    };
+    if tensor.ggml_type != TEST_F32_TYPE_ID {
+        return Err(format!("fixture tensor `{name}` must use F32"));
+    }
+    let value_count = tensor
+        .dims
+        .iter()
+        .copied()
+        .try_fold(1_u64, |count, dimension| {
+            count
+                .checked_mul(dimension)
+                .ok_or_else(|| format!("fixture tensor `{name}` value count overflowed"))
+        })?;
+    let value_count = usize::try_from(value_count)
+        .map_err(|error| format!("fixture tensor `{name}` value count exceeds usize: {error}"))?;
+    tensor.payload.clear();
+    tensor.payload.reserve(
+        value_count
+            .checked_mul(usize::from(4_u8))
+            .ok_or_else(|| format!("fixture tensor `{name}` payload byte count overflowed"))?,
+    );
+    for _ in 0..value_count {
+        tensor.payload.extend(value.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn set_f32_value(
+    fixture: &mut Fixture,
+    name: &str,
+    value_index: usize,
+    value: f32,
+) -> std::result::Result<(), String> {
+    let Some(tensor) = fixture
+        .tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == name)
+    else {
+        return Err(format!("fixture tensor `{name}` was not found"));
+    };
+    let byte_start = value_index
+        .checked_mul(usize::from(4_u8))
+        .ok_or_else(|| format!("fixture tensor `{name}` value offset overflowed"))?;
+    let byte_end = byte_start
+        .checked_add(usize::from(4_u8))
+        .ok_or_else(|| format!("fixture tensor `{name}` value end overflowed"))?;
+    let Some(slot) = tensor.payload.get_mut(byte_start..byte_end) else {
+        return Err(format!(
+            "fixture tensor `{name}` has no value {value_index}"
+        ));
+    };
+    slot.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn configure_asymmetric_recurrent_payload(
+    fixture: &mut Fixture,
+) -> std::result::Result<(), String> {
+    set_f32_values(
+        &mut *fixture,
+        "blk.0.attn_norm.weight",
+        vec![1.0, -0.75, 0.5],
+    )?;
+    set_f32_values(
+        &mut *fixture,
+        "blk.0.attn_qkv.weight",
+        asymmetric_values(usize::from(48_u8), 0),
+    )?;
+    set_f32_values(
+        &mut *fixture,
+        "blk.0.attn_gate.weight",
+        asymmetric_values(usize::from(24_u8), 1),
+    )?;
+    set_f32_values(
+        &mut *fixture,
+        "blk.0.ssm_alpha.weight",
+        asymmetric_values(usize::from(12_u8), 2),
+    )?;
+    set_f32_values(
+        &mut *fixture,
+        "blk.0.ssm_beta.weight",
+        asymmetric_values(usize::from(12_u8), 3),
+    )?;
+    set_f32_values(
+        &mut *fixture,
+        "blk.0.ssm_conv1d.weight",
+        asymmetric_values(usize::from(32_u8), 4),
+    )?;
+    set_f32_values(&mut *fixture, "blk.0.ssm_a", vec![-0.4, -0.9, -0.6, -0.8])?;
+    set_f32_values(
+        &mut *fixture,
+        "blk.0.ssm_dt.bias",
+        vec![0.15, -0.1, 0.3, 0.05],
+    )?;
+    set_f32_values(&mut *fixture, "blk.0.ssm_norm.weight", vec![0.7, -1.1])?;
+    set_f32_values(
+        &mut *fixture,
+        "blk.0.ssm_out.weight",
+        asymmetric_values(usize::from(24_u8), 5),
+    )?;
+    Ok(())
+}
+
+fn asymmetric_values(value_count: usize, phase: usize) -> Vec<f32> {
+    const VALUES: [f32; 7] = [-0.75, -0.25, 0.125, 0.375, 0.625, -0.5, 0.875];
+    (0..value_count)
+        .map(|index| VALUES[(index + phase) % VALUES.len()])
+        .collect()
+}
+
+fn set_f32_values(
+    fixture: &mut Fixture,
+    name: &str,
+    values: Vec<f32>,
+) -> std::result::Result<(), String> {
+    let Some(tensor) = fixture
+        .tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == name)
+    else {
+        return Err(format!("fixture tensor `{name}` was not found"));
+    };
+    if tensor.ggml_type != TEST_F32_TYPE_ID {
+        return Err(format!("fixture tensor `{name}` must use F32"));
+    }
+    let expected = tensor
+        .dims
+        .iter()
+        .try_fold(1_u64, |count, dimension| count.checked_mul(*dimension))
+        .ok_or_else(|| format!("fixture tensor `{name}` value count overflowed"))?;
+    let expected = usize::try_from(expected)
+        .map_err(|error| format!("fixture tensor `{name}` value count exceeds usize: {error}"))?;
+    if values.len() != expected {
+        return Err(format!(
+            "fixture tensor `{name}` needs {expected} F32 values, got {}",
+            values.len()
+        ));
+    }
+    tensor.payload.clear();
+    for value in values {
+        tensor.payload.extend(value.to_le_bytes());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct OracleShape {
+    hidden: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_width: usize,
+}
+
+fn recurrent_oracle(inputs: &[f32]) -> std::result::Result<(Vec<f64>, Vec<f64>), String> {
+    let shape = OracleShape {
+        hidden: test_dimension(TEST_HIDDEN)?,
+        key_heads: test_dimension(TEST_GROUP_COUNT)?,
+        value_heads: test_dimension(TEST_TIME_STEP_RANK)?,
+        key_dim: test_dimension(TEST_STATE)?,
+        value_dim: test_dimension(TEST_STATE)?,
+        conv_width: test_dimension(TEST_SSM_CONV_WIDTH)?,
+    };
+    let token_count = inputs
+        .len()
+        .checked_div(shape.hidden)
+        .ok_or_else(|| "oracle hidden width is zero".to_string())?;
+    let attention_norm = [1.0_f64, -0.75, 0.5];
+    let normalized = oracle_rms(
+        &inputs.iter().copied().map(f64::from).collect::<Vec<_>>(),
+        &attention_norm,
+        token_count,
+        shape.hidden,
+    )?;
+    let qkv = oracle_project(
+        &normalized,
+        &asymmetric_values(48, 0),
+        shape.hidden,
+        shape.conv_width,
+    );
+    let z = oracle_project(
+        &normalized,
+        &asymmetric_values(24, 1),
+        shape.hidden,
+        shape.value_heads * shape.value_dim,
+    );
+    let alpha = oracle_project(
+        &normalized,
+        &asymmetric_values(12, 2),
+        shape.hidden,
+        shape.value_heads,
+    );
+    let beta = oracle_project(
+        &normalized,
+        &asymmetric_values(12, 3),
+        shape.hidden,
+        shape.value_heads,
+    );
+    let conv = oracle_conv(
+        &qkv,
+        &asymmetric_values(32, 4),
+        token_count,
+        shape.conv_width,
+    );
+    let convolved = conv
+        .iter()
+        .map(|value| value / (1.0 + (-value).exp()))
+        .collect::<Vec<_>>();
+    let (recurrent_output, state) =
+        oracle_recurrence(&convolved, &alpha, &beta, token_count, shape)?;
+    let output_norm = oracle_rms(
+        &recurrent_output,
+        &[0.7, -1.1],
+        token_count * shape.value_heads,
+        shape.value_dim,
+    )?;
+    let gated = output_norm
+        .iter()
+        .zip(z)
+        .map(|(output, gate)| output * (gate / (1.0 + (-gate).exp())))
+        .collect::<Vec<_>>();
+    Ok((
+        oracle_project(
+            &gated,
+            &asymmetric_values(24, 5),
+            shape.value_heads * shape.value_dim,
+            shape.hidden,
+        ),
+        state,
+    ))
+}
+
+fn oracle_project(
+    input: &[f64],
+    weights: &[f32],
+    input_width: usize,
+    output_width: usize,
+) -> Vec<f64> {
+    input
+        .chunks_exact(input_width)
+        .flat_map(|row| {
+            weights
+                .chunks_exact(input_width)
+                .take(output_width)
+                .map(move |weight| {
+                    row.iter()
+                        .zip(weight)
+                        .map(|(input, weight)| input * f64::from(*weight))
+                        .sum()
+                })
+        })
+        .collect()
+}
+
+fn oracle_rms(
+    input: &[f64],
+    weight: &[f64],
+    rows: usize,
+    width: usize,
+) -> std::result::Result<Vec<f64>, String> {
+    let width_f64 = f64::from(u32::try_from(width).map_err(|error| error.to_string())?);
+    Ok(input
+        .chunks_exact(width)
+        .take(rows)
+        .flat_map(|row| {
+            let mean_square = row.iter().map(|value| value * value).sum::<f64>() / width_f64;
+            let inverse = (mean_square + f64::from(TEST_RMS_EPSILON)).sqrt().recip();
+            row.iter()
+                .zip(weight)
+                .map(move |(value, weight)| value * inverse * weight)
+        })
+        .collect())
+}
+
+fn oracle_conv(input: &[f64], weights: &[f32], token_count: usize, channels: usize) -> Vec<f64> {
+    let mut output = Vec::with_capacity(token_count * channels);
+    for token in 0..token_count {
+        for channel in 0..channels {
+            let current = input[token * channels + channel];
+            let previous = if token == 0 {
+                0.0
+            } else {
+                input[(token - 1) * channels + channel]
+            };
+            let weight = &weights[channel * usize::from(2_u8)..][..usize::from(2_u8)];
+            output.push(previous * f64::from(weight[0]) + current * f64::from(weight[1]));
+        }
+    }
+    output
+}
+
+fn oracle_recurrence(
+    convolved: &[f64],
+    alpha: &[f64],
+    beta: &[f64],
+    token_count: usize,
+    shape: OracleShape,
+) -> std::result::Result<(Vec<f64>, Vec<f64>), String> {
+    let mut state = vec![0.0; shape.value_heads * shape.key_dim * shape.value_dim];
+    let mut output = vec![0.0; token_count * shape.value_heads * shape.value_dim];
+    let a = [-0.4_f64, -0.9, -0.6, -0.8];
+    let dt = [0.15_f64, -0.1, 0.3, 0.05];
+    let scale = f64::from(u32::try_from(shape.key_dim).map_err(|error| error.to_string())?)
+        .sqrt()
+        .recip();
+    for token in 0..token_count {
+        let channels = &convolved[token * shape.conv_width..(token + 1) * shape.conv_width];
+        for value_head in 0..shape.value_heads {
+            let key_head = value_head % shape.key_heads;
+            let q = oracle_l2(&channels[key_head * shape.key_dim..(key_head + 1) * shape.key_dim]);
+            let k_offset = shape.key_heads * shape.key_dim;
+            let k = oracle_l2(
+                &channels[k_offset + key_head * shape.key_dim
+                    ..k_offset + (key_head + 1) * shape.key_dim],
+            );
+            let v_offset = 2 * shape.key_heads * shape.key_dim + value_head * shape.value_dim;
+            let v = &channels[v_offset..v_offset + shape.value_dim];
+            let beta_value = 1.0 / (1.0 + (-beta[token * shape.value_heads + value_head]).exp());
+            let alpha_dt = alpha[token * shape.value_heads + value_head] + dt[value_head];
+            let gate = a[value_head] * (alpha_dt.max(0.0) + (-alpha_dt.abs()).exp().ln_1p());
+            let decay = gate.exp();
+            for key in 0..shape.key_dim {
+                for value in 0..shape.value_dim {
+                    let state_index = (value_head * shape.key_dim + key) * shape.value_dim + value;
+                    state[state_index] *= decay;
+                }
+            }
+            let mut delta = vec![0.0; shape.value_dim];
+            for value in 0..shape.value_dim {
+                let state_projection = (0..shape.key_dim)
+                    .map(|key| {
+                        state[(value_head * shape.key_dim + key) * shape.value_dim + value] * k[key]
+                    })
+                    .sum::<f64>();
+                delta[value] = beta_value * (v[value] - state_projection);
+            }
+            for (key, key_value) in k.iter().copied().enumerate() {
+                for (value, delta_value) in delta.iter().copied().enumerate() {
+                    let state_index = (value_head * shape.key_dim + key) * shape.value_dim + value;
+                    state[state_index] += key_value * delta_value;
+                }
+            }
+            for value in 0..shape.value_dim {
+                output[(token * shape.value_heads + value_head) * shape.value_dim + value] = (0
+                    ..shape.key_dim)
+                    .map(|key| {
+                        state[(value_head * shape.key_dim + key) * shape.value_dim + value]
+                            * q[key]
+                            * scale
+                    })
+                    .sum();
+            }
+        }
+    }
+    Ok((output, state))
+}
+
+fn oracle_l2(values: &[f64]) -> Vec<f64> {
+    let denominator = values
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt()
+        .max(f64::from(TEST_RMS_EPSILON));
+    values.iter().map(|value| value / denominator).collect()
+}
+
+fn test_dimension(value: u64) -> std::result::Result<usize, String> {
+    usize::try_from(value).map_err(|error| error.to_string())
+}
+
+fn assert_f32_matches_f64(
+    actual: &[f32],
+    expected: &[f64],
+    subject: &str,
+) -> std::result::Result<(), String> {
+    if actual.len() != expected.len() {
+        return Err(format!(
+            "{subject} length differs: actual {}, expected {}",
+            actual.len(),
+            expected.len()
+        ));
+    }
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        if (f64::from(*actual) - expected).abs() > 2.0e-5 {
+            return Err(format!(
+                "{subject} differs at {index}: actual {actual}, expected {expected}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -865,6 +1457,16 @@ fn tensor_bytes(tensor: &FixtureTensor) -> std::result::Result<u64, String> {
             (logical_elements / values_per_block)
                 .checked_mul(block_bytes)
                 .ok_or_else(|| "test Q8_0 tensor byte count overflowed".to_string())
+        }
+        TEST_IQ4_NL_TYPE_ID => {
+            const VALUES_PER_BLOCK: u64 = 32;
+            const BYTES_PER_BLOCK: u64 = 18;
+            if !logical_elements.is_multiple_of(VALUES_PER_BLOCK) {
+                return Err("test IQ4NL tensor elements must occupy complete blocks".to_string());
+            }
+            (logical_elements / VALUES_PER_BLOCK)
+                .checked_mul(BYTES_PER_BLOCK)
+                .ok_or_else(|| "test IQ4NL tensor byte count overflowed".to_string())
         }
         other => Err(format!("test fixture does not support GGML type {other}")),
     }

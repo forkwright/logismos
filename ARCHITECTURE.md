@@ -38,12 +38,18 @@ semantically respects that boundary.
   `placement` for `plan` and metadata-only `loader` for `inspect` without
   linking the device runtime.
 - `decoders` consumes `loader` without its tensor adapter and consumes `quant`
-  for explicit CPU Q8_0 projection, without linking HIP. Structural profiles
-  remain distinct from payload-bound execution. The lower-level `quant` crate
-  owns Q8_0 block and row geometry; inspection and projection reuse that owner.
+  for explicit CPU row projection, without linking HIP. Its recurrent-attention
+  path uses the standalone CPU `kernels` graph. Structural profiles remain
+  distinct from payload-bound execution. The lower-level `quant` crate owns
+  executable block and row geometry; inspection and projection reuse that owner.
 - `emulation` is a CPU test aid, not a production device backend.
 - `taxis` depends locally on `hipcore`.
-- `kernels` depends locally on `hipcore` and `taxis`; it does not depend on `core`.
+- `kernels/gpu` enables the local `hipcore` and `taxis` dependencies and GPU
+  launcher modules, including their nested parity references. Standalone
+  `cpu_f32`, `gdn`, and `causal_conv` remain available without that feature;
+  `transformers` selects that CPU-only graph, while `praxis` explicitly enables
+  GPU launchers. Direct `kernels` users retain the default GPU feature. The
+  crate does not depend on `core`.
 - Cross-tier deps must be justified. Within-tier deps are code smell.
 
 ## Key invariants
@@ -89,10 +95,19 @@ does not establish publisher authenticity, a filesystem snapshot, or a total
 host-memory reservation. Existing observation receipts remain reporting data.
 
 `decoders::Qwen35Weights` binds the existing structural contract to that owner
-and executes named Q8_0 matrix projections through `quant`. Unsupported formats
-are explicit refusals. This is neither a complete decoder nor an implicit CPU
-fallback for a GPU operation; native model execution and admission integration
-remain separate requirements.
+and executes named F32, Q8_0, Q4_K, Q5_K, and Q6_K matrix projections through
+`quant`. IQ4 and other unsupported formats are explicit refusals.
+`Qwen35RecurrentExecution` binds convolution history and GDN state to those
+weights and one recurrent layer; an unsuccessful step commits neither state.
+It adapts GGUF tiled heads to the generic grouped GDN contract explicitly.
+Execution requires finite positive RMS epsilon; structural recognition does not.
+The shared CPU RMSNorm returns typed errors for malformed inputs and non-finite
+arithmetic instead of concealing overflow behind finite zero outputs.
+
+This is a recurrent-attention path, not a complete decoder block or model:
+residual/FFN composition, full attention, tokenizer/logits, NextN, artifact-level
+quality, and admission integration remain separate requirements. Explicit CPU
+execution is not a fallback for a GPU operation.
 
 ## cfg flags
 

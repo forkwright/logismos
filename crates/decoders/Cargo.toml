@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Decoder-only family boundaries, including Qwen3.5 structural preflight and one digest-verified Q8_0 projection."
+description = "Decoder-only family boundaries, including Qwen3.5 structural preflight and digest-verified executable row projections."
 publish = false
 
 [lints]
@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 # Metadata-only observation keeps structural preflight independent of HIP/tensor decoding.
 loader = { path = "../loader", default-features = false }
+kernels = { workspace = true, default-features = false }
 quant = { path = "../quant" }
 snafu = { workspace = true }
 

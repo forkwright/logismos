@@ -20,14 +20,64 @@
 use half::f16;
 
 pub mod error;
+pub mod f32_row;
+pub mod format;
+mod k;
+pub mod q4_k;
+pub mod q5_k;
+pub mod q6_k;
 pub mod q8_0;
+mod row;
 pub mod scheme;
 
+#[cfg(test)]
+mod row_tests;
+
 pub use crate::error::{Error, Result};
+pub use crate::format::RowFormat;
+pub use crate::q4_k::{Q4_K_BLOCK_BYTES, Q4_K_VALUES_PER_BLOCK, Q4KBlock};
+pub use crate::q5_k::{Q5_K_BLOCK_BYTES, Q5_K_VALUES_PER_BLOCK, Q5KBlock};
+pub use crate::q6_k::{Q6_K_BLOCK_BYTES, Q6_K_VALUES_PER_BLOCK, Q6KBlock};
 pub use crate::q8_0::{
     Q8_0_BLOCK_BYTES, Q8_0_SCALE_BYTES, Q8_0_VALUE_BYTES, Q8_0_VALUES_PER_BLOCK, Q8_0Block,
 };
 pub use crate::scheme::TurboQuantScheme;
+
+/// Compute one checked, sequential f32 dot product from an executable row format.
+///
+/// Values are multiplied and added strictly left-to-right in f32 order. This
+/// function does not request fused operations, parallel reduction, or
+/// reassociation; changing that contract requires numerical review.
+///
+/// # Errors
+///
+/// Returns [`Error`] if the format's geometry, encoded block data,
+/// activations, products, or running sum are invalid or non-finite.
+pub fn row_dot_f32(format: RowFormat, serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
+    match format {
+        RowFormat::F32 => f32_row::row_dot_f32(serialized_row, activations),
+        RowFormat::Q8_0 => q8_0::row_dot_f32(serialized_row, activations),
+        RowFormat::Q4K => q4_k::row_dot_f32(serialized_row, activations),
+        RowFormat::Q5K => q5_k::row_dot_f32(serialized_row, activations),
+        RowFormat::Q6K => q6_k::row_dot_f32(serialized_row, activations),
+    }
+}
+
+/// Derive one executable format's checked serialized row length.
+///
+/// # Errors
+///
+/// Returns [`Error`] when `value_count` cannot be represented by whole blocks
+/// for `format`, or its byte length overflows `usize`.
+pub fn row_byte_len(format: RowFormat, value_count: usize) -> Result<usize> {
+    match format {
+        RowFormat::F32 => f32_row::row_byte_len(value_count),
+        RowFormat::Q8_0 => q8_0::row_byte_len(value_count),
+        RowFormat::Q4K => q4_k::row_byte_len(value_count),
+        RowFormat::Q5K => q5_k::row_byte_len(value_count),
+        RowFormat::Q6K => q6_k::row_byte_len(value_count),
+    }
+}
 
 /// Number of scalar values represented by one `TurboQuant` block.
 pub const TURBOQUANT_VALUES_PER_BLOCK: usize = 32;

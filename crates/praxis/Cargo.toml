@@ -10,7 +10,8 @@ publish = false
 [dependencies]
 half.workspace = true
 hipcore.workspace = true
-kernels.workspace = true
+# Praxis owns the existing launch-path composition and must select it explicitly.
+kernels = { workspace = true, features = ["gpu"] }
 num-traits.workspace = true
 taxis.workspace = true
 snafu.workspace = true

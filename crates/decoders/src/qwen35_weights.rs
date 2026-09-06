@@ -1,4 +1,4 @@
-//! Verified-payload `Q8_0` projection for the narrow Qwen3.5 boundary.
+//! Verified-payload row projection for the narrow Qwen3.5 boundary.
 //!
 //! WHY: structural preflight validates metadata and descriptor topology without
 //! reading tensor bytes. This layer intentionally adds one digest-verified
@@ -8,7 +8,7 @@
 use snafu::ResultExt;
 
 use loader::gguf::{GgmlType, VerifiedArtifact};
-use quant::q8_0::{row_byte_len, row_dot_f32};
+use quant::{RowFormat, row_byte_len, row_dot_f32};
 
 use crate::Result;
 use crate::error::{
@@ -16,7 +16,8 @@ use crate::error::{
     ProjectionDtypeSnafu, ProjectionInputWidthSnafu, ProjectionLayoutSnafu, ProjectionRankSnafu,
     ProjectionRowSnafu,
 };
-use crate::qwen35::Qwen35StructuralProfile;
+use crate::qwen35::{Qwen35RecurrentLayout, Qwen35StructuralProfile};
+use crate::qwen35_recurrent::Qwen35RecurrentExecution;
 
 /// One payload-verified Qwen3.5 structural profile with a narrow CPU projection.
 ///
@@ -37,6 +38,7 @@ use crate::qwen35::Qwen35StructuralProfile;
 #[derive(Debug)]
 pub struct Qwen35Weights<'artifact> {
     payload: &'artifact VerifiedArtifact,
+    recurrent_layout: Qwen35RecurrentLayout,
 }
 
 impl<'artifact> Qwen35Weights<'artifact> {
@@ -47,23 +49,34 @@ impl<'artifact> Qwen35Weights<'artifact> {
     /// Returns [`crate::Error`] when the verified payload's retained
     /// observation does not meet the narrow Qwen3.5 structural contract.
     pub fn try_from_verified(payload: &'artifact VerifiedArtifact) -> Result<Self> {
-        Qwen35StructuralProfile::try_from_observed(payload.observation())?;
-        Ok(Self { payload })
+        let profile = Qwen35StructuralProfile::try_from_observed(payload.observation())?;
+        Ok(Self {
+            payload,
+            recurrent_layout: profile.recurrent_layout(),
+        })
     }
 
-    /// Project finite activations through one named, recognized `Q8_0` matrix.
+    pub(crate) const fn recurrent_layout(&self) -> Qwen35RecurrentLayout {
+        self.recurrent_layout
+    }
+
+    pub(crate) const fn payload(&self) -> &'artifact VerifiedArtifact {
+        self.payload
+    }
+
+    /// Project finite activations through one named, recognized executable matrix.
     ///
     /// GGUF matrix dimensions are `[input_width, output_width]`; each output
-    /// row therefore occupies a contiguous complete `Q8_0` row. All tensor
+    /// row therefore occupies one contiguous complete serialized row. All tensor
     /// geometry is checked before output allocation. A row failure drops the
     /// local vector, so this method never returns a partial projection.
     ///
     /// # Errors
     ///
     /// Returns [`crate::Error`] for an absent tensor, an unsupported matrix
-    /// dtype/rank/geometry, allocation failure, or invalid `Q8_0` row
+    /// dtype/rank/geometry, allocation failure, or invalid serialized-row
     /// arithmetic.
-    pub fn project_q8_0(&self, name: &str, activations: &[f32]) -> Result<Vec<f32>> {
+    pub fn project(&self, name: &str, activations: &[f32]) -> Result<Vec<f32>> {
         let tensor = self.payload.tensor(name).context(PayloadTensorSnafu {
             name: name.to_string(),
         })?;
@@ -76,22 +89,22 @@ impl<'artifact> Qwen35Weights<'artifact> {
             }
             .fail();
         };
-        if tensor.ggml_type() != GgmlType::Q8_0 {
-            return ProjectionDtypeSnafu {
-                name: tensor_name,
+        let format = row_format(tensor.ggml_type()).ok_or_else(|| {
+            ProjectionDtypeSnafu {
+                name: tensor_name.clone(),
                 actual: tensor.ggml_type(),
             }
-            .fail();
-        }
+            .build()
+        })?;
         let input_width = usize::try_from(*input_width).map_err(|_| {
             ArithmeticOverflowSnafu {
-                context: "Q8_0 projection input width",
+                context: "row projection input width",
             }
             .build()
         })?;
         let output_width = usize::try_from(*output_width).map_err(|_| {
             ArithmeticOverflowSnafu {
-                context: "Q8_0 projection output width",
+                context: "row projection output width",
             }
             .build()
         })?;
@@ -103,12 +116,13 @@ impl<'artifact> Qwen35Weights<'artifact> {
             }
             .fail();
         }
-        let row_byte_len = row_byte_len(input_width).with_context(|_| ProjectionLayoutSnafu {
-            name: tensor_name.clone(),
-        })?;
+        let row_byte_len =
+            row_byte_len(format, input_width).with_context(|_| ProjectionLayoutSnafu {
+                name: tensor_name.clone(),
+            })?;
         let expected_bytes = output_width.checked_mul(row_byte_len).ok_or_else(|| {
             ArithmeticOverflowSnafu {
-                context: "Q8_0 projection payload byte length",
+                context: "row projection payload byte length",
             }
             .build()
         })?;
@@ -130,13 +144,42 @@ impl<'artifact> Qwen35Weights<'artifact> {
                 output_width,
             })?;
         for (row, row_bytes) in bytes.chunks_exact(row_byte_len).enumerate() {
-            let value =
-                row_dot_f32(row_bytes, activations).with_context(|_| ProjectionRowSnafu {
+            let value = row_dot_f32(format, row_bytes, activations).with_context(|_| {
+                ProjectionRowSnafu {
                     name: tensor_name.clone(),
                     row,
-                })?;
+                }
+            })?;
             output.push(value);
         }
         Ok(output)
+    }
+
+    /// Prepare one stateful recurrent-attention trunk for a recurrent main block.
+    ///
+    /// WHY: state construction remains bound to this digest-verified payload and
+    /// one checked block role inventory, so callers cannot pair an arbitrary
+    /// recurrence state with a similarly shaped artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when the selected block is not recurrent or
+    /// when its execution-only finite parameters cannot be admitted.
+    pub fn recurrent_execution(
+        &self,
+        block_index: u64,
+    ) -> Result<Qwen35RecurrentExecution<'_, 'artifact>> {
+        Qwen35RecurrentExecution::try_from_weights(self, block_index)
+    }
+}
+
+fn row_format(ggml_type: GgmlType) -> Option<RowFormat> {
+    match ggml_type {
+        GgmlType::F32 => Some(RowFormat::F32),
+        GgmlType::Q8_0 => Some(RowFormat::Q8_0),
+        GgmlType::Q4K => Some(RowFormat::Q4K),
+        GgmlType::Q5K => Some(RowFormat::Q5K),
+        GgmlType::Q6K => Some(RowFormat::Q6K),
+        _ => None,
     }
 }

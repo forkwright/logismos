@@ -7,8 +7,8 @@ targeting AMD gfx1100, with owned HIP/WMMA kernels and progressively owned execu
 
 **Status:** HIP primitives, Stella CPU golden-fixture parity, action-free placement,
 process-local admission/residency coordination, and bounded instruction emulation exist.
-GGUF inspection, digest-bound payloads, Q8_0 CPU projections and generic GDN/convolution
-references are foundations, not native decoder serving or hardware qualification. The W7900
+GGUF inspection, digest-bound mixed-weight CPU projections and a stateful recurrent-attention
+path are foundations, not native decoder serving or hardware qualification. The W7900
 is available; the RX 7900 XTX is a
 planned second device and requires its own qualification. The experimental below-HIP
 provider remains unimplemented.
@@ -57,9 +57,11 @@ main decoder blocks remain distinct from an optional auxiliary NextN block. This
 validate payloads or authorize execution. For payload access, `loader::gguf::VerifiedArtifact`
 owns one immutable byte backing under an explicit size limit and requires a matching SHA-256
 expectation. `decoders::Qwen35Weights` binds that backing to the structural profile and executes
-named Q8_0 matrix projections using [`quant`](crates/quant/src/q8_0.rs). This explicit CPU path
-does not implement a complete model, qualify other quantization formats, authenticate a
-publisher, or reserve device memory. The existing mmap tensor adapter is a separate API.
+named F32/Q8_0/Q4_K/Q5_K/Q6_K matrix projections using [`quant`](crates/quant/src/lib.rs).
+Its recurrent-attention executor owns layer-bound convolution/GDN state and commits state
+only after a successful step. IQ4 remains execution-refused. This explicit CPU path does not
+implement full decoder blocks, tokenizer/logits, NextN, or a complete model; it does not
+authenticate a publisher or reserve device memory. The existing mmap tensor adapter is separate.
 
 [`contracts/runtime-scope.toml`](contracts/runtime-scope.toml) records this product boundary.
 Bounded adaptation remains absent unless a named consumer contract supplies an output owner,
@@ -68,12 +70,12 @@ requirements and concrete workspace/license invariants; semantic scope remains a
 
 ## Build configuration
 
-`crates/kernels/build.rs` compiles HIP sources with `hipcc` for the target in
-`contracts/gpu-target.txt`. The default and `LOGISMOS_HIP_BUILD=required`
-both fail if the compiler is missing or compilation fails. CPU-only iteration
-requires `LOGISMOS_HIP_BUILD=cpu-only`; the retired `LOGISMOS_SKIP_HIP_BUILD`
-variable is an error. A CPU-only build has no GPU kernels, and HIP-backed ops
-return `Error::NoGpuBuild` instead of running on-device.
+`kernels/gpu` enables HIP launchers and is on by default for direct consumers.
+With that feature, `crates/kernels/build.rs` compiles HIP sources with `hipcc`
+for the target in `contracts/gpu-target.txt`; CPU-only iteration explicitly
+selects `LOGISMOS_HIP_BUILD=cpu-only`. Without the feature, the standalone CPU
+graph needs no HIP compiler or runtime. The precise feature/build-mode matrix
+and its fail-closed witnesses are in the [runner documentation](docs/gpu-denied-runner.md).
 
 Build mode is not an isolation boundary. Agent-led checks run through the
 [GPU-denied runner](docs/gpu-denied-runner.md), which denies device access even
@@ -101,11 +103,12 @@ still gets a real `cargo check`/`clippy`/`nextest` pass across the
 whole workspace, `hipcore` included. On a non-ROCm host, push without
 a trailer and let that CI path attest the change.
 
-Before formatting, the public workflow runs two cheap repository guards. The runtime-scope guard
+Before formatting, the public workflow runs repository guards. The runtime-scope guard
 self-tests positive and negative cases, requires locked Cargo metadata, rejects retired
 path/package/lock identities, and derives license coherence from Cargo metadata plus the checked
-`LICENSE` bytes. The kanon-root SSOT guard rejects duplicate checkout-root instructions outside
-`CLAUDE.md`. Neither guard claims to infer arbitrary program semantics.
+`LICENSE` bytes. The document-contract guard checks authored crate navigation and fixture-generator
+output inventory. The kanon-root SSOT guard rejects duplicate checkout-root instructions outside
+`CLAUDE.md`. These guards do not claim to infer arbitrary program semantics.
 
 What it does not prove: the GH-hosted runner has no AMD GPU. This path
 proves the workspace compiles and links against real HIP headers/ABI —

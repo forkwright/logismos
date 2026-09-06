@@ -286,6 +286,7 @@ dependencies = [
 name = "decoders"
 version = "1.0.11"
 dependencies = [
+ "kernels",
  "loader",
  "quant",
  "sha2",

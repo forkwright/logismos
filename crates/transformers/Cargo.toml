@@ -8,7 +8,8 @@ description = "Shared transformer building blocks: attention, MLP/SwiGLU, RoPE, 
 publish = false
 
 [dependencies]
-kernels = { workspace = true }
+# Transformer CPU composition uses only kernels' pure `cpu_f32` references.
+kernels = { workspace = true, default-features = false }
 num-traits = { workspace = true }
 snafu = { workspace = true }
 

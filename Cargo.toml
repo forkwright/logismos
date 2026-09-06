@@ -77,7 +77,9 @@ sha2 = { version = "0.11.0", default-features = false }
 # Internal crate cross-refs.
 hipcore = { path = "crates/hipcore" }
 taxis = { path = "crates/taxis" }
-kernels = { path = "crates/kernels" }
+# CPU consumers inherit no GPU launcher feature. GPU consumers opt in at their
+# own manifest boundary, keeping HIP linkage out of CPU-only dependency graphs.
+kernels = { path = "crates/kernels", default-features = false }
 praxis = { path = "crates/praxis" }
 loader = { path = "crates/loader" }
 tokenize = { path = "crates/tokenize" }

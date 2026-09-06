@@ -112,8 +112,10 @@ pub enum Error {
         location: snafu::Location,
     },
 
-    /// A structurally recognized tensor does not use the one executable storage type.
-    #[snafu(display("qwen35 tensor `{name}` must use Q8_0 for this projection, got {actual:?}"))]
+    /// A structurally recognized tensor does not use an executable row storage type.
+    #[snafu(display(
+        "qwen35 tensor `{name}` has no executable row format for this projection, got {actual:?}"
+    ))]
     ProjectionDtype {
         /// Tensor requested by the bounded projection operation.
         name: String,
@@ -154,12 +156,12 @@ pub enum Error {
         location: snafu::Location,
     },
 
-    /// A matrix input dimension cannot form an integral finite `Q8_0` row.
-    #[snafu(display("qwen35 tensor `{name}` has invalid Q8_0 row layout: {source}"))]
+    /// A matrix input dimension cannot form an integral executable serialized row.
+    #[snafu(display("qwen35 tensor `{name}` has invalid executable row layout: {source}"))]
     ProjectionLayout {
         /// Tensor requested by the bounded projection operation.
         name: String,
-        /// Q8 row-geometry failure from the canonical quantization utility.
+        /// Row-geometry failure from the canonical quantization utility.
         source: quant::Error,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
@@ -196,15 +198,99 @@ pub enum Error {
         location: snafu::Location,
     },
 
-    /// One serialized `Q8_0` row was not executable as finite CPU arithmetic.
-    #[snafu(display("qwen35 tensor `{name}` Q8_0 projection row {row} failed: {source}"))]
+    /// One serialized row was not executable as finite CPU arithmetic.
+    #[snafu(display("qwen35 tensor `{name}` projection row {row} failed: {source}"))]
     ProjectionRow {
         /// Tensor requested by the bounded projection operation.
         name: String,
         /// Zero-based output-row index.
         row: usize,
-        /// Q8 row-decoding or arithmetic failure.
+        /// Executable row-decoding or arithmetic failure.
         source: quant::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A requested block is not a recurrent main decoder block.
+    #[snafu(display("qwen35 block {block_index} cannot run recurrent attention: {rule}"))]
+    RecurrentLayer {
+        /// Main-block index requested by the caller.
+        block_index: u64,
+        /// Source-derived reason this block cannot use the recurrent path.
+        rule: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The recurrent step input is not a complete hidden-width token sequence.
+    #[snafu(display(
+        "qwen35 recurrent input must contain complete hidden rows of width {hidden}, got {actual} values"
+    ))]
+    RecurrentInput {
+        /// Typed hidden width expected by the selected layer.
+        hidden: usize,
+        /// Supplied scalar count.
+        actual: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Recurrent execution could not allocate an all-or-nothing local result.
+    #[snafu(display("qwen35 recurrent {target} could not reserve {length} f32 values: {source}"))]
+    RecurrentAllocation {
+        /// Named local buffer that could not be reserved.
+        target: &'static str,
+        /// Exact scalar capacity requested.
+        length: usize,
+        /// Allocation failure.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Finite recurrent execution produced a non-finite intermediate.
+    #[snafu(display(
+        "qwen35 recurrent arithmetic became non-finite during {stage} at index {index}"
+    ))]
+    RecurrentArithmetic {
+        /// Named mathematical stage.
+        stage: &'static str,
+        /// Flat scalar index within that stage.
+        index: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The shared finite CPU `RMSNorm` rejected recurrent execution.
+    #[snafu(display("qwen35 recurrent RMSNorm failed: {source}"))]
+    RecurrentRmsNorm {
+        /// Checked shared CPU `RMSNorm` failure.
+        source: kernels::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The depthwise causal-convolution reference rejected a recurrent step.
+    #[snafu(display("qwen35 recurrent causal convolution failed: {source}"))]
+    RecurrentConvolution {
+        /// Checked causal-convolution failure.
+        source: kernels::CausalConvError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The grouped GDN reference rejected a recurrent step.
+    #[snafu(display("qwen35 recurrent GDN failed: {source}"))]
+    RecurrentGdn {
+        /// Checked grouped-GDN failure.
+        source: kernels::GdnError,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,

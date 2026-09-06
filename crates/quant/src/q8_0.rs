@@ -2,12 +2,9 @@
 
 use half::f16;
 
-use crate::Result;
-use crate::error::{
-    EmptyQ8RowInputSnafu, InvalidQ8BlockLengthSnafu, InvalidQ8RowInputLengthSnafu,
-    NonFiniteQ8ActivationSnafu, NonFiniteQ8ArithmeticSnafu, NonFiniteQ8ScaleSnafu,
-    Q8ArithmeticStage, Q8RowByteLengthMismatchSnafu, Q8RowByteLengthOverflowSnafu,
-};
+use crate::error::{InvalidQ8BlockLengthSnafu, NonFiniteQ8ScaleSnafu};
+use crate::row::{self, Geometry};
+use crate::{Result, RowFormat};
 
 /// Number of signed quantized values in one `Q8_0` block.
 pub const Q8_0_VALUES_PER_BLOCK: usize = 32;
@@ -20,6 +17,11 @@ pub const Q8_0_VALUE_BYTES: usize = Q8_0_VALUES_PER_BLOCK;
 
 /// Total byte width of one `Q8_0` block.
 pub const Q8_0_BLOCK_BYTES: usize = Q8_0_SCALE_BYTES + Q8_0_VALUE_BYTES;
+
+const GEOMETRY: Geometry = Geometry {
+    format: RowFormat::Q8_0,
+    bytes_per_block: Q8_0_BLOCK_BYTES,
+};
 
 /// One validated GGML `Q8_0` block.
 ///
@@ -101,52 +103,9 @@ impl Q8_0Block {
 /// Returns [`crate::Error`] when the row geometry is invalid, a `Q8_0` scale or
 /// activation is non-finite, or a product or running accumulator is non-finite.
 pub fn row_dot_f32(serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
-    let expected_bytes = row_byte_len(activations.len())?;
-    if serialized_row.len() != expected_bytes {
-        return Q8RowByteLengthMismatchSnafu {
-            actual: serialized_row.len(),
-            expected: expected_bytes,
-        }
-        .fail();
-    }
-
-    let mut accumulator = 0.0_f32;
-    for (block_index, (serialized_block, activation_block)) in serialized_row
-        .chunks_exact(Q8_0_BLOCK_BYTES)
-        .zip(activations.chunks_exact(Q8_0_VALUES_PER_BLOCK))
-        .enumerate()
-    {
-        let decoded_block = Q8_0Block::parse(serialized_block)?.decode_f32();
-        for (lane_index, (weight, activation)) in
-            decoded_block.iter().zip(activation_block).enumerate()
-        {
-            if !activation.is_finite() {
-                return NonFiniteQ8ActivationSnafu {
-                    index: block_index * Q8_0_VALUES_PER_BLOCK + lane_index,
-                }
-                .fail();
-            }
-            let product = *weight * *activation;
-            if !product.is_finite() {
-                return NonFiniteQ8ArithmeticSnafu {
-                    stage: Q8ArithmeticStage::Product,
-                    block_index,
-                    lane_index,
-                }
-                .fail();
-            }
-            accumulator += product;
-            if !accumulator.is_finite() {
-                return NonFiniteQ8ArithmeticSnafu {
-                    stage: Q8ArithmeticStage::Accumulation,
-                    block_index,
-                    lane_index,
-                }
-                .fail();
-            }
-        }
-    }
-    Ok(accumulator)
+    row::dot(GEOMETRY, serialized_row, activations, |block| {
+        Ok(Q8_0Block::parse(block)?.decode_f32())
+    })
 }
 
 /// Derive the exact serialized byte length for one complete `Q8_0` row.
@@ -159,30 +118,14 @@ pub fn row_dot_f32(serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
 /// Returns [`crate::Error`] when the logical width is zero, does not contain
 /// whole blocks, or its serialized byte count cannot fit in `usize`.
 pub fn row_byte_len(activation_len: usize) -> Result<usize> {
-    if activation_len == 0 {
-        return EmptyQ8RowInputSnafu.fail();
-    }
-    if !activation_len.is_multiple_of(Q8_0_VALUES_PER_BLOCK) {
-        return InvalidQ8RowInputLengthSnafu {
-            actual: activation_len,
-            block_elements: Q8_0_VALUES_PER_BLOCK,
-        }
-        .fail();
-    }
-    let block_count = activation_len / Q8_0_VALUES_PER_BLOCK;
-    block_count.checked_mul(Q8_0_BLOCK_BYTES).ok_or_else(|| {
-        Q8RowByteLengthOverflowSnafu {
-            block_count,
-            block_bytes: Q8_0_BLOCK_BYTES,
-        }
-        .build()
-    })
+    row::byte_len::<Q8_0_VALUES_PER_BLOCK>(GEOMETRY, activation_len)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Error;
+    use crate::error::RowArithmeticStage;
 
     const ACCUMULATION_ACTIVATION_DIVISOR: f32 = 16_000_000.0_f32;
 
@@ -341,7 +284,10 @@ mod tests {
         assert!(
             matches!(
                 row_dot_f32(&serialized, &empty),
-                Err(Error::EmptyQ8RowInput { .. })
+                Err(Error::EmptyRowInput {
+                    format: RowFormat::Q8_0,
+                    ..
+                })
             ),
             "empty activation rows must be refused"
         );
@@ -350,7 +296,7 @@ mod tests {
         assert!(
             matches!(
                 row_dot_f32(&serialized, &unaligned_activations),
-                Err(Error::InvalidQ8RowInputLength { actual, .. })
+                Err(Error::InvalidRowInputLength { format: RowFormat::Q8_0, actual, .. })
                     if actual == unaligned_activations.len()
             ),
             "activation lengths must contain whole Q8_0 blocks"
@@ -361,7 +307,7 @@ mod tests {
         assert!(
             matches!(
                 row_dot_f32(short_serialized, &full_activations),
-                Err(Error::Q8RowByteLengthMismatch { actual, expected, .. })
+                Err(Error::RowByteLengthMismatch { format: RowFormat::Q8_0, actual, expected, .. })
                     if actual == short_serialized.len() && expected == serialized.len()
             ),
             "serialized rows must exactly match activation geometry"
@@ -391,7 +337,7 @@ mod tests {
         assert!(
             matches!(
                 row_dot_f32(&finite_scale, &nonfinite_activations),
-                Err(Error::NonFiniteQ8Activation { index, .. }) if index == nonfinite_index
+                Err(Error::NonFiniteRowActivation { format: RowFormat::Q8_0, index, .. }) if index == nonfinite_index
             ),
             "non-finite activations must identify their flat row index"
         );
@@ -404,8 +350,9 @@ mod tests {
         assert!(
             matches!(
                 row_dot_f32(&maximum_scale, &maximum_activations),
-                Err(Error::NonFiniteQ8Arithmetic {
-                    stage: Q8ArithmeticStage::Product,
+                Err(Error::NonFiniteRowArithmetic {
+                    format: RowFormat::Q8_0,
+                    stage: RowArithmeticStage::Product,
                     block_index: 0,
                     lane_index: 0,
                     ..
@@ -426,8 +373,9 @@ mod tests {
         assert!(
             matches!(
                 row_dot_f32(&serialized, &activations),
-                Err(Error::NonFiniteQ8Arithmetic {
-                    stage: Q8ArithmeticStage::Accumulation,
+                Err(Error::NonFiniteRowArithmetic {
+                    format: RowFormat::Q8_0,
+                    stage: RowArithmeticStage::Accumulation,
                     block_index: 1,
                     lane_index: 0,
                     ..
@@ -443,7 +391,10 @@ mod tests {
         assert!(
             matches!(
                 row_byte_len(max_multiple),
-                Err(Error::Q8RowByteLengthOverflow { .. })
+                Err(Error::RowByteLengthOverflow {
+                    format: RowFormat::Q8_0,
+                    ..
+                })
             ),
             "serialized row geometry overflow must be refused"
         );

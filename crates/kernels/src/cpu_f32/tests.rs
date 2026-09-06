@@ -1,6 +1,7 @@
 //! Unit tests for the Phase-3 fp32 CPU reference kernels.
 
 use super::*;
+use crate::error::{Error, RmsNormStage};
 
 #[test]
 fn embed_lookup_in_range_copies_rows() {
@@ -34,12 +35,155 @@ fn embed_lookup_out_of_range_id_yields_zeroed_row_uniformly() {
 fn rms_norm_matches_manual() {
     let x = [1.0_f32, 2.0, 3.0, 4.0];
     let w = [1.0_f32; 4];
-    let y = rms_norm(&x, &w, 1, 4, 1e-6);
+    let result = rms_norm(&x, &w, 1, 4, 1e-6);
+    assert!(result.is_ok(), "valid RMSNorm fixture failed: {result:?}");
+    let Ok(y) = result else {
+        return;
+    };
     let inv = 1.0_f32 / f32::sqrt(((1.0 + 4.0 + 9.0 + 16.0) / 4.0) + 1e-6);
     let want = [1.0 * inv, 2.0 * inv, 3.0 * inv, 4.0 * inv];
     for (a, b) in y.iter().zip(want.iter()) {
         assert!((a - b).abs() < 1e-6, "a={a} b={b}");
     }
+}
+
+#[test]
+fn rms_norm_matches_independent_f64_oracle() {
+    let x = [0.25_f32, -1.75, 3.5, -2.0, 0.5, 1.25];
+    let weight = [1.5_f32, -0.75, 0.25];
+    let eps = 1e-5_f32;
+    let result = rms_norm(&x, &weight, 2, 3, eps);
+    assert!(result.is_ok(), "valid RMSNorm fixture failed: {result:?}");
+    let Ok(actual) = result else {
+        return;
+    };
+    let expected = rms_norm_f64_oracle(&x, &weight, 3, f64::from(eps));
+
+    for (got, want) in actual.iter().zip(expected.iter()) {
+        assert!(
+            (f64::from(*got) - want).abs() < 1e-6,
+            "got {got}, expected {want}"
+        );
+    }
+}
+
+#[test]
+fn rms_norm_rejects_invalid_shape_in_every_profile() {
+    assert!(
+        matches!(
+            rms_norm(&[1.0_f32], &[1.0, 1.0], 1, 2, 1e-6),
+            Err(Error::RmsNormShape {
+                stage: RmsNormStage::Input,
+                expected_len: 2,
+                actual_len: 1,
+                ..
+            })
+        ),
+        "invalid input extent must retain its typed shape stage"
+    );
+}
+
+#[test]
+fn rms_norm_rejects_overflowing_element_count_in_every_profile() {
+    assert!(
+        matches!(
+            rms_norm(&[], &[], usize::MAX, 2, 1e-6),
+            Err(Error::RmsNormSizeOverflow { .. })
+        ),
+        "overflowing rows * width must not wrap"
+    );
+}
+
+#[test]
+fn rms_norm_rejects_nonfinite_inputs_and_weights() {
+    assert!(
+        matches!(
+            rms_norm(&[f32::NAN], &[1.0], 1, 1, 1e-6),
+            Err(Error::RmsNormNonFinite {
+                stage: RmsNormStage::Input,
+                ..
+            })
+        ),
+        "non-finite input must identify the input stage"
+    );
+
+    assert!(
+        matches!(
+            rms_norm(&[1.0], &[f32::INFINITY], 1, 1, 1e-6),
+            Err(Error::RmsNormNonFinite {
+                stage: RmsNormStage::Weight,
+                ..
+            })
+        ),
+        "non-finite weight must identify the weight stage"
+    );
+}
+
+#[test]
+fn rms_norm_rejects_nonpositive_or_nonfinite_epsilon() {
+    for eps in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+        assert!(
+            matches!(
+                rms_norm(&[1.0], &[1.0], 1, 1, eps),
+                Err(Error::RmsNormInvalidParameter { .. })
+            ),
+            "epsilon {eps} must identify the epsilon stage"
+        );
+    }
+}
+
+#[test]
+fn rms_norm_rejects_finite_input_sum_overflow() {
+    let component = f32::MAX.sqrt() * 0.9;
+    let squared = component * component;
+    assert!(component.is_finite(), "test component must be finite");
+    assert!(
+        squared.is_finite(),
+        "each finite component square must be finite"
+    );
+
+    assert!(
+        matches!(
+            rms_norm(&[component, component], &[1.0, 1.0], 1, 2, 1e-6),
+            Err(Error::RmsNormNonFinite {
+                stage: RmsNormStage::Sum,
+                ..
+            })
+        ),
+        "finite squares that overflow while summing must identify the sum stage"
+    );
+}
+
+#[test]
+fn rms_norm_rejects_nonfinite_weighted_output() {
+    assert!(
+        matches!(
+            rms_norm(&[1.0_f32, 0.0], &[f32::MAX, 1.0], 1, 2, 1e-6),
+            Err(Error::RmsNormNonFinite {
+                stage: RmsNormStage::Output,
+                ..
+            })
+        ),
+        "non-finite weighted output must identify the output stage"
+    );
+}
+
+fn rms_norm_f64_oracle(x: &[f32], weight: &[f32], n: usize, eps: f64) -> Vec<f64> {
+    let mut output = Vec::with_capacity(x.len());
+    for input_row in x.chunks_exact(n) {
+        let sum_sq = input_row
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>();
+        let inverse = ((sum_sq / usize_to_f64(n)) + eps).sqrt().recip();
+        output.extend(
+            input_row
+                .iter()
+                .zip(weight.iter())
+                .map(|(value, scale)| f64::from(*value) * inverse * f64::from(*scale)),
+        );
+    }
+    output
 }
 
 #[test]
