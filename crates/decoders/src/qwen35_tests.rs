@@ -1,4 +1,4 @@
-use std::{fs, num::NonZeroU64};
+use std::{collections::BTreeMap, fs, num::NonZeroU64};
 
 use loader::gguf::{
     ArtifactByteLimit, ObservedArtifact, Sha256Digest, VerifiedArtifact, observe_gguf_with_sha256,
@@ -37,6 +37,11 @@ const TEST_Q8_SCALE_ONE_BITS: u16 = 0x3c00;
 const TEST_Q8_SCALE_NONFINITE_BITS: u16 = 0x7c00;
 const TEST_ALTERNATING_PERIOD: usize = 2;
 const TEST_RMS_EPSILON: f32 = 0.001;
+const CANONICAL_HEADS: u64 = 4;
+const CANONICAL_KEY_VALUE_HEADS: u64 = 2;
+const CANONICAL_HEAD_WIDTH: u64 = 128;
+const CANONICAL_CONTEXT: usize = 4;
+const CANONICAL_ROPE_SECTIONS: [i32; 4] = [11, 11, 10, 0];
 
 #[derive(Clone)]
 enum MetadataEntry {
@@ -68,7 +73,7 @@ struct FixtureTensor {
 }
 
 #[derive(Clone)]
-struct Fixture {
+pub(crate) struct Fixture {
     metadata: Vec<MetadataEntry>,
     tensors: Vec<FixtureTensor>,
 }
@@ -226,6 +231,101 @@ fn executes_verified_token_ids_through_hybrid_main_blocks_transactionally()
         "nonzero text positions and retained hybrid state must affect the next token logits"
     );
     Ok(())
+}
+
+#[test]
+fn canonical_hybrid_execution_matches_independent_f64_oracle_and_rolls_back()
+-> std::result::Result<(), String> {
+    let fixture = canonical_hybrid_fixture()?;
+    let mut oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
+    let expected_batch = oracle.step(&[1, 2])?;
+    let expected_continuation = oracle.step(&[3])?;
+    let mut no_attention = CanonicalHybridOracle::from_fixture(&fixture)?.without_attention();
+    let no_attention_logits = no_attention.step(&[1, 2])?;
+    let mut no_ffn = CanonicalHybridOracle::from_fixture(&fixture)?.without_ffn();
+    let no_ffn_logits = no_ffn.step(&[1, 2])?;
+    let mut adjacent_pairs = CanonicalHybridOracle::from_fixture(&fixture)?.with_adjacent_pairs();
+    let adjacent_pair_logits = adjacent_pairs.step(&[1, 2])?;
+    assert_oracle_difference(
+        &expected_batch,
+        &no_attention_logits,
+        "attention residual path",
+    )?;
+    assert_oracle_difference(&expected_batch, &no_ffn_logits, "SwiGLU residual path")?;
+    assert_oracle_difference(
+        &expected_batch,
+        &adjacent_pair_logits,
+        "half-split IMRoPE layout",
+    )?;
+
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let mut batched = weights
+        .execution(CANONICAL_CONTEXT)
+        .map_err(|error| error.to_string())?;
+    let actual_batch = batched.step(&[1, 2]).map_err(|error| error.to_string())?;
+    assert_f32_matches_f64(
+        &actual_batch,
+        &expected_batch,
+        "canonical recurrent/full-attention logits",
+    )?;
+    let actual_continuation = batched.step(&[3]).map_err(|error| error.to_string())?;
+    assert_f32_matches_f64(
+        &actual_continuation,
+        &expected_continuation,
+        "canonical hybrid continuation state",
+    )?;
+
+    let mut sequential = weights
+        .execution(CANONICAL_CONTEXT)
+        .map_err(|error| error.to_string())?;
+    let mut sequential_logits = sequential.step(&[1]).map_err(|error| error.to_string())?;
+    sequential_logits.extend(sequential.step(&[2]).map_err(|error| error.to_string())?);
+    assert_eq!(
+        actual_batch, sequential_logits,
+        "multi-token execution must be exactly token-serial, including hybrid state"
+    );
+
+    let mut rollback = weights
+        .execution(CANONICAL_CONTEXT)
+        .map_err(|error| error.to_string())?;
+    let refusal = rollback.step(&[1, u32::MAX]);
+    assert!(
+        refusal.is_err(),
+        "an invalid second token must refuse the whole call"
+    );
+    let retry = rollback.step(&[1]).map_err(|error| error.to_string())?;
+    let mut pristine = weights
+        .execution(CANONICAL_CONTEXT)
+        .map_err(|error| error.to_string())?;
+    let pristine_first = pristine.step(&[1]).map_err(|error| error.to_string())?;
+    assert_eq!(
+        retry, pristine_first,
+        "a refused call after a fully executed first hybrid token must not commit any state"
+    );
+    Ok(())
+}
+
+#[test]
+fn canonical_hybrid_execution_honors_a_shorter_rope_rotation_domain()
+-> std::result::Result<(), String> {
+    let fixture = canonical_hybrid_fixture_with_n_rot(Some(64))?;
+    let mut oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
+    let expected = oracle.step(&[1, 2])?;
+    let mut full_width = CanonicalHybridOracle::from_fixture(&fixture)?.with_full_rotation();
+    let full_width_logits = full_width.step(&[1, 2])?;
+    assert_oracle_difference(
+        &expected,
+        &full_width_logits,
+        "n_rot=64 IMRoPE tail preservation",
+    )?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let mut session = weights
+        .execution(CANONICAL_CONTEXT)
+        .map_err(|error| error.to_string())?;
+    let actual = session.step(&[1, 2]).map_err(|error| error.to_string())?;
+    assert_f32_matches_f64(&actual, &expected, "D=128 n_rot=64 canonical IMRoPE logits")
 }
 
 #[test]
@@ -933,7 +1033,7 @@ fn set_f32_repeated(
     Ok(())
 }
 
-fn set_f32_value(
+pub(crate) fn set_f32_value(
     fixture: &mut Fixture,
     name: &str,
     value_index: usize,
@@ -1014,6 +1114,622 @@ fn asymmetric_values(value_count: usize, phase: usize) -> Vec<f32> {
     (0..value_count)
         .map(|index| VALUES[(index + phase) % VALUES.len()])
         .collect()
+}
+
+pub(crate) fn canonical_hybrid_fixture() -> std::result::Result<Fixture, String> {
+    canonical_hybrid_fixture_with_n_rot(None)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the isolated GGUF fixture names each architecture-owned tensor explicitly"
+)]
+fn canonical_hybrid_fixture_with_n_rot(n_rot: Option<u64>) -> std::result::Result<Fixture, String> {
+    let mut fixture = fixture(0)?;
+    set_u32(&mut fixture, HEAD_COUNT_KEY, to_u32(CANONICAL_HEADS)?)?;
+    set_u32(
+        &mut fixture,
+        KEY_VALUE_HEAD_COUNT_KEY,
+        to_u32(CANONICAL_KEY_VALUE_HEADS)?,
+    )?;
+    set_u32(&mut fixture, KEY_LENGTH_KEY, to_u32(CANONICAL_HEAD_WIDTH)?)?;
+    set_u32(
+        &mut fixture,
+        VALUE_LENGTH_KEY,
+        to_u32(CANONICAL_HEAD_WIDTH)?,
+    )?;
+    set_u32(
+        &mut fixture,
+        "qwen35.context_length",
+        u32::try_from(CANONICAL_CONTEXT).map_err(|error| error.to_string())?,
+    )?;
+    replace_metadata(
+        &mut fixture,
+        MetadataEntry::I32Array(
+            "qwen35.rope.dimension_sections",
+            CANONICAL_ROPE_SECTIONS.to_vec(),
+        ),
+    )?;
+    if let Some(n_rot) = n_rot {
+        fixture.metadata.push(MetadataEntry::U32(
+            "qwen35.rope.dimension_count",
+            to_u32(n_rot)?,
+        ));
+    }
+    mutate_tensor_shape(
+        &mut fixture,
+        "blk.3.attn_k.weight",
+        vec![
+            TEST_HIDDEN,
+            CANONICAL_KEY_VALUE_HEADS * CANONICAL_HEAD_WIDTH,
+        ],
+    )?;
+    mutate_tensor_shape(
+        &mut fixture,
+        "blk.3.attn_k_norm.weight",
+        vec![CANONICAL_HEAD_WIDTH],
+    )?;
+    mutate_tensor_shape(
+        &mut fixture,
+        "blk.3.attn_q.weight",
+        vec![TEST_HIDDEN, CANONICAL_HEADS * CANONICAL_HEAD_WIDTH * 2],
+    )?;
+    mutate_tensor_shape(
+        &mut fixture,
+        "blk.3.attn_q_norm.weight",
+        vec![CANONICAL_HEAD_WIDTH],
+    )?;
+    mutate_tensor_shape(
+        &mut fixture,
+        "blk.3.attn_v.weight",
+        vec![
+            TEST_HIDDEN,
+            CANONICAL_KEY_VALUE_HEADS * CANONICAL_HEAD_WIDTH,
+        ],
+    )?;
+    mutate_tensor_shape(
+        &mut fixture,
+        "blk.3.attn_output.weight",
+        vec![CANONICAL_HEADS * CANONICAL_HEAD_WIDTH, TEST_HIDDEN],
+    )?;
+
+    let parameters = fixture
+        .tensors
+        .iter()
+        .map(|tensor| {
+            let count = tensor
+                .dims
+                .iter()
+                .try_fold(1_u64, |total, dimension| total.checked_mul(*dimension))
+                .ok_or_else(|| format!("canonical tensor `{}` size overflowed", tensor.name))?;
+            let count = usize::try_from(count).map_err(|error| error.to_string())?;
+            let phase = tensor
+                .name
+                .bytes()
+                .fold(0_usize, |total, byte| total + usize::from(byte))
+                % 7;
+            Ok((tensor.name.clone(), asymmetric_values(count, phase)))
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?;
+    for (name, values) in parameters {
+        set_f32_values(&mut fixture, &name, values)?;
+    }
+    for block in 0..3_u8 {
+        set_f32_values(
+            &mut fixture,
+            &format!("blk.{block}.ssm_a"),
+            vec![-0.4, -0.9, -0.6, -0.8],
+        )?;
+    }
+    Ok(fixture)
+}
+
+pub(crate) struct CanonicalHybridOracle {
+    tensors: BTreeMap<String, Vec<f64>>,
+    recurrent: Vec<OracleRecurrentState>,
+    keys: Vec<Vec<f64>>,
+    values: Vec<Vec<f64>>,
+    position: usize,
+    rope_width: usize,
+    include_attention: bool,
+    include_ffn: bool,
+    adjacent_pairs: bool,
+}
+
+type OracleStateSnapshot = (usize, Vec<(Vec<f64>, Vec<f64>)>, Vec<f64>, Vec<f64>);
+
+struct OracleRecurrentState {
+    convolution: Vec<f64>,
+    gdn: Vec<f64>,
+}
+
+impl CanonicalHybridOracle {
+    pub(crate) fn from_fixture(fixture: &Fixture) -> std::result::Result<Self, String> {
+        let mut tensors = BTreeMap::new();
+        for tensor in &fixture.tensors {
+            if tensor.ggml_type != TEST_F32_TYPE_ID {
+                return Err(format!(
+                    "canonical oracle requires F32 tensor `{}`",
+                    tensor.name
+                ));
+            }
+            let values = tensor
+                .payload
+                .chunks_exact(4)
+                .map(|bytes| {
+                    f64::from(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                })
+                .collect::<Vec<_>>();
+            tensors.insert(tensor.name.clone(), values);
+        }
+        let rope_width = fixture
+            .metadata
+            .iter()
+            .find_map(|entry| match entry {
+                MetadataEntry::U32("qwen35.rope.dimension_count", value) => Some(*value),
+                _ => None,
+            })
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(test_dimension(CANONICAL_HEAD_WIDTH)?);
+        Ok(Self {
+            tensors,
+            recurrent: (0..3)
+                .map(|_| OracleRecurrentState {
+                    convolution: vec![0.0; test_dimension(TEST_SSM_CONV_WIDTH).unwrap_or(0)],
+                    gdn: vec![0.0; 16],
+                })
+                .collect(),
+            keys: Vec::new(),
+            values: Vec::new(),
+            position: 0,
+            rope_width,
+            include_attention: true,
+            include_ffn: true,
+            adjacent_pairs: false,
+        })
+    }
+
+    fn without_attention(mut self) -> Self {
+        self.include_attention = false;
+        self
+    }
+
+    fn without_ffn(mut self) -> Self {
+        self.include_ffn = false;
+        self
+    }
+
+    fn with_adjacent_pairs(mut self) -> Self {
+        self.adjacent_pairs = true;
+        self
+    }
+
+    fn with_full_rotation(mut self) -> Self {
+        self.rope_width = 128;
+        self
+    }
+
+    fn tensor(&self, name: &str) -> std::result::Result<&[f64], String> {
+        self.tensors
+            .get(name)
+            .map(Vec::as_slice)
+            .ok_or_else(|| format!("canonical oracle is missing `{name}`"))
+    }
+
+    pub(crate) fn step(&mut self, tokens: &[u32]) -> std::result::Result<Vec<f64>, String> {
+        let mut logits = Vec::new();
+        for token in tokens {
+            let token = usize::try_from(*token).map_err(|error| error.to_string())?;
+            let embedding = self.tensor(TOKEN_EMBEDDING_TENSOR)?;
+            let hidden_width = test_dimension(TEST_HIDDEN)?;
+            let start = token
+                .checked_mul(hidden_width)
+                .ok_or_else(|| "canonical token offset overflowed".to_string())?;
+            let mut hidden = embedding
+                .get(start..start + hidden_width)
+                .ok_or_else(|| "canonical oracle token must be in vocabulary".to_string())?
+                .to_vec();
+            for block in 0..4 {
+                let residual = hidden.clone();
+                let mut attention = if block == 3 {
+                    self.full_attention(&hidden)?
+                } else {
+                    self.recurrent_attention(block, &hidden)?
+                };
+                if !self.include_attention {
+                    attention.fill(0.0);
+                }
+                add_f64(&mut hidden, &attention)?;
+                let normalized = oracle_rms(
+                    &hidden,
+                    self.tensor(&format!("blk.{block}.post_attention_norm.weight"))?,
+                    1,
+                    hidden_width,
+                )?;
+                let mut ffn = self.ffn(block, &normalized)?;
+                if !self.include_ffn {
+                    ffn.fill(0.0);
+                }
+                hidden = residual;
+                add_f64(&mut hidden, &attention)?;
+                add_f64(&mut hidden, &ffn)?;
+            }
+            let normalized =
+                oracle_rms(&hidden, self.tensor(OUTPUT_NORM_TENSOR)?, 1, hidden_width)?;
+            logits.extend(oracle_project(
+                &normalized,
+                self.tensor(OUTPUT_TENSOR)?,
+                hidden_width,
+                test_dimension(TEST_VOCABULARY)?,
+            ));
+            self.position += 1;
+        }
+        Ok(logits)
+    }
+
+    fn ffn(&self, block: usize, input: &[f64]) -> std::result::Result<Vec<f64>, String> {
+        let hidden = test_dimension(TEST_HIDDEN)?;
+        let feed_forward = test_dimension(TEST_FEED_FORWARD)?;
+        let gate = oracle_project(
+            input,
+            self.tensor(&format!("blk.{block}.ffn_gate.weight"))?,
+            hidden,
+            feed_forward,
+        );
+        let up = oracle_project(
+            input,
+            self.tensor(&format!("blk.{block}.ffn_up.weight"))?,
+            hidden,
+            feed_forward,
+        );
+        let fused = gate
+            .iter()
+            .zip(up)
+            .map(|(gate, up)| (gate / (1.0 + (-gate).exp())) * up)
+            .collect::<Vec<_>>();
+        Ok(oracle_project(
+            &fused,
+            self.tensor(&format!("blk.{block}.ffn_down.weight"))?,
+            feed_forward,
+            hidden,
+        ))
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::needless_range_loop,
+        clippy::too_many_lines,
+        reason = "the scalar oracle deliberately spells out the pinned recurrent state transition"
+    )]
+    fn recurrent_attention(
+        &mut self,
+        block: usize,
+        input: &[f64],
+    ) -> std::result::Result<Vec<f64>, String> {
+        let hidden = test_dimension(TEST_HIDDEN)?;
+        let inner = test_dimension(TEST_INNER)?;
+        let state_width = test_dimension(TEST_STATE)?;
+        let value_heads = test_dimension(TEST_TIME_STEP_RANK)?;
+        let key_heads = test_dimension(TEST_GROUP_COUNT)?;
+        let conv_width = test_dimension(TEST_SSM_CONV_WIDTH)?;
+        let normalized = oracle_rms(
+            input,
+            self.tensor(&format!("blk.{block}.attn_norm.weight"))?,
+            1,
+            hidden,
+        )?;
+        let qkv = oracle_project(
+            &normalized,
+            self.tensor(&format!("blk.{block}.attn_qkv.weight"))?,
+            hidden,
+            conv_width,
+        );
+        let z = oracle_project(
+            &normalized,
+            self.tensor(&format!("blk.{block}.attn_gate.weight"))?,
+            hidden,
+            inner,
+        );
+        let alpha = oracle_project(
+            &normalized,
+            self.tensor(&format!("blk.{block}.ssm_alpha.weight"))?,
+            hidden,
+            value_heads,
+        );
+        let beta = oracle_project(
+            &normalized,
+            self.tensor(&format!("blk.{block}.ssm_beta.weight"))?,
+            hidden,
+            value_heads,
+        );
+        let convolution_weights = self
+            .tensor(&format!("blk.{block}.ssm_conv1d.weight"))?
+            .to_vec();
+        let a = self.tensor(&format!("blk.{block}.ssm_a"))?.to_vec();
+        let dt = self.tensor(&format!("blk.{block}.ssm_dt.bias"))?.to_vec();
+        let norm = self
+            .tensor(&format!("blk.{block}.ssm_norm.weight"))?
+            .to_vec();
+        let output_weight = self
+            .tensor(&format!("blk.{block}.ssm_out.weight"))?
+            .to_vec();
+        let state = self
+            .recurrent
+            .get_mut(block)
+            .ok_or_else(|| "canonical recurrent block is absent".to_string())?;
+        let mut convolved = Vec::with_capacity(conv_width);
+        for channel in 0..conv_width {
+            let weights = &convolution_weights[channel * 2..channel * 2 + 2];
+            convolved.push(state.convolution[channel] * weights[0] + qkv[channel] * weights[1]);
+        }
+        state.convolution.copy_from_slice(&qkv);
+        let convolved = convolved
+            .into_iter()
+            .map(|value| value / (1.0 + (-value).exp()))
+            .collect::<Vec<_>>();
+        let key_width = key_heads * state_width;
+        let mut output = vec![0.0; inner];
+        for value_head in 0..value_heads {
+            let key_head = value_head % key_heads;
+            let q = oracle_l2(&convolved[key_head * state_width..(key_head + 1) * state_width]);
+            let k = oracle_l2(
+                &convolved
+                    [key_width + key_head * state_width..key_width + (key_head + 1) * state_width],
+            );
+            let values = &convolved[2 * key_width + value_head * state_width
+                ..2 * key_width + (value_head + 1) * state_width];
+            let beta = 1.0 / (1.0 + (-beta[value_head]).exp());
+            let alpha_dt = alpha[value_head] + dt[value_head];
+            let gate = a[value_head] * (alpha_dt.max(0.0) + (-alpha_dt.abs()).exp().ln_1p());
+            let decay = gate.exp();
+            for key in 0..state_width {
+                for value in 0..state_width {
+                    state.gdn[(value_head * state_width + key) * state_width + value] *= decay;
+                }
+            }
+            let mut delta = vec![0.0; state_width];
+            for value in 0..state_width {
+                let prior = (0..state_width)
+                    .map(|key| {
+                        state.gdn[(value_head * state_width + key) * state_width + value] * k[key]
+                    })
+                    .sum::<f64>();
+                delta[value] = beta * (values[value] - prior);
+            }
+            for key in 0..state_width {
+                for value in 0..state_width {
+                    state.gdn[(value_head * state_width + key) * state_width + value] +=
+                        k[key] * delta[value];
+                }
+            }
+            for value in 0..state_width {
+                output[value_head * state_width + value] = (0..state_width)
+                    .map(|key| {
+                        state.gdn[(value_head * state_width + key) * state_width + value] * q[key]
+                            / (state_width as f64).sqrt()
+                    })
+                    .sum();
+            }
+        }
+        let output = oracle_rms(&output, &norm, value_heads, state_width)?;
+        let gated = output
+            .iter()
+            .zip(z)
+            .map(|(output, z)| output * (z / (1.0 + (-z).exp())))
+            .collect::<Vec<_>>();
+        Ok(oracle_project(&gated, &output_weight, inner, hidden))
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::too_many_lines,
+        reason = "the scalar oracle deliberately keeps pinned full-attention order visible"
+    )]
+    fn full_attention(&mut self, input: &[f64]) -> std::result::Result<Vec<f64>, String> {
+        let hidden = test_dimension(TEST_HIDDEN)?;
+        let heads = test_dimension(CANONICAL_HEADS)?;
+        let kv_heads = test_dimension(CANONICAL_KEY_VALUE_HEADS)?;
+        let width = test_dimension(CANONICAL_HEAD_WIDTH)?;
+        let normalized = oracle_rms(input, self.tensor("blk.3.attn_norm.weight")?, 1, hidden)?;
+        let q_gate = oracle_project(
+            &normalized,
+            self.tensor("blk.3.attn_q.weight")?,
+            hidden,
+            heads * width * 2,
+        );
+        let mut query = Vec::with_capacity(heads * width);
+        let mut gate = Vec::with_capacity(heads * width);
+        for head in 0..heads {
+            let base = head * width * 2;
+            query.extend_from_slice(&q_gate[base..base + width]);
+            gate.extend_from_slice(&q_gate[base + width..base + 2 * width]);
+        }
+        let mut query = oracle_rms(
+            query.as_slice(),
+            self.tensor("blk.3.attn_q_norm.weight")?,
+            heads,
+            width,
+        )?;
+        let key = oracle_project(
+            &normalized,
+            self.tensor("blk.3.attn_k.weight")?,
+            hidden,
+            kv_heads * width,
+        );
+        let mut key = oracle_rms(
+            &key,
+            self.tensor("blk.3.attn_k_norm.weight")?,
+            kv_heads,
+            width,
+        )?;
+        let value = oracle_project(
+            &normalized,
+            self.tensor("blk.3.attn_v.weight")?,
+            hidden,
+            kv_heads * width,
+        );
+        canonical_mrope(
+            &mut query,
+            heads,
+            width,
+            self.rope_width,
+            self.position,
+            self.adjacent_pairs,
+        )?;
+        canonical_mrope(
+            &mut key,
+            kv_heads,
+            width,
+            self.rope_width,
+            self.position,
+            self.adjacent_pairs,
+        )?;
+        self.keys.push(key);
+        self.values.push(value);
+        let mut merged = Vec::with_capacity(heads * width);
+        for head in 0..heads {
+            let kv_head = head / (heads / kv_heads);
+            let query = &query[head * width..(head + 1) * width];
+            let scores = self
+                .keys
+                .iter()
+                .map(|key| {
+                    query
+                        .iter()
+                        .zip(&key[kv_head * width..(kv_head + 1) * width])
+                        .map(|(left, right)| left * right)
+                        .sum::<f64>()
+                        / (width as f64).sqrt()
+                })
+                .collect::<Vec<_>>();
+            let probabilities = oracle_softmax(&scores)?;
+            for lane in 0..width {
+                let attended = probabilities
+                    .iter()
+                    .zip(&self.values)
+                    .map(|(probability, value)| probability * value[kv_head * width + lane])
+                    .sum::<f64>();
+                let gate = gate[head * width + lane];
+                merged.push(attended / (1.0 + (-gate).exp()));
+            }
+        }
+        Ok(oracle_project(
+            &merged,
+            self.tensor("blk.3.attn_output.weight")?,
+            heads * width,
+            hidden,
+        ))
+    }
+
+    pub(crate) fn state_for_test(&self) -> OracleStateSnapshot {
+        (
+            self.position,
+            self.recurrent
+                .iter()
+                .map(|state| (state.convolution.clone(), state.gdn.clone()))
+                .collect(),
+            self.keys.iter().flatten().copied().collect(),
+            self.values.iter().flatten().copied().collect(),
+        )
+    }
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the f64 oracle intentionally converts checked small fixture indexes to angles"
+)]
+fn canonical_mrope(
+    values: &mut [f64],
+    rows: usize,
+    width: usize,
+    n_rot: usize,
+    position: usize,
+    adjacent_pairs: bool,
+) -> std::result::Result<(), String> {
+    if width != test_dimension(CANONICAL_HEAD_WIDTH)?
+        || values.len() != rows * width
+        || n_rot == 0
+        || !n_rot.is_multiple_of(2)
+        || n_rot > width
+    {
+        return Err(
+            "canonical IMRoPE witness width does not match its serialized layout".to_string(),
+        );
+    }
+    let positions = [position as f64, position as f64, position as f64, 0.0];
+    for row in values.chunks_exact_mut(width) {
+        for pair in 0..(n_rot / 2) {
+            let sector = pair % 32;
+            let axis = if sector % 3 == 1 && sector < 3 * 11 {
+                1
+            } else if sector % 3 == 2 && sector < 3 * 10 {
+                2
+            } else if sector.is_multiple_of(3) && sector < 3 * 11 {
+                0
+            } else {
+                3
+            };
+            let angle = positions[axis] / 10_000.0_f64.powf((2 * pair) as f64 / n_rot as f64);
+            let (sine, cosine) = angle.sin_cos();
+            let (left, right) = if adjacent_pairs {
+                (pair * 2, pair * 2 + 1)
+            } else {
+                (pair, pair + n_rot / 2)
+            };
+            let left_value = row[left];
+            let right_value = row[right];
+            row[left] = left_value * cosine - right_value * sine;
+            row[right] = left_value * sine + right_value * cosine;
+        }
+    }
+    Ok(())
+}
+
+fn oracle_softmax(scores: &[f64]) -> std::result::Result<Vec<f64>, String> {
+    let maximum = scores
+        .iter()
+        .copied()
+        .reduce(f64::max)
+        .ok_or_else(|| "canonical attention has no causal scores".to_string())?;
+    let exponentials = scores
+        .iter()
+        .map(|score| (score - maximum).exp())
+        .collect::<Vec<_>>();
+    let total = exponentials.iter().sum::<f64>();
+    Ok(exponentials
+        .into_iter()
+        .map(|value| value / total)
+        .collect())
+}
+
+fn add_f64(left: &mut [f64], right: &[f64]) -> std::result::Result<(), String> {
+    if left.len() != right.len() {
+        return Err("canonical residual widths differ".to_string());
+    }
+    for (left, right) in left.iter_mut().zip(right) {
+        *left += right;
+    }
+    Ok(())
+}
+
+fn assert_oracle_difference(
+    expected: &[f64],
+    alternate: &[f64],
+    path: &str,
+) -> std::result::Result<(), String> {
+    let greatest = expected
+        .iter()
+        .zip(alternate)
+        .map(|(expected, alternate)| (expected - alternate).abs())
+        .fold(0.0_f64, f64::max);
+    if greatest <= 2.0e-5 {
+        return Err(format!(
+            "canonical fixture is insensitive to the required {path}: greatest logit delta {greatest}"
+        ));
+    }
+    Ok(())
 }
 
 fn set_f32_values(
@@ -1139,12 +1855,15 @@ fn recurrent_oracle(inputs: &[f32]) -> std::result::Result<(Vec<f64>, Vec<f64>),
     ))
 }
 
-fn oracle_project(
+fn oracle_project<W>(
     input: &[f64],
-    weights: &[f32],
+    weights: &[W],
     input_width: usize,
     output_width: usize,
-) -> Vec<f64> {
+) -> Vec<f64>
+where
+    W: Copy + Into<f64>,
+{
     input
         .chunks_exact(input_width)
         .flat_map(|row| {
@@ -1154,7 +1873,7 @@ fn oracle_project(
                 .map(move |weight| {
                     row.iter()
                         .zip(weight)
-                        .map(|(input, weight)| input * f64::from(*weight))
+                        .map(|(input, weight)| input * (*weight).into())
                         .sum()
                 })
         })
@@ -1421,7 +2140,7 @@ fn observe_fixture(fixture: &Fixture) -> std::result::Result<ObservedArtifact, S
     observe_gguf_with_sha256(&path).map_err(|error| error.to_string())
 }
 
-fn verify_fixture(fixture: &Fixture) -> std::result::Result<VerifiedArtifact, String> {
+pub(crate) fn verify_fixture(fixture: &Fixture) -> std::result::Result<VerifiedArtifact, String> {
     let bytes = fixture_bytes(fixture)?;
     let expected = Sha256Digest::from_bytes(Sha256::digest(&bytes).into());
     let byte_limit = u64::try_from(bytes.len())

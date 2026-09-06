@@ -164,6 +164,11 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         &self.recurrent_state
     }
 
+    #[cfg(test)]
+    pub(crate) fn transaction_state_for_test(&self) -> (&[f32], &[f32]) {
+        (&self.convolution_history, &self.recurrent_state)
+    }
+
     fn normalize_input(&self, hidden_tokens: &[f32]) -> Result<(usize, Vec<f32>)> {
         if hidden_tokens.is_empty() || !hidden_tokens.len().is_multiple_of(self.layout.hidden) {
             return RecurrentInputSnafu {

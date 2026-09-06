@@ -252,6 +252,20 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// Native execution could not allocate an all-or-nothing local result.
+    #[snafu(display("qwen35 execution {target} could not reserve {length} elements: {source}"))]
+    ExecutionAllocation {
+        /// Named local buffer that could not be reserved.
+        target: &'static str,
+        /// Exact element capacity requested.
+        length: usize,
+        /// Allocation failure retained as the error source.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// Finite recurrent execution produced a non-finite intermediate.
     #[snafu(display(
         "qwen35 recurrent arithmetic became non-finite during {stage} at index {index}"

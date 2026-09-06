@@ -6,10 +6,10 @@ use quant::f32_row::F32Row;
 use snafu::ResultExt;
 
 use crate::error::{
-    ArithmeticOverflowSnafu, ExecutionArithmeticSnafu, ExecutionContextSnafu, ExecutionTokenSnafu,
-    MetadataRelationSnafu, MetadataTypeSnafu, MissingMetadataSnafu, PayloadTensorSnafu,
-    ProjectionBytesSnafu, ProjectionDtypeSnafu, ProjectionRowSnafu, RecurrentRmsNormSnafu,
-    TensorShapeSnafu,
+    ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionArithmeticSnafu,
+    ExecutionContextSnafu, ExecutionTokenSnafu, MetadataRelationSnafu, MetadataTypeSnafu,
+    MissingMetadataSnafu, PayloadTensorSnafu, ProjectionBytesSnafu, ProjectionDtypeSnafu,
+    ProjectionRowSnafu, RecurrentRmsNormSnafu, TensorShapeSnafu,
 };
 use crate::qwen35::recurrent_layernorm_rms_epsilon;
 use crate::{Qwen35RecurrentExecution, Qwen35Weights, Result};
@@ -58,7 +58,7 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
     ) -> Result<Self> {
         let layout = Layout::from_metadata(weights, max_context)?;
         let block_count = layout.main_blocks;
-        let mut layers = reserve_slots("main-block execution slots", block_count)?;
+        let mut layers = reserve("main-block execution slots", block_count)?;
         for block in 0..block_count {
             if layout.is_full(block) {
                 layers.push(LayerState::Full(FullAttentionState::new(&layout)?));
@@ -118,7 +118,7 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
     }
 
     fn stage(&self) -> Result<Self> {
-        let mut layers = reserve_slots("transaction main-block slots", self.layers.len())?;
+        let mut layers = reserve("transaction main-block slots", self.layers.len())?;
         for layer in &self.layers {
             layers.push(match layer {
                 LayerState::Recurrent(execution) => {
@@ -310,14 +310,14 @@ fn full_attention(
             }
             .build()
         })?;
-        query.extend(q_gate.get(start..middle).ok_or_else(|| {
+        query.extend_from_slice(q_gate.get(start..middle).ok_or_else(|| {
             ExecutionContextSnafu {
                 requested: start,
                 rule: "Q/gate projection must be interleaved per head",
             }
             .build()
         })?);
-        gate.extend(q_gate.get(middle..end).ok_or_else(|| {
+        gate.extend_from_slice(q_gate.get(middle..end).ok_or_else(|| {
             ExecutionContextSnafu {
                 requested: middle,
                 rule: "Q/gate projection must be interleaved per head",
@@ -734,7 +734,7 @@ impl Layout {
             }
             .fail();
         }
-        let sections = i32_array(metadata, ROPE_SECTIONS_KEY)?;
+        let sections = rope_sections(metadata, ROPE_SECTIONS_KEY)?;
         if sections.iter().any(|section| *section < 0) {
             return MetadataRelationSnafu {
                 key: ROPE_SECTIONS_KEY,
@@ -756,10 +756,7 @@ impl Layout {
                 .build()
             })
         })?;
-        if sections.len() != 4
-            || section_pairs > key
-            || sections[..3].iter().all(|section| *section == 0)
-        {
+        if section_pairs > key || sections[..3].iter().all(|section| *section == 0) {
             return MetadataRelationSnafu {
                 key: ROPE_SECTIONS_KEY,
                 rule: "must contain four sections no wider than the key width, with one text axis",
@@ -1045,10 +1042,10 @@ fn optional_string_meta<'a>(
         .fail(),
     }
 }
-fn i32_array(
+fn rope_sections(
     metadata: &std::collections::HashMap<String, MetaValue>,
     key: &'static str,
-) -> Result<Vec<i32>> {
+) -> Result<[i32; 4]> {
     let Some(MetaValue::Array(array)) = metadata.get(key) else {
         return match metadata.get(key) {
             None => MissingMetadataSnafu { key }.fail(),
@@ -1067,39 +1064,36 @@ fn i32_array(
         }
         .fail();
     }
-    array
-        .values()
-        .iter()
-        .map(|value| match value {
-            MetaValue::I32(number) => Ok(*number),
-            _ => MetadataRelationSnafu {
-                key,
-                rule: "must contain only i32 values",
+    if array.values().len() != 4 {
+        return MetadataRelationSnafu {
+            key,
+            rule: "must contain exactly four sections",
+        }
+        .fail();
+    }
+    let mut sections = [0; 4];
+    for (section, value) in sections.iter_mut().zip(array.values()) {
+        match value {
+            MetaValue::I32(number) => *section = *number,
+            _ => {
+                return MetadataRelationSnafu {
+                    key,
+                    rule: "must contain only i32 values",
+                }
+                .fail();
             }
-            .fail(),
-        })
-        .collect()
+        }
+    }
+    Ok(sections)
 }
 fn block_name(block: usize, role: &str) -> String {
     format!("blk.{block}.{role}")
 }
-fn reserve(target: &'static str, length: usize) -> Result<Vec<f32>> {
+fn reserve<T>(target: &'static str, length: usize) -> Result<Vec<T>> {
     let mut values = Vec::new();
     values
         .try_reserve_exact(length)
-        .map_err(|_| ArithmeticOverflowSnafu { context: target }.build())?;
-    Ok(values)
-}
-fn clone_values(target: &'static str, source: &[f32]) -> Result<Vec<f32>> {
-    let mut values = reserve(target, source.len())?;
-    values.extend_from_slice(source);
-    Ok(values)
-}
-fn reserve_slots<T>(target: &'static str, length: usize) -> Result<Vec<T>> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(length)
-        .map_err(|_| ArithmeticOverflowSnafu { context: target }.build())?;
+        .context(ExecutionAllocationSnafu { target, length })?;
     Ok(values)
 }
 fn finite(values: &[f32], stage: &'static str) -> Result<()> {
@@ -1129,3 +1123,6 @@ fn add_in_place(destination: &mut [f32], source: &[f32], stage: &'static str) ->
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod qwen35_execution_oracle_tests;

@@ -865,4 +865,4 @@ fn checked_add(left: u64, right: u64, context: &'static str) -> Result<u64> {
 
 #[cfg(test)]
 #[path = "qwen35_tests.rs"]
-mod tests;
+pub(crate) mod tests;
