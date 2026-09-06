@@ -11,6 +11,25 @@ const NIBBLES: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 const HIGH_PAIRS: [u8; 4] = [0, 1, 2, 3];
 const Q6_SCALES: [i8; 16] = [-8, -7, -6, -5, -4, -3, -2, -1, 1, 2, 3, 4, 5, 6, 7, 8];
 
+// WHY: Original synthetic conformance vector manually derived and independently
+// read-checked on 2026-09-06 against pinned llama.cpp
+// 6a1a922d269908a29cbd4b49c27e6a8e7fd10fae: ggml/src/ggml-common.h:323-368
+// and ggml/src/ggml-quants.c:880-886,1529-1550,1731-1755,1939-1967. No upstream
+// fixture, table, or implementation code is carried.
+const FIXED_K_PREFIX: [u8; 4] = [0x00, 0x3c, 0x00, 0x3c];
+const FIXED_K_SCALE_MIN: [u8; 12] = [
+    0x01, 0x52, 0xa3, 0xf4, 0x3c, 0x6b, 0x9a, 0xc9, 0x75, 0x86, 0x97, 0xa8,
+];
+const FIXED_K_PAYLOAD: [u8; 16] = [
+    0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f,
+];
+const FIXED_Q6_OTHER_PAYLOAD: [u8; 16] = [
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+];
+const FIXED_Q5_HIGH_BITS: [u8; 8] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80];
+const FIXED_K_SCALES: [u8; 8] = [1, 18, 35, 52, 5, 22, 39, 56];
+const FIXED_K_MINIMA: [u8; 8] = [60, 43, 26, 9, 7, 24, 41, 58];
+
 #[test]
 fn q4_k_decodes_all_scale_min_fields_and_two_block_dispatcher_dot() -> crate::Result<()> {
     let (first_bytes, first_expected) = q4_fixture(0);
@@ -27,6 +46,14 @@ fn q4_k_decodes_all_scale_min_fields_and_two_block_dispatcher_dot() -> crate::Re
         expected.to_bits(),
         "Q4_K dispatcher dot must equal the independent f64 oracle"
     );
+    Ok(())
+}
+
+#[test]
+fn fixed_q4_k_witness_decodes_all_packed_scale_min_fields() -> crate::Result<()> {
+    let bytes = fixed_q4_witness();
+    let decoded = Q4KBlock::parse(&bytes)?.decode_f32();
+    assert_full_vector(&decoded, &fixed_q4_expected(), "fixed Q4_K witness");
     Ok(())
 }
 
@@ -59,6 +86,14 @@ fn q5_k_decodes_all_fifth_bit_planes_and_two_block_dispatcher_dot() -> crate::Re
 }
 
 #[test]
+fn fixed_q5_k_witness_decodes_all_fifth_bit_planes() -> crate::Result<()> {
+    let bytes = fixed_q5_witness();
+    let decoded = Q5KBlock::parse(&bytes)?.decode_f32();
+    assert_full_vector(&decoded, &fixed_q5_expected(), "fixed Q5_K witness");
+    Ok(())
+}
+
+#[test]
 fn q6_k_decodes_all_scale_groups_both_halves_and_two_block_dispatcher_dot() -> crate::Result<()> {
     let (first_bytes, first_expected) = q6_fixture(0);
     let (second_bytes, second_expected) = q6_fixture(3);
@@ -83,6 +118,14 @@ fn q6_k_decodes_all_scale_groups_both_halves_and_two_block_dispatcher_dot() -> c
         expected.to_bits(),
         "Q6_K dispatcher dot must equal the independent f64 oracle"
     );
+    Ok(())
+}
+
+#[test]
+fn fixed_q6_k_witness_decodes_both_halves_signed_scales_and_lane_splits() -> crate::Result<()> {
+    let bytes = fixed_q6_witness();
+    let decoded = Q6KBlock::parse(&bytes)?.decode_f32();
+    assert_full_vector(&decoded, &fixed_q6_expected(), "fixed Q6_K witness");
     Ok(())
 }
 
@@ -162,15 +205,15 @@ fn q4_k_dispatcher_refuses_invalid_geometry_and_nonfinite_arithmetic() {
 }
 
 fn q4_fixture(seed: usize) -> ([u8; Q4_K_BLOCK_BYTES], [f32; VALUES_PER_BLOCK]) {
-    let scales = [1, 2, 3, 4, 17, 18, 19, 20];
-    let minima = [5, 6, 7, 8, 33, 34, 35, 36];
+    let scales = [1, 2, 3, 4, 9, 18, 35, 52];
+    let minima = [5, 6, 7, 8, 10, 21, 38, 55];
     let mut bytes = [0; Q4_K_BLOCK_BYTES];
     bytes[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
     bytes[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
     pack_scale_min(&mut bytes[4..16], scales, minima);
 
     let mut expected = [0.0; VALUES_PER_BLOCK];
-    for group in 0..8 {
+    for group in 0_usize..8 {
         for lane in 0..VALUES_PER_GROUP {
             let quantized = NIBBLES[(group + lane + seed) % NIBBLES.len()];
             expected[group * VALUES_PER_GROUP + lane] =
@@ -188,16 +231,44 @@ fn q4_fixture(seed: usize) -> ([u8; Q4_K_BLOCK_BYTES], [f32; VALUES_PER_BLOCK]) 
     (bytes, expected)
 }
 
+fn fixed_q4_witness() -> [u8; Q4_K_BLOCK_BYTES] {
+    let mut bytes = [0; Q4_K_BLOCK_BYTES];
+    bytes[..4].copy_from_slice(&FIXED_K_PREFIX);
+    bytes[4..16].copy_from_slice(&FIXED_K_SCALE_MIN);
+    for fragment in bytes[16..].chunks_exact_mut(FIXED_K_PAYLOAD.len()) {
+        fragment.copy_from_slice(&FIXED_K_PAYLOAD);
+    }
+    bytes
+}
+
+fn fixed_q4_expected() -> [f32; VALUES_PER_BLOCK] {
+    let mut expected = [0.0; VALUES_PER_BLOCK];
+    for group in 0_usize..8 {
+        for lane in 0..VALUES_PER_GROUP {
+            let nibble = lane % NIBBLES.len();
+            let quantized = if group.is_multiple_of(2) {
+                NIBBLES[nibble]
+            } else {
+                NIBBLES[NIBBLES.len() - 1 - nibble]
+            };
+            expected[group * VALUES_PER_GROUP + lane] = f32::from(FIXED_K_SCALES[group])
+                * f32::from(quantized)
+                - f32::from(FIXED_K_MINIMA[group]);
+        }
+    }
+    expected
+}
+
 fn q5_fixture(seed: usize) -> ([u8; Q5_K_BLOCK_BYTES], [f32; VALUES_PER_BLOCK]) {
-    let scales = [1, 2, 3, 4, 17, 18, 19, 20];
-    let minima = [5, 6, 7, 8, 33, 34, 35, 36];
+    let scales = [1, 2, 3, 4, 9, 18, 35, 52];
+    let minima = [5, 6, 7, 8, 10, 21, 38, 55];
     let mut bytes = [0; Q5_K_BLOCK_BYTES];
     bytes[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
     bytes[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
     pack_scale_min(&mut bytes[4..16], scales, minima);
 
     let mut expected = [0.0; VALUES_PER_BLOCK];
-    for group in 0..8 {
+    for group in 0_usize..8 {
         for lane in 0..VALUES_PER_GROUP {
             let high = (group + lane + seed).is_multiple_of(2);
             let low = NIBBLES[(group * 3 + lane + seed) % NIBBLES.len()];
@@ -217,6 +288,38 @@ fn q5_fixture(seed: usize) -> ([u8; Q5_K_BLOCK_BYTES], [f32; VALUES_PER_BLOCK]) 
         }
     }
     (bytes, expected)
+}
+
+fn fixed_q5_witness() -> [u8; Q5_K_BLOCK_BYTES] {
+    let mut bytes = [0; Q5_K_BLOCK_BYTES];
+    bytes[..4].copy_from_slice(&FIXED_K_PREFIX);
+    bytes[4..16].copy_from_slice(&FIXED_K_SCALE_MIN);
+    for fragment in bytes[16..48].chunks_exact_mut(FIXED_Q5_HIGH_BITS.len()) {
+        fragment.copy_from_slice(&FIXED_Q5_HIGH_BITS);
+    }
+    for fragment in bytes[48..].chunks_exact_mut(FIXED_K_PAYLOAD.len()) {
+        fragment.copy_from_slice(&FIXED_K_PAYLOAD);
+    }
+    bytes
+}
+
+fn fixed_q5_expected() -> [f32; VALUES_PER_BLOCK] {
+    let mut expected = [0.0; VALUES_PER_BLOCK];
+    for group in 0_usize..8 {
+        for lane in 0..VALUES_PER_GROUP {
+            let nibble = lane % NIBBLES.len();
+            let low = if group.is_multiple_of(2) {
+                NIBBLES[nibble]
+            } else {
+                NIBBLES[NIBBLES.len() - 1 - nibble]
+            };
+            let quantized = low + if lane % 8 == group { 16 } else { 0 };
+            expected[group * VALUES_PER_GROUP + lane] = f32::from(FIXED_K_SCALES[group])
+                * f32::from(quantized)
+                - f32::from(FIXED_K_MINIMA[group]);
+        }
+    }
+    expected
 }
 
 fn q6_fixture(seed: usize) -> ([u8; Q6_K_BLOCK_BYTES], [f32; VALUES_PER_BLOCK]) {
@@ -249,6 +352,60 @@ fn q6_fixture(seed: usize) -> ([u8; Q6_K_BLOCK_BYTES], [f32; VALUES_PER_BLOCK]) 
         bytes[192 + index] = scale.to_le_bytes()[0];
     }
     (bytes, expected)
+}
+
+fn fixed_q6_witness() -> [u8; Q6_K_BLOCK_BYTES] {
+    let mut bytes = [0; Q6_K_BLOCK_BYTES];
+    for fragment in bytes[..32].chunks_exact_mut(FIXED_K_PAYLOAD.len()) {
+        fragment.copy_from_slice(&FIXED_K_PAYLOAD);
+    }
+    for fragment in bytes[32..96].chunks_exact_mut(FIXED_Q6_OTHER_PAYLOAD.len()) {
+        fragment.copy_from_slice(&FIXED_Q6_OTHER_PAYLOAD);
+    }
+    for fragment in bytes[96..128].chunks_exact_mut(FIXED_K_PAYLOAD.len()) {
+        fragment.copy_from_slice(&FIXED_K_PAYLOAD);
+    }
+    bytes[128..160].fill(0xe4);
+    bytes[160..192].fill(0x1b);
+    for (index, scale) in Q6_SCALES.iter().enumerate() {
+        bytes[192 + index] = scale.to_le_bytes()[0];
+    }
+    bytes[208..].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    bytes
+}
+
+fn fixed_q6_expected() -> [f32; VALUES_PER_BLOCK] {
+    let mut expected = [0.0; VALUES_PER_BLOCK];
+    for half in 0..2 {
+        for quarter in 0..4 {
+            for lane in 0..VALUES_PER_GROUP {
+                let remainder = i16::from(NIBBLES[lane % NIBBLES.len()]);
+                let quantized = if half == 0 {
+                    if quarter == 0 {
+                        remainder - 32
+                    } else if quarter == 1 {
+                        remainder - 16
+                    } else if quarter == 2 {
+                        15 - remainder
+                    } else {
+                        remainder + 16
+                    }
+                } else if quarter == 0 {
+                    remainder + 16
+                } else if quarter == 1 {
+                    remainder
+                } else if quarter == 2 {
+                    remainder - 16
+                } else {
+                    -17 - remainder
+                };
+                let scale_index = half * 8 + quarter * 2 + lane / 16;
+                let output_index = half * 128 + quarter * VALUES_PER_GROUP + lane;
+                expected[output_index] = f32::from(Q6_SCALES[scale_index]) * f32::from(quantized);
+            }
+        }
+    }
+    expected
 }
 
 fn pack_scale_min(destination: &mut [u8], scales: [u8; 8], minima: [u8; 8]) {
