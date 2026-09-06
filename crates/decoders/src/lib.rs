@@ -21,6 +21,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod error;
+mod matrix;
 pub mod qwen35;
 pub mod qwen35_execution;
 pub mod qwen35_recurrent;

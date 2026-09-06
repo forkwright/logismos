@@ -5,17 +5,10 @@
 //! payload-backed CPU operation without turning that cheap preflight into a
 //! decoder-execution or model-support claim.
 
-use snafu::ResultExt;
-
-use loader::gguf::{GgmlType, VerifiedArtifact, VerifiedTensor};
-use quant::{RowFormat, row_byte_len, row_decode_f32, row_dot_f32};
+use loader::gguf::VerifiedArtifact;
 
 use crate::Result;
-use crate::error::{
-    ArithmeticOverflowSnafu, PayloadTensorSnafu, ProjectionAllocationSnafu, ProjectionBytesSnafu,
-    ProjectionDtypeSnafu, ProjectionInputWidthSnafu, ProjectionLayoutSnafu, ProjectionRankSnafu,
-    ProjectionRowSnafu,
-};
+use crate::matrix::CheckedMatrix;
 use crate::qwen35::{Qwen35ExecutionDimensions, Qwen35RecurrentLayout, Qwen35StructuralProfile};
 use crate::qwen35_execution::{Qwen35Execution, Qwen35ExecutionPlan, Qwen35LogitSelection};
 use crate::qwen35_recurrent::Qwen35RecurrentExecution;
@@ -96,38 +89,7 @@ impl<'artifact> Qwen35Weights<'artifact> {
     /// dtype/rank/geometry, allocation failure, or invalid serialized-row
     /// arithmetic.
     pub fn project(&self, name: &str, activations: &[f32]) -> Result<Vec<f32>> {
-        let matrix = self.matrix(name)?;
-        if activations.len() != matrix.input_width {
-            return ProjectionInputWidthSnafu {
-                name: matrix.name,
-                expected: matrix.input_width,
-                actual: activations.len(),
-            }
-            .fail();
-        }
-        let output_elements = Self::projection_output_elements(matrix.output_width);
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(output_elements)
-            .with_context(|_| ProjectionAllocationSnafu {
-                name: matrix.name.clone(),
-                output_width: output_elements,
-            })?;
-        for (row, row_bytes) in matrix
-            .tensor
-            .bytes()
-            .chunks_exact(matrix.row_byte_len)
-            .enumerate()
-        {
-            let value = row_dot_f32(matrix.format, row_bytes, activations).with_context(|_| {
-                ProjectionRowSnafu {
-                    name: matrix.name.clone(),
-                    row,
-                }
-            })?;
-            output.push(value);
-        }
-        Ok(output)
+        self.matrix(name)?.project(activations)
     }
 
     /// Decode one checked matrix row without materialising every output row.
@@ -135,17 +97,7 @@ impl<'artifact> Qwen35Weights<'artifact> {
     /// This is used for token embedding lookup, whose GGUF storage is a
     /// matrix with vocabulary rows and hidden columns.
     pub(crate) fn decode_row(&self, name: &str, row: usize) -> Result<Vec<f32>> {
-        let matrix = self.matrix(name)?;
-        let format = matrix.format;
-        let input_width = matrix.input_width;
-        let matrix_name = matrix.name.clone();
-        let row_bytes = matrix.row(row)?;
-        row_decode_f32(format, row_bytes, Self::decoded_row_elements(input_width)).with_context(
-            |_| ProjectionRowSnafu {
-                name: matrix_name,
-                row,
-            },
-        )
+        self.matrix(name)?.decode_row(row)
     }
 
     fn matrix(&self, name: &str) -> Result<CheckedMatrix<'_>> {
@@ -195,120 +147,5 @@ impl<'artifact> Qwen35Weights<'artifact> {
         selection: Qwen35LogitSelection,
     ) -> Result<Qwen35ExecutionPlan<'_, 'artifact>> {
         Qwen35ExecutionPlan::try_from_weights(self, max_context, max_step_tokens, selection)
-    }
-}
-
-struct CheckedMatrix<'a> {
-    name: String,
-    tensor: VerifiedTensor<'a>,
-    format: RowFormat,
-    input_width: usize,
-    output_width: usize,
-    row_byte_len: usize,
-}
-
-impl<'a> CheckedMatrix<'a> {
-    fn from_payload(payload: &'a VerifiedArtifact, name: &str) -> Result<Self> {
-        let tensor = payload.tensor(name).context(PayloadTensorSnafu {
-            name: name.to_string(),
-        })?;
-        let tensor_name = tensor.name().to_string();
-        let [input_width, output_width] = tensor.dims() else {
-            return ProjectionRankSnafu {
-                name: tensor_name,
-                actual: tensor.dims().len(),
-            }
-            .fail();
-        };
-        let format = row_format(tensor.ggml_type()).ok_or_else(|| {
-            ProjectionDtypeSnafu {
-                name: tensor_name.clone(),
-                actual: tensor.ggml_type(),
-            }
-            .build()
-        })?;
-        let input_width = usize::try_from(*input_width).map_err(|_| {
-            ArithmeticOverflowSnafu {
-                context: "row projection input width",
-            }
-            .build()
-        })?;
-        let output_width = usize::try_from(*output_width).map_err(|_| {
-            ArithmeticOverflowSnafu {
-                context: "row projection output width",
-            }
-            .build()
-        })?;
-        let row_byte_len =
-            row_byte_len(format, input_width).with_context(|_| ProjectionLayoutSnafu {
-                name: tensor_name.clone(),
-            })?;
-        let expected_bytes = output_width.checked_mul(row_byte_len).ok_or_else(|| {
-            ArithmeticOverflowSnafu {
-                context: "row projection payload byte length",
-            }
-            .build()
-        })?;
-        let bytes = tensor.bytes();
-        if bytes.len() != expected_bytes {
-            return ProjectionBytesSnafu {
-                name: tensor_name,
-                expected: expected_bytes,
-                actual: bytes.len(),
-            }
-            .fail();
-        }
-        Ok(Self {
-            name: tensor.name().to_string(),
-            tensor,
-            format,
-            input_width,
-            output_width,
-            row_byte_len,
-        })
-    }
-
-    fn row(&self, row: usize) -> Result<&[u8]> {
-        if row >= self.output_width {
-            return ProjectionInputWidthSnafu {
-                name: self.name.clone(),
-                expected: self.output_width,
-                actual: row,
-            }
-            .fail();
-        }
-        let start = row.checked_mul(self.row_byte_len).ok_or_else(|| {
-            ArithmeticOverflowSnafu {
-                context: "row projection row offset",
-            }
-            .build()
-        })?;
-        let end = start.checked_add(self.row_byte_len).ok_or_else(|| {
-            ArithmeticOverflowSnafu {
-                context: "row projection row end",
-            }
-            .build()
-        })?;
-        self.tensor.bytes().get(start..end).ok_or_else(|| {
-            ProjectionBytesSnafu {
-                name: self.name.clone(),
-                expected: end,
-                actual: self.tensor.bytes().len(),
-            }
-            .build()
-        })
-    }
-}
-
-fn row_format(ggml_type: GgmlType) -> Option<RowFormat> {
-    match ggml_type {
-        GgmlType::F32 => Some(RowFormat::F32),
-        GgmlType::Q8_0 => Some(RowFormat::Q8_0),
-        GgmlType::Q4K => Some(RowFormat::Q4K),
-        GgmlType::Q5K => Some(RowFormat::Q5K),
-        GgmlType::Q6K => Some(RowFormat::Q6K),
-        GgmlType::IQ4NL => Some(RowFormat::IQ4NL),
-        GgmlType::IQ4XS => Some(RowFormat::IQ4XS),
-        _ => None,
     }
 }
