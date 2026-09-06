@@ -39,11 +39,11 @@ records implemented crate ownership; Kanon standards govern engineering practice
 - `crates/kernels/` - HIP + CPU reference kernels
 - `crates/transformers/` - transformer building blocks (attention, norms)
 - `crates/encoders/` - encoder model impls (Stella, ModernBERT)
-- `crates/embed/` - embedding pipeline
+- `crates/embed/` - native CPU Qwen3 embedding adapter; default Stella pipeline
 - `crates/rerank/` - `Reranker` trait and cross-encoder implementations (GteReranker, ModernBERT CPU)
 - `crates/quant/` - original CPU block/row reconstruction for admitted quantized formats
 - `crates/loader/` - safetensors, bounded GGUF v3 observation, and digest-bound immutable payload ownership
-- `crates/decoders/` - Qwen3.5-family structural preflight and explicit bounded native CPU hybrid execution
+- `crates/decoders/` - verified Qwen3 causal embedding and Qwen3.5 hybrid CPU execution
 - `crates/decode/` - checked CPU logit processing and token selection
 - `crates/bin/` - CPU-only `plan` and typed GGUF `inspect` commands
 - `crates/tokenize/` - tokenizer facade

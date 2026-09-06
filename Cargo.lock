@@ -355,13 +355,16 @@ name = "embed"
 version = "1.0.11"
 dependencies = [
  "core",
+ "decoders",
  "encoders",
  "kernels",
  "loader",
  "rayon",
+ "sha2",
  "snafu",
  "taxis",
  "tempfile",
+ "test-fixtures",
  "thiserror",
  "tokenize",
 ]

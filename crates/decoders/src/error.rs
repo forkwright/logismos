@@ -101,7 +101,7 @@ pub enum Error {
     },
 
     /// The verified payload could not supply the named tensor.
-    #[snafu(display("qwen35 verified payload cannot provide tensor `{name}`: {source}"))]
+    #[snafu(display("native decoder verified payload cannot provide tensor `{name}`: {source}"))]
     PayloadTensor {
         /// Tensor requested by the bounded projection operation.
         name: String,
@@ -114,7 +114,7 @@ pub enum Error {
 
     /// A structurally recognized tensor does not use an executable row storage type.
     #[snafu(display(
-        "qwen35 tensor `{name}` has no executable row format for this projection, got {actual:?}"
+        "native decoder tensor `{name}` has no executable row format for this projection, got {actual:?}"
     ))]
     ProjectionDtype {
         /// Tensor requested by the bounded projection operation.
@@ -128,7 +128,7 @@ pub enum Error {
 
     /// A structurally recognized tensor is not a matrix.
     #[snafu(display(
-        "qwen35 tensor `{name}` must be rank 2 for this projection, got rank {actual}"
+        "native decoder tensor `{name}` must be rank 2 for this projection, got rank {actual}"
     ))]
     ProjectionRank {
         /// Tensor requested by the bounded projection operation.
@@ -142,7 +142,7 @@ pub enum Error {
 
     /// The supplied activation width does not match the matrix input dimension.
     #[snafu(display(
-        "qwen35 tensor `{name}` projection input must have width {expected}, got {actual}"
+        "native decoder tensor `{name}` projection input must have width {expected}, got {actual}"
     ))]
     ProjectionInputWidth {
         /// Tensor requested by the bounded projection operation.
@@ -157,7 +157,7 @@ pub enum Error {
     },
 
     /// A matrix input dimension cannot form an integral executable serialized row.
-    #[snafu(display("qwen35 tensor `{name}` has invalid executable row layout: {source}"))]
+    #[snafu(display("native decoder tensor `{name}` has invalid executable row layout: {source}"))]
     ProjectionLayout {
         /// Tensor requested by the bounded projection operation.
         name: String,
@@ -169,7 +169,9 @@ pub enum Error {
     },
 
     /// Tensor bytes do not form the contiguous rows implied by its validated dimensions.
-    #[snafu(display("qwen35 tensor `{name}` projection bytes must be {expected}, got {actual}"))]
+    #[snafu(display(
+        "native decoder tensor `{name}` projection bytes must be {expected}, got {actual}"
+    ))]
     ProjectionBytes {
         /// Tensor requested by the bounded projection operation.
         name: String,
@@ -184,7 +186,7 @@ pub enum Error {
 
     /// Output allocation failed before any projection result could escape.
     #[snafu(display(
-        "qwen35 tensor `{name}` could not reserve {output_width} projection outputs: {source}"
+        "native decoder tensor `{name}` could not reserve {output_width} projection outputs: {source}"
     ))]
     ProjectionAllocation {
         /// Tensor requested by the bounded projection operation.
@@ -199,7 +201,7 @@ pub enum Error {
     },
 
     /// One serialized row was not executable as finite CPU arithmetic.
-    #[snafu(display("qwen35 tensor `{name}` projection row {row} failed: {source}"))]
+    #[snafu(display("native decoder tensor `{name}` projection row {row} failed: {source}"))]
     ProjectionRow {
         /// Tensor requested by the bounded projection operation.
         name: String,
@@ -394,6 +396,80 @@ pub enum Error {
     #[snafu(display("qwen35 execution CPU elementwise operation failed: {source}"))]
     ExecutionCpu {
         /// Checked shared CPU reference failure.
+        source: kernels::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A Qwen3 embedding metadata value is missing, mistyped, or unsupported.
+    #[snafu(display("qwen3 embedding metadata `{key}` violates {rule}"))]
+    Qwen3Metadata {
+        /// Exact GGUF key responsible for the refusal.
+        key: &'static str,
+        /// Source-derived requirement that did not hold.
+        rule: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A Qwen3 embedding tensor inventory entry is missing or malformed.
+    #[snafu(display("qwen3 embedding tensor `{name}` violates {rule}"))]
+    Qwen3Tensor {
+        /// Exact GGUF tensor name responsible for the refusal.
+        name: String,
+        /// Source-derived tensor requirement that did not hold.
+        rule: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A bounded Qwen3 embedding execution request is invalid.
+    #[snafu(display("qwen3 embedding execution request {requested} violates {rule}"))]
+    Qwen3Execution {
+        /// Requested token count or other bounded execution value.
+        requested: usize,
+        /// Execution invariant that refused the request.
+        rule: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Qwen3 embedding execution could not reserve one named local buffer.
+    #[snafu(display("qwen3 embedding could not reserve {length} values for {target}: {source}"))]
+    Qwen3Allocation {
+        /// Named local buffer.
+        target: &'static str,
+        /// Requested scalar capacity.
+        length: usize,
+        /// Allocation failure retained for diagnosis.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Qwen3 embedding execution produced a non-finite scalar.
+    #[snafu(display(
+        "qwen3 embedding arithmetic became non-finite during {stage} at index {index}"
+    ))]
+    Qwen3Arithmetic {
+        /// Mathematical stage.
+        stage: &'static str,
+        /// Flat scalar index within that stage.
+        index: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A checked shared CPU operation rejected Qwen3 embedding execution.
+    #[snafu(display("qwen3 embedding CPU operation failed: {source}"))]
+    Qwen3Cpu {
+        /// Checked CPU operation failure.
         source: kernels::Error,
         /// Source code location where the error was reported.
         #[snafu(implicit)]

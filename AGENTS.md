@@ -26,6 +26,8 @@ own named worktree. Run one Cargo command at a time in each worktree; do not
 share `/data/target` across agent lanes. See
 [`docs/gpu-denied-runner.md`](docs/gpu-denied-runner.md) for prerequisites and
 the precise threat model. Ordinary compilation is not a hardware-test permit.
+Every Cargo invocation, including lockfile generation and formatting, uses the
+runner; an ambient compiler wrapper must not escape the isolated lane.
 
 ## Key patterns
 

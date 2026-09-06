@@ -7,6 +7,105 @@ use snafu::Snafu;
 #[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
+    /// Required Qwen3 GGUF metadata was absent or had the wrong type.
+    #[snafu(display("invalid Qwen3 metadata `{key}`"))]
+    Metadata {
+        /// GGUF metadata key.
+        key: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Native Qwen3 decoder failure.
+    #[snafu(display("native Qwen3 decoder: {source}"))]
+    Decoders {
+        /// Source decoder failure.
+        source: decoders::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Native Qwen3 tokenizer or artifact-token compatibility failure.
+    #[snafu(display("native Qwen3 tokenize: {source}"))]
+    Qwen3Tokenizer {
+        /// Source tokenizer error.
+        source: tokenize::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// A semantic query role lacked trusted setup instructions.
+    #[snafu(display("no trusted instruction is configured for {role}"))]
+    UnresolvedPromptRole {
+        /// Requested semantic role.
+        role: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// The final hidden vector was not finite or had zero L2 norm.
+    #[snafu(display("native Qwen3 final hidden vector is not normalizable"))]
+    NonNormalizable {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Native Qwen3 embedding limits are internally inconsistent.
+    #[snafu(display("invalid Qwen3 embedding limits: {rule}"))]
+    InvalidLimits {
+        /// Violated setup or request-limit invariant.
+        rule: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// A bounded request-local allocation could not be reserved.
+    #[snafu(display("Qwen3 embedding could not reserve {target}"))]
+    Allocation {
+        /// Allocation purpose.
+        target: &'static str,
+        /// Allocator failure.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// The prefixed request text exceeds its configured byte bound.
+    #[snafu(display("embedding request has {actual} UTF-8 bytes, limit {limit}"))]
+    InputBytesTooLong {
+        /// Actual combined prefix-and-text byte count.
+        actual: usize,
+        /// Configured maximum byte count.
+        limit: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// The prefix and input lengths could not be represented together.
+    #[snafu(display("embedding prefix-and-input byte length overflowed usize"))]
+    InputByteLengthOverflow {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// An embedding request had no input text before trusted prefix policy.
+    #[snafu(display("embedding request text must not be empty"))]
+    EmptyInput {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// A batch exceeded the adapter's trusted bounded-work policy.
+    #[snafu(display("embedding batch has {actual} inputs, limit {limit}"))]
+    BatchTooLarge {
+        /// Number of requested inputs.
+        actual: usize,
+        /// Maximum number accepted by the derived batch policy.
+        limit: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// Model directory lookup failed.
     #[snafu(display("io: {message}"))]
     Io {
@@ -18,6 +117,7 @@ pub enum Error {
     },
     /// Encoder crate bubbled an error.
     #[snafu(transparent)]
+    #[cfg(feature = "stella")]
     Encoders {
         /// Source encoder error.
         source: encoders::Error,
