@@ -8,7 +8,7 @@ description = "Sentence-transformer heads and Matryoshka projection; concrete em
 publish = false
 
 [features]
-# Preserve the established Stella API and its accelerator-capable graph for
+# WHY: Preserve the established Stella API and its accelerator-capable graph for
 # ordinary embed users. Native Qwen3 retrieval selects only CPU-safe edges.
 default = ["stella"]
 stella = ["dep:encoders", "dep:kernels", "loader/tensor", "dep:rayon", "dep:taxis"]

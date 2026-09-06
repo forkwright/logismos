@@ -127,7 +127,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
             exit 1
         fi
         # WHY: One package selection owns both graph and compiler witnesses.
-        set -- -p kernels -p transformers -p decoders -p text -p decode
+        set -- -p kernels -p transformers -p decoders -p text -p decode -p embed
         cargo tree --offline --locked --no-default-features "$@" \
             --edges normal,build --prefix none --format "{p}" >"$out/cpu-dependencies.log"
         if grep -Eq "^(hipcore|taxis) " "$out/cpu-dependencies.log"; then
@@ -136,6 +136,12 @@ OUT="$ROOT/target/hip-build-mode-witness"
         fi
         env -u LOGISMOS_HIP_BUILD HIPCC=/not-a-hipcc \
             cargo check --offline --locked --no-default-features "$@" --lib --jobs 4
+        # WHY: Workspace feature unification can hide broken CPU-only test paths;
+        # exercise the same minimal consumers in both numerical build profiles.
+        env -u LOGISMOS_HIP_BUILD HIPCC=/not-a-hipcc \
+            cargo test --offline --locked --no-default-features "$@" --lib --jobs 4
+        env -u LOGISMOS_HIP_BUILD HIPCC=/not-a-hipcc \
+            cargo test --offline --locked --release --no-default-features "$@" --lib --jobs 4
     ' /bin/sh "$ROOT" "$OUT" </dev/null
 } 2>&1 | /usr/bin/cat
 

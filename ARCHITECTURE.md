@@ -56,6 +56,11 @@ semantically respects that boundary.
   not depend on scheduling, a provider adapter, or a device runtime.
 - `test-fixtures` is dev-only shared synthetic GGUF support. It has no model
   execution dependency and is never a production dependency of a pipeline.
+- `embed` consumes the CPU-only `decoders` and verified-tokenizer paths for
+  native Qwen3 embeddings. Its default `stella` feature preserves the existing
+  Stella API and tensor/encoder graph; direct consumers disable default
+  features to exclude that accelerator-capable graph. Consumers still use the
+  unchanged `core::EmbeddingModel` contract.
 - `taxis` depends locally on `hipcore`.
 - `kernels/gpu` enables the local `hipcore` and `taxis` dependencies and GPU
   launcher modules, including their nested parity references. Standalone
@@ -158,6 +163,28 @@ heap use or authenticate the selected model/tokenizer's publisher.
 NextN, serving, exact-artifact quality, physical residency and admission
 integration remain separate requirements.
 Explicit CPU execution is not a fallback for a GPU operation.
+
+## Native embedding ownership
+
+`decoders::Qwen3Weights` binds a causal Qwen3 embedding profile to the same
+verified-payload owner. Qwen3 and Qwen3.5 share private checked GGUF matrix
+access, including its allocation geometry; model-specific attention and
+positional contracts remain separate. Qwen3 admits the bounded F32/Q8_0
+matrix profile, derives projection widths independently of hidden width, and
+uses per-head Q/K RMS normalization followed by split-half RoPE. One stateless
+CPU call executes all causal blocks and returns the final-RMS terminal hidden
+row. Inputs are unpadded token sequences, not a padded batch or persistent KV
+session. Extra output/classifier heads and unsupported metadata are refused.
+
+`embed::qwen3::Qwen3EmbeddingModel` owns text/prefix/token policy and full-width
+L2-normalized output through the stable embedding trait. `tokenize` owns the
+format-neutral ordered vocabulary and declared-special compatibility checks;
+it does not depend on GGUF, templates or model-specific policy. Each pipeline
+binds its verified tokenizer to its own artifact metadata and applies its own
+special-token policy. Embedding input uses no chat template or implicit query
+instruction, and advertised dimensions do not imply Matryoshka qualification.
+Synthetic family and pipeline tests do not establish deployed-artifact parity,
+retrieval quality, reindex authority, serving or GPU qualification.
 
 ## cfg flags
 

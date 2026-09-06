@@ -13,6 +13,27 @@ The runner is intentionally non-interactive. Its standard descriptors must be
 pipes, `/dev/null`, or safe regular files as described below; redirect through
 a pipe when launching it from a terminal.
 
+## Lockfile maintenance
+
+Cargo runs inside the boundary even when resolving dependencies or checking
+formatting. The source mount remains read-only. To refresh workspace lockfile
+edges without changing third-party pins, copy source into private scratch,
+resolve there, and export only the generated lockfile into writable `target/`:
+
+```bash
+scripts/gpu-denied-runner.sh -- /bin/sh -ceu '
+  lock_staging=$(mktemp -d /tmp/logismos-lock.XXXXXX)
+  tar --exclude=./target --exclude=./.git -cf - . | tar -xf - -C "$lock_staging"
+  cargo update --workspace --offline --manifest-path "$lock_staging/Cargo.toml"
+  cp "$lock_staging/Cargo.lock" "$PWD/target/refreshed-Cargo.lock"
+'
+diff -u Cargo.lock target/refreshed-Cargo.lock
+```
+
+Review and apply that generated delta with the normal source-editing tool.
+Do not add host-write mounts, use an ambient Cargo wrapper, or copy `target/`
+into its own scratch snapshot.
+
 ## Exact artifact inspection
 
 `--ro-input-file` admits one exact artifact as an explicit, read-only host
@@ -164,7 +185,8 @@ select GPU launchers explicitly; CPU consumers disable default features.
 Cargo unifies features within a dependency graph, so mixing a GPU consumer
 with a CPU consumer can enable HIP for both. The build-mode witness also
 checks the standalone CPU consumers' dependency graph and compiles their
-libraries with no GPU feature and no HIP compiler. A minimal-graph check and the
+libraries with no GPU feature and no HIP compiler, then runs their library
+tests in debug and release profiles. A minimal-graph check and the
 OS-enforced runner prove different properties; neither replaces the other.
 
 The runner discovers libclang without executing an ambient program. It checks

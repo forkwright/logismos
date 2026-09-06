@@ -7,8 +7,9 @@ targeting AMD gfx1100, with owned HIP/WMMA kernels and progressively owned execu
 
 **Status:** HIP primitives, Stella CPU golden-fixture parity, action-free placement,
 process-local admission/residency coordination, and bounded instruction emulation exist.
-GGUF inspection, digest-bound mixed-weight CPU projections and bounded hybrid CPU
-text generation are foundations, not native decoder serving or hardware qualification. The W7900
+GGUF inspection, digest-bound mixed-weight CPU projections, bounded hybrid CPU
+text generation and native Qwen3 CPU embeddings are foundations, not serving or
+hardware qualification. The W7900
 is available; the RX 7900 XTX is a
 planned second device and requires its own qualification. The experimental below-HIP
 provider remains unimplemented.
@@ -89,6 +90,16 @@ no-ops. Fuel, recursion and rendered-output limits are operational bounds, not a
 or total-process-memory sandbox. Tokenizer parse/encode/decode intermediate allocations are not
 bounded by the returned-output byte limit. Direct `text` and `decode` consumers do not link HIP;
 CPU execution is explicit, never a fallback for a GPU operation.
+
+[`embed::qwen3`](crates/embed/src/qwen3.rs) exposes native Qwen3 CPU embeddings
+through the unchanged `core::EmbeddingModel` trait. Verified artifact and
+tokenizer contents drive causal execution, last-token pooling and full-width
+L2-normalized output. Query prefixes are explicit setup policy; embedding
+input uses no chat template. Unsupported dimensions and malformed or oversized
+requests fail rather than truncate. Independent synthetic proofs do not
+establish exact deployed-artifact parity, retrieval quality or reindex authority.
+Direct `embed` consumers disable default features for the HIP-free native path;
+the default `stella` feature preserves the existing Stella API and dependencies.
 
 [`contracts/runtime-scope.toml`](contracts/runtime-scope.toml) records this product boundary.
 Bounded adaptation remains absent unless a named consumer contract supplies an output owner,
