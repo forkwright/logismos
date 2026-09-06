@@ -39,15 +39,19 @@
 )]
 
 pub mod error;
+#[cfg(feature = "stella")]
 pub mod stella;
 
 pub use crate::error::{Error, Result};
+#[cfg(feature = "stella")]
 pub use crate::stella::{StellaDim, StellaModel};
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "stella")]
     use super::*;
 
+    #[cfg(feature = "stella")]
     #[test]
     fn stella_dims_include_default_width() {
         assert!(StellaDim::all().contains(&StellaDim::Dim1024));
