@@ -22,6 +22,14 @@ pub(crate) struct CheckedMatrix<'artifact> {
 }
 
 impl<'artifact> CheckedMatrix<'artifact> {
+    pub(crate) const fn projection_output_elements(output_width: usize) -> usize {
+        output_width
+    }
+
+    pub(crate) const fn decoded_row_elements(input_width: usize) -> usize {
+        input_width
+    }
+
     pub(crate) fn from_payload(payload: &'artifact VerifiedArtifact, name: &str) -> Result<Self> {
         let tensor = payload.tensor(name).context(PayloadTensorSnafu {
             name: name.to_string(),
@@ -93,10 +101,10 @@ impl<'artifact> CheckedMatrix<'artifact> {
         }
         let mut output = Vec::new();
         output
-            .try_reserve_exact(self.output_width)
+            .try_reserve_exact(Self::projection_output_elements(self.output_width))
             .with_context(|_| ProjectionAllocationSnafu {
                 name: self.name.clone(),
-                output_width: self.output_width,
+                output_width: Self::projection_output_elements(self.output_width),
             })?;
         for (row, row_bytes) in self
             .tensor
@@ -144,11 +152,14 @@ impl<'artifact> CheckedMatrix<'artifact> {
             }
             .build()
         })?;
-        row_decode_f32(self.format, row_bytes, self.input_width).with_context(|_| {
-            ProjectionRowSnafu {
-                name: self.name.clone(),
-                row,
-            }
+        row_decode_f32(
+            self.format,
+            row_bytes,
+            Self::decoded_row_elements(self.input_width),
+        )
+        .with_context(|_| ProjectionRowSnafu {
+            name: self.name.clone(),
+            row,
         })
     }
 }

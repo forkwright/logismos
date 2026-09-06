@@ -399,4 +399,78 @@ pub enum Error {
         #[snafu(implicit)]
         location: snafu::Location,
     },
+
+    /// A Qwen3 embedding metadata value is missing, mistyped, or unsupported.
+    #[snafu(display("qwen3 embedding metadata `{key}` violates {rule}"))]
+    Qwen3Metadata {
+        /// Exact GGUF key responsible for the refusal.
+        key: &'static str,
+        /// Source-derived requirement that did not hold.
+        rule: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A Qwen3 embedding tensor inventory entry is missing or malformed.
+    #[snafu(display("qwen3 embedding tensor `{name}` violates {rule}"))]
+    Qwen3Tensor {
+        /// Exact GGUF tensor name responsible for the refusal.
+        name: String,
+        /// Source-derived tensor requirement that did not hold.
+        rule: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A bounded Qwen3 embedding execution request is invalid.
+    #[snafu(display("qwen3 embedding execution request {requested} violates {rule}"))]
+    Qwen3Execution {
+        /// Requested token count or other bounded execution value.
+        requested: usize,
+        /// Execution invariant that refused the request.
+        rule: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Qwen3 embedding execution could not reserve one named local buffer.
+    #[snafu(display("qwen3 embedding could not reserve {length} values for {target}: {source}"))]
+    Qwen3Allocation {
+        /// Named local buffer.
+        target: &'static str,
+        /// Requested scalar capacity.
+        length: usize,
+        /// Allocation failure retained for diagnosis.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Qwen3 embedding execution produced a non-finite scalar.
+    #[snafu(display(
+        "qwen3 embedding arithmetic became non-finite during {stage} at index {index}"
+    ))]
+    Qwen3Arithmetic {
+        /// Mathematical stage.
+        stage: &'static str,
+        /// Flat scalar index within that stage.
+        index: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A checked shared CPU operation rejected Qwen3 embedding execution.
+    #[snafu(display("qwen3 embedding CPU operation failed: {source}"))]
+    Qwen3Cpu {
+        /// Checked CPU operation failure.
+        source: kernels::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }

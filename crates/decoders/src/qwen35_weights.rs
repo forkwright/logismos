@@ -42,11 +42,11 @@ pub struct Qwen35Weights<'artifact> {
 
 impl<'artifact> Qwen35Weights<'artifact> {
     pub(crate) const fn projection_output_elements(output_width: usize) -> usize {
-        output_width
+        CheckedMatrix::projection_output_elements(output_width)
     }
 
     pub(crate) const fn decoded_row_elements(input_width: usize) -> usize {
-        input_width
+        CheckedMatrix::decoded_row_elements(input_width)
     }
 
     /// Bind one verified payload to the existing Qwen3.5 structural preflight.

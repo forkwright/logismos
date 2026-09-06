@@ -22,6 +22,7 @@
 
 pub mod error;
 mod matrix;
+pub mod qwen3;
 pub mod qwen35;
 pub mod qwen35_execution;
 pub mod qwen35_recurrent;
@@ -29,6 +30,7 @@ mod qwen35_requirements;
 pub mod qwen35_weights;
 
 pub use crate::error::{Error, Result};
+pub use crate::qwen3::{Qwen3Execution, Qwen3Weights};
 pub use crate::qwen35::Qwen35StructuralProfile;
 pub use crate::qwen35_execution::{Qwen35Execution, Qwen35ExecutionPlan, Qwen35LogitSelection};
 pub use crate::qwen35_recurrent::Qwen35RecurrentExecution;
