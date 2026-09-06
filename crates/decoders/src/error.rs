@@ -290,6 +290,16 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// A fallible CPU elementwise reference rejected recurrent execution.
+    #[snafu(display("qwen35 recurrent CPU elementwise operation failed: {source}"))]
+    RecurrentCpu {
+        /// Checked shared CPU reference failure.
+        source: kernels::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// The depthwise causal-convolution reference rejected a recurrent step.
     #[snafu(display("qwen35 recurrent causal convolution failed: {source}"))]
     RecurrentConvolution {
@@ -343,6 +353,16 @@ pub enum Error {
         stage: &'static str,
         /// Flat scalar index within that stage.
         index: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A fallible CPU elementwise reference rejected hybrid execution.
+    #[snafu(display("qwen35 execution CPU elementwise operation failed: {source}"))]
+    ExecutionCpu {
+        /// Checked shared CPU reference failure.
+        source: kernels::Error,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,

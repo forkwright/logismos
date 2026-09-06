@@ -17,7 +17,7 @@ use crate::error::{
     ProjectionRowSnafu,
 };
 use crate::qwen35::{Qwen35ExecutionDimensions, Qwen35RecurrentLayout, Qwen35StructuralProfile};
-use crate::qwen35_execution::Qwen35Execution;
+use crate::qwen35_execution::{Qwen35Execution, Qwen35ExecutionPlan, Qwen35LogitSelection};
 use crate::qwen35_recurrent::Qwen35RecurrentExecution;
 
 /// One payload-verified Qwen3.5 structural profile with a narrow CPU projection.
@@ -169,6 +169,21 @@ impl<'artifact> Qwen35Weights<'artifact> {
     /// incomplete, unsupported, or the requested context is out of range.
     pub fn execution(&self, max_context: usize) -> Result<Qwen35Execution<'_, 'artifact>> {
         Qwen35Execution::try_from_weights(self, max_context)
+    }
+
+    /// Derive one artifact-bound CPU execution plan before allocating session state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when the requested context or step bound cannot
+    /// be admitted from this verified artifact's execution metadata.
+    pub fn execution_plan(
+        &self,
+        max_context: usize,
+        max_step_tokens: usize,
+        selection: Qwen35LogitSelection,
+    ) -> Result<Qwen35ExecutionPlan<'_, 'artifact>> {
+        Qwen35ExecutionPlan::try_from_weights(self, max_context, max_step_tokens, selection)
     }
 }
 

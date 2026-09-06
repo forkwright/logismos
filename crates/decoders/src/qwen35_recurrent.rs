@@ -15,8 +15,8 @@ use crate::Result;
 use crate::error::{
     ArithmeticOverflowSnafu, PayloadTensorSnafu, ProjectionBytesSnafu, ProjectionDtypeSnafu,
     ProjectionRowSnafu, RecurrentAllocationSnafu, RecurrentArithmeticSnafu,
-    RecurrentConvolutionSnafu, RecurrentGdnSnafu, RecurrentInputSnafu, RecurrentLayerSnafu,
-    RecurrentRmsNormSnafu, TensorShapeSnafu,
+    RecurrentConvolutionSnafu, RecurrentCpuSnafu, RecurrentGdnSnafu, RecurrentInputSnafu,
+    RecurrentLayerSnafu, RecurrentRmsNormSnafu, TensorShapeSnafu,
 };
 use crate::qwen35::{Qwen35RecurrentLayout, recurrent_layernorm_rms_epsilon};
 use crate::qwen35_weights::Qwen35Weights;
@@ -319,7 +319,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         token_count: usize,
         convolution: &[f32],
     ) -> Result<ArrangedRecurrence> {
-        let convolved = kernels::cpu_f32::silu(convolution);
+        let convolved = kernels::cpu_f32::try_silu(convolution).context(RecurrentCpuSnafu)?;
         ensure_finite(&convolved, "convolution SiLU", 0)?;
         let q = l2_heads(&convolved, token_count, 0, self.layout)?;
         let k = l2_heads(&convolved, token_count, self.layout.key_width, self.layout)?;
@@ -377,8 +377,9 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         )
         .context(RecurrentRmsNormSnafu)?;
         ensure_finite(&normalized_output, "recurrent RMSNorm", 0)?;
+        let gate = kernels::cpu_f32::try_silu(z).context(RecurrentCpuSnafu)?;
         let gated_output =
-            kernels::cpu_f32::hadamard(&normalized_output, &kernels::cpu_f32::silu(z));
+            kernels::cpu_f32::try_hadamard(&normalized_output, &gate).context(RecurrentCpuSnafu)?;
         ensure_finite(&gated_output, "recurrent output gate", 0)?;
         project_tokens(
             self.weights,

@@ -6,7 +6,7 @@
 //! Bounds describe the admitted shapes and numerical domain, not a memory
 //! quota; allocation exhaustion remains a process-level failure.
 
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 const GDN_RECURRENCE: &str = "gdn_recurrent_fwd";
 
@@ -33,6 +33,20 @@ pub enum GdnError {
     DimensionProductOverflow {
         /// The multiplied dimensions.
         dimensions: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A checked recurrence buffer could not reserve its exact capacity.
+    #[snafu(display("{GDN_RECURRENCE}: allocation for {allocation} ({elements} elements) failed"))]
+    Allocation {
+        /// Named recurrence buffer.
+        allocation: &'static str,
+        /// Exact requested scalar count.
+        elements: usize,
+        /// Allocation failure.
+        source: std::collections::TryReserveError,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
@@ -425,8 +439,10 @@ pub fn recurrent_fwd(input: &RecurrentInput<'_>) -> GdnResult<RecurrentOutput> {
         input.value_dim,
         "token_count * value_dim",
     )?;
-    let mut state = input.state.to_vec();
-    let mut output = vec![0.0_f32; output_len];
+    let mut state = reserve_f32("one-head state", input.state.len())?;
+    state.extend_from_slice(input.state);
+    let mut output = reserve_f32("one-head output", output_len)?;
+    output.resize(output_len, 0.0);
 
     for token_index in 0..input.token_count {
         let q_start = checked_product(token_index, input.key_dim, "token index * key_dim")?;
@@ -446,7 +462,8 @@ pub fn recurrent_fwd(input: &RecurrentInput<'_>) -> GdnResult<RecurrentOutput> {
             ensure_finite(*state_value, "state decay", state_index)?;
         }
 
-        let mut state_times_key = vec![0.0_f32; input.value_dim];
+        let mut state_times_key = reserve_f32("state times key", input.value_dim)?;
+        state_times_key.resize(input.value_dim, 0.0);
         for (key_index, key_value) in k_row.iter().copied().enumerate() {
             for (value_index, accumulator) in state_times_key.iter_mut().enumerate() {
                 let state_index = matrix_index(key_index, value_index, input.value_dim)?;
@@ -456,7 +473,7 @@ pub fn recurrent_fwd(input: &RecurrentInput<'_>) -> GdnResult<RecurrentOutput> {
             }
         }
 
-        let mut delta = Vec::with_capacity(input.value_dim);
+        let mut delta = reserve_f32("delta", input.value_dim)?;
         for (value_index, (&value, state_projection)) in v_row
             .iter()
             .zip(state_times_key.iter().copied())
@@ -539,8 +556,8 @@ pub fn multi_head_recurrent_fwd(
         state_head_width,
         "value_head_count * key_dim * value_dim",
     )?;
-    let mut output = Vec::with_capacity(output_capacity);
-    let mut state = Vec::with_capacity(state_capacity);
+    let mut output = reserve_f32("multi-head output", output_capacity)?;
+    let mut state = reserve_f32("multi-head state", state_capacity)?;
 
     for value_head_index in 0..input.value_head_count {
         let head_output = recurrent_fwd(&input.head_input(value_head_index)?)?;
@@ -554,6 +571,17 @@ pub fn multi_head_recurrent_fwd(
 fn checked_product(left: usize, right: usize, dimensions: &'static str) -> GdnResult<usize> {
     left.checked_mul(right)
         .ok_or_else(|| DimensionProductOverflowSnafu { dimensions }.build())
+}
+
+fn reserve_f32(allocation: &'static str, elements: usize) -> GdnResult<Vec<f32>> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(elements)
+        .context(AllocationSnafu {
+            allocation,
+            elements,
+        })?;
+    Ok(values)
 }
 
 fn validate_nonzero_dimension(dimension: &'static str, value: usize) -> GdnResult<()> {

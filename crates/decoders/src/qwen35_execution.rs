@@ -7,9 +7,9 @@ use snafu::ResultExt;
 
 use crate::error::{
     ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionArithmeticSnafu,
-    ExecutionContextSnafu, ExecutionTokenSnafu, MetadataRelationSnafu, MetadataTypeSnafu,
-    MissingMetadataSnafu, PayloadTensorSnafu, ProjectionBytesSnafu, ProjectionDtypeSnafu,
-    ProjectionRowSnafu, RecurrentRmsNormSnafu, TensorShapeSnafu,
+    ExecutionContextSnafu, ExecutionCpuSnafu, ExecutionTokenSnafu, MetadataRelationSnafu,
+    MetadataTypeSnafu, MissingMetadataSnafu, PayloadTensorSnafu, ProjectionBytesSnafu,
+    ProjectionDtypeSnafu, ProjectionRowSnafu, RecurrentRmsNormSnafu, TensorShapeSnafu,
 };
 use crate::qwen35::recurrent_layernorm_rms_epsilon;
 use crate::{Qwen35RecurrentExecution, Qwen35Weights, Result};
@@ -28,6 +28,25 @@ const TOKEN_EMBEDDING: &str = "token_embd.weight";
 const OUTPUT_NORM: &str = "output_norm.weight";
 const OUTPUT: &str = "output.weight";
 
+/// Select which token-logit rows a bounded execution retains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Qwen35LogitSelection {
+    /// Retain one vocabulary-logit row for every supplied token.
+    AllTokens,
+    /// Execute every supplied token but retain only the final vocabulary-logit row.
+    LastToken,
+}
+
+/// Opaque artifact-bound construction plan for one CPU execution session.
+#[derive(Debug)]
+pub struct Qwen35ExecutionPlan<'weights, 'artifact> {
+    weights: &'weights Qwen35Weights<'artifact>,
+    layout: Layout,
+    max_step_tokens: usize,
+    selection: Qwen35LogitSelection,
+}
+
 /// Stateful, bounded CPU text execution bound to one verified payload.
 ///
 /// Each successful [`Self::step`] returns one vocabulary-logit row per input
@@ -37,6 +56,8 @@ const OUTPUT: &str = "output.weight";
 pub struct Qwen35Execution<'weights, 'artifact> {
     weights: &'weights Qwen35Weights<'artifact>,
     layout: Layout,
+    max_step_tokens: usize,
+    selection: Qwen35LogitSelection,
     layers: Vec<LayerState<'weights, 'artifact>>,
     position: usize,
 }
@@ -56,7 +77,43 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
         weights: &'weights Qwen35Weights<'artifact>,
         max_context: usize,
     ) -> Result<Self> {
+        Qwen35ExecutionPlan::try_from_weights(
+            weights,
+            max_context,
+            max_context,
+            Qwen35LogitSelection::AllTokens,
+        )?
+        .execution()
+    }
+}
+
+impl<'weights, 'artifact> Qwen35ExecutionPlan<'weights, 'artifact> {
+    pub(crate) fn try_from_weights(
+        weights: &'weights Qwen35Weights<'artifact>,
+        max_context: usize,
+        max_step_tokens: usize,
+        selection: Qwen35LogitSelection,
+    ) -> Result<Self> {
         let layout = Layout::from_metadata(weights, max_context)?;
+        if max_step_tokens == 0 || max_step_tokens > max_context {
+            return ExecutionContextSnafu {
+                requested: max_step_tokens,
+                rule: "maximum step tokens must be nonzero and no greater than caller context",
+            }
+            .fail();
+        }
+        Ok(Self {
+            weights,
+            layout,
+            max_step_tokens,
+            selection,
+        })
+    }
+
+    /// Construct the session described by this checked plan.
+    pub fn execution(self) -> Result<Qwen35Execution<'weights, 'artifact>> {
+        let weights = self.weights;
+        let layout = self.layout;
         let block_count = layout.main_blocks;
         let mut layers = reserve("main-block execution slots", block_count)?;
         for block in 0..block_count {
@@ -73,14 +130,18 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
                 )?));
             }
         }
-        Ok(Self {
+        Ok(Qwen35Execution {
             weights,
             layout,
+            max_step_tokens: self.max_step_tokens,
+            selection: self.selection,
             layers,
             position: 0,
         })
     }
+}
 
+impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
     /// Execute complete token ids and return token-major vocabulary logits.
     ///
     /// The session owns only state derived from its verified payload; callers
@@ -104,10 +165,10 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
             }
             .build()
         })?;
-        if requested > self.layout.max_context {
+        if token_ids.len() > self.max_step_tokens || requested > self.layout.max_context {
             return ExecutionContextSnafu {
                 requested,
-                rule: "must not exceed the caller-bounded context",
+                rule: "must not exceed the plan's step or caller-bounded context",
             }
             .fail();
         }
@@ -132,14 +193,19 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
         Ok(Self {
             weights: self.weights,
             layout: self.layout,
+            max_step_tokens: self.max_step_tokens,
+            selection: self.selection,
             layers,
             position: self.position,
         })
     }
 
     fn step_staged(&mut self, token_ids: &[u32]) -> Result<Vec<f32>> {
-        let total = token_ids
-            .len()
+        let output_rows = match self.selection {
+            Qwen35LogitSelection::AllTokens => token_ids.len(),
+            Qwen35LogitSelection::LastToken => 1,
+        };
+        let total = output_rows
             .checked_mul(self.layout.vocabulary)
             .ok_or_else(|| {
                 ArithmeticOverflowSnafu {
@@ -148,7 +214,7 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
                 .build()
             })?;
         let mut logits = reserve("token logits", total)?;
-        for token_id in token_ids {
+        for (token_index, token_id) in token_ids.iter().enumerate() {
             let mut hidden = self.embed(*token_id)?;
             for block in 0..self.layout.main_blocks {
                 let weights = self.weights;
@@ -193,7 +259,11 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
                 self.layout.epsilon,
             )
             .context(RecurrentRmsNormSnafu)?;
-            logits.extend(self.weights.project(OUTPUT, &normalized)?);
+            if matches!(self.selection, Qwen35LogitSelection::AllTokens)
+                || token_index + 1 == token_ids.len()
+            {
+                logits.extend(self.weights.project(OUTPUT, &normalized)?);
+            }
             self.position = self.position.checked_add(1).ok_or_else(|| {
                 ArithmeticOverflowSnafu {
                     context: "execution position increment",
@@ -238,7 +308,7 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
         let up = self
             .weights
             .project(&block_name(block, "ffn_up.weight"), input)?;
-        let activated = kernels::cpu_f32::silu(&gate);
+        let activated = kernels::cpu_f32::try_silu(&gate).context(ExecutionCpuSnafu)?;
         let mut fused = reserve("SwiGLU activation", self.layout.feed_forward)?;
         for (index, (left, right)) in activated.iter().zip(up.iter()).enumerate() {
             let value = left * right;

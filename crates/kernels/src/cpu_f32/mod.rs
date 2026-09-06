@@ -22,8 +22,9 @@ use num_traits::ToPrimitive;
 use snafu::ResultExt;
 
 use crate::error::{
-    Result, RmsNormAllocationSnafu, RmsNormInvalidDimensionSnafu, RmsNormInvalidParameterSnafu,
-    RmsNormNonFiniteSnafu, RmsNormShapeSnafu, RmsNormSizeOverflowSnafu, RmsNormStage,
+    CpuF32AllocationSnafu, CpuF32ShapeSnafu, Result, RmsNormAllocationSnafu,
+    RmsNormInvalidDimensionSnafu, RmsNormInvalidParameterSnafu, RmsNormNonFiniteSnafu,
+    RmsNormShapeSnafu, RmsNormSizeOverflowSnafu, RmsNormStage,
 };
 
 fn usize_to_f32(value: usize) -> f32 {
@@ -487,7 +488,24 @@ pub fn linear_t(
 /// SiLU / swish: `y = x * sigmoid(x)`.
 #[must_use]
 pub fn silu(x: &[f32]) -> Vec<f32> {
-    x.iter().map(|&v| v / (1.0 + (-v).exp())).collect()
+    x.iter().copied().map(silu_scalar).collect()
+}
+
+/// Fallibly evaluate SiLU into one exact output allocation.
+///
+/// # Errors
+///
+/// Returns [`crate::Error`] when the result backing cannot be reserved.
+pub fn try_silu(x: &[f32]) -> Result<Vec<f32>> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(x.len())
+        .context(CpuF32AllocationSnafu {
+            operation: "SiLU",
+            requested_len: x.len(),
+        })?;
+    output.extend(x.iter().copied().map(silu_scalar));
+    Ok(output)
 }
 
 /// Elementwise product `c = a * b`.
@@ -510,7 +528,50 @@ pub fn hadamard(a: &[f32], b: &[f32]) -> Vec<f32> {
         a.len(),
         b.len()
     );
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).collect()
+    a.iter()
+        .copied()
+        .zip(b.iter().copied())
+        .map(|(left, right)| multiply_scalar(left, right))
+        .collect()
+}
+
+/// Fallibly multiply equal-length operands into one exact output allocation.
+///
+/// # Errors
+///
+/// Returns [`crate::Error`] when input lengths differ or output storage cannot
+/// be reserved.
+pub fn try_hadamard(a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
+    if a.len() != b.len() {
+        return CpuF32ShapeSnafu {
+            operation: "Hadamard",
+            left: a.len(),
+            right: b.len(),
+        }
+        .fail();
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(a.len())
+        .context(CpuF32AllocationSnafu {
+            operation: "Hadamard",
+            requested_len: a.len(),
+        })?;
+    output.extend(
+        a.iter()
+            .copied()
+            .zip(b.iter().copied())
+            .map(|(left, right)| multiply_scalar(left, right)),
+    );
+    Ok(output)
+}
+
+fn silu_scalar(value: f32) -> f32 {
+    value / (1.0 + (-value).exp())
+}
+
+fn multiply_scalar(left: f32, right: f32) -> f32 {
+    left * right
 }
 
 /// Row-wise softmax along the last axis (fp32 throughout).

@@ -28,7 +28,7 @@ pub mod qwen35_weights;
 
 pub use crate::error::{Error, Result};
 pub use crate::qwen35::Qwen35StructuralProfile;
-pub use crate::qwen35_execution::Qwen35Execution;
+pub use crate::qwen35_execution::{Qwen35Execution, Qwen35ExecutionPlan, Qwen35LogitSelection};
 pub use crate::qwen35_recurrent::Qwen35RecurrentExecution;
 pub use crate::qwen35_weights::Qwen35Weights;
 
