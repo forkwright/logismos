@@ -79,8 +79,8 @@ pub fn row_byte_len(value_count: usize) -> Result<usize> {
 /// Returns [`crate::Error`] for invalid geometry, non-finite serialized
 /// weights or activations, and non-finite products or running accumulator.
 pub fn row_dot_f32(serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
+    F32Row::parse(serialized_row)?;
     row::dot(GEOMETRY, serialized_row, activations, |encoded| {
-        F32Row::parse(encoded)?;
         Ok([decode_one(encoded)])
     })
 }
@@ -156,12 +156,15 @@ mod tests {
 
     #[test]
     fn dispatcher_refuses_nonfinite_serialized_weight_before_arithmetic() {
+        let mut bytes = Vec::new();
+        bytes.extend(1.0_f32.to_le_bytes());
+        bytes.extend(f32::INFINITY.to_le_bytes());
         assert!(
             matches!(
-                dispatch_row_dot_f32(RowFormat::F32, &f32::INFINITY.to_le_bytes(), &[1.0]),
-                Err(Error::NonFiniteF32Weight { index: 0, .. })
+                dispatch_row_dot_f32(RowFormat::F32, &bytes, &[1.0, 1.0]),
+                Err(Error::NonFiniteF32Weight { index: 1, .. })
             ),
-            "F32 dispatcher must reject an infinite encoded weight as a weight parse error"
+            "F32 dispatcher must report the flat index of an infinite encoded weight"
         );
     }
 }

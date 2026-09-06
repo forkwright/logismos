@@ -30,6 +30,9 @@ pub mod q8_0;
 mod row;
 pub mod scheme;
 
+#[cfg(test)]
+mod row_tests;
+
 pub use crate::error::{Error, Result};
 pub use crate::format::RowFormat;
 pub use crate::q4_k::{Q4_K_BLOCK_BYTES, Q4_K_VALUES_PER_BLOCK, Q4KBlock};
