@@ -39,10 +39,12 @@
 )]
 
 pub mod error;
+pub mod qwen3;
 #[cfg(feature = "stella")]
 pub mod stella;
 
 pub use crate::error::{Error, Result};
+pub use crate::qwen3::{Qwen3EmbeddingLimits, Qwen3EmbeddingModel, Qwen3RolePrefixes};
 #[cfg(feature = "stella")]
 pub use crate::stella::{StellaDim, StellaModel};
 

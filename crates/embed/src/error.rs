@@ -7,6 +7,28 @@ use snafu::Snafu;
 #[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
+    /// Native Qwen3 decoder failure.
+    #[snafu(transparent)]
+    Decoders {
+        /// Source decoder failure.
+        source: decoders::Error,
+    },
+    /// A semantic query role lacked trusted setup instructions.
+    #[snafu(display("no trusted instruction is configured for {role}"))]
+    UnresolvedPromptRole {
+        /// Requested semantic role.
+        role: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// The final hidden vector was not finite or had zero L2 norm.
+    #[snafu(display("native Qwen3 final hidden vector is not normalizable"))]
+    NonNormalizable {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// Model directory lookup failed.
     #[snafu(display("io: {message}"))]
     Io {
