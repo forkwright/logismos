@@ -48,6 +48,9 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 # runtime. No loader, multi-template imports, debug source dumps, or host I/O;
 # explicit fuel/recursion/output limits do not imply total-memory isolation.
 minijinja = { version = "2.24", default-features = false, features = ["builtins", "macros", "serde", "fuel", "json", "adjacent_loop_items", "std_collections"] }
+# WHY: artifact templates use Python-style primitive string methods; the
+# maintained compatibility adapter supplies those semantics without host I/O.
+minijinja-contrib = { version = "2.24", default-features = false, features = ["pycompat"] }
 # memmap2: read-only mmap for bulk-tensor files. No alternatives in the
 # Rust ecosystem; used only inside loader's safetensors path.
 memmap2 = "0.9"
