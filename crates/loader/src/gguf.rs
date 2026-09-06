@@ -100,6 +100,13 @@ pub enum GgmlType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
+    /// Inspection-only `GGML_TYPE_IQ4_NL` storage layout.
+    ///
+    /// Source: `ggml-org/llama.cpp` `6a1a922d269908a29cbd4b49c27e6a8e7fd10fae`,
+    /// `ggml/include/ggml.h` (id 20), `ggml/src/ggml.c` (block type), and
+    /// `ggml/src/ggml-common.h` (`QK4_NL` and `block_iq4_nl`). This permits
+    /// descriptor inspection only; tensor decoding remains unsupported.
+    IQ4NL = 20,
     /// Inspection-only `GGML_TYPE_IQ4_XS` storage layout.
     ///
     /// Source: `ggml-org/llama.cpp` `6a1a922d269908a29cbd4b49c27e6a8e7fd10fae`,
@@ -132,6 +139,7 @@ impl GgmlType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            20 => Self::IQ4NL,
             23 => Self::IQ4XS,
             24 => Self::I8,
             25 => Self::I16,
@@ -165,7 +173,7 @@ impl GgmlType {
 
     fn block_layout(self) -> Option<(u64, u64)> {
         Some(match self {
-            Self::Q4_0 => (32, 18),
+            Self::Q4_0 | Self::IQ4NL => (32, 18),
             Self::Q4_1 => (32, 20),
             Self::Q5_0 => (32, 22),
             Self::Q5_1 => (32, 24),
