@@ -902,6 +902,93 @@ fn reader_rejects_unsupported_iq_ggml_type_before_profile_creation() -> Result<(
 }
 
 #[test]
+fn inspection_accepts_iq4_xs_with_exact_block_extent_and_census() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("iq4-xs-valid-block.gguf");
+    std::fs::write(&path, one_tensor_fixture(23, &[256], 32, 168)?)?;
+
+    let inspection = Reader::open(&path)?.inspect()?;
+    assert_eq!(inspection.tensors.len(), 1);
+    let tensor = &inspection.tensors[0];
+    assert_eq!(tensor.ggml_type, GgmlType::IQ4XS);
+    assert_eq!(tensor.dims, [256]);
+    assert_eq!(tensor.logical_elements, 256);
+    assert_eq!(tensor.byte_len, 136);
+    assert_eq!(tensor.file_offset % inspection.alignment, 0);
+    assert_eq!(tensor.file_offset, inspection.file_len - tensor.byte_len);
+    assert_eq!(inspection.type_census.len(), 1);
+    assert_eq!(inspection.type_census[0].ggml_type, GgmlType::IQ4XS);
+    assert_eq!(inspection.type_census[0].tensor_count, 1);
+    assert_eq!(inspection.type_census[0].logical_elements, 256);
+    assert_eq!(inspection.type_census[0].byte_len, 136);
+    Ok(())
+}
+
+#[test]
+fn inspection_rejects_iq4_xs_partial_block() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("iq4-xs-partial-block.gguf");
+    std::fs::write(&path, one_tensor_fixture(23, &[255], 0, 136)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn inspection_rejects_iq4_xs_misaligned_row_shape() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("iq4-xs-misaligned-row.gguf");
+    // The total is one block, but GGML's first-dimension row stride must be
+    // expressed in whole blocks rather than carrying a block across rows.
+    std::fs::write(&path, one_tensor_fixture(23, &[128, 2], 0, 136)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn inspection_rejects_iq4_xs_misaligned_tensor_offset() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("iq4-xs-misaligned-offset.gguf");
+    std::fs::write(&path, one_tensor_fixture(23, &[256], 1, 137)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn inspection_rejects_iq4_xs_truncated_payload() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("iq4-xs-truncated.gguf");
+    std::fs::write(&path, one_tensor_fixture(23, &[256], 0, 135)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+fn inspection_rejects_iq4_xs_byte_count_overflow() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("iq4-xs-extent-overflow.gguf");
+    std::fs::write(&path, one_tensor_fixture(23, &[256, u64::MAX], 0, 0)?)?;
+
+    assert!(matches!(Reader::open(&path), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "tensor")]
+fn reader_still_rejects_iq4_xs_tensor_decoding() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("iq4-xs-not-decodable.gguf");
+    std::fs::write(&path, one_tensor_fixture(23, &[256], 0, 136)?)?;
+
+    let reader = Reader::open(&path)?;
+    assert!(matches!(reader.get("tensor"), Err(Error::Gguf { .. })));
+    Ok(())
+}
+
+#[test]
 fn reader_rejects_metadata_count_above_inspection_limit() -> Result<()> {
     let dir = tempdir_for_test();
     let path = dir.join("too-many-metadata-entries.gguf");

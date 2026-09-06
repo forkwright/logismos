@@ -18,10 +18,11 @@
 //! - `BF16` (id 30),
 //! - `I8` / `I16` / `I32` / `I64` metadata tensors.
 //!
-//! K-quant blocks (`Q4_K`, `Q6_K`, etc.) deliberately error out with a
-//! clear message — they land in Phase 6 when the quant kernels + block
-//! decoders ship. This keeps the surface honest: we don't pretend to
-//! decode bytes whose layout we can't yet apply.
+//! Known block-quant layouts are inspected for exact descriptor geometry, but
+//! deliberately error out when a caller asks the tensor reader to decode
+//! them. Quant kernels and block decoders land in Phase 6. This keeps the
+//! surface honest: we don't pretend to decode bytes whose layout we can't yet
+//! apply.
 //!
 //! Spec reference: <https://github.com/ggerganov/ggml/blob/master/docs/gguf.md>
 //! (GGUF v3; magic 0x46554747, little-endian throughout).
@@ -99,6 +100,13 @@ pub enum GgmlType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
+    /// Inspection-only `GGML_TYPE_IQ4_XS` storage layout.
+    ///
+    /// Source: `ggml-org/llama.cpp` `6a1a922d269908a29cbd4b49c27e6a8e7fd10fae`,
+    /// `ggml/include/ggml.h` (id 23), `ggml/src/ggml.c` (block type), and
+    /// `ggml/src/ggml-common.h` (`QK_K` and `block_iq4_xs`). This permits
+    /// descriptor inspection only; tensor decoding remains unsupported.
+    IQ4XS = 23,
     I8 = 24,
     I16 = 25,
     I32 = 26,
@@ -124,6 +132,7 @@ impl GgmlType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            23 => Self::IQ4XS,
             24 => Self::I8,
             25 => Self::I16,
             26 => Self::I32,
@@ -168,6 +177,7 @@ impl GgmlType {
             Self::Q5K => (256, 176),
             Self::Q6K => (256, 210),
             Self::Q8K => (256, 292),
+            Self::IQ4XS => (256, 136),
             _ => return None,
         })
     }
@@ -610,6 +620,16 @@ impl ParsedArchive {
     }
 
     fn extent_for(&self, desc: &TensorDescriptor, file_len: u64) -> Result<TensorExtent> {
+        if !desc.data_offset.is_multiple_of(self.alignment) {
+            return GgufSnafu {
+                offset: desc.data_offset,
+                msg: format!(
+                    "tensor `{}` data offset {} is not aligned to {}",
+                    desc.name, desc.data_offset, self.alignment
+                ),
+            }
+            .fail();
+        }
         let elements = checked_element_count(desc)?;
         let byte_len = checked_byte_len(desc, elements)?;
         let start = self
@@ -1248,6 +1268,23 @@ fn checked_element_count(desc: &TensorDescriptor) -> Result<u64> {
 
 fn checked_byte_len(desc: &TensorDescriptor, elements: u64) -> Result<u64> {
     if let Some((block_elements, block_bytes)) = desc.ggml_type.block_layout() {
+        let row_elements = desc.dims.first().copied().ok_or_else(|| {
+            GgufSnafu {
+                offset: desc.data_offset,
+                msg: format!("tensor `{}` has no dimensions", desc.name),
+            }
+            .build()
+        })?;
+        if !row_elements.is_multiple_of(block_elements) {
+            return GgufSnafu {
+                offset: desc.data_offset,
+                msg: format!(
+                    "tensor `{}` row width {row_elements} is not a multiple of {block_elements} for {:?}",
+                    desc.name, desc.ggml_type
+                ),
+            }
+            .fail();
+        }
         if !elements.is_multiple_of(block_elements) {
             return GgufSnafu {
                 offset: desc.data_offset,
