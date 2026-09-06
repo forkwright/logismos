@@ -1,0 +1,26 @@
+[package]
+name = "text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Artifact-bound native text request pipeline."
+publish = false
+
+[dependencies]
+decoders = { path = "../decoders" }
+decode = { path = "../decode" }
+loader = { path = "../loader", default-features = false }
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+snafu = { workspace = true }
+tokenize = { path = "../tokenize" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+test-fixtures = { path = "../test-fixtures" }
