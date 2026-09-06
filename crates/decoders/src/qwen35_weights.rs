@@ -31,7 +31,7 @@ use crate::qwen35::Qwen35StructuralProfile;
 /// use loader::gguf::ObservedArtifact;
 ///
 /// fn forge_from_observation(observed: &ObservedArtifact) {
-///     let _ = Qwen35Weights::try_from_observed(observed);
+///     let _ = Qwen35Weights::try_from_verified(observed);
 /// }
 /// ```
 #[derive(Debug)]

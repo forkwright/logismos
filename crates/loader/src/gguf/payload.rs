@@ -47,10 +47,10 @@ impl ArtifactByteLimit {
 /// authenticity or an atomic filesystem snapshot.
 ///
 /// ```compile_fail
-/// use loader::gguf::VerifiedArtifact;
+/// use loader::gguf::{ObservedArtifact, VerifiedArtifact};
 ///
-/// fn forge_artifact() {
-///     let _ = VerifiedArtifact { backing: Vec::new() };
+/// fn forge_artifact(observation: ObservedArtifact) {
+///     let _ = VerifiedArtifact { backing: Vec::new(), observation };
 /// }
 /// ```
 pub struct VerifiedArtifact {

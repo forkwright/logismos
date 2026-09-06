@@ -132,7 +132,7 @@ const NEXTN_EXTENSION_TEMPLATES: &[TensorTemplate] = &[
 /// use loader::gguf::Inspection;
 ///
 /// fn forge_from_report(receipt: &Inspection) {
-///     let _ = Qwen35StructuralProfile::from_inspection(receipt);
+///     let _ = Qwen35StructuralProfile::try_from_observed(receipt);
 /// }
 /// ```
 #[derive(Debug)]
