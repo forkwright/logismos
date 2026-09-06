@@ -68,6 +68,10 @@ Each call commits all layer state only after every input token and output projec
 Other unsupported formats or execution configurations fail explicitly.
 `execution_plan` additionally bounds tokens per step and selects all-token or last-token
 logits; prefill for generation need not retain a vocabulary row for every prompt token.
+Its `cpu_requirements()` reports artifact-bound logical `f32` backing: retained state,
+transaction copies, a conservative workspace upper bound, and returned logits. The allocation
+owners consume the same named sizes. Serialized artifact bytes are separate; neither value is
+an allocation guarantee, whole-process memory estimate, GPU requirement or physical reservation.
 This CPU path does not provide NextN, serving, real-artifact quality or GPU
 qualification; it does not authenticate a publisher or reserve device memory. The existing
 mmap tensor adapter is separate.

@@ -125,6 +125,23 @@ limits. Whole-call staging is fallible and commits only after all token logits
 succeed. Its text-only interleaved RoPE supports checked full or partial rotary
 dimensions; unsupported effective scaling fails explicitly.
 
+`Qwen35ExecutionPlan` validates caller context and step bounds and chooses
+all-token or last-token logits. Its precomputed `Qwen35CpuRequirements` derives
+logical `f32` backing from allocation owners, not a separate estimator.
+Causal-convolution and grouped-GDN plans are consumed by their kernels;
+recurrent, full-attention, FFN and LM-head owners compose named allocation
+phases. The report separates retained state, its transaction clone, transient
+workspace upper bound, and returned logits. Serialized verified backing is
+reported separately. Structure/stack storage, allocator overhead and capacity,
+template/tokenizer allocations, process RSS, physical residency and GPU memory
+are outside this report. It is neither an allocation guarantee nor device
+admission input.
+
+Independent synthetic f64 witnesses cover the composed mixed-quantized model,
+retained recurrent/KV/position state, continuation and rollback. Deliberately
+incorrect format/order/operator paths must be distinguishable at the same
+comparison tolerance; batch-versus-sequential agreement alone is insufficient.
+
 `text::TextPipeline` binds an explicitly selected tokenizer identity to the
 verified model's vocabulary and special-token policy. The same model digest
 commits the embedded template; no second template identity authority exists.

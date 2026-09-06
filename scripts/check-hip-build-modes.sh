@@ -135,7 +135,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
             exit 1
         fi
         env -u LOGISMOS_HIP_BUILD HIPCC=/not-a-hipcc \
-            cargo check --offline --locked --no-default-features "$@" --lib
+            cargo check --offline --locked --no-default-features "$@" --lib --jobs 4
     ' /bin/sh "$ROOT" "$OUT" </dev/null
 } 2>&1 | /usr/bin/cat
 
