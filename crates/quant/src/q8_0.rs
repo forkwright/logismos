@@ -442,7 +442,7 @@ mod tests {
         let max_multiple = usize::MAX - (usize::MAX % Q8_0_VALUES_PER_BLOCK);
         assert!(
             matches!(
-            row_byte_len(max_multiple),
+                row_byte_len(max_multiple),
                 Err(Error::Q8RowByteLengthOverflow { .. })
             ),
             "serialized row geometry overflow must be refused"
