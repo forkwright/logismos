@@ -15,10 +15,10 @@ must not initialize a GPU, start a process, or reserve physical memory merely by
 | Tier | Role |
 |------|------|
 | T0 Foundation | HIP FFI, errors, stable model API, and pure resource contracts |
-| T1 Infrastructure | Kernels, quantization, tokenization, loading, and caching |
+| T1 Infrastructure | Kernels, quantization, tokenization, loading, caching, and CPU decode policy |
 | T2 Model families | Transformer operations and encoder/decoder implementations |
 | T3 Pipelines | End-to-end inference pipelines |
-| T4 Serving | Scheduling, admission/residency coordination, sampling, and provider adapters |
+| T4 Serving | Scheduling, admission/residency coordination, and provider adapters |
 | T5 Entrypoint | Integration facade and binary |
 
 The exact crate inventory derives from `cargo metadata --format-version 1 --no-deps --locked`; it
@@ -45,6 +45,11 @@ semantically respects that boundary.
   distinct from payload-bound execution. The lower-level `quant` crate owns
   executable block and row geometry; inspection and projection reuse that owner.
 - `emulation` is a CPU test aid, not a production device backend.
+- `decode` owns checked logit processing and token selection over CPU slices.
+  It has no tensor/device-runtime dependency; a pipeline can consume it without
+  depending on a serving layer. Empty, NaN, positive-infinity and fully masked
+  rows fail explicitly. Negative infinity is the masking representation, not
+  an implicit fallback to token zero.
 - `taxis` depends locally on `hipcore`.
 - `kernels/gpu` enables the local `hipcore` and `taxis` dependencies and GPU
   launcher modules, including their nested parity references. Standalone
