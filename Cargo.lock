@@ -287,6 +287,8 @@ name = "decoders"
 version = "1.0.11"
 dependencies = [
  "loader",
+ "quant",
+ "sha2",
  "snafu",
  "tempfile",
 ]
@@ -585,6 +587,7 @@ dependencies = [
  "half",
  "memmap2",
  "quant",
+ "rustix",
  "safetensors",
  "sha2",
  "snafu",

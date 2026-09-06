@@ -47,6 +47,10 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 # memmap2: read-only mmap for bulk-tensor files. No alternatives in the
 # Rust ecosystem; used only inside loader's safetensors path.
 memmap2 = "0.9"
+# rustix: descriptor-first filesystem operations at the verified GGUF input
+# boundary. `fs` supplies open/mkfifoat and `std` converts its owned descriptor
+# and errno into standard Rust I/O types.
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "std"] }
 # rayon: work-stealing thread pool for CPU parallel matmul (Phase 3
 # throughput floor). Single dep, no feature knobs needed.
 rayon = "1.10"

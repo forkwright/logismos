@@ -1,8 +1,11 @@
 //! Error types for the `loader` crate.
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 use snafu::Snafu;
+
+use crate::gguf::Sha256Digest;
 
 /// Result alias used throughout `loader`.
 pub type Result<T> = core::result::Result<T, Error>;
@@ -58,7 +61,6 @@ pub enum Error {
     },
 
     /// Requested tensor does not exist in the archive.
-    #[cfg(feature = "tensor")]
     #[snafu(display("tensor `{name}` not found in archive"))]
     TensorNotFound {
         /// Missing tensor name.
@@ -130,6 +132,56 @@ pub enum Error {
         expected_len: u64,
         /// Length observed on the just-completed handle re-stat.
         actual_len: u64,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The serialized artifact cannot fit in the caller-authorized backing.
+    #[snafu(display(
+        "artifact has {serialized_bytes} serialized bytes, exceeding the caller limit of {limit}"
+    ))]
+    ArtifactExceedsByteLimit {
+        /// Serialized byte length obtained from the opened input file.
+        serialized_bytes: u64,
+        /// Explicit maximum permitted serialized backing length.
+        limit: NonZeroU64,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The supplied input is not a regular file.
+    #[snafu(display("verified artifact input {} is not a regular file", path.display()))]
+    ArtifactInputNotRegular {
+        /// Path supplied to the verified-artifact loader.
+        path: PathBuf,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Reserving the verified serialized backing failed.
+    #[snafu(display(
+        "unable to reserve {serialized_bytes} bytes for the verified artifact backing: {source}"
+    ))]
+    ArtifactBackingAllocation {
+        /// Requested serialized backing length.
+        serialized_bytes: u64,
+        /// Allocator failure retained for typed error inspection.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The copied serialized bytes do not equal the required artifact identity.
+    #[snafu(display("verified artifact digest mismatch: expected {expected}, observed {actual}"))]
+    ArtifactDigestMismatch {
+        /// Required SHA-256 identity supplied by the caller.
+        expected: Sha256Digest,
+        /// SHA-256 computed from the privately owned backing bytes.
+        actual: Sha256Digest,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,

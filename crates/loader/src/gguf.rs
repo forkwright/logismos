@@ -38,9 +38,7 @@ use memmap2::Mmap;
 use quant::{Q8_0_BLOCK_BYTES, Q8_0_VALUES_PER_BLOCK};
 use sha2::{Digest, Sha256};
 
-#[cfg(feature = "tensor")]
-use crate::error::TensorNotFoundSnafu;
-use crate::error::{GgufSnafu, MmapStaleSnafu, Result, UnknownGgmlTypeSnafu};
+use crate::error::{GgufSnafu, MmapStaleSnafu, Result, TensorNotFoundSnafu, UnknownGgmlTypeSnafu};
 // WHY imported without a code reference: the `# Errors` sections below link to
 // `Error` variants by intra-doc path, which rustdoc resolves only against items
 // in scope. Split from the group above so the expectation covers this import
@@ -52,6 +50,10 @@ use crate::error::{GgufSnafu, MmapStaleSnafu, Result, UnknownGgmlTypeSnafu};
 use crate::error::Error;
 #[cfg(feature = "tensor")]
 use crate::{TensorView, WeightProvider};
+
+mod payload;
+
+pub use payload::{ArtifactByteLimit, VerifiedArtifact, VerifiedTensor};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_V3: u32 = 3;
@@ -386,6 +388,12 @@ pub struct TensorDescriptor {
 pub struct Sha256Digest([u8; SHA256_DIGEST_BYTES]);
 
 impl Sha256Digest {
+    /// Construct a SHA-256 digest from canonical digest bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; SHA256_DIGEST_BYTES]) -> Self {
+        Self(bytes)
+    }
+
     /// Borrow the canonical digest bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; SHA256_DIGEST_BYTES] {
@@ -487,9 +495,10 @@ pub struct Inspection {
 /// `ObservedArtifact` is constructed only by
 /// [`observe_gguf_with_sha256`], after that retained handle supplied both the
 /// bounded descriptor prefix and the complete SHA-256 stream. It keeps the
-/// typed metadata and source-order tensor descriptors available for a later
-/// architecture-specific admission boundary without making a caller-built
-/// [`Inspection`] authoritative.
+/// typed metadata and source-order tensor descriptors for reporting without
+/// making a caller-built [`Inspection`] authoritative. It cannot construct a
+/// [`VerifiedArtifact`]; verified payload access must copy and hash its own
+/// private backing against a caller-supplied digest.
 ///
 /// This is an observation, not source provenance, an atomic snapshot, model
 /// admission, or a runtime support claim. In particular, a same-length
@@ -531,6 +540,30 @@ impl ObservedArtifact {
     pub fn tensor_descriptors(&self) -> &[TensorDescriptor] {
         &self.parsed.tensors
     }
+
+    pub(super) fn descriptor_by_name(&self, name: &str) -> Result<&TensorDescriptor> {
+        let idx = self
+            .parsed
+            .tensor_by_name
+            .get(name)
+            .copied()
+            .ok_or_else(|| {
+                TensorNotFoundSnafu {
+                    name: name.to_string(),
+                }
+                .build()
+            })?;
+        self.parsed.tensors.get(idx).ok_or_else(|| {
+            GgufSnafu {
+                offset: 0u64,
+                msg: format!(
+                    "internal: tensor index {idx} out of range (len={})",
+                    self.parsed.tensors.len()
+                ),
+            }
+            .build()
+        })
+    }
 }
 
 /// Owning GGUF archive.
@@ -545,7 +578,6 @@ pub struct Reader {
 struct ParsedArchive {
     metadata: HashMap<String, MetaValue>,
     tensors: Vec<TensorDescriptor>,
-    #[cfg(feature = "tensor")]
     tensor_by_name: HashMap<String, usize>,
     data_region_start: u64,
     alignment: u64,
@@ -826,12 +858,9 @@ impl Reader {
         let after_header = cur.pos;
         let data_region_start = align_up(after_header, alignment)?;
 
-        #[cfg(not(feature = "tensor"))]
-        let _ = tensor_by_name;
         Ok(ParsedArchive {
             metadata,
             tensors,
-            #[cfg(feature = "tensor")]
             tensor_by_name,
             data_region_start,
             alignment,
