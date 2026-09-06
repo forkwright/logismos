@@ -6,7 +6,7 @@ tightens: original inference implementations, explicit hardware-access boundary,
 
 # AGENTS.md - Logismos
 
-Cross-tool guide for AI coding agents (Claude Code, Kimi, Codex, Cursor, Copilot, etc.). Read [CLAUDE.md](CLAUDE.md) for operating instructions, including how to resolve the kanon checkout root on this box. Planning canonical lives in kanon: `projects/logismos/{vision,ROADMAP,STATE}.md`.
+Cross-tool guide for AI coding agents (Claude Code, Kimi, Codex, Cursor, Copilot, etc.). Read [CLAUDE.md](CLAUDE.md) for operating instructions, including how to obtain the active private plan and resolve Kanon standards on this box. The operator-managed private planning corpus is canonical for Logismos planning; this repository's [ARCHITECTURE.md](ARCHITECTURE.md) records implemented crate ownership.
 
 ## Build / Test / Lint
 
@@ -60,7 +60,8 @@ the precise threat model. Ordinary compilation is not a hardware-test permit.
 | STT pipeline | `crates/ekphrasis/` |
 | Tokenizer | `crates/tokenize/` |
 
-Crate architecture + dependency direction lives in kanon's `projects/logismos/vision.md` (role table) and `projects/logismos/STATE.md` (current state).
+The private planning corpus governs future scope and sequencing. This repository's
+[ARCHITECTURE.md](ARCHITECTURE.md) governs implemented crate ownership and dependency direction.
 
 Logismos owns load, quantize, infer, and serve. It does not own general model formation, training,
 or model release. [`contracts/runtime-scope.toml`](contracts/runtime-scope.toml) records that
