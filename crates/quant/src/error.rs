@@ -1,10 +1,31 @@
 //! Errors surfaced by `quant` preflight and block-decoding utilities.
 
+use core::fmt;
+
 use crate::scheme::TurboQuantScheme;
 use snafu::Snafu;
 
 /// Crate-local result alias.
 pub type Result<T> = core::result::Result<T, Error>;
+
+/// The non-finite arithmetic phase in a `Q8_0` row dot product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Q8ArithmeticStage {
+    /// A decoded weight multiplied by its activation was non-finite.
+    Product,
+    /// Adding a finite product to the running row total was non-finite.
+    Accumulation,
+}
+
+impl fmt::Display for Q8ArithmeticStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Product => formatter.write_str("product"),
+            Self::Accumulation => formatter.write_str("accumulation"),
+        }
+    }
+}
 
 /// Errors surfaced by `quant` preflight and block-decoding utilities.
 #[derive(Debug, PartialEq, Eq, Snafu)]
@@ -151,7 +172,7 @@ pub enum Error {
     ))]
     NonFiniteQ8Arithmetic {
         /// Arithmetic stage that overflowed or became non-finite.
-        stage: &'static str,
+        stage: Q8ArithmeticStage,
         /// Zero-based `Q8_0` block index.
         block_index: usize,
         /// Zero-based value index inside the `Q8_0` block.

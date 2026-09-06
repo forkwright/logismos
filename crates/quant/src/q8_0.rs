@@ -6,7 +6,7 @@ use crate::Result;
 use crate::error::{
     EmptyQ8RowInputSnafu, InvalidQ8BlockLengthSnafu, InvalidQ8RowInputLengthSnafu,
     NonFiniteQ8ActivationSnafu, NonFiniteQ8ArithmeticSnafu, NonFiniteQ8ScaleSnafu,
-    Q8RowByteLengthMismatchSnafu, Q8RowByteLengthOverflowSnafu,
+    Q8ArithmeticStage, Q8RowByteLengthMismatchSnafu, Q8RowByteLengthOverflowSnafu,
 };
 
 /// Number of signed quantized values in one `Q8_0` block.
@@ -85,6 +85,12 @@ impl Q8_0Block {
 /// each block through [`Q8_0Block::parse`], uses a single stack-resident
 /// decoded block, and returns no output on a refusal.
 ///
+/// Numerics are sequential: serialized blocks and their lanes are visited in
+/// order; every lane performs one f32 multiply followed by one f32 add to the
+/// running accumulator. This implementation does not request fused multiply-
+/// add, parallel reduction, or reassociation; changing that order requires
+/// numerical review.
+///
 /// WHY: a later artifact-bound tensor capability can lend one validated `Q8_0`
 /// row without materializing a full f32 matrix; this keeps GGML block semantics
 /// in one CPU-only authority rather than duplicating a dequantization loop in
@@ -123,7 +129,7 @@ pub fn row_dot_f32(serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
             let product = *weight * *activation;
             if !product.is_finite() {
                 return NonFiniteQ8ArithmeticSnafu {
-                    stage: "product",
+                    stage: Q8ArithmeticStage::Product,
                     block_index,
                     lane_index,
                 }
@@ -132,7 +138,7 @@ pub fn row_dot_f32(serialized_row: &[u8], activations: &[f32]) -> Result<f32> {
             accumulator += product;
             if !accumulator.is_finite() {
                 return NonFiniteQ8ArithmeticSnafu {
-                    stage: "accumulation",
+                    stage: Q8ArithmeticStage::Accumulation,
                     block_index,
                     lane_index,
                 }
@@ -323,25 +329,34 @@ mod tests {
         let serialized = block_bytes(0x3c00, [1; Q8_0_VALUES_PER_BLOCK]).to_vec();
         let original_serialized = serialized.clone();
         let empty: [f32; 0] = [];
-        assert!(matches!(
-            row_dot_f32(&serialized, &empty),
-            Err(Error::EmptyQ8RowInput { .. })
-        ));
+        assert!(
+            matches!(
+                row_dot_f32(&serialized, &empty),
+                Err(Error::EmptyQ8RowInput { .. })
+            ),
+            "empty activation rows must be refused"
+        );
 
         let unaligned_activations = [1.0_f32; Q8_0_VALUES_PER_BLOCK + 1];
-        assert!(matches!(
-            row_dot_f32(&serialized, &unaligned_activations),
-            Err(Error::InvalidQ8RowInputLength { actual, .. })
-                if actual == unaligned_activations.len()
-        ));
+        assert!(
+            matches!(
+                row_dot_f32(&serialized, &unaligned_activations),
+                Err(Error::InvalidQ8RowInputLength { actual, .. })
+                    if actual == unaligned_activations.len()
+            ),
+            "activation lengths must contain whole Q8_0 blocks"
+        );
 
         let short_serialized = &serialized[..Q8_0_BLOCK_BYTES - 1];
         let full_activations = [1.0_f32; Q8_0_VALUES_PER_BLOCK];
-        assert!(matches!(
-            row_dot_f32(short_serialized, &full_activations),
-            Err(Error::Q8RowByteLengthMismatch { actual, expected, .. })
-                if actual == short_serialized.len() && expected == serialized.len()
-        ));
+        assert!(
+            matches!(
+                row_dot_f32(short_serialized, &full_activations),
+                Err(Error::Q8RowByteLengthMismatch { actual, expected, .. })
+                    if actual == short_serialized.len() && expected == serialized.len()
+            ),
+            "serialized rows must exactly match activation geometry"
+        );
         assert_eq!(
             serialized, original_serialized,
             "row-dot refusal must not mutate bytes"
@@ -352,34 +367,43 @@ mod tests {
     fn row_dot_rejects_nonfinite_scale_and_activation() {
         let nonfinite_scale = block_bytes(0x7c00, [1; Q8_0_VALUES_PER_BLOCK]);
         let finite_activations = [1.0_f32; Q8_0_VALUES_PER_BLOCK];
-        assert!(matches!(
-            row_dot_f32(&nonfinite_scale, &finite_activations),
-            Err(Error::NonFiniteQ8Scale { bits: 0x7c00, .. })
-        ));
+        assert!(
+            matches!(
+                row_dot_f32(&nonfinite_scale, &finite_activations),
+                Err(Error::NonFiniteQ8Scale { bits: 0x7c00, .. })
+            ),
+            "non-finite serialized scales must be refused"
+        );
 
         let finite_scale = block_bytes(0x3c00, [1; Q8_0_VALUES_PER_BLOCK]);
         let mut nonfinite_activations = [1.0_f32; Q8_0_VALUES_PER_BLOCK];
         let nonfinite_index = 5;
         nonfinite_activations[nonfinite_index] = f32::NAN;
-        assert!(matches!(
-            row_dot_f32(&finite_scale, &nonfinite_activations),
-            Err(Error::NonFiniteQ8Activation { index, .. }) if index == nonfinite_index
-        ));
+        assert!(
+            matches!(
+                row_dot_f32(&finite_scale, &nonfinite_activations),
+                Err(Error::NonFiniteQ8Activation { index, .. }) if index == nonfinite_index
+            ),
+            "non-finite activations must identify their flat row index"
+        );
     }
 
     #[test]
     fn row_dot_rejects_nonfinite_product_and_accumulator() {
         let maximum_scale = block_bytes(0x7bff, [127; Q8_0_VALUES_PER_BLOCK]);
         let maximum_activations = [f32::MAX; Q8_0_VALUES_PER_BLOCK];
-        assert!(matches!(
-            row_dot_f32(&maximum_scale, &maximum_activations),
-            Err(Error::NonFiniteQ8Arithmetic {
-                stage: "product",
-                block_index: 0,
-                lane_index: 0,
-                ..
-            })
-        ));
+        assert!(
+            matches!(
+                row_dot_f32(&maximum_scale, &maximum_activations),
+                Err(Error::NonFiniteQ8Arithmetic {
+                    stage: Q8ArithmeticStage::Product,
+                    block_index: 0,
+                    lane_index: 0,
+                    ..
+                })
+            ),
+            "non-finite multiplication must report the product stage"
+        );
 
         let mut serialized = block_bytes(0x7bff, [0; Q8_0_VALUES_PER_BLOCK]).to_vec();
         serialized[Q8_0_SCALE_BYTES] = 127_u8;
@@ -390,24 +414,30 @@ mod tests {
         let large_finite_activation = f32::MAX / ACCUMULATION_ACTIVATION_DIVISOR;
         activations[0] = large_finite_activation;
         activations[Q8_0_VALUES_PER_BLOCK] = large_finite_activation;
-        assert!(matches!(
-            row_dot_f32(&serialized, &activations),
-            Err(Error::NonFiniteQ8Arithmetic {
-                stage: "accumulation",
-                block_index: 1,
-                lane_index: 0,
-                ..
-            })
-        ));
+        assert!(
+            matches!(
+                row_dot_f32(&serialized, &activations),
+                Err(Error::NonFiniteQ8Arithmetic {
+                    stage: Q8ArithmeticStage::Accumulation,
+                    block_index: 1,
+                    lane_index: 0,
+                    ..
+                })
+            ),
+            "non-finite accumulation must report the accumulation stage"
+        );
     }
 
     #[test]
     fn row_dot_rejects_unrepresentable_serialized_length() {
         let max_multiple = usize::MAX - (usize::MAX % Q8_0_VALUES_PER_BLOCK);
-        assert!(matches!(
-            checked_row_byte_len(max_multiple),
-            Err(Error::Q8RowByteLengthOverflow { .. })
-        ));
+        assert!(
+            matches!(
+                checked_row_byte_len(max_multiple),
+                Err(Error::Q8RowByteLengthOverflow { .. })
+            ),
+            "serialized row geometry overflow must be refused"
+        );
     }
 
     fn block_bytes(scale_bits: u16, values: [i8; Q8_0_VALUES_PER_BLOCK]) -> [u8; Q8_0_BLOCK_BYTES] {
