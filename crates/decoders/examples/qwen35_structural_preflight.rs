@@ -9,7 +9,7 @@
 use std::{env, ffi::OsString, path::PathBuf, process::ExitCode};
 
 use decoders::Qwen35StructuralProfile;
-use loader::gguf::{ArtifactDigest, ObservedArtifact, observe_gguf_with_sha256};
+use loader::gguf::{ArtifactDigest, observe_gguf_with_sha256};
 
 const INPUT_ENVIRONMENT: &str = "LOGISMOS_GPU_DENIED_INPUT";
 const REPORT_SCHEMA_VERSION: u64 = 1;
@@ -29,7 +29,7 @@ fn main() -> ExitCode {
         eprintln!("qwen35 structural preflight refused the observed artifact");
         return ExitCode::from(REFUSAL_EXIT);
     };
-    let Some(report) = report(&observed, &profile) else {
+    let Some(report) = report(&profile) else {
         eprintln!("qwen35 structural observation did not retain a SHA-256 digest");
         return ExitCode::from(REFUSAL_EXIT);
     };
@@ -41,7 +41,8 @@ fn input_path(value: Option<OsString>) -> Option<PathBuf> {
     value.map(PathBuf::from)
 }
 
-fn report(observed: &ObservedArtifact, profile: &Qwen35StructuralProfile<'_>) -> Option<String> {
+fn report(profile: &Qwen35StructuralProfile<'_>) -> Option<String> {
+    let observed = profile.observed();
     let inspection = observed.inspection();
     let ArtifactDigest::Sha256(digest) = inspection.digest else {
         return None;
