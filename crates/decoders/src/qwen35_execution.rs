@@ -6,12 +6,14 @@ use quant::f32_row::F32Row;
 use snafu::ResultExt;
 
 use crate::error::{
-    ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionArithmeticSnafu,
-    ExecutionContextSnafu, ExecutionCpuSnafu, ExecutionTokenSnafu, MetadataRelationSnafu,
-    MetadataTypeSnafu, MissingMetadataSnafu, PayloadTensorSnafu, ProjectionBytesSnafu,
-    ProjectionDtypeSnafu, ProjectionRowSnafu, RecurrentRmsNormSnafu, TensorShapeSnafu,
+    ArithmeticOverflowSnafu, ExecutionAllocationPlanSnafu, ExecutionAllocationSnafu,
+    ExecutionArithmeticSnafu, ExecutionContextSnafu, ExecutionCpuSnafu, ExecutionTokenSnafu,
+    MetadataRelationSnafu, MetadataTypeSnafu, MissingMetadataSnafu, PayloadTensorSnafu,
+    ProjectionBytesSnafu, ProjectionDtypeSnafu, ProjectionRowSnafu, RecurrentRmsNormSnafu,
+    TensorShapeSnafu,
 };
 use crate::qwen35::recurrent_layernorm_rms_epsilon;
+use crate::qwen35_requirements::Qwen35CpuRequirements;
 use crate::{Qwen35RecurrentExecution, Qwen35Weights, Result};
 
 const CONTEXT_LENGTH_KEY: &str = "qwen35.context_length";
@@ -45,13 +47,15 @@ pub struct Qwen35ExecutionPlan<'weights, 'artifact> {
     layout: Layout,
     max_step_tokens: usize,
     selection: Qwen35LogitSelection,
+    requirements: Qwen35CpuRequirements,
 }
 
 /// Stateful, bounded CPU text execution bound to one verified payload.
 ///
-/// Each successful [`Self::step`] returns one vocabulary-logit row per input
-/// token. The method stages recurrent and full-attention history in a clone,
-/// committing it only after the whole call, including final logits, succeeds.
+/// Each successful [`Self::step`] executes every input token and returns rows
+/// according to the plan's [`Qwen35LogitSelection`]. The method stages recurrent
+/// and full-attention history in a clone, committing it only after the whole
+/// call, including selected final logits, succeeds.
 #[derive(Debug)]
 pub struct Qwen35Execution<'weights, 'artifact> {
     weights: &'weights Qwen35Weights<'artifact>,
@@ -102,18 +106,31 @@ impl<'weights, 'artifact> Qwen35ExecutionPlan<'weights, 'artifact> {
             }
             .fail();
         }
+        let requirements =
+            Qwen35CpuRequirements::try_from_plan(weights, layout, max_step_tokens, selection)?;
         Ok(Self {
             weights,
             layout,
             max_step_tokens,
             selection,
+            requirements,
         })
     }
 
     /// Construct the session described by this checked plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] if one plan-derived retained allocation or
+    /// artifact-bound recurrent state cannot be constructed.
     pub fn execution(self) -> Result<Qwen35Execution<'weights, 'artifact>> {
-        let weights = self.weights;
-        let layout = self.layout;
+        let Self {
+            weights,
+            layout,
+            max_step_tokens,
+            selection,
+            requirements: _,
+        } = self;
         let block_count = layout.main_blocks;
         let mut layers = reserve("main-block execution slots", block_count)?;
         for block in 0..block_count {
@@ -133,19 +150,30 @@ impl<'weights, 'artifact> Qwen35ExecutionPlan<'weights, 'artifact> {
         Ok(Qwen35Execution {
             weights,
             layout,
-            max_step_tokens: self.max_step_tokens,
-            selection: self.selection,
+            max_step_tokens,
+            selection,
             layers,
             position: 0,
         })
     }
+
+    /// Return the precomputed logical CPU allocation envelope for this plan.
+    ///
+    /// WHY: all fallible size arithmetic runs during plan admission, so reading
+    /// an admitted plan's requirements cannot introduce a new failure.
+    #[must_use]
+    pub const fn cpu_requirements(&self) -> Qwen35CpuRequirements {
+        self.requirements
+    }
 }
 
-impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
+impl Qwen35Execution<'_, '_> {
     /// Execute complete token ids and return token-major vocabulary logits.
     ///
     /// The session owns only state derived from its verified payload; callers
-    /// cannot inject KV or recurrent state.
+    /// cannot inject KV or recurrent state. [`Qwen35LogitSelection::AllTokens`]
+    /// returns one row per input token; [`Qwen35LogitSelection::LastToken`]
+    /// still executes and commits every token but returns only the final row.
     ///
     /// # Errors
     ///
@@ -201,18 +229,7 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
     }
 
     fn step_staged(&mut self, token_ids: &[u32]) -> Result<Vec<f32>> {
-        let output_rows = match self.selection {
-            Qwen35LogitSelection::AllTokens => token_ids.len(),
-            Qwen35LogitSelection::LastToken => 1,
-        };
-        let total = output_rows
-            .checked_mul(self.layout.vocabulary)
-            .ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "token logits allocation",
-                }
-                .build()
-            })?;
+        let total = returned_logits_elements(self.layout, token_ids.len(), self.selection)?;
         let mut logits = reserve("token logits", total)?;
         for (token_index, token_id) in token_ids.iter().enumerate() {
             let mut hidden = self.embed(*token_id)?;
@@ -233,24 +250,15 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
                         full_attention(weights, layout, position, block, &hidden, state)?
                     }
                 };
-                add_in_place(&mut hidden, &attention, "attention residual")?;
-                let post_norm = read_f32(
-                    self.weights,
-                    &block_name(block, "post_attention_norm.weight"),
-                    &[self.layout.hidden_u64],
-                )?;
-                let normalized = kernels::cpu_f32::rms_norm(
-                    &hidden,
-                    &post_norm,
-                    1,
-                    self.layout.hidden,
-                    self.layout.epsilon,
-                )
-                .context(RecurrentRmsNormSnafu)?;
-                let ffn = self.ffn(block, &normalized)?;
-                add_in_place(&mut hidden, &ffn, "FFN residual")?;
+                self.finish_layer(block, &mut hidden, &attention)?;
             }
-            let output_norm = read_f32(self.weights, OUTPUT_NORM, &[self.layout.hidden_u64])?;
+            let lm_head = LmHeadWorkspaceAllocations::try_from_layout(self.layout)?;
+            let output_norm = read_f32(
+                self.weights,
+                OUTPUT_NORM,
+                &[self.layout.hidden_u64],
+                lm_head.output_norm,
+            )?;
             let normalized = kernels::cpu_f32::rms_norm(
                 &hidden,
                 &output_norm,
@@ -259,10 +267,20 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
                 self.layout.epsilon,
             )
             .context(RecurrentRmsNormSnafu)?;
+            ensure_execution_plan(
+                "LM-head normalized hidden",
+                normalized.len(),
+                lm_head.normalized_hidden,
+            )?;
             if matches!(self.selection, Qwen35LogitSelection::AllTokens)
                 || token_index + 1 == token_ids.len()
             {
-                logits.extend(self.weights.project(OUTPUT, &normalized)?);
+                logits.extend(project_checked(
+                    self.weights,
+                    OUTPUT,
+                    &normalized,
+                    lm_head.vocabulary_projection,
+                )?);
             }
             self.position = self.position.checked_add(1).ok_or_else(|| {
                 ArithmeticOverflowSnafu {
@@ -272,6 +290,37 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
             })?;
         }
         Ok(logits)
+    }
+
+    fn finish_layer(&self, block: usize, hidden: &mut [f32], attention: &[f32]) -> Result<()> {
+        let finish = LayerFinishWorkspaceAllocations::try_from_layout(self.layout)?;
+        ensure_execution_plan(
+            "layer attention output",
+            attention.len(),
+            finish.attention_output,
+        )?;
+        add_in_place(hidden, attention, "attention residual")?;
+        let post_norm = read_f32(
+            self.weights,
+            &block_name(block, "post_attention_norm.weight"),
+            &[self.layout.hidden_u64],
+            finish.post_attention_norm,
+        )?;
+        let normalized = kernels::cpu_f32::rms_norm(
+            hidden,
+            &post_norm,
+            1,
+            self.layout.hidden,
+            self.layout.epsilon,
+        )
+        .context(RecurrentRmsNormSnafu)?;
+        ensure_execution_plan(
+            "post-attention normalized hidden",
+            normalized.len(),
+            finish.normalized_hidden,
+        )?;
+        let ffn = self.ffn(block, &normalized, finish.feed_forward)?;
+        add_in_place(hidden, &ffn, "FFN residual")
     }
 
     fn embed(&self, token_id: u32) -> Result<Vec<f32>> {
@@ -290,7 +339,8 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
             .fail();
         }
         let embedding = self.weights.decode_row(TOKEN_EMBEDDING, token)?;
-        if embedding.len() != self.layout.hidden {
+        let planned = Qwen35Weights::decoded_row_elements(self.layout.hidden);
+        if embedding.len() != planned {
             return ExecutionContextSnafu {
                 requested: embedding.len(),
                 rule: "token embedding row must match artifact-derived hidden width",
@@ -301,22 +351,42 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
         Ok(embedding)
     }
 
-    fn ffn(&self, block: usize, input: &[f32]) -> Result<Vec<f32>> {
-        let gate = self
-            .weights
-            .project(&block_name(block, "ffn_gate.weight"), input)?;
-        let up = self
-            .weights
-            .project(&block_name(block, "ffn_up.weight"), input)?;
+    fn ffn(
+        &self,
+        block: usize,
+        input: &[f32],
+        allocations: FeedForwardWorkspaceAllocations,
+    ) -> Result<Vec<f32>> {
+        let gate = project_checked(
+            self.weights,
+            &block_name(block, "ffn_gate.weight"),
+            input,
+            allocations.gate_projection,
+        )?;
+        let up = project_checked(
+            self.weights,
+            &block_name(block, "ffn_up.weight"),
+            input,
+            allocations.up_projection,
+        )?;
         let activated = kernels::cpu_f32::try_silu(&gate).context(ExecutionCpuSnafu)?;
-        let mut fused = reserve("SwiGLU activation", self.layout.feed_forward)?;
+        ensure_execution_plan(
+            "SwiGLU activated gate",
+            activated.len(),
+            allocations.activated_gate,
+        )?;
+        let mut fused = reserve("SwiGLU activation", allocations.fused_activation)?;
         for (index, (left, right)) in activated.iter().zip(up.iter()).enumerate() {
             let value = left * right;
             finite_one(value, "SwiGLU", index)?;
             fused.push(value);
         }
-        self.weights
-            .project(&block_name(block, "ffn_down.weight"), &fused)
+        project_checked(
+            self.weights,
+            &block_name(block, "ffn_down.weight"),
+            &fused,
+            allocations.down_projection,
+        )
     }
 }
 
@@ -332,28 +402,58 @@ fn full_attention(
     input: &[f32],
     state: &mut FullAttentionState,
 ) -> Result<Vec<f32>> {
+    let attention_tokens = state.tokens.checked_add(1).ok_or_else(|| {
+        ArithmeticOverflowSnafu {
+            context: "full-attention token count",
+        }
+        .build()
+    })?;
+    let allocations = FullAttentionWorkspaceAllocations::try_from_layout(layout, attention_tokens)?;
     let norm = read_f32(
         weights,
         &block_name(block, "attn_norm.weight"),
         &[layout.hidden_u64],
+        allocations.attention_norm,
     )?;
     let normalized = kernels::cpu_f32::rms_norm(input, &norm, 1, layout.hidden, layout.epsilon)
         .context(RecurrentRmsNormSnafu)?;
-    let q_gate = weights.project(&block_name(block, "attn_q.weight"), &normalized)?;
-    let key = weights.project(&block_name(block, "attn_k.weight"), &normalized)?;
-    let value = weights.project(&block_name(block, "attn_v.weight"), &normalized)?;
+    ensure_execution_plan(
+        "full-attention normalized input",
+        normalized.len(),
+        allocations.normalized_input,
+    )?;
+    let q_gate = project_checked(
+        weights,
+        &block_name(block, "attn_q.weight"),
+        &normalized,
+        allocations.query_gate_projection,
+    )?;
+    let key = project_checked(
+        weights,
+        &block_name(block, "attn_k.weight"),
+        &normalized,
+        allocations.key_projection,
+    )?;
+    let value = project_checked(
+        weights,
+        &block_name(block, "attn_v.weight"),
+        &normalized,
+        allocations.value_projection,
+    )?;
     let q_norm = read_f32(
         weights,
         &block_name(block, "attn_q_norm.weight"),
         &[layout.key_u64],
+        allocations.query_norm,
     )?;
     let k_norm = read_f32(
         weights,
         &block_name(block, "attn_k_norm.weight"),
         &[layout.key_u64],
+        allocations.key_norm,
     )?;
-    let mut query = reserve("full-attention query", layout.query_width)?;
-    let mut gate = reserve("full-attention gate", layout.query_width)?;
+    let mut query = reserve("full-attention query", allocations.split_query)?;
+    let mut gate = reserve("full-attention gate", allocations.split_gate)?;
     for head in 0..layout.heads {
         let start = head
             .checked_mul(layout.key.checked_mul(2).ok_or_else(|| {
@@ -397,13 +497,23 @@ fn full_attention(
     }
     query = kernels::cpu_f32::rms_norm(&query, &q_norm, layout.heads, layout.key, layout.epsilon)
         .context(RecurrentRmsNormSnafu)?;
+    ensure_execution_plan(
+        "full-attention normalized query",
+        query.len(),
+        allocations.normalized_query,
+    )?;
     let mut key =
         kernels::cpu_f32::rms_norm(&key, &k_norm, layout.kv_heads, layout.key, layout.epsilon)
             .context(RecurrentRmsNormSnafu)?;
+    ensure_execution_plan(
+        "full-attention normalized key",
+        key.len(),
+        allocations.normalized_key,
+    )?;
     apply_text_mrope(layout, position, &mut query)?;
     apply_text_mrope(layout, position, &mut key)?;
     state.push(&key, &value, &layout)?;
-    let mut merged = reserve("full-attention merged output", layout.query_width)?;
+    let mut merged = reserve("full-attention merged output", allocations.merged_output)?;
     for head in 0..layout.heads {
         let kv_head = head / layout.gqa_group;
         let query_start = head.checked_mul(layout.key).ok_or_else(|| {
@@ -421,7 +531,7 @@ fn full_attention(
                 }
                 .build()
             })?;
-        let attended = state.attend(query, kv_head, &layout)?;
+        let attended = state.attend(query, kv_head, &layout, allocations)?;
         let gate_row = gate
             .get(query_start..query_start + layout.key)
             .ok_or_else(|| {
@@ -438,7 +548,12 @@ fn full_attention(
             merged.push(value);
         }
     }
-    weights.project(&block_name(block, "attn_output.weight"), &merged)
+    project_checked(
+        weights,
+        &block_name(block, "attn_output.weight"),
+        &merged,
+        allocations.output_projection,
+    )
 }
 
 fn apply_text_mrope(layout: Layout, position: usize, values: &mut [f32]) -> Result<()> {
@@ -510,6 +625,271 @@ fn apply_text_mrope(layout: Layout, position: usize, values: &mut [f32]) -> Resu
     finite(values, "text MRoPE")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FullAttentionStateAllocations {
+    keys: usize,
+    values: usize,
+}
+
+impl FullAttentionStateAllocations {
+    fn try_from_layout(layout: Layout) -> Result<Self> {
+        let cache_elements = layout
+            .max_context
+            .checked_mul(layout.kv_width)
+            .ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "full-attention KV capacity",
+                }
+                .build()
+            })?;
+        Ok(Self {
+            keys: cache_elements,
+            values: cache_elements,
+        })
+    }
+
+    fn total_elements(self) -> Result<usize> {
+        checked_add(
+            self.keys,
+            self.values,
+            "full-attention retained KV elements",
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FullAttentionWorkspaceAllocations {
+    attention_norm: usize,
+    normalized_input: usize,
+    query_gate_projection: usize,
+    key_projection: usize,
+    value_projection: usize,
+    query_norm: usize,
+    key_norm: usize,
+    split_query: usize,
+    split_gate: usize,
+    normalized_query: usize,
+    normalized_key: usize,
+    merged_output: usize,
+    attention_scores: usize,
+    attention_head_output: usize,
+    output_projection: usize,
+    workspace_elements: usize,
+}
+
+impl FullAttentionWorkspaceAllocations {
+    fn try_from_layout(layout: Layout, attention_tokens: usize) -> Result<Self> {
+        let attention_norm = f32_tensor_elements(&[layout.hidden_u64])?;
+        let normalized_input = kernels::cpu_f32::rms_norm_output_elements(1, layout.hidden)
+            .context(RecurrentRmsNormSnafu)?;
+        let query_gate_projection = Qwen35Weights::projection_output_elements(
+            layout.query_width.checked_mul(2).ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "full-attention Q/gate projection",
+                }
+                .build()
+            })?,
+        );
+        let key_projection = Qwen35Weights::projection_output_elements(layout.kv_width);
+        let value_projection = Qwen35Weights::projection_output_elements(layout.kv_width);
+        let query_norm = f32_tensor_elements(&[layout.key_u64])?;
+        let key_norm = f32_tensor_elements(&[layout.key_u64])?;
+        let split_query = layout.query_width;
+        let split_gate = layout.query_width;
+        let normalized_query = kernels::cpu_f32::rms_norm_output_elements(layout.heads, layout.key)
+            .context(RecurrentRmsNormSnafu)?;
+        let normalized_key =
+            kernels::cpu_f32::rms_norm_output_elements(layout.kv_heads, layout.key)
+                .context(RecurrentRmsNormSnafu)?;
+        let merged_output = layout.query_width;
+        let attention_scores = attention_tokens;
+        let attention_head_output = layout.key;
+        let output_projection = Qwen35Weights::projection_output_elements(layout.hidden);
+        let core = sum_elements(
+            &[
+                attention_norm,
+                normalized_input,
+                query_gate_projection,
+                key_projection,
+                value_projection,
+                query_norm,
+                key_norm,
+                split_query,
+                split_gate,
+                normalized_query,
+                normalized_key,
+                merged_output,
+            ],
+            "full-attention core workspace",
+        )?;
+        let attention_phase = sum_elements(
+            &[core, attention_scores, attention_head_output],
+            "full-attention score phase",
+        )?;
+        let output_phase = checked_add(
+            core,
+            output_projection,
+            "full-attention output projection phase",
+        )?;
+        Ok(Self {
+            attention_norm,
+            normalized_input,
+            query_gate_projection,
+            key_projection,
+            value_projection,
+            query_norm,
+            key_norm,
+            split_query,
+            split_gate,
+            normalized_query,
+            normalized_key,
+            merged_output,
+            attention_scores,
+            attention_head_output,
+            output_projection,
+            workspace_elements: attention_phase.max(output_phase),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FeedForwardWorkspaceAllocations {
+    gate_projection: usize,
+    up_projection: usize,
+    activated_gate: usize,
+    fused_activation: usize,
+    down_projection: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LayerFinishWorkspaceAllocations {
+    attention_output: usize,
+    post_attention_norm: usize,
+    normalized_hidden: usize,
+    feed_forward: FeedForwardWorkspaceAllocations,
+}
+
+impl LayerFinishWorkspaceAllocations {
+    fn try_from_layout(layout: Layout) -> Result<Self> {
+        Ok(Self {
+            attention_output: Qwen35Weights::projection_output_elements(layout.hidden),
+            post_attention_norm: f32_tensor_elements(&[layout.hidden_u64])?,
+            normalized_hidden: kernels::cpu_f32::rms_norm_output_elements(1, layout.hidden)
+                .context(RecurrentRmsNormSnafu)?,
+            feed_forward: FeedForwardWorkspaceAllocations::from_layout(layout),
+        })
+    }
+
+    fn total_elements(self) -> Result<usize> {
+        sum_elements(
+            &[
+                self.attention_output,
+                self.post_attention_norm,
+                self.normalized_hidden,
+                self.feed_forward.total_elements()?,
+            ],
+            "post-attention feed-forward phase",
+        )
+    }
+}
+
+impl FeedForwardWorkspaceAllocations {
+    fn from_layout(layout: Layout) -> Self {
+        Self {
+            gate_projection: Qwen35Weights::projection_output_elements(layout.feed_forward),
+            up_projection: Qwen35Weights::projection_output_elements(layout.feed_forward),
+            activated_gate: kernels::cpu_f32::unary_output_elements(layout.feed_forward),
+            fused_activation: layout.feed_forward,
+            down_projection: Qwen35Weights::projection_output_elements(layout.hidden),
+        }
+    }
+
+    fn total_elements(self) -> Result<usize> {
+        sum_elements(
+            &[
+                self.gate_projection,
+                self.up_projection,
+                self.activated_gate,
+                self.fused_activation,
+                self.down_projection,
+            ],
+            "feed-forward workspace",
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LmHeadWorkspaceAllocations {
+    output_norm: usize,
+    normalized_hidden: usize,
+    vocabulary_projection: usize,
+}
+
+impl LmHeadWorkspaceAllocations {
+    fn try_from_layout(layout: Layout) -> Result<Self> {
+        Ok(Self {
+            output_norm: f32_tensor_elements(&[layout.hidden_u64])?,
+            normalized_hidden: kernels::cpu_f32::rms_norm_output_elements(1, layout.hidden)
+                .context(RecurrentRmsNormSnafu)?,
+            vocabulary_projection: Qwen35Weights::projection_output_elements(layout.vocabulary),
+        })
+    }
+
+    fn total_elements(self) -> Result<usize> {
+        sum_elements(
+            &[
+                self.output_norm,
+                self.normalized_hidden,
+                self.vocabulary_projection,
+            ],
+            "LM-head workspace",
+        )
+    }
+}
+
+pub(crate) fn full_attention_retained_elements(layout: Layout) -> Result<usize> {
+    FullAttentionStateAllocations::try_from_layout(layout)?.total_elements()
+}
+
+pub(crate) fn full_attention_workspace_elements(
+    layout: Layout,
+    attention_tokens: usize,
+) -> Result<usize> {
+    Ok(
+        FullAttentionWorkspaceAllocations::try_from_layout(layout, attention_tokens)?
+            .workspace_elements,
+    )
+}
+
+pub(crate) fn layer_finish_workspace_elements(layout: Layout) -> Result<usize> {
+    LayerFinishWorkspaceAllocations::try_from_layout(layout)?.total_elements()
+}
+
+pub(crate) const fn embedding_workspace_elements(layout: Layout) -> usize {
+    Qwen35Weights::decoded_row_elements(layout.hidden)
+}
+
+pub(crate) fn lm_head_workspace_elements(layout: Layout) -> Result<usize> {
+    LmHeadWorkspaceAllocations::try_from_layout(layout)?.total_elements()
+}
+
+pub(crate) fn returned_logits_elements(
+    layout: Layout,
+    token_count: usize,
+    selection: Qwen35LogitSelection,
+) -> Result<usize> {
+    let rows = match selection {
+        Qwen35LogitSelection::AllTokens => token_count,
+        Qwen35LogitSelection::LastToken => 1,
+    };
+    rows.checked_mul(layout.vocabulary).ok_or_else(|| {
+        ArithmeticOverflowSnafu {
+            context: "returned logits allocation",
+        }
+        .build()
+    })
+}
+
 #[derive(Debug)]
 struct FullAttentionState {
     keys: Vec<f32>,
@@ -519,27 +899,10 @@ struct FullAttentionState {
 
 impl FullAttentionState {
     fn new(layout: &Layout) -> Result<Self> {
-        let key_capacity = layout
-            .max_context
-            .checked_mul(layout.kv_width)
-            .ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "KV key capacity",
-                }
-                .build()
-            })?;
-        let value_capacity = layout
-            .max_context
-            .checked_mul(layout.kv_width)
-            .ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "KV value capacity",
-                }
-                .build()
-            })?;
+        let allocations = FullAttentionStateAllocations::try_from_layout(*layout)?;
         Ok(Self {
-            keys: reserve("KV keys", key_capacity)?,
-            values: reserve("KV values", value_capacity)?,
+            keys: reserve("KV keys", allocations.keys)?,
+            values: reserve("KV values", allocations.values)?,
             tokens: 0,
         })
     }
@@ -566,18 +929,10 @@ impl FullAttentionState {
     }
 
     fn try_clone_for_transaction(&self, layout: &Layout) -> Result<Self> {
-        let capacity = layout
-            .max_context
-            .checked_mul(layout.kv_width)
-            .ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "transaction KV capacity",
-                }
-                .build()
-            })?;
-        let mut keys = reserve("transaction KV keys", capacity)?;
+        let allocations = FullAttentionStateAllocations::try_from_layout(*layout)?;
+        let mut keys = reserve("transaction KV keys", allocations.keys)?;
         keys.extend_from_slice(&self.keys);
-        let mut values = reserve("transaction KV values", capacity)?;
+        let mut values = reserve("transaction KV values", allocations.values)?;
         values.extend_from_slice(&self.values);
         Ok(Self {
             keys,
@@ -586,8 +941,19 @@ impl FullAttentionState {
         })
     }
 
-    fn attend(&self, query: &[f32], kv_head: usize, layout: &Layout) -> Result<Vec<f32>> {
-        let mut scores = reserve("attention scores", self.tokens)?;
+    fn attend(
+        &self,
+        query: &[f32],
+        kv_head: usize,
+        layout: &Layout,
+        allocations: FullAttentionWorkspaceAllocations,
+    ) -> Result<Vec<f32>> {
+        ensure_execution_plan(
+            "attention scores",
+            self.tokens,
+            allocations.attention_scores,
+        )?;
+        let mut scores = reserve("attention scores", allocations.attention_scores)?;
         let scale = layout
             .key
             .to_f32()
@@ -626,8 +992,8 @@ impl FullAttentionState {
             .map(|score| (*score - maximum).exp())
             .sum::<f32>();
         finite_one(normalizer, "attention softmax normalizer", 0)?;
-        let mut output = reserve("attention head output", layout.key)?;
-        output.resize(layout.key, 0.0);
+        let mut output = reserve("attention head output", allocations.attention_head_output)?;
+        output.resize(allocations.attention_head_output, 0.0);
         for (token, score) in scores.iter().enumerate() {
             let probability = (*score - maximum).exp() / normalizer;
             let start = token
@@ -656,7 +1022,7 @@ impl FullAttentionState {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Layout {
+pub(crate) struct Layout {
     hidden: usize,
     hidden_u64: u64,
     feed_forward: usize,
@@ -678,6 +1044,29 @@ struct Layout {
 }
 
 impl Layout {
+    pub(crate) const fn max_context(self) -> usize {
+        self.max_context
+    }
+
+    pub(crate) const fn epsilon(self) -> f32 {
+        self.epsilon
+    }
+
+    pub(crate) const fn full_layer_count(self) -> usize {
+        self.main_blocks / self.full_interval
+    }
+
+    pub(crate) fn recurrent_layer_count(self) -> Result<usize> {
+        self.main_blocks
+            .checked_sub(self.full_layer_count())
+            .ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "recurrent execution layer count",
+                }
+                .build()
+            })
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "execution-only metadata is admitted at one artifact-bound boundary"
@@ -971,7 +1360,12 @@ impl Layout {
     }
 }
 
-fn read_f32(weights: &Qwen35Weights<'_>, name: &str, expected_dims: &[u64]) -> Result<Vec<f32>> {
+fn read_f32(
+    weights: &Qwen35Weights<'_>,
+    name: &str,
+    expected_dims: &[u64],
+    planned_values: usize,
+) -> Result<Vec<f32>> {
     let tensor = weights.payload().tensor(name).context(PayloadTensorSnafu {
         name: name.to_string(),
     })?;
@@ -990,21 +1384,8 @@ fn read_f32(weights: &Qwen35Weights<'_>, name: &str, expected_dims: &[u64]) -> R
         }
         .fail();
     }
-    let values = expected_dims.iter().try_fold(1usize, |count, dimension| {
-        count
-            .checked_mul(usize::try_from(*dimension).map_err(|_| {
-                ArithmeticOverflowSnafu {
-                    context: "F32 tensor dimension",
-                }
-                .build()
-            })?)
-            .ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "F32 tensor values",
-                }
-                .build()
-            })
-    })?;
+    let values = f32_tensor_elements(expected_dims)?;
+    ensure_execution_plan("F32 parameter", values, planned_values)?;
     let row = F32Row::parse(tensor.bytes()).with_context(|_| ProjectionRowSnafu {
         name: tensor.name().to_string(),
         row: 0_usize,
@@ -1022,8 +1403,8 @@ fn read_f32(weights: &Qwen35Weights<'_>, name: &str, expected_dims: &[u64]) -> R
         }
         .fail();
     }
-    let mut output = reserve("F32 parameter", values)?;
-    for index in 0..values {
+    let mut output = reserve("F32 parameter", planned_values)?;
+    for index in 0..planned_values {
         output.push(row.value(index).ok_or_else(|| {
             ProjectionBytesSnafu {
                 name: tensor.name().to_string(),
@@ -1166,6 +1547,58 @@ fn reserve<T>(target: &'static str, length: usize) -> Result<Vec<T>> {
         .context(ExecutionAllocationSnafu { target, length })?;
     Ok(values)
 }
+
+fn f32_tensor_elements(dimensions: &[u64]) -> Result<usize> {
+    dimensions.iter().try_fold(1_usize, |elements, dimension| {
+        let dimension = usize::try_from(*dimension).map_err(|_| {
+            ArithmeticOverflowSnafu {
+                context: "F32 tensor dimension",
+            }
+            .build()
+        })?;
+        elements.checked_mul(dimension).ok_or_else(|| {
+            ArithmeticOverflowSnafu {
+                context: "F32 tensor values",
+            }
+            .build()
+        })
+    })
+}
+
+fn project_checked(
+    weights: &Qwen35Weights<'_>,
+    name: &str,
+    input: &[f32],
+    planned_values: usize,
+) -> Result<Vec<f32>> {
+    let output = weights.project(name, input)?;
+    ensure_execution_plan("matrix projection", output.len(), planned_values)?;
+    Ok(output)
+}
+
+fn ensure_execution_plan(target: &'static str, derived: usize, planned: usize) -> Result<()> {
+    if derived != planned {
+        return ExecutionAllocationPlanSnafu {
+            target,
+            planned,
+            derived,
+        }
+        .fail();
+    }
+    Ok(())
+}
+
+fn checked_add(left: usize, right: usize, context: &'static str) -> Result<usize> {
+    left.checked_add(right)
+        .ok_or_else(|| ArithmeticOverflowSnafu { context }.build())
+}
+
+fn sum_elements(elements: &[usize], context: &'static str) -> Result<usize> {
+    elements
+        .iter()
+        .copied()
+        .try_fold(0_usize, |sum, value| checked_add(sum, value, context))
+}
 fn finite(values: &[f32], stage: &'static str) -> Result<()> {
     for (index, value) in values.iter().copied().enumerate() {
         finite_one(value, stage, index)?;
@@ -1196,3 +1629,6 @@ fn add_in_place(destination: &mut [f32], source: &[f32], stage: &'static str) ->
 
 #[cfg(test)]
 mod qwen35_execution_oracle_tests;
+
+#[cfg(test)]
+mod qwen35_execution_requirements_tests;

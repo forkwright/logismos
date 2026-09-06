@@ -48,6 +48,14 @@ pub struct Qwen35Weights<'artifact> {
 }
 
 impl<'artifact> Qwen35Weights<'artifact> {
+    pub(crate) const fn projection_output_elements(output_width: usize) -> usize {
+        output_width
+    }
+
+    pub(crate) const fn decoded_row_elements(input_width: usize) -> usize {
+        input_width
+    }
+
     /// Bind one verified payload to the existing Qwen3.5 structural preflight.
     ///
     /// # Errors
@@ -97,12 +105,13 @@ impl<'artifact> Qwen35Weights<'artifact> {
             }
             .fail();
         }
+        let output_elements = Self::projection_output_elements(matrix.output_width);
         let mut output = Vec::new();
         output
-            .try_reserve_exact(matrix.output_width)
+            .try_reserve_exact(output_elements)
             .with_context(|_| ProjectionAllocationSnafu {
                 name: matrix.name.clone(),
-                output_width: matrix.output_width,
+                output_width: output_elements,
             })?;
         for (row, row_bytes) in matrix
             .tensor
@@ -131,10 +140,12 @@ impl<'artifact> Qwen35Weights<'artifact> {
         let input_width = matrix.input_width;
         let matrix_name = matrix.name.clone();
         let row_bytes = matrix.row(row)?;
-        row_decode_f32(format, row_bytes, input_width).with_context(|_| ProjectionRowSnafu {
-            name: matrix_name,
-            row,
-        })
+        row_decode_f32(format, row_bytes, Self::decoded_row_elements(input_width)).with_context(
+            |_| ProjectionRowSnafu {
+                name: matrix_name,
+                row,
+            },
+        )
     }
 
     fn matrix(&self, name: &str) -> Result<CheckedMatrix<'_>> {

@@ -252,6 +252,22 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// A recurrent allocation owner disagreed with its precomputed request.
+    #[snafu(display(
+        "qwen35 recurrent {target} derived {derived} f32 values after planning {planned}"
+    ))]
+    RecurrentAllocationPlan {
+        /// Named allocation whose owner/request relation drifted.
+        target: &'static str,
+        /// Capacity precomputed by the recurrent owner plan.
+        planned: usize,
+        /// Capacity independently implied at the reservation site.
+        derived: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// Native execution could not allocate an all-or-nothing local result.
     #[snafu(display("qwen35 execution {target} could not reserve {length} elements: {source}"))]
     ExecutionAllocation {
@@ -261,6 +277,22 @@ pub enum Error {
         length: usize,
         /// Allocation failure retained as the error source.
         source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// An executor allocation owner disagreed with its precomputed request.
+    #[snafu(display(
+        "qwen35 execution {target} derived {derived} f32 values after planning {planned}"
+    ))]
+    ExecutionAllocationPlan {
+        /// Named allocation whose owner/request relation drifted.
+        target: &'static str,
+        /// Capacity precomputed by the executor owner plan.
+        planned: usize,
+        /// Capacity independently implied at the reservation site.
+        derived: usize,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,

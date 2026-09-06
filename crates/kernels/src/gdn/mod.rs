@@ -3,8 +3,9 @@
 //! This module accepts dense single-head and grouped multi-head recurrent input.
 //! It is a correctness oracle for a future device kernel, not a model adapter or
 //! a permissive fallback for unsupported GDN variants.
-//! Bounds describe the admitted shapes and numerical domain, not a memory
-//! quota; allocation exhaustion remains a process-level failure.
+//! Bounds describe admitted shapes and exact logical `f32` requests. Every
+//! owned output or scratch vector is reserved fallibly; this is not a process
+//! RSS, allocator-overhead, or physical-memory guarantee.
 
 use snafu::{ResultExt, Snafu};
 
@@ -12,6 +13,115 @@ const GDN_RECURRENCE: &str = "gdn_recurrent_fwd";
 
 /// Result alias for the bounded GDN reference.
 pub type GdnResult<T> = core::result::Result<T, GdnError>;
+
+/// Exact logical `f32` capacities owned by one grouped GDN evaluation.
+///
+/// The aggregate output and state coexist with one value head's output, state,
+/// state-times-key projection, and delta. These are requested vector
+/// capacities, not allocator capacity or resident memory.
+///
+/// WHY: callers can compose the kernel's allocation envelope without copying
+/// its dimension arithmetic or inventing model-level coefficients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiHeadRecurrentAllocationPlan {
+    output_elements: usize,
+    state_elements: usize,
+    head: RecurrentAllocationPlan,
+    workspace_elements: usize,
+}
+
+impl MultiHeadRecurrentAllocationPlan {
+    /// Derive the allocation requests for one grouped recurrence shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GdnError`] when a required dimension is zero or an element
+    /// product or allocation-envelope sum overflows.
+    pub fn try_from_dimensions(
+        token_count: usize,
+        value_head_count: usize,
+        key_dim: usize,
+        value_dim: usize,
+    ) -> GdnResult<Self> {
+        validate_nonzero_dimension("token_count", token_count)?;
+        validate_nonzero_dimension("value_head_count", value_head_count)?;
+        validate_nonzero_dimension("key_dim", key_dim)?;
+        validate_nonzero_dimension("value_dim", value_dim)?;
+        let head = RecurrentAllocationPlan::try_from_dimensions(token_count, key_dim, value_dim)?;
+        let output_elements = checked_product(
+            value_head_count,
+            head.output,
+            "value_head_count * token_count * value_dim",
+        )?;
+        let state_elements = checked_product(
+            value_head_count,
+            head.state,
+            "value_head_count * key_dim * value_dim",
+        )?;
+        let workspace_elements = [
+            output_elements,
+            state_elements,
+            head.output,
+            head.state,
+            head.state_times_key,
+            head.delta,
+        ]
+        .into_iter()
+        .try_fold(0_usize, checked_allocation_sum)?;
+        Ok(Self {
+            output_elements,
+            state_elements,
+            head,
+            workspace_elements,
+        })
+    }
+
+    /// Return the aggregate head-major output request.
+    #[must_use]
+    pub const fn output_elements(self) -> usize {
+        self.output_elements
+    }
+
+    /// Return the aggregate final-state request.
+    #[must_use]
+    pub const fn state_elements(self) -> usize {
+        self.state_elements
+    }
+
+    /// Return one concurrently evaluated head's output request.
+    #[must_use]
+    pub const fn head_output_elements(self) -> usize {
+        self.head.output
+    }
+
+    /// Return one concurrently evaluated head's state request.
+    #[must_use]
+    pub const fn head_state_elements(self) -> usize {
+        self.head.state
+    }
+
+    /// Return one token's state-times-key projection request.
+    #[must_use]
+    pub const fn state_times_key_elements(self) -> usize {
+        self.head.state_times_key
+    }
+
+    /// Return one token's delta request.
+    #[must_use]
+    pub const fn delta_elements(self) -> usize {
+        self.head.delta
+    }
+
+    /// Return the conservative sum of simultaneously owned GDN requests.
+    #[must_use]
+    pub const fn workspace_elements(self) -> usize {
+        self.workspace_elements
+    }
+
+    const fn head_allocations(self) -> RecurrentAllocationPlan {
+        self.head
+    }
+}
 
 /// Failures while admitting or evaluating the bounded GDN reference.
 #[derive(Debug, Snafu)]
@@ -33,6 +143,14 @@ pub enum GdnError {
     DimensionProductOverflow {
         /// The multiplied dimensions.
         dimensions: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Summing checked recurrence allocation requests exceeded `usize`.
+    #[snafu(display("{GDN_RECURRENCE}: logical allocation sum overflows usize"))]
+    DimensionSumOverflow {
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
@@ -124,6 +242,7 @@ pub struct RecurrentInput<'a> {
     token_count: usize,
     key_dim: usize,
     value_dim: usize,
+    allocations: RecurrentAllocationPlan,
 }
 
 impl<'a> RecurrentInput<'a> {
@@ -149,6 +268,39 @@ impl<'a> RecurrentInput<'a> {
         key_dim: usize,
         value_dim: usize,
     ) -> GdnResult<Self> {
+        let token_count = beta.len();
+        let allocations =
+            RecurrentAllocationPlan::try_from_dimensions(token_count, key_dim, value_dim)?;
+        Self::new_with_allocations(
+            q,
+            k,
+            v,
+            beta,
+            g,
+            scale,
+            state,
+            key_dim,
+            value_dim,
+            allocations,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the internal admission path additionally receives its owner-derived allocation plan"
+    )]
+    fn new_with_allocations(
+        q: &'a [f32],
+        k: &'a [f32],
+        v: &'a [f32],
+        beta: &'a [f32],
+        g: &'a [f32],
+        scale: f32,
+        state: &'a [f32],
+        key_dim: usize,
+        value_dim: usize,
+        allocations: RecurrentAllocationPlan,
+    ) -> GdnResult<Self> {
         if key_dim == 0 {
             return ZeroDimensionSnafu {
                 dimension: "key_dim",
@@ -171,14 +323,12 @@ impl<'a> RecurrentInput<'a> {
         }
 
         let query_and_key_len = checked_product(token_count, key_dim, "token_count * key_dim")?;
-        let value_len = checked_product(token_count, value_dim, "token_count * value_dim")?;
-        let state_len = checked_product(key_dim, value_dim, "key_dim * value_dim")?;
 
         validate_length("q", q.len(), query_and_key_len)?;
         validate_length("k", k.len(), query_and_key_len)?;
-        validate_length("v", v.len(), value_len)?;
+        validate_length("v", v.len(), allocations.output)?;
         validate_length("g", g.len(), token_count)?;
-        validate_length("state", state.len(), state_len)?;
+        validate_length("state", state.len(), allocations.state)?;
         validate_scalars("q", q)?;
         validate_scalars("k", k)?;
         validate_scalars("v", v)?;
@@ -204,6 +354,7 @@ impl<'a> RecurrentInput<'a> {
             token_count,
             key_dim,
             value_dim,
+            allocations,
         })
     }
 }
@@ -254,6 +405,7 @@ pub struct MultiHeadRecurrentInput<'a> {
     value_head_count: usize,
     key_dim: usize,
     value_dim: usize,
+    allocations: MultiHeadRecurrentAllocationPlan,
 }
 
 impl<'a> MultiHeadRecurrentInput<'a> {
@@ -295,9 +447,15 @@ impl<'a> MultiHeadRecurrentInput<'a> {
             .fail();
         }
 
+        let allocations = MultiHeadRecurrentAllocationPlan::try_from_dimensions(
+            token_count,
+            value_head_count,
+            key_dim,
+            value_dim,
+        )?;
+
         let key_head_width = checked_product(token_count, key_dim, "token_count * key_dim")?;
         let value_head_width = checked_product(token_count, value_dim, "token_count * value_dim")?;
-        let state_head_width = checked_product(key_dim, value_dim, "key_dim * value_dim")?;
         validate_length(
             "q",
             q.len(),
@@ -343,15 +501,7 @@ impl<'a> MultiHeadRecurrentInput<'a> {
                 "value_head_count * token_count",
             )?,
         )?;
-        validate_length(
-            "state",
-            state.len(),
-            checked_product(
-                value_head_count,
-                state_head_width,
-                "value_head_count * key_dim * value_dim",
-            )?,
-        )?;
+        validate_length("state", state.len(), allocations.state_elements())?;
 
         let input = Self {
             q,
@@ -366,6 +516,7 @@ impl<'a> MultiHeadRecurrentInput<'a> {
             value_head_count,
             key_dim,
             value_dim,
+            allocations,
         };
         input.validate_all_heads()?;
         Ok(input)
@@ -387,7 +538,7 @@ impl<'a> MultiHeadRecurrentInput<'a> {
             checked_product(self.token_count, self.value_dim, "token_count * value_dim")?;
         let state_head_width =
             checked_product(self.key_dim, self.value_dim, "key_dim * value_dim")?;
-        RecurrentInput::new(
+        RecurrentInput::new_with_allocations(
             head_slice(self.q, key_head_index, key_head_width, "q")?,
             head_slice(self.k, key_head_index, key_head_width, "k")?,
             head_slice(self.v, value_head_index, value_head_width, "v")?,
@@ -397,6 +548,7 @@ impl<'a> MultiHeadRecurrentInput<'a> {
             head_slice(self.state, value_head_index, state_head_width, "state")?,
             self.key_dim,
             self.value_dim,
+            self.allocations.head_allocations(),
         )
     }
 }
@@ -434,15 +586,10 @@ impl MultiHeadRecurrentOutput {
 /// Returns [`GdnError::NonFiniteArithmetic`] if a decay, projection, delta,
 /// state update, or output calculation becomes non-finite.
 pub fn recurrent_fwd(input: &RecurrentInput<'_>) -> GdnResult<RecurrentOutput> {
-    let output_len = checked_product(
-        input.token_count,
-        input.value_dim,
-        "token_count * value_dim",
-    )?;
-    let mut state = reserve_f32("one-head state", input.state.len())?;
+    let mut state = reserve_f32("one-head state", input.allocations.state)?;
     state.extend_from_slice(input.state);
-    let mut output = reserve_f32("one-head output", output_len)?;
-    output.resize(output_len, 0.0);
+    let mut output = reserve_f32("one-head output", input.allocations.output)?;
+    output.resize(input.allocations.output, 0.0);
 
     for token_index in 0..input.token_count {
         let q_start = checked_product(token_index, input.key_dim, "token index * key_dim")?;
@@ -462,8 +609,9 @@ pub fn recurrent_fwd(input: &RecurrentInput<'_>) -> GdnResult<RecurrentOutput> {
             ensure_finite(*state_value, "state decay", state_index)?;
         }
 
-        let mut state_times_key = reserve_f32("state times key", input.value_dim)?;
-        state_times_key.resize(input.value_dim, 0.0);
+        let mut state_times_key =
+            reserve_f32("state times key", input.allocations.state_times_key)?;
+        state_times_key.resize(input.allocations.state_times_key, 0.0);
         for (key_index, key_value) in k_row.iter().copied().enumerate() {
             for (value_index, accumulator) in state_times_key.iter_mut().enumerate() {
                 let state_index = matrix_index(key_index, value_index, input.value_dim)?;
@@ -473,7 +621,7 @@ pub fn recurrent_fwd(input: &RecurrentInput<'_>) -> GdnResult<RecurrentOutput> {
             }
         }
 
-        let mut delta = reserve_f32("delta", input.value_dim)?;
+        let mut delta = reserve_f32("delta", input.allocations.delta)?;
         for (value_index, (&value, state_projection)) in v_row
             .iter()
             .zip(state_times_key.iter().copied())
@@ -540,24 +688,8 @@ pub fn multi_head_recurrent_fwd(
     input: &MultiHeadRecurrentInput<'_>,
 ) -> GdnResult<MultiHeadRecurrentOutput> {
     input.validate_all_heads()?;
-    let output_head_width = checked_product(
-        input.token_count,
-        input.value_dim,
-        "token_count * value_dim",
-    )?;
-    let state_head_width = checked_product(input.key_dim, input.value_dim, "key_dim * value_dim")?;
-    let output_capacity = checked_product(
-        input.value_head_count,
-        output_head_width,
-        "value_head_count * token_count * value_dim",
-    )?;
-    let state_capacity = checked_product(
-        input.value_head_count,
-        state_head_width,
-        "value_head_count * key_dim * value_dim",
-    )?;
-    let mut output = reserve_f32("multi-head output", output_capacity)?;
-    let mut state = reserve_f32("multi-head state", state_capacity)?;
+    let mut output = reserve_f32("multi-head output", input.allocations.output_elements())?;
+    let mut state = reserve_f32("multi-head state", input.allocations.state_elements())?;
 
     for value_head_index in 0..input.value_head_count {
         let head_output = recurrent_fwd(&input.head_input(value_head_index)?)?;
@@ -571,6 +703,34 @@ pub fn multi_head_recurrent_fwd(
 fn checked_product(left: usize, right: usize, dimensions: &'static str) -> GdnResult<usize> {
     left.checked_mul(right)
         .ok_or_else(|| DimensionProductOverflowSnafu { dimensions }.build())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecurrentAllocationPlan {
+    output: usize,
+    state: usize,
+    state_times_key: usize,
+    delta: usize,
+}
+
+impl RecurrentAllocationPlan {
+    fn try_from_dimensions(
+        token_count: usize,
+        key_dim: usize,
+        value_dim: usize,
+    ) -> GdnResult<Self> {
+        Ok(Self {
+            output: checked_product(token_count, value_dim, "token_count * value_dim")?,
+            state: checked_product(key_dim, value_dim, "key_dim * value_dim")?,
+            state_times_key: value_dim,
+            delta: value_dim,
+        })
+    }
+}
+
+fn checked_allocation_sum(sum: usize, elements: usize) -> GdnResult<usize> {
+    sum.checked_add(elements)
+        .ok_or_else(|| DimensionSumOverflowSnafu.build())
 }
 
 fn reserve_f32(allocation: &'static str, elements: usize) -> GdnResult<Vec<f32>> {
