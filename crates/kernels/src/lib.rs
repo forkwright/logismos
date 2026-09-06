@@ -50,4 +50,7 @@ pub mod rope;
 pub mod softmax;
 
 pub use crate::error::{Error, Result};
-pub use crate::gdn::{GdnError, GdnResult, RecurrentInput, RecurrentOutput, recurrent_fwd};
+pub use crate::gdn::{
+    GdnError, GdnResult, MultiHeadRecurrentInput, MultiHeadRecurrentOutput, RecurrentInput,
+    RecurrentOutput, multi_head_recurrent_fwd, recurrent_fwd,
+};
