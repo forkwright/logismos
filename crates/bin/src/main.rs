@@ -6,6 +6,7 @@
 //! different linkage graph without changing that command behavior.
 
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
     fmt,
@@ -15,11 +16,15 @@ use std::{
     process::ExitCode,
 };
 
-use serde::Serialize;
+use serde::{
+    Serialize, Serializer,
+    ser::{SerializeSeq, SerializeStruct},
+};
 
 const USAGE: &str = "usage: logismos plan [--input <path>|-]";
-const INSPECTION_USAGE: &str = "usage: logismos inspect --input <path>";
+const INSPECTION_USAGE: &str = "usage: logismos inspect --input <path> [--metadata]";
 const INSPECTION_SCHEMA_VERSION: u32 = 1;
+const INSPECTION_METADATA_SCHEMA_VERSION: u32 = 1;
 /// Maximum accepted placement-contract size, preventing unbounded CLI input allocation.
 const MAX_PLAN_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -40,7 +45,7 @@ fn run() -> Result<CommandOutcome, CliError> {
     match arguments.next().as_deref() {
         Some(command) if command == "plan" => plan_command(arguments).map(CommandOutcome::Plan),
         Some(command) if command == "inspect" => {
-            inspect_command(arguments).map(CommandOutcome::Inspection)
+            inspect_command(arguments).map(|outcome| CommandOutcome::Inspection(Box::new(outcome)))
         }
         _ => Err(CliError::Usage),
     }
@@ -48,7 +53,15 @@ fn run() -> Result<CommandOutcome, CliError> {
 
 enum CommandOutcome {
     Plan(placement::PlanOutcome),
-    Inspection(InspectionReceipt),
+    Inspection(Box<InspectionOutcome>),
+}
+
+enum InspectionOutcome {
+    Receipt(InspectionReceipt),
+    Metadata {
+        receipt: InspectionReceipt,
+        observed: Box<loader::gguf::ObservedArtifact>,
+    },
 }
 
 fn plan_command(
@@ -82,7 +95,7 @@ fn plan_command(
 
 fn inspect_command(
     mut arguments: impl Iterator<Item = OsString>,
-) -> Result<InspectionReceipt, CliError> {
+) -> Result<InspectionOutcome, CliError> {
     let Some(flag) = arguments.next() else {
         return Err(CliError::Inspection(InspectionError::InvalidArguments));
     };
@@ -92,12 +105,26 @@ fn inspect_command(
     let Some(path) = arguments.next() else {
         return Err(CliError::Inspection(InspectionError::InvalidArguments));
     };
-    if path == "-" || arguments.next().is_some() {
+    if path == "-" || path == "--metadata" {
         return Err(CliError::Inspection(InspectionError::InvalidArguments));
     }
+    let metadata_requested = match arguments.next().as_deref() {
+        None => false,
+        Some(flag) if flag == "--metadata" && arguments.next().is_none() => true,
+        Some(_) => return Err(CliError::Inspection(InspectionError::InvalidArguments)),
+    };
     let observed = loader::gguf::observe_gguf_with_sha256(Path::new(&path))
         .map_err(|error| map_inspection_error(&error))?;
-    InspectionReceipt::from_inspection(observed.inspection()).map_err(CliError::Inspection)
+    let receipt =
+        InspectionReceipt::from_inspection(observed.inspection()).map_err(CliError::Inspection)?;
+    Ok(if metadata_requested {
+        InspectionOutcome::Metadata {
+            receipt,
+            observed: Box::new(observed),
+        }
+    } else {
+        InspectionOutcome::Receipt(receipt)
+    })
 }
 
 fn read_stdin() -> Result<String, CliError> {
@@ -131,7 +158,7 @@ fn read_input(reader: &mut impl Read) -> Result<String, CliError> {
 fn write_outcome(outcome: &CommandOutcome) -> ExitCode {
     match outcome {
         CommandOutcome::Plan(outcome) => write_plan_outcome(outcome),
-        CommandOutcome::Inspection(receipt) => write_inspection_receipt(receipt),
+        CommandOutcome::Inspection(outcome) => write_inspection_outcome(outcome),
     }
 }
 
@@ -158,6 +185,35 @@ fn write_inspection_receipt(receipt: &InspectionReceipt) -> ExitCode {
         "unable to serialize inspection receipt",
         ExitCode::SUCCESS,
     )
+}
+
+fn write_inspection_outcome(outcome: &InspectionOutcome) -> ExitCode {
+    match outcome {
+        InspectionOutcome::Receipt(receipt) => write_inspection_receipt(receipt),
+        InspectionOutcome::Metadata { receipt, observed } => {
+            write_inspection_metadata_report(receipt, observed.metadata())
+        }
+    }
+}
+
+fn write_inspection_metadata_report(
+    receipt: &InspectionReceipt,
+    metadata: &HashMap<String, loader::gguf::MetaValue>,
+) -> ExitCode {
+    let report = InspectionMetadataReport {
+        schema_version: INSPECTION_METADATA_SCHEMA_VERSION,
+        outcome: "inspection_metadata",
+        format: "gguf-v3",
+        inspection: receipt,
+        metadata: MetadataEntries(metadata),
+    };
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    if serde_json::to_writer(&mut writer, &report).is_err() || writeln!(writer).is_err() {
+        eprintln!("unable to serialize inspection metadata report");
+        return ExitCode::from(2);
+    }
+    ExitCode::SUCCESS
 }
 
 fn write_inspection_error(error: InspectionError) -> ExitCode {
@@ -267,6 +323,120 @@ impl InspectionReceipt {
             },
             type_census,
         })
+    }
+}
+
+/// Explicit metadata-report contract for an observed GGUF artifact.
+///
+/// This report is diagnostic output only. It exposes parsed file metadata but
+/// is not a model-admission authority, source-provenance assertion, or runtime
+/// support claim.
+#[derive(Serialize)]
+struct InspectionMetadataReport<'a> {
+    schema_version: u32,
+    outcome: &'static str,
+    format: &'static str,
+    inspection: &'a InspectionReceipt,
+    metadata: MetadataEntries<'a>,
+}
+
+struct MetadataEntries<'a>(&'a HashMap<String, loader::gguf::MetaValue>);
+
+impl Serialize for MetadataEntries<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // WHY: `HashMap` iteration is deliberately nondeterministic; the
+        // loader's parser already bounds this collection, so sorting borrowed
+        // entries gives a stable report without copying metadata values.
+        let mut entries: Vec<_> = self.0.iter().collect();
+        entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let mut sequence = serializer.serialize_seq(Some(entries.len()))?;
+        for (key, value) in entries {
+            sequence.serialize_element(&MetadataEntry {
+                key,
+                value: TaggedMetadataValue(value),
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct MetadataEntry<'a> {
+    key: &'a str,
+    value: TaggedMetadataValue<'a>,
+}
+
+struct TaggedMetadataValue<'a>(&'a loader::gguf::MetaValue);
+
+impl Serialize for TaggedMetadataValue<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use loader::gguf::MetaValue;
+
+        match self.0 {
+            MetaValue::U8(value) => serialize_tagged_value(serializer, "u8", "value", value),
+            MetaValue::I8(value) => serialize_tagged_value(serializer, "i8", "value", value),
+            MetaValue::U16(value) => serialize_tagged_value(serializer, "u16", "value", value),
+            MetaValue::I16(value) => serialize_tagged_value(serializer, "i16", "value", value),
+            MetaValue::U32(value) => serialize_tagged_value(serializer, "u32", "value", value),
+            MetaValue::I32(value) => serialize_tagged_value(serializer, "i32", "value", value),
+            MetaValue::U64(value) => serialize_tagged_value(serializer, "u64", "value", value),
+            MetaValue::I64(value) => serialize_tagged_value(serializer, "i64", "value", value),
+            MetaValue::F32(value) => {
+                let bits = format!("{:08x}", value.to_bits());
+                serialize_tagged_value(serializer, "f32", "bits", &bits)
+            }
+            MetaValue::F64(value) => {
+                let bits = format!("{:016x}", value.to_bits());
+                serialize_tagged_value(serializer, "f64", "bits", &bits)
+            }
+            MetaValue::Bool(value) => serialize_tagged_value(serializer, "bool", "value", value),
+            MetaValue::String(value) => {
+                serialize_tagged_value(serializer, "string", "value", value)
+            }
+            MetaValue::Array(values) => {
+                serialize_tagged_value(serializer, "array", "values", &MetadataArray(values))
+            }
+            _ => Err(serde::ser::Error::custom(
+                "unsupported GGUF metadata variant in metadata report",
+            )),
+        }
+    }
+}
+
+fn serialize_tagged_value<S, T>(
+    serializer: S,
+    type_name: &'static str,
+    value_name: &'static str,
+    value: &T,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Serialize + ?Sized,
+{
+    let mut tagged = serializer.serialize_struct("TaggedMetadataValue", 2)?;
+    tagged.serialize_field("type", type_name)?;
+    tagged.serialize_field(value_name, value)?;
+    tagged.end()
+}
+
+struct MetadataArray<'a>(&'a [loader::gguf::MetaValue]);
+
+impl Serialize for MetadataArray<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for value in self.0 {
+            sequence.serialize_element(&TaggedMetadataValue(value))?;
+        }
+        sequence.end()
     }
 }
 
