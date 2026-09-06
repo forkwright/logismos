@@ -99,4 +99,114 @@ pub enum Error {
         #[snafu(implicit)]
         location: snafu::Location,
     },
+
+    /// The verified payload could not supply the named tensor.
+    #[snafu(display("qwen35 verified payload cannot provide tensor `{name}`: {source}"))]
+    PayloadTensor {
+        /// Tensor requested by the bounded projection operation.
+        name: String,
+        /// Verified-payload lookup failure.
+        source: loader::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A structurally recognized tensor does not use the one executable storage type.
+    #[snafu(display("qwen35 tensor `{name}` must use Q8_0 for this projection, got {actual:?}"))]
+    ProjectionDtype {
+        /// Tensor requested by the bounded projection operation.
+        name: String,
+        /// Observed GGML storage type.
+        actual: loader::gguf::GgmlType,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A structurally recognized tensor is not a matrix.
+    #[snafu(display(
+        "qwen35 tensor `{name}` must be rank 2 for this projection, got rank {actual}"
+    ))]
+    ProjectionRank {
+        /// Tensor requested by the bounded projection operation.
+        name: String,
+        /// Observed tensor rank.
+        actual: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The supplied activation width does not match the matrix input dimension.
+    #[snafu(display(
+        "qwen35 tensor `{name}` projection input must have width {expected}, got {actual}"
+    ))]
+    ProjectionInputWidth {
+        /// Tensor requested by the bounded projection operation.
+        name: String,
+        /// Matrix input dimension.
+        expected: usize,
+        /// Supplied activation length.
+        actual: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A matrix input dimension cannot form an integral finite `Q8_0` row.
+    #[snafu(display("qwen35 tensor `{name}` has invalid Q8_0 row layout: {source}"))]
+    ProjectionLayout {
+        /// Tensor requested by the bounded projection operation.
+        name: String,
+        /// Q8 row-geometry failure from the canonical quantization utility.
+        source: quant::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Tensor bytes do not form the contiguous rows implied by its validated dimensions.
+    #[snafu(display("qwen35 tensor `{name}` projection bytes must be {expected}, got {actual}"))]
+    ProjectionBytes {
+        /// Tensor requested by the bounded projection operation.
+        name: String,
+        /// Required serialized row-major byte length.
+        expected: usize,
+        /// Observed borrowed payload length.
+        actual: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Output allocation failed before any projection result could escape.
+    #[snafu(display(
+        "qwen35 tensor `{name}` could not reserve {output_width} projection outputs: {source}"
+    ))]
+    ProjectionAllocation {
+        /// Tensor requested by the bounded projection operation.
+        name: String,
+        /// Matrix output dimension.
+        output_width: usize,
+        /// Allocation failure.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// One serialized `Q8_0` row was not executable as finite CPU arithmetic.
+    #[snafu(display("qwen35 tensor `{name}` Q8_0 projection row {row} failed: {source}"))]
+    ProjectionRow {
+        /// Tensor requested by the bounded projection operation.
+        name: String,
+        /// Zero-based output-row index.
+        row: usize,
+        /// Q8 row-decoding or arithmetic failure.
+        source: quant::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }

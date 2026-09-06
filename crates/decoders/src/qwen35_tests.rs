@@ -1,9 +1,13 @@
-use std::fs;
+use std::{fs, num::NonZeroU64};
 
-use loader::gguf::{ObservedArtifact, observe_gguf_with_sha256};
+use loader::gguf::{
+    ArtifactByteLimit, ObservedArtifact, Sha256Digest, VerifiedArtifact, observe_gguf_with_sha256,
+};
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 use super::*;
+use crate::Qwen35Weights;
 
 const TEST_ALIGNMENT: u32 = 32;
 const TEST_HIDDEN: u64 = 3;
@@ -20,10 +24,17 @@ const TEST_VOCABULARY: u64 = 5;
 const TEST_MAIN_BLOCKS: u64 = 4;
 const TEST_FULL_ATTENTION_INTERVAL: u64 = 4;
 const TEST_F32_BYTES: u64 = 4;
+const TEST_F32_TYPE_ID: u32 = 0;
+const TEST_Q8_0_TYPE_ID: u32 = 8;
 const TEST_Q_WIDTH: u64 = 8;
 const TEST_FULL_ATTENTION_OUTPUT_WIDTH: u64 = 4;
 const TEST_SSM_CONV_WIDTH: u64 = 14;
 const TEST_NEXTN_PROJECTION_WIDTH: u64 = 6;
+const TEST_PROJECTION_INPUT_WIDTH: u64 = 64;
+const TEST_PROJECTION_OUTPUT_WIDTH: usize = 3;
+const TEST_Q8_SCALE_ONE_BITS: u16 = 0x3c00;
+const TEST_Q8_SCALE_NONFINITE_BITS: u16 = 0x7c00;
+const TEST_ALTERNATING_PERIOD: usize = 2;
 
 #[derive(Clone)]
 enum MetadataEntry {
@@ -48,6 +59,8 @@ impl MetadataEntry {
 struct FixtureTensor {
     name: String,
     dims: Vec<u64>,
+    ggml_type: u32,
+    payload: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -284,7 +297,112 @@ fn loader_refuses_duplicate_tensors_before_profile_construction() -> std::result
     Ok(())
 }
 
+#[test]
+fn projects_verified_multiblock_q8_rows() -> std::result::Result<(), String> {
+    let mut fixture = fixture_with_feed_forward(1, TEST_PROJECTION_INPUT_WIDTH)?;
+    set_q8_payload(
+        &mut fixture,
+        "blk.0.ffn_down.weight",
+        projection_payload(false),
+    )?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let activations = ordered_projection_activations()?;
+
+    let output = weights
+        .project_q8_0("blk.0.ffn_down.weight", &activations)
+        .map_err(|error| error.to_string())?;
+
+    assert_eq!(
+        output,
+        vec![2080.0, -496.0, 1536.0],
+        "three nonzero Q8_0 rows across two blocks each must affect the projection"
+    );
+    assert_eq!(
+        output.len(),
+        TEST_PROJECTION_OUTPUT_WIDTH,
+        "the second GGUF dimension is the number of contiguous output rows"
+    );
+    Ok(())
+}
+
+#[test]
+fn projection_rejects_wrong_name_rank_dtype_and_width() -> std::result::Result<(), String> {
+    let mut fixture = fixture_with_feed_forward(1, TEST_PROJECTION_INPUT_WIDTH)?;
+    set_q8_payload(
+        &mut fixture,
+        "blk.0.ffn_down.weight",
+        projection_payload(false),
+    )?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let activations = vec![
+        1.0;
+        usize::try_from(TEST_PROJECTION_INPUT_WIDTH).map_err(|error| {
+            format!("test projection width must fit usize: {error}")
+        })?
+    ];
+
+    let wrong_name = weights.project_q8_0("blk.0.not_a_role.weight", &activations);
+    assert!(
+        matches!(wrong_name, Err(crate::Error::PayloadTensor { .. })),
+        "unknown tensor names must not create a projection"
+    );
+
+    let wrong_rank = weights.project_q8_0(OUTPUT_NORM_TENSOR, &activations);
+    assert!(
+        matches!(wrong_rank, Err(crate::Error::ProjectionRank { .. })),
+        "recognized rank-one tensors must not be treated as matrices"
+    );
+
+    let wrong_dtype = weights.project_q8_0(OUTPUT_TENSOR, &activations);
+    assert!(
+        matches!(wrong_dtype, Err(crate::Error::ProjectionDtype { .. })),
+        "rank-two non-Q8 tensors must not be decoded by the Q8 path"
+    );
+
+    let wrong_width = weights.project_q8_0("blk.0.ffn_down.weight", &activations[..63]);
+    assert!(
+        matches!(wrong_width, Err(crate::Error::ProjectionInputWidth { .. })),
+        "activation width must exactly match the first GGUF matrix dimension"
+    );
+    Ok(())
+}
+
+#[test]
+fn projection_drops_local_output_when_a_late_q8_row_is_nonfinite() -> std::result::Result<(), String>
+{
+    let mut fixture = fixture_with_feed_forward(1, TEST_PROJECTION_INPUT_WIDTH)?;
+    set_q8_payload(
+        &mut fixture,
+        "blk.0.ffn_down.weight",
+        projection_payload(true),
+    )?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let activations = vec![
+        1.0;
+        usize::try_from(TEST_PROJECTION_INPUT_WIDTH).map_err(|error| {
+            format!("test projection width must fit usize: {error}")
+        })?
+    ];
+
+    let result = weights.project_q8_0("blk.0.ffn_down.weight", &activations);
+    assert!(
+        matches!(result, Err(crate::Error::ProjectionRow { row: 1, .. })),
+        "the second output row's non-finite serialized scale must refuse without returning row zero"
+    );
+    Ok(())
+}
+
 fn fixture(nextn_block_count: u64) -> std::result::Result<Fixture, String> {
+    fixture_with_feed_forward(nextn_block_count, TEST_FEED_FORWARD)
+}
+
+fn fixture_with_feed_forward(
+    nextn_block_count: u64,
+    feed_forward: u64,
+) -> std::result::Result<Fixture, String> {
     let stored_block_count = TEST_MAIN_BLOCKS
         .checked_add(nextn_block_count)
         .ok_or_else(|| "test stored block count overflowed".to_string())?;
@@ -302,13 +420,13 @@ fn fixture(nextn_block_count: u64) -> std::result::Result<Fixture, String> {
     );
     for block_index in 0..TEST_MAIN_BLOCKS {
         if (block_index + 1).is_multiple_of(TEST_FULL_ATTENTION_INTERVAL) {
-            add_full_attention_block(&mut tensors, block_index);
+            add_full_attention_block(&mut tensors, block_index, feed_forward);
         } else {
-            add_recurrent_block(&mut tensors, block_index);
+            add_recurrent_block(&mut tensors, block_index, feed_forward);
         }
     }
     if nextn_block_count == 1 {
-        add_nextn_block(&mut tensors, TEST_MAIN_BLOCKS);
+        add_nextn_block(&mut tensors, TEST_MAIN_BLOCKS, feed_forward);
     }
 
     Ok(Fixture {
@@ -321,7 +439,7 @@ fn fixture(nextn_block_count: u64) -> std::result::Result<Fixture, String> {
                 to_u32(TEST_FULL_ATTENTION_INTERVAL)?,
             ),
             MetadataEntry::U32(EMBEDDING_LENGTH_KEY, to_u32(TEST_HIDDEN)?),
-            MetadataEntry::U32(FEED_FORWARD_LENGTH_KEY, to_u32(TEST_FEED_FORWARD)?),
+            MetadataEntry::U32(FEED_FORWARD_LENGTH_KEY, to_u32(feed_forward)?),
             MetadataEntry::U32(HEAD_COUNT_KEY, to_u32(TEST_HEADS)?),
             MetadataEntry::U32(KEY_VALUE_HEAD_COUNT_KEY, to_u32(TEST_KEY_VALUE_HEADS)?),
             MetadataEntry::U32(KEY_LENGTH_KEY, to_u32(TEST_HEAD_WIDTH)?),
@@ -343,7 +461,7 @@ fn fixture(nextn_block_count: u64) -> std::result::Result<Fixture, String> {
     })
 }
 
-fn add_full_attention_block(tensors: &mut Vec<FixtureTensor>, block_index: u64) {
+fn add_full_attention_block(tensors: &mut Vec<FixtureTensor>, block_index: u64, feed_forward: u64) {
     add_tensor(
         tensors,
         &block_tensor_name(block_index, ATTN_K_ROLE),
@@ -379,7 +497,7 @@ fn add_full_attention_block(tensors: &mut Vec<FixtureTensor>, block_index: u64) 
         &block_tensor_name(block_index, ATTN_V_ROLE),
         vec![TEST_HIDDEN, TEST_HEAD_WIDTH],
     );
-    add_ffn_tensors(tensors, block_index);
+    add_ffn_tensors(tensors, block_index, feed_forward);
     add_tensor(
         tensors,
         &block_tensor_name(block_index, POST_ATTENTION_NORM_ROLE),
@@ -387,7 +505,7 @@ fn add_full_attention_block(tensors: &mut Vec<FixtureTensor>, block_index: u64) 
     );
 }
 
-fn add_recurrent_block(tensors: &mut Vec<FixtureTensor>, block_index: u64) {
+fn add_recurrent_block(tensors: &mut Vec<FixtureTensor>, block_index: u64, feed_forward: u64) {
     add_tensor(
         tensors,
         &block_tensor_name(block_index, ATTN_GATE_ROLE),
@@ -403,7 +521,7 @@ fn add_recurrent_block(tensors: &mut Vec<FixtureTensor>, block_index: u64) {
         &block_tensor_name(block_index, ATTN_QKV_ROLE),
         vec![TEST_HIDDEN, TEST_SSM_CONV_WIDTH],
     );
-    add_ffn_tensors(tensors, block_index);
+    add_ffn_tensors(tensors, block_index, feed_forward);
     add_tensor(
         tensors,
         &block_tensor_name(block_index, POST_ATTENTION_NORM_ROLE),
@@ -446,8 +564,8 @@ fn add_recurrent_block(tensors: &mut Vec<FixtureTensor>, block_index: u64) {
     );
 }
 
-fn add_nextn_block(tensors: &mut Vec<FixtureTensor>, block_index: u64) {
-    add_full_attention_block(tensors, block_index);
+fn add_nextn_block(tensors: &mut Vec<FixtureTensor>, block_index: u64, feed_forward: u64) {
+    add_full_attention_block(tensors, block_index, feed_forward);
     add_tensor(
         tensors,
         &block_tensor_name(block_index, NEXTN_EH_PROJ_ROLE),
@@ -470,21 +588,21 @@ fn add_nextn_block(tensors: &mut Vec<FixtureTensor>, block_index: u64) {
     );
 }
 
-fn add_ffn_tensors(tensors: &mut Vec<FixtureTensor>, block_index: u64) {
+fn add_ffn_tensors(tensors: &mut Vec<FixtureTensor>, block_index: u64, feed_forward: u64) {
     add_tensor(
         tensors,
         &block_tensor_name(block_index, FFN_DOWN_ROLE),
-        vec![TEST_FEED_FORWARD, TEST_HIDDEN],
+        vec![feed_forward, TEST_HIDDEN],
     );
     add_tensor(
         tensors,
         &block_tensor_name(block_index, FFN_GATE_ROLE),
-        vec![TEST_HIDDEN, TEST_FEED_FORWARD],
+        vec![TEST_HIDDEN, feed_forward],
     );
     add_tensor(
         tensors,
         &block_tensor_name(block_index, FFN_UP_ROLE),
-        vec![TEST_HIDDEN, TEST_FEED_FORWARD],
+        vec![TEST_HIDDEN, feed_forward],
     );
 }
 
@@ -492,7 +610,70 @@ fn add_tensor(tensors: &mut Vec<FixtureTensor>, name: &str, dims: Vec<u64>) {
     tensors.push(FixtureTensor {
         name: name.to_string(),
         dims,
+        ggml_type: TEST_F32_TYPE_ID,
+        payload: Vec::new(),
     });
+}
+
+fn set_q8_payload(
+    fixture: &mut Fixture,
+    name: &str,
+    payload: Vec<u8>,
+) -> std::result::Result<(), String> {
+    let Some(tensor) = fixture
+        .tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == name)
+    else {
+        return Err(format!("fixture tensor `{name}` was not found"));
+    };
+    tensor.ggml_type = TEST_Q8_0_TYPE_ID;
+    tensor.payload = payload;
+    Ok(())
+}
+
+fn projection_payload(late_nonfinite_row: bool) -> Vec<u8> {
+    let positive = [1_i8; quant::q8_0::Q8_0_VALUES_PER_BLOCK];
+    let doubled = [2_i8; quant::q8_0::Q8_0_VALUES_PER_BLOCK];
+    let negative = [-1_i8; quant::q8_0::Q8_0_VALUES_PER_BLOCK];
+    let alternating = std::array::from_fn(|index| {
+        if index.is_multiple_of(TEST_ALTERNATING_PERIOD) {
+            1
+        } else {
+            -1
+        }
+    });
+    let mut payload = Vec::new();
+    append_q8_block(&mut payload, TEST_Q8_SCALE_ONE_BITS, positive);
+    append_q8_block(&mut payload, TEST_Q8_SCALE_ONE_BITS, positive);
+    append_q8_block(
+        &mut payload,
+        if late_nonfinite_row {
+            TEST_Q8_SCALE_NONFINITE_BITS
+        } else {
+            TEST_Q8_SCALE_ONE_BITS
+        },
+        doubled,
+    );
+    append_q8_block(&mut payload, TEST_Q8_SCALE_ONE_BITS, negative);
+    append_q8_block(&mut payload, TEST_Q8_SCALE_ONE_BITS, alternating);
+    append_q8_block(&mut payload, TEST_Q8_SCALE_ONE_BITS, positive);
+    payload
+}
+
+fn append_q8_block(
+    payload: &mut Vec<u8>,
+    scale_bits: u16,
+    values: [i8; quant::q8_0::Q8_0_VALUES_PER_BLOCK],
+) {
+    payload.extend_from_slice(&scale_bits.to_le_bytes());
+    payload.extend(values.map(|value| value.to_le_bytes()[0]));
+}
+
+fn ordered_projection_activations() -> std::result::Result<Vec<f32>, String> {
+    let count = u8::try_from(TEST_PROJECTION_INPUT_WIDTH)
+        .map_err(|error| format!("test projection width must fit u8: {error}"))?;
+    Ok((1..=count).map(f32::from).collect())
 }
 
 fn set_u32(
@@ -556,6 +737,20 @@ fn observe_fixture(fixture: &Fixture) -> std::result::Result<ObservedArtifact, S
     observe_gguf_with_sha256(&path).map_err(|error| error.to_string())
 }
 
+fn verify_fixture(fixture: &Fixture) -> std::result::Result<VerifiedArtifact, String> {
+    let bytes = fixture_bytes(fixture)?;
+    let expected = Sha256Digest::from_bytes(Sha256::digest(&bytes).into());
+    let byte_limit = u64::try_from(bytes.len())
+        .map_err(|error| format!("test fixture length must fit u64: {error}"))?;
+    let byte_limit = NonZeroU64::new(byte_limit)
+        .ok_or_else(|| "test fixture must contain GGUF header bytes".to_string())?;
+    let directory = tempdir().map_err(|error| error.to_string())?;
+    let path = directory.path().join("qwen35-payload.gguf");
+    fs::write(&path, bytes).map_err(|error| error.to_string())?;
+    VerifiedArtifact::load(&path, expected, ArtifactByteLimit::new(byte_limit))
+        .map_err(|error| error.to_string())
+}
+
 fn preflight_error(artifact: &ObservedArtifact) -> std::result::Result<crate::Error, String> {
     match Qwen35StructuralProfile::try_from_observed(artifact) {
         Ok(_) => {
@@ -590,7 +785,7 @@ fn fixture_bytes(fixture: &Fixture) -> std::result::Result<Vec<u8>, String> {
         for dimension in &tensor.dims {
             bytes.extend_from_slice(&dimension.to_le_bytes());
         }
-        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&tensor.ggml_type.to_le_bytes());
         bytes.extend_from_slice(&offset.to_le_bytes());
     }
     pad_to_alignment(&mut bytes, u64::from(TEST_ALIGNMENT))?;
@@ -598,7 +793,17 @@ fn fixture_bytes(fixture: &Fixture) -> std::result::Result<Vec<u8>, String> {
         pad_to_alignment(&mut bytes, u64::from(TEST_ALIGNMENT))?;
         let byte_count = usize::try_from(tensor_bytes(tensor)?)
             .map_err(|_| "test tensor payload length exceeds usize".to_string())?;
-        bytes.extend(std::iter::repeat_n(0u8, byte_count));
+        if tensor.payload.is_empty() {
+            bytes.extend(std::iter::repeat_n(0u8, byte_count));
+        } else if tensor.payload.len() == byte_count {
+            bytes.extend_from_slice(&tensor.payload);
+        } else {
+            return Err(format!(
+                "test tensor `{}` payload must be {byte_count} bytes, got {}",
+                tensor.name,
+                tensor.payload.len()
+            ));
+        }
     }
     Ok(bytes)
 }
@@ -637,17 +842,32 @@ fn append_string(bytes: &mut Vec<u8>, value: &str) -> std::result::Result<(), St
 }
 
 fn tensor_bytes(tensor: &FixtureTensor) -> std::result::Result<u64, String> {
-    tensor
-        .dims
-        .iter()
-        .copied()
-        .try_fold(1u64, |element_count, dimension| {
-            element_count
-                .checked_mul(dimension)
-                .ok_or_else(|| "test tensor element count overflowed".to_string())
-        })?
-        .checked_mul(TEST_F32_BYTES)
-        .ok_or_else(|| "test tensor byte count overflowed".to_string())
+    let logical_elements =
+        tensor
+            .dims
+            .iter()
+            .copied()
+            .try_fold(1u64, |element_count, dimension| {
+                element_count
+                    .checked_mul(dimension)
+                    .ok_or_else(|| "test tensor element count overflowed".to_string())
+            })?;
+    match tensor.ggml_type {
+        TEST_F32_TYPE_ID => logical_elements
+            .checked_mul(TEST_F32_BYTES)
+            .ok_or_else(|| "test F32 tensor byte count overflowed".to_string()),
+        TEST_Q8_0_TYPE_ID => {
+            let values_per_block = to_u64(quant::q8_0::Q8_0_VALUES_PER_BLOCK)?;
+            if !logical_elements.is_multiple_of(values_per_block) {
+                return Err("test Q8_0 tensor elements must occupy complete blocks".to_string());
+            }
+            let block_bytes = to_u64(quant::q8_0::Q8_0_BLOCK_BYTES)?;
+            (logical_elements / values_per_block)
+                .checked_mul(block_bytes)
+                .ok_or_else(|| "test Q8_0 tensor byte count overflowed".to_string())
+        }
+        other => Err(format!("test fixture does not support GGML type {other}")),
+    }
 }
 
 fn align_up(value: u64, alignment: u64) -> std::result::Result<u64, String> {
