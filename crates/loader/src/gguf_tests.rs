@@ -115,6 +115,21 @@ fn q8_0_descriptor_geometry_comes_from_quant() {
         Some((quant::Q8_0_VALUES_PER_BLOCK, quant::Q8_0_BLOCK_BYTES)),
         "loader Q8_0 extents must use quant's canonical block geometry"
     );
+    assert_eq!(
+        GgmlType::Q4K.block_layout(),
+        Some((quant::Q4_K_VALUES_PER_BLOCK, quant::Q4_K_BLOCK_BYTES)),
+        "loader Q4_K extents must use quant's canonical block geometry"
+    );
+    assert_eq!(
+        GgmlType::Q5K.block_layout(),
+        Some((quant::Q5_K_VALUES_PER_BLOCK, quant::Q5_K_BLOCK_BYTES)),
+        "loader Q5_K extents must use quant's canonical block geometry"
+    );
+    assert_eq!(
+        GgmlType::Q6K.block_layout(),
+        Some((quant::Q6_K_VALUES_PER_BLOCK, quant::Q6_K_BLOCK_BYTES)),
+        "loader Q6_K extents must use quant's canonical block geometry"
+    );
 }
 
 #[test]

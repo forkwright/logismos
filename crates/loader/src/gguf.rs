@@ -35,7 +35,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memmap2::Mmap;
-use quant::{Q8_0_BLOCK_BYTES, Q8_0_VALUES_PER_BLOCK};
+use quant::{
+    Q4_K_BLOCK_BYTES, Q4_K_VALUES_PER_BLOCK, Q5_K_BLOCK_BYTES, Q5_K_VALUES_PER_BLOCK,
+    Q6_K_BLOCK_BYTES, Q6_K_VALUES_PER_BLOCK, Q8_0_BLOCK_BYTES, Q8_0_VALUES_PER_BLOCK,
+};
 use sha2::{Digest, Sha256};
 
 use crate::error::{GgufSnafu, MmapStaleSnafu, Result, TensorNotFoundSnafu, UnknownGgmlTypeSnafu};
@@ -184,9 +187,9 @@ impl GgmlType {
             Self::Q8_1 => (32, 36),
             Self::Q2K => (256, 84),
             Self::Q3K => (256, 110),
-            Self::Q4K => (256, 144),
-            Self::Q5K => (256, 176),
-            Self::Q6K => (256, 210),
+            Self::Q4K => (Q4_K_VALUES_PER_BLOCK, Q4_K_BLOCK_BYTES),
+            Self::Q5K => (Q5_K_VALUES_PER_BLOCK, Q5_K_BLOCK_BYTES),
+            Self::Q6K => (Q6_K_VALUES_PER_BLOCK, Q6_K_BLOCK_BYTES),
             Self::Q8K => (256, 292),
             Self::IQ4XS => (256, 136),
             _ => return None,
