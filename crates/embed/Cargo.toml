@@ -24,7 +24,7 @@ logismos-core = { path = "../core", package = "core" }
 decoders = { path = "../decoders" }
 encoders = { path = "../encoders", optional = true }
 kernels = { workspace = true, default-features = false, optional = true }
-loader = { workspace = true, default-features = false }
+loader = { path = "../loader", default-features = false }
 rayon = { workspace = true, optional = true }
 taxis = { workspace = true, optional = true }
 tokenize = { workspace = true }

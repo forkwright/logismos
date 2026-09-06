@@ -7,6 +7,15 @@ use snafu::Snafu;
 #[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
+    /// Required Qwen3 GGUF metadata was absent or had the wrong type.
+    #[snafu(display("invalid Qwen3 metadata `{key}`"))]
+    Metadata {
+        /// GGUF metadata key.
+        key: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// Native Qwen3 decoder failure.
     #[snafu(transparent)]
     Decoders {
@@ -40,6 +49,7 @@ pub enum Error {
     },
     /// Encoder crate bubbled an error.
     #[snafu(transparent)]
+    #[cfg(feature = "stella")]
     Encoders {
         /// Source encoder error.
         source: encoders::Error,
