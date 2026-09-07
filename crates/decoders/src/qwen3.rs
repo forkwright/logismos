@@ -305,7 +305,7 @@ impl Qwen3Execution<'_, '_> {
             hidden.extend(embedding_row);
         }
         for block in 0..self.body.layout.blocks {
-            self.run_block(block, &mut hidden, shape)?;
+            self.run_block(block, &mut hidden, &shape)?;
         }
         let final_norm = read_f32_vector(self.body.payload(), OUTPUT_NORM, shape.final_norm)?;
         let normalized = kernels::cpu_f32::rms_norm(
@@ -353,7 +353,7 @@ impl Qwen3Execution<'_, '_> {
             inspection.digest,
             inspection.file_len,
             self.max_context,
-            shape,
+            &shape,
         )
     }
 
@@ -373,7 +373,7 @@ impl Qwen3Execution<'_, '_> {
         &self,
         block: usize,
         hidden: &mut [f32],
-        shape: Qwen3AllocationShape,
+        shape: &Qwen3AllocationShape,
     ) -> Result<()> {
         let layout = self.body.layout;
         if hidden.len() != shape.hidden_rows {
@@ -767,7 +767,7 @@ fn causal_attention(
     values: &[f32],
     tokens: usize,
     layout: Layout,
-    shape: Qwen3AllocationShape,
+    shape: &Qwen3AllocationShape,
 ) -> Result<Vec<f32>> {
     let prefix = shape.causal_prefix_elements(tokens)?;
     let mut output = reserve("causal attention output", shape.causal_attention_output)?;

@@ -109,7 +109,7 @@ impl Qwen3RankExecution<'_, '_> {
         let max_context = self.body_execution.admitted_max_context();
         let shape = self.body_execution.allocation_shape(max_context)?;
         let inspection = self.weights.body.payload().observation().inspection();
-        Qwen3CpuRequirements::rank(inspection.digest, inspection.file_len, max_context, shape)
+        Qwen3CpuRequirements::rank(inspection.digest, inspection.file_len, max_context, &shape)
     }
 }
 

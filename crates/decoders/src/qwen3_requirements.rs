@@ -28,7 +28,7 @@ impl Qwen3CpuRequirements {
         artifact_digest: ArtifactDigest,
         serialized_backing_bytes: u64,
         max_context: usize,
-        shape: Qwen3AllocationShape,
+        shape: &Qwen3AllocationShape,
     ) -> Result<Self> {
         Self::from_shape(
             artifact_digest,
@@ -43,7 +43,7 @@ impl Qwen3CpuRequirements {
         artifact_digest: ArtifactDigest,
         serialized_backing_bytes: u64,
         max_context: usize,
-        shape: Qwen3AllocationShape,
+        shape: &Qwen3AllocationShape,
     ) -> Result<Self> {
         let body_envelope = checked_add(
             shape.embedding_workspace_upper_bound()?,
@@ -236,7 +236,7 @@ impl Qwen3AllocationShape {
         Ok(shape)
     }
 
-    pub(crate) fn embedding_workspace_upper_bound(self) -> Result<usize> {
+    pub(crate) fn embedding_workspace_upper_bound(&self) -> Result<usize> {
         let embedding = self.embedding_lookup_elements()?;
         let attention = self.attention_phase_elements()?;
         let ffn = self.ffn_phase_elements()?;
@@ -247,7 +247,7 @@ impl Qwen3AllocationShape {
             .unwrap_or(0))
     }
 
-    pub(crate) fn causal_prefix_elements(self, tokens: usize) -> Result<usize> {
+    pub(crate) fn causal_prefix_elements(&self, tokens: usize) -> Result<usize> {
         if tokens == 0 || tokens > self.tokens {
             return Qwen3ExecutionSnafu {
                 requested: tokens,
@@ -258,7 +258,7 @@ impl Qwen3AllocationShape {
         Ok(tokens)
     }
 
-    fn embedding_lookup_elements(self) -> Result<usize> {
+    fn embedding_lookup_elements(&self) -> Result<usize> {
         checked_add(
             self.hidden_rows,
             self.decoded_embedding_row,
@@ -266,7 +266,7 @@ impl Qwen3AllocationShape {
         )
     }
 
-    fn finalization_workspace_elements(self) -> Result<usize> {
+    fn finalization_workspace_elements(&self) -> Result<usize> {
         checked_add(
             checked_add(
                 self.hidden_rows,
@@ -278,7 +278,7 @@ impl Qwen3AllocationShape {
         )
     }
 
-    fn attention_phase_elements(self) -> Result<usize> {
+    fn attention_phase_elements(&self) -> Result<usize> {
         let token_local = self.attention_token_workspace()?;
         sum(
             &[
@@ -295,7 +295,7 @@ impl Qwen3AllocationShape {
         )
     }
 
-    fn attention_token_workspace(self) -> Result<usize> {
+    fn attention_token_workspace(&self) -> Result<usize> {
         let query_renorm = sum(
             &[
                 self.attention_row_norm,
@@ -345,7 +345,7 @@ impl Qwen3AllocationShape {
             .unwrap_or(0))
     }
 
-    fn ffn_phase_elements(self) -> Result<usize> {
+    fn ffn_phase_elements(&self) -> Result<usize> {
         let gate_activation = sum(
             &[self.ffn_row_norm, self.gate_projection, self.silu_output],
             "Qwen3 FFN gate activation workspace",
@@ -378,7 +378,7 @@ impl Qwen3AllocationShape {
         )
     }
 
-    fn validate_f32_vec_capacities(self) -> Result<()> {
+    fn validate_f32_vec_capacities(&self) -> Result<()> {
         for (elements, rule) in [
             (self.hidden_rows, "Qwen3 token hidden rows"),
             (self.decoded_embedding_row, "Qwen3 decoded embedding row"),
