@@ -1,4 +1,4 @@
-//! Bounded native CPU Qwen3 embedding execution over one verified GGUF payload.
+//! Bounded native CPU Qwen3 causal execution and embedding-profile admission.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -37,6 +37,8 @@ const TOKEN_EMBEDDING: &str = "token_embd.weight";
 const OUTPUT_NORM: &str = "output_norm.weight";
 const LAST_POOLING_TYPE: u64 = 3;
 pub(crate) const RANK_HEAD: &str = "cls.output.weight";
+pub(crate) const RANK_LABELS_KEY: &str = "qwen3.classifier.output_labels";
+pub(crate) const RANK_LABELS: [&str; 2] = ["yes", "no"];
 
 #[derive(Clone, Copy)]
 pub(crate) enum Qwen3Profile {
@@ -51,6 +53,13 @@ impl Qwen3Profile {
             Self::Rank => 4,
         }
     }
+
+    const fn profile_roles(self) -> &'static [Role] {
+        match self {
+            Self::Embedding => &[],
+            Self::Rank => &[RANK_HEAD_ROLE],
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -63,7 +72,7 @@ enum Shape {
     QueryHidden,
     HiddenFeedForward,
     FeedForwardHidden,
-    HiddenTwo,
+    HiddenRankLabels,
 }
 
 #[derive(Clone, Copy)]
@@ -81,7 +90,7 @@ pub(crate) struct Role {
 
 pub(crate) const RANK_HEAD_ROLE: Role = Role {
     name: RANK_HEAD,
-    shape: Shape::HiddenTwo,
+    shape: Shape::HiddenRankLabels,
     storage: Storage::F32OrQ8Matrix,
 };
 
@@ -167,13 +176,12 @@ impl<'artifact> Qwen3BodyWeights<'artifact> {
     pub(crate) fn try_from_verified(
         payload: &'artifact VerifiedArtifact,
         profile: Qwen3Profile,
-        profile_roles: &[Role],
     ) -> Result<Self> {
         let layout = Layout::from_artifact(payload, profile)?;
         validate_inventory(
             payload.observation().tensor_descriptors(),
             layout,
-            profile_roles,
+            profile.profile_roles(),
         )?;
         Ok(Self { payload, layout })
     }
@@ -220,7 +228,7 @@ impl<'artifact> Qwen3Weights<'artifact> {
     /// bounded no-output-head profile are not satisfied.
     pub fn try_from_verified(payload: &'artifact VerifiedArtifact) -> Result<Self> {
         Ok(Self {
-            body: Qwen3BodyWeights::try_from_verified(payload, Qwen3Profile::Embedding, &[])?,
+            body: Qwen3BodyWeights::try_from_verified(payload, Qwen3Profile::Embedding)?,
         })
     }
 
@@ -247,7 +255,7 @@ impl<'artifact> Qwen3Weights<'artifact> {
     }
 }
 
-/// Stateless Qwen3 causal embedding execution with an explicit caller context bound.
+/// Stateless Qwen3 causal execution with an explicit caller context bound.
 #[derive(Debug)]
 pub struct Qwen3Execution<'weights, 'artifact> {
     body: &'weights Qwen3BodyWeights<'artifact>,
@@ -460,7 +468,7 @@ impl Layout {
         if matches!(metadata.get(CAUSAL), Some(MetaValue::Bool(false))) {
             return Qwen3MetadataSnafu {
                 key: CAUSAL,
-                rule: "explicit false is outside the causal embedding profile",
+                rule: "explicit false is outside the bounded causal profile",
             }
             .fail();
         }
@@ -573,7 +581,7 @@ fn validate_inventory(
         let Some(role) = role_for_name(&tensor.name, layout.blocks, profile_roles) else {
             return Qwen3TensorSnafu {
                 name: tensor.name.clone(),
-                rule: "is outside the bounded embedding role inventory",
+                rule: "is outside the bounded profile role inventory",
             }
             .fail();
         };
@@ -612,7 +620,7 @@ fn validate_inventory(
         if !found.contains(role.name) {
             return Qwen3TensorSnafu {
                 name: role.name.to_string(),
-                rule: "is required by the bounded embedding profile",
+                rule: "is required by the bounded profile",
             }
             .fail();
         }
@@ -632,7 +640,7 @@ fn validate_inventory(
             if !found.contains(&name) {
                 return Qwen3TensorSnafu {
                     name,
-                    rule: "is required by the bounded embedding profile",
+                    rule: "is required by the bounded profile",
                 }
                 .fail();
             }
@@ -658,7 +666,7 @@ impl Shape {
             Self::QueryHidden => vec![query, hidden],
             Self::HiddenFeedForward => vec![hidden, feed_forward],
             Self::FeedForwardHidden => vec![feed_forward, hidden],
-            Self::HiddenTwo => vec![hidden, 2],
+            Self::HiddenRankLabels => vec![hidden, u64_from(RANK_LABELS.len())?],
         })
     }
 }
@@ -1294,31 +1302,62 @@ mod tests {
 
     #[test]
     fn rejects_rank_profile_metadata_and_inventory_deviations() -> std::result::Result<(), String> {
-        let cases: [fn(&mut RawGguf); 8] = [
-            rank_pooling_as_embedding,
-            remove_rank_labels,
-            reverse_rank_labels,
-            wrong_rank_labels,
-            wrong_rank_head_shape,
-            wrong_rank_head_dtype,
-            extra_rank_lm_head,
-            rank_causal_false,
+        let cases = [
+            ProfileCase::metadata("embedding pool", rank_pooling_as_embedding, POOLING_TYPE),
+            ProfileCase::metadata("missing labels", remove_rank_labels, RANK_LABELS_KEY),
+            ProfileCase::metadata("typed labels", mistype_rank_labels, RANK_LABELS_KEY),
+            ProfileCase::metadata("reversed labels", reverse_rank_labels, RANK_LABELS_KEY),
+            ProfileCase::metadata("wrong labels", wrong_rank_labels, RANK_LABELS_KEY),
+            ProfileCase::metadata("extra label", extra_rank_label, RANK_LABELS_KEY),
+            ProfileCase::tensor("missing head", remove_rank_head, "inventory"),
+            ProfileCase::tensor("wrong head shape", wrong_rank_head_shape, RANK_HEAD),
+            ProfileCase::tensor("wrong head dtype", wrong_rank_head_dtype, RANK_HEAD),
+            ProfileCase::tensor("extra classifier bias", extra_rank_bias, "inventory"),
+            ProfileCase::tensor("extra language head", extra_rank_lm_head, "inventory"),
+            ProfileCase::tensor("missing trunk tensor", remove_tensor, "inventory"),
+            ProfileCase::metadata("noncausal", rank_causal_false, CAUSAL),
+            ProfileCase::metadata(
+                "nonneutral rope scaling",
+                nonneutral_current_rope_scaling,
+                ROPE_SCALING_FACTOR,
+            ),
         ];
-        for mutate in cases {
-            let mut raw = rank_fixture()?;
-            mutate(&mut raw);
-            let artifact = verify(&raw)?;
-            if crate::Qwen3RankWeights::try_from_verified(&artifact).is_ok() {
-                return Err(
-                    "rank profile accepted a strict metadata or inventory deviation".to_string(),
-                );
-            }
+        for case in cases {
+            assert_rank_profile_case(case)?;
         }
-        let mut scaled = rank_fixture()?;
-        nonneutral_current_rope_scaling(&mut scaled);
-        let artifact = verify(&scaled)?;
-        if crate::Qwen3RankWeights::try_from_verified(&artifact).is_ok() {
-            return Err("rank profile accepted nonneutral rope scaling".to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_duplicate_rank_head_during_gguf_verification() -> std::result::Result<(), String> {
+        let mut raw = rank_fixture()?;
+        let Some(head) = raw
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == RANK_HEAD)
+            .cloned()
+        else {
+            return Err("rank fixture was missing its classifier head".to_string());
+        };
+        raw.tensors.push(head);
+        if verify(&raw).is_ok() {
+            return Err("GGUF verification accepted a duplicate rank classifier head".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_profile_refuses_an_otherwise_valid_rank_artifact()
+    -> std::result::Result<(), String> {
+        let artifact = verify(&rank_fixture()?)?;
+        if !matches!(
+            Qwen3Weights::try_from_verified(&artifact),
+            Err(crate::Error::Qwen3Metadata {
+                key: POOLING_TYPE,
+                ..
+            })
+        ) {
+            return Err("embedding profile accepted a valid rank artifact".to_string());
         }
         Ok(())
     }
@@ -1416,11 +1455,40 @@ mod tests {
         }
     }
 
+    fn assert_rank_profile_case(case: ProfileCase) -> std::result::Result<(), String> {
+        let mut raw = rank_fixture()?;
+        (case.mutate)(&mut raw);
+        let error = rank_profile_error(&raw)?;
+        let accepted = match case.expected {
+            ExpectedProfileError::Metadata(key) => {
+                matches!(error, crate::Error::Qwen3Metadata { key: actual, .. } if actual == key)
+            }
+            ExpectedProfileError::Tensor(name) => {
+                matches!(error, crate::Error::Qwen3Tensor { name: ref actual, .. } if actual == name)
+            }
+        };
+        if accepted {
+            Ok(())
+        } else {
+            Err(format!(
+                "rank {} returned the wrong typed profile error: {error}",
+                case.name
+            ))
+        }
+    }
+
     fn profile_error(raw: &RawGguf) -> std::result::Result<crate::Error, String> {
         let artifact = verify(raw)?;
         Qwen3Weights::try_from_verified(&artifact)
             .err()
             .ok_or_else(|| "invalid profile fixture was accepted".to_string())
+    }
+
+    fn rank_profile_error(raw: &RawGguf) -> std::result::Result<crate::Error, String> {
+        let artifact = verify(raw)?;
+        crate::Qwen3RankWeights::try_from_verified(&artifact)
+            .err()
+            .ok_or_else(|| "invalid rank profile fixture was accepted".to_string())
     }
 
     fn remove_hidden(raw: &mut RawGguf) {
@@ -1432,14 +1500,21 @@ mod tests {
     }
 
     fn remove_rank_labels(raw: &mut RawGguf) {
-        raw.metadata
-            .retain(|entry| entry.key != "qwen3.classifier.output_labels");
+        raw.metadata.retain(|entry| entry.key != RANK_LABELS_KEY);
+    }
+
+    fn mistype_rank_labels(raw: &mut RawGguf) {
+        replace_metadata(
+            raw,
+            RANK_LABELS_KEY,
+            &RawMetadataValue::I32Array(vec![1, 2]),
+        );
     }
 
     fn reverse_rank_labels(raw: &mut RawGguf) {
         replace_metadata(
             raw,
-            "qwen3.classifier.output_labels",
+            RANK_LABELS_KEY,
             &RawMetadataValue::StringArray(vec!["no".to_string(), "yes".to_string()]),
         );
     }
@@ -1447,13 +1522,29 @@ mod tests {
     fn wrong_rank_labels(raw: &mut RawGguf) {
         replace_metadata(
             raw,
-            "qwen3.classifier.output_labels",
+            RANK_LABELS_KEY,
             &RawMetadataValue::StringArray(vec!["yes".to_string(), "maybe".to_string()]),
         );
     }
 
     fn wrong_rank_head_shape(raw: &mut RawGguf) {
         replace_tensor_dimensions(raw, RANK_HEAD, &[TEST_HIDDEN, 1]);
+    }
+
+    fn extra_rank_label(raw: &mut RawGguf) {
+        replace_metadata(
+            raw,
+            RANK_LABELS_KEY,
+            &RawMetadataValue::StringArray(vec![
+                "yes".to_string(),
+                "no".to_string(),
+                "maybe".to_string(),
+            ]),
+        );
+    }
+
+    fn remove_rank_head(raw: &mut RawGguf) {
+        raw.tensors.retain(|tensor| tensor.name != RANK_HEAD);
     }
 
     fn wrong_rank_head_dtype(raw: &mut RawGguf) {
@@ -1471,6 +1562,15 @@ mod tests {
             dims: vec![TEST_HIDDEN, TEST_VOCABULARY],
             format: 0,
             payload: vec![0; 48],
+        });
+    }
+
+    fn extra_rank_bias(raw: &mut RawGguf) {
+        raw.tensors.push(RawTensor {
+            name: "cls.output.bias".to_string(),
+            dims: vec![2],
+            format: 0,
+            payload: vec![0; 8],
         });
     }
 
@@ -1729,8 +1829,13 @@ mod tests {
         let mut raw = fixture()?;
         replace_metadata(&mut raw, POOLING_TYPE, &RawMetadataValue::U32(4));
         raw.metadata.push(RawMetadata {
-            key: "qwen3.classifier.output_labels".to_string(),
-            value: RawMetadataValue::StringArray(vec!["yes".to_string(), "no".to_string()]),
+            key: RANK_LABELS_KEY.to_string(),
+            value: RawMetadataValue::StringArray(
+                RANK_LABELS
+                    .iter()
+                    .map(|label| (*label).to_string())
+                    .collect(),
+            ),
         });
         raw.tensors
             .push(tensor(RANK_HEAD, vec![TEST_HIDDEN, 2], 0.3125)?);

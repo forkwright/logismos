@@ -5,10 +5,7 @@ use loader::gguf::{MetaValue, MetaValueType, VerifiedArtifact};
 use crate::Result;
 use crate::error::{Qwen3ExecutionSnafu, Qwen3MetadataSnafu};
 use crate::matrix::CheckedMatrix;
-use crate::qwen3::{Qwen3BodyWeights, Qwen3Profile, RANK_HEAD, RANK_HEAD_ROLE};
-
-const CLASSIFIER_OUTPUT_LABELS: &str = "qwen3.classifier.output_labels";
-const RANK_LABELS: [&str; 2] = ["yes", "no"];
+use crate::qwen3::{Qwen3BodyWeights, Qwen3Profile, RANK_HEAD, RANK_LABELS, RANK_LABELS_KEY};
 
 /// One verified Qwen3 rank payload with its checked causal body and two-row head.
 #[derive(Debug)]
@@ -26,11 +23,7 @@ impl<'artifact> Qwen3RankWeights<'artifact> {
     pub fn try_from_verified(payload: &'artifact VerifiedArtifact) -> Result<Self> {
         require_rank_labels(payload)?;
         Ok(Self {
-            body: Qwen3BodyWeights::try_from_verified(
-                payload,
-                Qwen3Profile::Rank,
-                &[RANK_HEAD_ROLE],
-            )?,
+            body: Qwen3BodyWeights::try_from_verified(payload, Qwen3Profile::Rank)?,
         })
     }
 
@@ -105,9 +98,9 @@ impl Qwen3RankExecution<'_, '_> {
 
 fn require_rank_labels(payload: &VerifiedArtifact) -> Result<()> {
     let metadata = payload.observation().metadata();
-    let Some(MetaValue::Array(labels)) = metadata.get(CLASSIFIER_OUTPUT_LABELS) else {
+    let Some(MetaValue::Array(labels)) = metadata.get(RANK_LABELS_KEY) else {
         return Qwen3MetadataSnafu {
-            key: CLASSIFIER_OUTPUT_LABELS,
+            key: RANK_LABELS_KEY,
             rule: "must be the exact string array [yes, no]",
         }
         .fail();
@@ -121,7 +114,7 @@ fn require_rank_labels(payload: &VerifiedArtifact) -> Result<()> {
             .all(|(label, expected)| matches!(label, MetaValue::String(value) if value == expected))
     {
         return Qwen3MetadataSnafu {
-            key: CLASSIFIER_OUTPUT_LABELS,
+            key: RANK_LABELS_KEY,
             rule: "must be the exact string array [yes, no] in source label order",
         }
         .fail();
