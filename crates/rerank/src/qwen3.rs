@@ -296,25 +296,5 @@ fn validate_batch(batch: &RerankBatch, limit: usize) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::signed_relevance_score;
-
-    #[test]
-    fn signed_score_preserves_yes_minus_no_direction_and_refuses_overflow()
-    -> std::result::Result<(), String> {
-        let positive =
-            signed_relevance_score(0, [3.5, -1.25]).map_err(|error| error.to_string())?;
-        let negative =
-            signed_relevance_score(1, [-1.25, 3.5]).map_err(|error| error.to_string())?;
-        if positive != 4.75 || negative != -4.75 {
-            return Err("signed rerank score must remain raw yes minus no logits".to_string());
-        }
-        if !matches!(
-            signed_relevance_score(2, [f32::MAX, -f32::MAX]),
-            Err(crate::Error::Qwen3NonFiniteScore { index: 2, .. })
-        ) {
-            return Err("non-finite signed subtraction must be refused".to_string());
-        }
-        Ok(())
-    }
-}
+#[path = "qwen3/tests.rs"]
+mod tests;
