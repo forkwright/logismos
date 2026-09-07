@@ -517,3 +517,7 @@ mod tests {
         assert!(Qwen3AllocationShape::new(usize::MAX, 2, 1, 1, 1, 1, 1, 1, 2).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "qwen3_requirements_tests.rs"]
+mod allocation_witnesses;
