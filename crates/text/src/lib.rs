@@ -287,6 +287,9 @@ impl<'artifact> TextPipeline<'artifact> {
             limits.tokenizer_bytes,
         )
         .context(TokenizerSnafu)?;
+        tokenizer
+            .verify_unpadded_untruncated()
+            .context(TokenizerSnafu)?;
         let metadata = artifact.observation().metadata();
         let template = metadata_string(metadata, CHAT_TEMPLATE_KEY)?;
         check_limit("template bytes", template.len(), limits.template_bytes)?;
@@ -1376,6 +1379,60 @@ mod tests {
             6,
             5,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn configured_tokenizer_padding_and_truncation_are_refused_in_native_setup() -> TestResult<()> {
+        let config = fixture_config(&TOKENS, 3, false, false, "hello");
+        let fixture = build_qwen35_fixture(&config)?;
+        let (_directory, artifact) = load_fixture(&fixture)?;
+        let ordinary = tokenizer_json();
+        let cases = [
+            (
+                ordinary.replace(
+                    "\"truncation\":null",
+                    "\"truncation\":{\"direction\":\"Right\",\"max_length\":1,\"strategy\":\"LongestFirst\",\"stride\":0}",
+                ),
+                "truncation",
+            ),
+            (
+                ordinary.replace(
+                    "\"padding\":null",
+                    "\"padding\":{\"strategy\":{\"Fixed\":4},\"direction\":\"Right\",\"pad_to_multiple_of\":null,\"pad_id\":0,\"pad_type_id\":0,\"pad_token\":\"[UNK]\"}",
+                ),
+                "padding",
+            ),
+        ];
+        for (configured, setting) in cases {
+            let error = text_error(pipeline_result(
+                &artifact,
+                &configured,
+                test_limits(configured.len())?,
+            ))?;
+            match (setting, error) {
+                (
+                    "truncation",
+                    Error::Tokenizer {
+                        source: tokenize::Error::ConfiguredTruncation { .. },
+                        ..
+                    },
+                )
+                | (
+                    "padding",
+                    Error::Tokenizer {
+                        source: tokenize::Error::ConfiguredPadding { .. },
+                        ..
+                    },
+                ) => {}
+                (_, error) => {
+                    return Err(std::io::Error::other(format!(
+                        "native text setup accepted or misreported configured tokenizer {setting}: {error}"
+                    ))
+                    .into());
+                }
+            }
+        }
         Ok(())
     }
 
