@@ -10,7 +10,7 @@ use std::num::NonZeroU64;
 use loader::gguf::{ArtifactByteLimit, Sha256Digest, VerifiedArtifact};
 use test_fixtures::{RawGguf, RawMetadata, RawMetadataValue, RawTensor, serialize_raw_gguf};
 
-use crate::Qwen3Weights;
+use crate::{Qwen3RankWeights, Qwen3Weights};
 
 type TestResult<T> = std::result::Result<T, String>;
 
@@ -62,6 +62,9 @@ enum Fault {
     MissingFfnResidual,
     MissingFinalNorm,
     FirstTokenPool,
+    SwappedRankRows,
+    NegatedRankHead,
+    SoftmaxRankHead,
 }
 
 impl Fault {
@@ -103,6 +106,18 @@ impl Fault {
 
     const fn pools_first_token(self) -> bool {
         matches!(self, Self::FirstTokenPool)
+    }
+
+    const fn swaps_rank_rows(self) -> bool {
+        matches!(self, Self::SwappedRankRows)
+    }
+
+    const fn negates_rank_head(self) -> bool {
+        matches!(self, Self::NegatedRankHead)
+    }
+
+    const fn softmaxes_rank_head(self) -> bool {
+        matches!(self, Self::SoftmaxRankHead)
     }
 }
 
@@ -180,6 +195,86 @@ fn late_invalid_token_refusal_leaves_stateless_execution_retryable() -> TestResu
         .map_err(|error| error.to_string())?;
     if retry != fresh {
         return Err("late refusal changed a stateless executor's subsequent result".to_string());
+    }
+    Ok(())
+}
+
+#[test]
+fn rank_head_matches_independent_f64_raw_logits_for_f32_and_q8_storage() -> TestResult<()> {
+    for storage in [Storage::F32, Storage::Q8] {
+        let fixture = qwen3_rank_fixture(storage)?;
+        let artifact = verify_fixture(&fixture)?;
+        let weights =
+            Qwen3RankWeights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let actual = weights
+            .execution(CONTEXT)
+            .and_then(|execution| execution.last_logits(&TOKEN_IDS))
+            .map_err(|error| error.to_string())?;
+        let expected = oracle_rank_logits(&fixture, &TOKEN_IDS, Fault::None)?;
+        assert_f32_matches_f64(&actual, &expected, "raw rank logits")?;
+
+        let score = expected[0] - expected[1];
+        if !score.is_finite() || score.abs() <= 2.0 * tolerance(expected[0], expected[1]) {
+            return Err(
+                "rank fixture did not produce an asymmetric signed yes-minus-no score".to_string(),
+            );
+        }
+
+        for (name, fault) in [
+            ("swapped yes/no rank rows", Fault::SwappedRankRows),
+            ("negated rank head", Fault::NegatedRankHead),
+            ("first-token rank pooling", Fault::FirstTokenPool),
+            ("missing final rank normalization", Fault::MissingFinalNorm),
+            (
+                "softmax rank probabilities instead of raw logits",
+                Fault::SoftmaxRankHead,
+            ),
+        ] {
+            let incorrect = oracle_rank_logits(&fixture, &TOKEN_IDS, fault)?;
+            assert_discriminated(&expected, &incorrect, name)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rank_head_late_nonfinite_refusal_preserves_pristine_retry() -> TestResult<()> {
+    for value in [f32::NAN, f32::INFINITY] {
+        let mut malformed = qwen3_rank_fixture(Storage::F32)?;
+        let head = raw_tensor_mut(&mut malformed, "cls.output.weight")?;
+        head.payload[..4].copy_from_slice(&value.to_le_bytes());
+        let artifact = verify_fixture(&malformed)?;
+        let weights =
+            Qwen3RankWeights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let execution = weights
+            .execution(CONTEXT)
+            .map_err(|error| error.to_string())?;
+        if execution.last_logits(&TOKEN_IDS).is_ok() {
+            return Err(format!(
+                "nonfinite rank head value {value:?} unexpectedly executed"
+            ));
+        }
+    }
+
+    let fixture = qwen3_rank_fixture(Storage::F32)?;
+    let artifact = verify_fixture(&fixture)?;
+    let weights =
+        Qwen3RankWeights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+    let retry = weights
+        .execution(CONTEXT)
+        .and_then(|execution| execution.last_logits(&TOKEN_IDS))
+        .map_err(|error| error.to_string())?;
+    let fresh = weights
+        .execution(CONTEXT)
+        .and_then(|execution| execution.last_logits(&TOKEN_IDS))
+        .map_err(|error| error.to_string())?;
+    if retry
+        .iter()
+        .zip(fresh)
+        .any(|(retry, fresh)| retry.to_bits() != fresh.to_bits())
+        || !retry.iter().all(|value| value.is_finite())
+    {
+        return Err("a refused rank head changed a subsequent pristine rank retry".to_string());
     }
     Ok(())
 }
@@ -284,6 +379,33 @@ fn qwen3_fixture() -> TestResult<RawGguf> {
         ],
         tensors,
     })
+}
+
+fn qwen3_rank_fixture(head_storage: Storage) -> TestResult<RawGguf> {
+    let mut fixture = qwen3_fixture()?;
+    replace_metadata(&mut fixture, "qwen3.pooling_type", RawMetadataValue::U32(4))?;
+    fixture.metadata.push(RawMetadata {
+        key: "qwen3.classifier.output_labels".to_string(),
+        value: RawMetadataValue::StringArray(vec!["yes".to_string(), "no".to_string()]),
+    });
+    fixture.tensors.push(matrix_tensor(
+        "cls.output.weight",
+        HIDDEN,
+        2,
+        head_storage,
+        131,
+    )?);
+    Ok(fixture)
+}
+
+fn replace_metadata(fixture: &mut RawGguf, key: &str, value: RawMetadataValue) -> TestResult<()> {
+    let metadata = fixture
+        .metadata
+        .iter_mut()
+        .find(|metadata| metadata.key == key)
+        .ok_or_else(|| format!("rank fixture is missing metadata `{key}`"))?;
+    metadata.value = value;
+    Ok(())
 }
 
 fn block_name(block: usize, role: &str) -> String {
@@ -455,6 +577,35 @@ fn oracle_last_hidden(raw: &RawGguf, token_ids: &[u32], fault: Fault) -> TestRes
         .get(selected)
         .cloned()
         .ok_or_else(|| "oracle pooled row is outside the token sequence".to_string())
+}
+
+fn oracle_rank_logits(raw: &RawGguf, token_ids: &[u32], fault: Fault) -> TestResult<[f64; 2]> {
+    let hidden = oracle_last_hidden(raw, token_ids, fault)?;
+    let head = decode_matrix(raw, "cls.output.weight")?;
+    let values = project(&head, &hidden, Fault::None)?;
+    let mut logits: [f64; 2] = values.try_into().map_err(|values: Vec<f64>| {
+        format!("rank oracle expected two head logits, got {}", values.len())
+    })?;
+    if fault.swaps_rank_rows() {
+        logits.swap(0, 1);
+    }
+    if fault.negates_rank_head() {
+        logits = [-logits[0], -logits[1]];
+    }
+    if fault.softmaxes_rank_head() {
+        let maximum = logits[0].max(logits[1]);
+        let yes = (logits[0] - maximum).exp();
+        let no = (logits[1] - maximum).exp();
+        let total = yes + no;
+        if !total.is_finite() || total <= 0.0 {
+            return Err("rank oracle softmax normalization is not finite positive".to_string());
+        }
+        logits = [yes / total, no / total];
+    }
+    if !logits.iter().all(|value| value.is_finite()) {
+        return Err("rank oracle logits are non-finite".to_string());
+    }
+    Ok(logits)
 }
 
 fn oracle_block(
@@ -805,6 +956,20 @@ fn raw_tensor<'fixture>(raw: &'fixture RawGguf, name: &str) -> TestResult<&'fixt
         .ok_or_else(|| format!("oracle fixture is missing tensor `{name}`"))?;
     if matching.next().is_some() {
         return Err(format!("oracle fixture duplicates tensor `{name}`"));
+    }
+    Ok(tensor)
+}
+
+fn raw_tensor_mut<'fixture>(
+    raw: &'fixture mut RawGguf,
+    name: &str,
+) -> TestResult<&'fixture mut RawTensor> {
+    let mut matching = raw.tensors.iter_mut().filter(|tensor| tensor.name == name);
+    let tensor = matching
+        .next()
+        .ok_or_else(|| format!("rank fixture is missing tensor `{name}`"))?;
+    if matching.next().is_some() {
+        return Err(format!("rank fixture duplicates tensor `{name}`"));
     }
     Ok(tensor)
 }
