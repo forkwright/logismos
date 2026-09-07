@@ -7,14 +7,28 @@ license.workspace = true
 description = "Cross-encoder reranker contract and preflight surface. Phase 5 Option A."
 publish = false
 
+[features]
+# WHY: Preserve the established ModernBERT CPU reference as the ordinary
+# rerank surface while allowing native Qwen3 CPU consumers to avoid its graph.
+default = ["modernbert"]
+modernbert = ["dep:encoders", "dep:kernels"]
+
 [dependencies]
-encoders = { workspace = true }
-kernels = { workspace = true }
+decoders = { path = "../decoders" }
+encoders = { workspace = true, optional = true }
+kernels = { workspace = true, default-features = false, optional = true }
+loader = { path = "../loader", default-features = false }
+num-traits = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 snafu = { workspace = true }
+templates = { path = "../templates" }
+tokenize = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+test-fixtures = { path = "../test-fixtures" }
 transformers = { workspace = true }
 
 [lints]
