@@ -92,9 +92,8 @@ impl<'artifact> Qwen3Reranker<'artifact> {
         require_no_automatic_specials(metadata, ADD_EOS)?;
         verify_special(&tokenizer, vocabulary.len(), IM_START)?;
         verify_special(&tokenizer, vocabulary.len(), IM_END)?;
-        let template_source = match metadata.get(CHAT_TEMPLATE) {
-            Some(MetaValue::String(source)) => source,
-            _ => return Qwen3MetadataSnafu { key: CHAT_TEMPLATE }.fail(),
+        let Some(MetaValue::String(template_source)) = metadata.get(CHAT_TEMPLATE) else {
+            return Qwen3MetadataSnafu { key: CHAT_TEMPLATE }.fail();
         };
         let template =
             BoundedTemplate::new(template_source, limits.template).context(Qwen3TemplateSnafu)?;

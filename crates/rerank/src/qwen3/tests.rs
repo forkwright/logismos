@@ -33,7 +33,7 @@ const TEMPLATE: &str = "{% if messages[0].role == \"system\" and messages[1].rol
 fn signed_score_is_raw_yes_minus_no_and_refuses_f32_overflow() -> TestResult<()> {
     let positive = signed_relevance_score(0, [3.5, -1.25])?;
     let negative = signed_relevance_score(1, [-1.25, 3.5])?;
-    if positive != 4.75 || negative != -4.75 {
+    if positive.to_bits() != 4.75_f32.to_bits() || negative.to_bits() != (-4.75_f32).to_bits() {
         return Err("signed rerank score must remain raw yes minus no logits".into());
     }
     assert!(matches!(
@@ -328,10 +328,10 @@ fn later_item_refusal_discards_partial_batch_and_allows_same_instance_retry() ->
     )
 }
 
-fn reranker<'artifact>(
-    artifact: &'artifact VerifiedArtifact,
+fn reranker(
+    artifact: &VerifiedArtifact,
     limits: Qwen3RerankerLimits,
-) -> TestResult<Qwen3Reranker<'artifact>> {
+) -> TestResult<Qwen3Reranker<'_>> {
     reranker_with_instruction(artifact, limits, INSTRUCTION)
 }
 
@@ -454,6 +454,10 @@ fn verified_artifact(raw: &RawGguf) -> TestResult<(tempfile::TempDir, VerifiedAr
     ))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the complete original synthetic model inventory together for oracle review"
+)]
 fn raw_rank_fixture() -> TestResult<RawGguf> {
     let tokens = vocabulary();
     let mut embedding = vec![0.0; tokens.len() * HIDDEN];
