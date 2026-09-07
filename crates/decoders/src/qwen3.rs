@@ -1,4 +1,4 @@
-//! Bounded native CPU Qwen3 causal execution and embedding-profile admission.
+//! Bounded native CPU Qwen3 causal execution with strict embedding and rank profiles.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;

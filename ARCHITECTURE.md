@@ -61,6 +61,18 @@ semantically respects that boundary.
   Stella API and tensor/encoder graph; direct consumers disable default
   features to exclude that accelerator-capable graph. Consumers still use the
   unchanged `core::EmbeddingModel` contract.
+- `rerank` consumes the same CPU decoder/tokenizer graph and `templates` for
+  native Qwen3 pair scoring. Its default `modernbert` feature preserves the
+  existing encoder implementation; disabling default features removes that
+  accelerator-capable graph without changing the `Reranker` contract.
+- `templates` owns bounded, capability-free artifact-template rendering for
+  `text` and `rerank`. It has no model, GGUF, tokenizer or device dependency;
+  pipelines retain artifact binding, typed message roles and token policy.
+- `tokenize` owns exact vocabulary/special-ID verification and refusal of
+  configured tokenizer padding or truncation. Native text, embedding and
+  reranking setup invoke that guard; ordinary tokenizer consumers retain their
+  configured behavior. Disabling automatic special tokens alone does not
+  disable padding or truncation.
 - `taxis` depends locally on `hipcore`.
 - `kernels/gpu` enables the local `hipcore` and `taxis` dependencies and GPU
   launcher modules, including their nested parity references. Standalone
@@ -185,6 +197,26 @@ special-token policy. Embedding input uses no chat template or implicit query
 instruction, and advertised dimensions do not imply Matryoshka qualification.
 Synthetic family and pipeline tests do not establish deployed-artifact parity,
 retrieval quality, reindex authority, serving or GPU qualification.
+
+## Native reranking ownership
+
+`decoders::Qwen3RankWeights` admits a distinct rank profile over the shared
+private Qwen3 body. Rank pooling, exact `[yes, no]` labels and a two-row
+`cls.output.weight` are required; embedding admission still refuses extra
+heads. The decoder returns raw terminal-token classifier logits after final
+RMS normalization. `rerank` owns their signed `yes - no` reduction and returns
+one relevance logit per input index, not probabilities or sorted results.
+
+The pipeline renders its verified artifact's embedded template using typed
+system/query/document messages and an explicit setup instruction. It encodes
+the whole render with automatic special tokens disabled. Separate byte,
+token and batch bounds reject oversized inputs without truncation. The shared
+`templates` owner retains strict undefined values, fuel, recursion and output
+bounds, without external or named template resolution. Public batch structs
+are revalidated at the prediction boundary; failure publishes no partial map.
+These controls do not bound all tokenizer/template intermediates or total
+process memory. Synthetic execution does not resolve exact-artifact conversion
+provenance, template parity, retrieval quality, deployment or hardware gates.
 
 ## cfg flags
 

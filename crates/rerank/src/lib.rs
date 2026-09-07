@@ -12,12 +12,11 @@
 //! ## Responsibility
 //!
 //! - `Reranker` impls backed by cross-encoder transformers
-//! - GTE-reranker-modernbert-base (aletheia Phase 06 target, 149 M)
+//! - Existing ModernBERT CPU execution behind the default `modernbert` feature
 //! - Qwen3 rank GGUF payloads with artifact-owned chat framing
-//! - bge-reranker family
 //!
-//! Lands in Phase 5. Consumers: kanon/mnemosyne Phase 04f hybrid
-//! rerank, aletheia's memory recall.
+//! Native Qwen3 consumers may disable default features for a GPU-free graph.
+//! CPU execution does not establish model-quality or hardware qualification.
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![expect(

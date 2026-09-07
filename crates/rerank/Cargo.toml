@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Cross-encoder reranker contract and preflight surface. Phase 5 Option A."
+description = "Cross-encoder reranking with native Qwen3 and ModernBERT CPU implementations."
 publish = false
 
 [features]

@@ -175,15 +175,15 @@ impl<'text> RenderContext<'text> {
         Self {
             messages: [
                 RenderMessage {
-                    role: "system",
+                    role: RenderRole::System,
                     content: instruction,
                 },
                 RenderMessage {
-                    role: "query",
+                    role: RenderRole::Query,
                     content: query,
                 },
                 RenderMessage {
-                    role: "document",
+                    role: RenderRole::Document,
                     content: document,
                 },
             ],
@@ -192,8 +192,16 @@ impl<'text> RenderContext<'text> {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum RenderRole {
+    System,
+    Query,
+    Document,
+}
+
+#[derive(Serialize)]
 struct RenderMessage<'text> {
-    role: &'static str,
+    role: RenderRole,
     content: &'text str,
 }
 
@@ -206,7 +214,7 @@ fn validate_limits(limits: Qwen3RerankerLimits) -> Result<()> {
     .contains(&0)
     {
         return Qwen3LimitsSnafu {
-            rule: "pair, token, batch, and template limits must be nonzero",
+            rule: "pair, token, and batch limits must be nonzero",
         }
         .fail();
     }
