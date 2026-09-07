@@ -1156,6 +1156,7 @@ mod tests {
         let weights =
             Qwen3Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
         let execution = weights.execution(2).map_err(|error| error.to_string())?;
+        let inspection = artifact.observation().inspection();
         let requirements = execution
             .cpu_requirements()
             .map_err(|error| error.to_string())?;
@@ -1168,13 +1169,23 @@ mod tests {
         if requirements.max_context() != 2 {
             return Err("requirements did not retain the executor context bound".to_string());
         }
-        if requirements.returned_output_bytes() != TEST_HIDDEN * 4 {
-            return Err("requirements did not retain the final hidden output backing".to_string());
-        }
-        if requirements.serialized_backing_bytes() == 0
-            || requirements.workspace_upper_bound_bytes() == 0
+        if requirements.artifact_digest() != inspection.digest
+            || requirements.serialized_backing_bytes() != inspection.file_len
         {
-            return Err("requirements omitted verified backing or transient workspace".to_string());
+            return Err("requirements did not bind the verified artifact inspection".to_string());
+        }
+        let hidden = execution
+            .last_hidden(&[0, 1])
+            .map_err(|error| error.to_string())?;
+        let returned_bytes = u64::try_from(std::mem::size_of_val(hidden.as_slice()))
+            .map_err(|error| error.to_string())?;
+        if requirements.returned_output_bytes() != returned_bytes {
+            return Err(
+                "requirements did not retain the actual final hidden Vec backing".to_string(),
+            );
+        }
+        if requirements.workspace_upper_bound_bytes() == 0 {
+            return Err("requirements omitted transient workspace".to_string());
         }
         if requirements.logical_f32_upper_bound_bytes()
             != requirements.workspace_upper_bound_bytes() + requirements.returned_output_bytes()
@@ -1397,10 +1408,29 @@ mod tests {
         {
             return Err("rank profile did not retain its artifact geometry".to_string());
         }
-        let logits = weights
-            .execution(usize::try_from(TEST_CONTEXT).map_err(|error| error.to_string())?)
-            .and_then(|execution| execution.last_logits(&[0, 1]))
+        let execution = weights.execution(2).map_err(|error| error.to_string())?;
+        let requirements = execution
+            .cpu_requirements()
             .map_err(|error| error.to_string())?;
+        let inspection = artifact.observation().inspection();
+        if requirements.max_context() != 2
+            || requirements.artifact_digest() != inspection.digest
+            || requirements.serialized_backing_bytes() != inspection.file_len
+        {
+            return Err(
+                "rank requirements did not bind the admitted verified executor".to_string(),
+            );
+        }
+        let logits = execution
+            .last_logits(&[0, 1])
+            .map_err(|error| error.to_string())?;
+        if requirements.returned_output_bytes() != 0
+            || std::mem::size_of_val(&logits) != 2 * std::mem::size_of::<f32>()
+        {
+            return Err(
+                "rank requirements did not preserve stack-array output semantics".to_string(),
+            );
+        }
         if !logits.iter().all(|value| value.is_finite())
             || logits[0].to_bits() == logits[1].to_bits()
         {
