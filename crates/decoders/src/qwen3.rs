@@ -340,7 +340,8 @@ impl Qwen3Execution<'_, '_> {
     /// Return the checked CPU allocation envelope for this executor's admitted context.
     ///
     /// The envelope is a logical `f32` backing bound, not allocator capacity,
-    /// process RSS, tokenizer storage, GPU memory, or decoded GGUF weight storage.
+    /// process RSS, tokenizer storage, or GPU memory. Serialized GGUF backing
+    /// is reported separately; transient decoded norm vectors are workspace.
     ///
     /// # Errors
     ///
