@@ -36,6 +36,22 @@ const POOLING_TYPE: &str = "qwen3.pooling_type";
 const TOKEN_EMBEDDING: &str = "token_embd.weight";
 const OUTPUT_NORM: &str = "output_norm.weight";
 const LAST_POOLING_TYPE: u64 = 3;
+pub(crate) const RANK_HEAD: &str = "cls.output.weight";
+
+#[derive(Clone, Copy)]
+pub(crate) enum Qwen3Profile {
+    Embedding,
+    Rank,
+}
+
+impl Qwen3Profile {
+    const fn pooling_type(self) -> u64 {
+        match self {
+            Self::Embedding => LAST_POOLING_TYPE,
+            Self::Rank => 4,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -47,6 +63,7 @@ enum Shape {
     QueryHidden,
     HiddenFeedForward,
     FeedForwardHidden,
+    HiddenTwo,
 }
 
 #[derive(Clone, Copy)]
@@ -56,11 +73,17 @@ enum Storage {
 }
 
 #[derive(Clone, Copy)]
-struct Role {
+pub(crate) struct Role {
     name: &'static str,
     shape: Shape,
     storage: Storage,
 }
+
+pub(crate) const RANK_HEAD_ROLE: Role = Role {
+    name: RANK_HEAD,
+    shape: Shape::HiddenTwo,
+    storage: Storage::F32OrQ8Matrix,
+};
 
 const GLOBAL_ROLES: &[Role] = &[
     Role {
@@ -133,11 +156,59 @@ const BLOCK_ROLES: &[Role] = &[
     },
 ];
 
+/// Shared, verified Qwen3 causal body with its checked geometry.
+#[derive(Debug)]
+pub(crate) struct Qwen3BodyWeights<'artifact> {
+    payload: &'artifact VerifiedArtifact,
+    layout: Layout,
+}
+
+impl<'artifact> Qwen3BodyWeights<'artifact> {
+    pub(crate) fn try_from_verified(
+        payload: &'artifact VerifiedArtifact,
+        profile: Qwen3Profile,
+        profile_roles: &[Role],
+    ) -> Result<Self> {
+        let layout = Layout::from_artifact(payload, profile)?;
+        validate_inventory(
+            payload.observation().tensor_descriptors(),
+            layout,
+            profile_roles,
+        )?;
+        Ok(Self { payload, layout })
+    }
+
+    pub(crate) const fn hidden_width(&self) -> usize {
+        self.layout.hidden
+    }
+
+    pub(crate) const fn max_context(&self) -> usize {
+        self.layout.context
+    }
+
+    pub(crate) const fn payload(&self) -> &'artifact VerifiedArtifact {
+        self.payload
+    }
+
+    pub(crate) fn execution(&self, max_context: usize) -> Result<Qwen3Execution<'_, 'artifact>> {
+        if max_context == 0 || max_context > self.max_context() {
+            return Qwen3ExecutionSnafu {
+                requested: max_context,
+                rule: "max context must be nonzero and no greater than the artifact context",
+            }
+            .fail();
+        }
+        Ok(Qwen3Execution {
+            body: self,
+            max_context,
+        })
+    }
+}
+
 /// One verified Qwen3 embedding payload with its checked causal geometry.
 #[derive(Debug)]
 pub struct Qwen3Weights<'artifact> {
-    payload: &'artifact VerifiedArtifact,
-    layout: Layout,
+    body: Qwen3BodyWeights<'artifact>,
 }
 
 impl<'artifact> Qwen3Weights<'artifact> {
@@ -148,21 +219,21 @@ impl<'artifact> Qwen3Weights<'artifact> {
     /// Returns [`crate::Error`] when metadata, tensor roles, shapes, or the
     /// bounded no-output-head profile are not satisfied.
     pub fn try_from_verified(payload: &'artifact VerifiedArtifact) -> Result<Self> {
-        let layout = Layout::from_artifact(payload)?;
-        validate_inventory(payload.observation().tensor_descriptors(), layout)?;
-        Ok(Self { payload, layout })
+        Ok(Self {
+            body: Qwen3BodyWeights::try_from_verified(payload, Qwen3Profile::Embedding, &[])?,
+        })
     }
 
     /// Return the artifact-derived hidden-vector width.
     #[must_use]
     pub const fn hidden_width(&self) -> usize {
-        self.layout.hidden
+        self.body.hidden_width()
     }
 
     /// Return the artifact-derived maximum context length.
     #[must_use]
     pub const fn max_context(&self) -> usize {
-        self.layout.context
+        self.body.max_context()
     }
 
     /// Create one stateless bounded CPU embedding executor.
@@ -172,24 +243,14 @@ impl<'artifact> Qwen3Weights<'artifact> {
     /// Returns [`crate::Error`] when `max_context` is zero or exceeds the
     /// verified artifact's declared context length.
     pub fn execution(&self, max_context: usize) -> Result<Qwen3Execution<'_, 'artifact>> {
-        if max_context == 0 || max_context > self.layout.context {
-            return Qwen3ExecutionSnafu {
-                requested: max_context,
-                rule: "max context must be nonzero and no greater than the artifact context",
-            }
-            .fail();
-        }
-        Ok(Qwen3Execution {
-            weights: self,
-            max_context,
-        })
+        self.body.execution(max_context)
     }
 }
 
 /// Stateless Qwen3 causal embedding execution with an explicit caller context bound.
 #[derive(Debug)]
 pub struct Qwen3Execution<'weights, 'artifact> {
-    weights: &'weights Qwen3Weights<'artifact>,
+    body: &'weights Qwen3BodyWeights<'artifact>,
     max_context: usize,
 }
 
@@ -213,10 +274,10 @@ impl Qwen3Execution<'_, '_> {
             }
             .fail();
         }
-        let embedding = CheckedMatrix::from_payload(self.weights.payload, TOKEN_EMBEDDING)?;
+        let embedding = CheckedMatrix::from_payload(self.body.payload(), TOKEN_EMBEDDING)?;
         let mut hidden = reserve(
             "token hidden rows",
-            product(token_ids.len(), self.weights.layout.hidden)?,
+            product(token_ids.len(), self.body.layout.hidden)?,
         )?;
         for token_id in token_ids {
             let token = usize::try_from(*token_id).map_err(|_| {
@@ -228,23 +289,20 @@ impl Qwen3Execution<'_, '_> {
             })?;
             hidden.extend(embedding.decode_row(token)?);
         }
-        for block in 0..self.weights.layout.blocks {
+        for block in 0..self.body.layout.blocks {
             self.run_block(block, &mut hidden)?;
         }
-        let final_norm = read_f32_vector(
-            self.weights.payload,
-            OUTPUT_NORM,
-            self.weights.layout.hidden,
-        )?;
+        let final_norm =
+            read_f32_vector(self.body.payload(), OUTPUT_NORM, self.body.layout.hidden)?;
         let normalized = kernels::cpu_f32::rms_norm(
             &hidden,
             &final_norm,
             token_ids.len(),
-            self.weights.layout.hidden,
-            self.weights.layout.epsilon,
+            self.body.layout.hidden,
+            self.body.layout.epsilon,
         )
         .context(Qwen3CpuSnafu)?;
-        let start = product(token_ids.len() - 1, self.weights.layout.hidden)?;
+        let start = product(token_ids.len() - 1, self.body.layout.hidden)?;
         let result = normalized.get(start..).ok_or_else(|| {
             Qwen3ExecutionSnafu {
                 requested: start,
@@ -263,31 +321,31 @@ impl Qwen3Execution<'_, '_> {
         reason = "the checked causal-attention and FFN order is one source-defined transformer block"
     )]
     fn run_block(&self, block: usize, hidden: &mut [f32]) -> Result<()> {
-        let layout = self.weights.layout;
+        let layout = self.body.layout;
         let tokens = hidden.len() / layout.hidden;
         let attn_norm = read_f32_vector(
-            self.weights.payload,
+            self.body.payload(),
             &block_name(block, "attn_norm.weight"),
             layout.hidden,
         )?;
         let q_norm = read_f32_vector(
-            self.weights.payload,
+            self.body.payload(),
             &block_name(block, "attn_q_norm.weight"),
             layout.head_dim,
         )?;
         let k_norm = read_f32_vector(
-            self.weights.payload,
+            self.body.payload(),
             &block_name(block, "attn_k_norm.weight"),
             layout.head_dim,
         )?;
         let q =
-            CheckedMatrix::from_payload(self.weights.payload, &block_name(block, "attn_q.weight"))?;
+            CheckedMatrix::from_payload(self.body.payload(), &block_name(block, "attn_q.weight"))?;
         let k =
-            CheckedMatrix::from_payload(self.weights.payload, &block_name(block, "attn_k.weight"))?;
+            CheckedMatrix::from_payload(self.body.payload(), &block_name(block, "attn_k.weight"))?;
         let v =
-            CheckedMatrix::from_payload(self.weights.payload, &block_name(block, "attn_v.weight"))?;
+            CheckedMatrix::from_payload(self.body.payload(), &block_name(block, "attn_v.weight"))?;
         let output = CheckedMatrix::from_payload(
-            self.weights.payload,
+            self.body.payload(),
             &block_name(block, "attn_output.weight"),
         )?;
         let key_cache_len = product(tokens, layout.kv_width)?;
@@ -330,18 +388,18 @@ impl Qwen3Execution<'_, '_> {
         }
         add_in_place(hidden, &attention, "attention residual")?;
         let ffn_norm = read_f32_vector(
-            self.weights.payload,
+            self.body.payload(),
             &block_name(block, "ffn_norm.weight"),
             layout.hidden,
         )?;
         let gate = CheckedMatrix::from_payload(
-            self.weights.payload,
+            self.body.payload(),
             &block_name(block, "ffn_gate.weight"),
         )?;
         let up =
-            CheckedMatrix::from_payload(self.weights.payload, &block_name(block, "ffn_up.weight"))?;
+            CheckedMatrix::from_payload(self.body.payload(), &block_name(block, "ffn_up.weight"))?;
         let down = CheckedMatrix::from_payload(
-            self.weights.payload,
+            self.body.payload(),
             &block_name(block, "ffn_down.weight"),
         )?;
         let mut ffn = reserve("FFN residual", hidden.len())?;
@@ -386,16 +444,16 @@ impl Layout {
         clippy::too_many_lines,
         reason = "strict metadata parsing keeps Qwen3 profile relations in one auditable authority"
     )]
-    fn from_artifact(payload: &VerifiedArtifact) -> Result<Self> {
+    fn from_artifact(payload: &VerifiedArtifact, profile: Qwen3Profile) -> Result<Self> {
         let metadata = payload.observation().metadata();
         require_string(metadata, ARCHITECTURE, "qwen3")?;
-        require_u32(metadata, POOLING_TYPE, "last-token pooling type")?
-            .eq(&LAST_POOLING_TYPE)
+        require_u32(metadata, POOLING_TYPE, "profile pooling type")?
+            .eq(&profile.pooling_type())
             .then_some(())
             .ok_or_else(|| {
                 Qwen3MetadataSnafu {
                     key: POOLING_TYPE,
-                    rule: "must select last-token pooling type 3",
+                    rule: "must select the requested bounded profile pooling type",
                 }
                 .build()
             })?;
@@ -480,11 +538,16 @@ impl Layout {
     clippy::too_many_lines,
     reason = "one role inventory defines the complete bounded Qwen3 embedding tensor contract"
 )]
-fn validate_inventory(tensors: &[loader::gguf::TensorDescriptor], layout: Layout) -> Result<()> {
+fn validate_inventory(
+    tensors: &[loader::gguf::TensorDescriptor],
+    layout: Layout,
+    profile_roles: &[Role],
+) -> Result<()> {
     let expected_count = layout
         .blocks
         .checked_mul(BLOCK_ROLES.len())
         .and_then(|count| count.checked_add(GLOBAL_ROLES.len()))
+        .and_then(|count| count.checked_add(profile_roles.len()))
         .ok_or_else(|| {
             Qwen3ExecutionSnafu {
                 requested: layout.blocks,
@@ -507,7 +570,7 @@ fn validate_inventory(tensors: &[loader::gguf::TensorDescriptor], layout: Layout
             length: expected_count,
         })?;
     for tensor in tensors {
-        let Some(role) = role_for_name(&tensor.name, layout.blocks) else {
+        let Some(role) = role_for_name(&tensor.name, layout.blocks, profile_roles) else {
             return Qwen3TensorSnafu {
                 name: tensor.name.clone(),
                 rule: "is outside the bounded embedding role inventory",
@@ -554,6 +617,15 @@ fn validate_inventory(tensors: &[loader::gguf::TensorDescriptor], layout: Layout
             .fail();
         }
     }
+    for role in profile_roles {
+        if !found.contains(role.name) {
+            return Qwen3TensorSnafu {
+                name: role.name.to_string(),
+                rule: "is required by the bounded Qwen3 profile",
+            }
+            .fail();
+        }
+    }
     for block in 0..layout.blocks {
         for role in BLOCK_ROLES {
             let name = block_name(block, role.name);
@@ -586,12 +658,16 @@ impl Shape {
             Self::QueryHidden => vec![query, hidden],
             Self::HiddenFeedForward => vec![hidden, feed_forward],
             Self::FeedForwardHidden => vec![feed_forward, hidden],
+            Self::HiddenTwo => vec![hidden, 2],
         })
     }
 }
 
-fn role_for_name(name: &str, blocks: usize) -> Option<Role> {
+fn role_for_name(name: &str, blocks: usize, profile_roles: &[Role]) -> Option<Role> {
     if let Some(role) = GLOBAL_ROLES.iter().copied().find(|role| role.name == name) {
+        return Some(role);
+    }
+    if let Some(role) = profile_roles.iter().copied().find(|role| role.name == name) {
         return Some(role);
     }
     let remainder = name.strip_prefix("blk.")?;
@@ -1188,6 +1264,101 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn executes_the_rank_profile_to_ordered_raw_classifier_logits()
+    -> std::result::Result<(), String> {
+        let raw = rank_fixture()?;
+        let artifact = verify(&raw)?;
+        let weights = crate::Qwen3RankWeights::try_from_verified(&artifact)
+            .map_err(|error| error.to_string())?;
+        if weights.hidden_width()
+            != usize::try_from(TEST_HIDDEN).map_err(|error| error.to_string())?
+            || weights.max_context()
+                != usize::try_from(TEST_CONTEXT).map_err(|error| error.to_string())?
+        {
+            return Err("rank profile did not retain its artifact geometry".to_string());
+        }
+        let logits = weights
+            .execution(usize::try_from(TEST_CONTEXT).map_err(|error| error.to_string())?)
+            .and_then(|execution| execution.last_logits(&[0, 1]))
+            .map_err(|error| error.to_string())?;
+        if !logits.iter().all(|value| value.is_finite())
+            || logits[0].to_bits() == logits[1].to_bits()
+        {
+            return Err(
+                "rank classifier did not preserve finite distinct yes/no logits".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_rank_profile_metadata_and_inventory_deviations() -> std::result::Result<(), String> {
+        let cases: [fn(&mut RawGguf); 8] = [
+            rank_pooling_as_embedding,
+            remove_rank_labels,
+            reverse_rank_labels,
+            wrong_rank_labels,
+            wrong_rank_head_shape,
+            wrong_rank_head_dtype,
+            extra_rank_lm_head,
+            rank_causal_false,
+        ];
+        for mutate in cases {
+            let mut raw = rank_fixture()?;
+            mutate(&mut raw);
+            let artifact = verify(&raw)?;
+            if crate::Qwen3RankWeights::try_from_verified(&artifact).is_ok() {
+                return Err(
+                    "rank profile accepted a strict metadata or inventory deviation".to_string(),
+                );
+            }
+        }
+        let mut scaled = rank_fixture()?;
+        nonneutral_current_rope_scaling(&mut scaled);
+        let artifact = verify(&scaled)?;
+        if crate::Qwen3RankWeights::try_from_verified(&artifact).is_ok() {
+            return Err("rank profile accepted nonneutral rope scaling".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rank_head_refuses_nonfinite_and_overflowing_projection_without_poisoning_retry()
+    -> std::result::Result<(), String> {
+        for value in [f32::NAN, f32::INFINITY, f32::MAX] {
+            let mut malformed = rank_fixture()?;
+            let head = find_tensor_mut(&mut malformed, RANK_HEAD)?;
+            for lane in head.payload[..12].chunks_exact_mut(4) {
+                lane.copy_from_slice(&value.to_le_bytes());
+            }
+            let artifact = verify(&malformed)?;
+            let weights = crate::Qwen3RankWeights::try_from_verified(&artifact)
+                .map_err(|error| error.to_string())?;
+            let execution = weights
+                .execution(usize::try_from(TEST_CONTEXT).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+            match execution.last_logits(&[0]) {
+                Err(crate::Error::ProjectionRow { .. } | crate::Error::Qwen3Arithmetic { .. }) => {}
+                other => {
+                    return Err(format!(
+                        "rank head nonfinite or overflowing projection was accepted for {value:?}: {other:?}"
+                    ));
+                }
+            }
+        }
+        let artifact = verify(&rank_fixture()?)?;
+        let logits = crate::Qwen3RankWeights::try_from_verified(&artifact)
+            .map_err(|error| error.to_string())?
+            .execution(usize::try_from(TEST_CONTEXT).map_err(|error| error.to_string())?)
+            .and_then(|execution| execution.last_logits(&[0]))
+            .map_err(|error| error.to_string())?;
+        if !logits.iter().all(|value| value.is_finite()) {
+            return Err("pristine rank retry produced nonfinite logits".to_string());
+        }
+        Ok(())
+    }
+
     #[derive(Clone, Copy)]
     enum ExpectedProfileError {
         Metadata(&'static str),
@@ -1254,6 +1425,57 @@ mod tests {
 
     fn remove_hidden(raw: &mut RawGguf) {
         raw.metadata.retain(|entry| entry.key != HIDDEN);
+    }
+
+    fn rank_pooling_as_embedding(raw: &mut RawGguf) {
+        replace_metadata(raw, POOLING_TYPE, &RawMetadataValue::U32(3));
+    }
+
+    fn remove_rank_labels(raw: &mut RawGguf) {
+        raw.metadata
+            .retain(|entry| entry.key != "qwen3.classifier.output_labels");
+    }
+
+    fn reverse_rank_labels(raw: &mut RawGguf) {
+        replace_metadata(
+            raw,
+            "qwen3.classifier.output_labels",
+            &RawMetadataValue::StringArray(vec!["no".to_string(), "yes".to_string()]),
+        );
+    }
+
+    fn wrong_rank_labels(raw: &mut RawGguf) {
+        replace_metadata(
+            raw,
+            "qwen3.classifier.output_labels",
+            &RawMetadataValue::StringArray(vec!["yes".to_string(), "maybe".to_string()]),
+        );
+    }
+
+    fn wrong_rank_head_shape(raw: &mut RawGguf) {
+        replace_tensor_dimensions(raw, RANK_HEAD, &[TEST_HIDDEN, 1]);
+    }
+
+    fn wrong_rank_head_dtype(raw: &mut RawGguf) {
+        for tensor in &mut raw.tensors {
+            if tensor.name == RANK_HEAD {
+                tensor.format = 1;
+                tensor.payload = vec![0; 12];
+            }
+        }
+    }
+
+    fn extra_rank_lm_head(raw: &mut RawGguf) {
+        raw.tensors.push(RawTensor {
+            name: "output.weight".to_string(),
+            dims: vec![TEST_HIDDEN, TEST_VOCABULARY],
+            format: 0,
+            payload: vec![0; 48],
+        });
+    }
+
+    fn rank_causal_false(raw: &mut RawGguf) {
+        raw.metadata.push(metadata_bool(CAUSAL, false));
     }
 
     fn mistype_hidden(raw: &mut RawGguf) {
@@ -1501,6 +1723,18 @@ mod tests {
             ],
             tensors,
         })
+    }
+
+    fn rank_fixture() -> std::result::Result<RawGguf, String> {
+        let mut raw = fixture()?;
+        replace_metadata(&mut raw, POOLING_TYPE, &RawMetadataValue::U32(4));
+        raw.metadata.push(RawMetadata {
+            key: "qwen3.classifier.output_labels".to_string(),
+            value: RawMetadataValue::StringArray(vec!["yes".to_string(), "no".to_string()]),
+        });
+        raw.tensors
+            .push(tensor(RANK_HEAD, vec![TEST_HIDDEN, 2], 0.3125)?);
+        Ok(raw)
     }
 
     fn metadata_u32(key: &str, value: u32) -> RawMetadata {
