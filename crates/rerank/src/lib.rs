@@ -39,7 +39,7 @@ pub use crate::config::{ModernBertConfig, ModernBertPreflight};
 pub use crate::cpu_reranker::{ClassifierHead, ModernBertCpuReranker};
 pub use crate::error::{Error, Result};
 pub use crate::gte::GteReranker;
-pub use crate::qwen3::{Qwen3Reranker, Qwen3RerankerLimits};
+pub use crate::qwen3::{Qwen3Reranker, Qwen3RerankerCpuRequirements, Qwen3RerankerLimits};
 pub use crate::reranker::Reranker;
 
 #[cfg(test)]

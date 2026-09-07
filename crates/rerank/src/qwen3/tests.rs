@@ -292,6 +292,57 @@ fn late_head_refusal_returns_an_error_and_pristine_retry_remains_usable() -> Tes
 }
 
 #[test]
+fn cpu_requirements_compose_sequential_scalar_score_rows() -> TestResult<()> {
+    let raw = raw_rank_fixture()?;
+    let (_directory, artifact) = verified_artifact(&raw)?;
+    let single = reranker(&artifact, limits(128, 6, 1)?)?.cpu_requirements()?;
+    let batch = reranker(&artifact, limits(128, 6, 3)?)?.cpu_requirements()?;
+    let decoder = single.decoder_cpu_requirements();
+    let score_bytes = u64::try_from(std::mem::size_of::<f32>())?;
+    assert_eq!(single.max_batch_items(), 1);
+    assert_eq!(single.returned_output_bytes(), score_bytes);
+    assert_eq!(
+        single.logical_f32_upper_bound_bytes(),
+        score_bytes.max(decoder.workspace_upper_bound_bytes())
+    );
+    assert_eq!(batch.max_batch_items(), 3);
+    assert_eq!(
+        batch.returned_output_bytes(),
+        score_bytes
+            .checked_mul(3)
+            .ok_or("synthetic rerank output multiplication overflowed")?
+    );
+    assert_eq!(
+        batch.logical_f32_upper_bound_bytes(),
+        score_bytes
+            .checked_mul(3)
+            .ok_or("synthetic rerank output multiplication overflowed")?
+            .max(
+                score_bytes
+                    .checked_mul(2)
+                    .and_then(|prior| prior.checked_add(decoder.workspace_upper_bound_bytes()))
+                    .ok_or("synthetic rerank peak multiplication overflowed")?,
+            )
+    );
+    if decoder.returned_output_bytes() != 0 {
+        return Err("rank decoder must classify terminal hidden output as workspace".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn cpu_requirements_refuse_overflowing_scalar_batch_output() -> TestResult<()> {
+    let raw = raw_rank_fixture()?;
+    let (_directory, artifact) = verified_artifact(&raw)?;
+    let model = reranker(&artifact, limits(128, 6, usize::MAX)?)?;
+    assert!(matches!(
+        model.cpu_requirements(),
+        Err(Error::Qwen3RequirementsOverflow { .. })
+    ));
+    Ok(())
+}
+
+#[test]
 fn later_item_refusal_discards_partial_batch_and_allows_same_instance_retry() -> TestResult<()> {
     let raw = raw_rank_fixture()?;
     let (_directory, artifact) = verified_artifact(&raw)?;

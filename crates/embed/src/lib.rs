@@ -44,7 +44,9 @@ pub mod qwen3;
 pub mod stella;
 
 pub use crate::error::{Error, Result};
-pub use crate::qwen3::{Qwen3EmbeddingLimits, Qwen3EmbeddingModel, Qwen3RolePrefixes};
+pub use crate::qwen3::{
+    Qwen3EmbeddingCpuRequirements, Qwen3EmbeddingLimits, Qwen3EmbeddingModel, Qwen3RolePrefixes,
+};
 #[cfg(feature = "stella")]
 pub use crate::stella::{StellaDim, StellaModel};
 

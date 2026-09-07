@@ -1,6 +1,6 @@
 //! Bounded CPU Qwen3 retrieval embeddings.
 
-use decoders::Qwen3Weights;
+use decoders::{Qwen3CpuRequirements, Qwen3Weights};
 use loader::gguf::{MetaValue, VerifiedArtifact};
 use logismos_core::{
     ComputeSnafu as CoreComputeSnafu, EmbeddingError, EmbeddingModel, EncodeOpts,
@@ -14,8 +14,8 @@ use tokenize::VerifiedTokenizer;
 use crate::error::{
     AllocationSnafu, BatchTooLargeSnafu, DecodersSnafu, EmptyInputSnafu,
     InputByteLengthOverflowSnafu, InputBytesTooLongSnafu, InputTooLongSnafu, InvalidLimitsSnafu,
-    MetadataSnafu, NonNormalizableSnafu, Qwen3TokenizerSnafu, Result, UnresolvedPromptRoleSnafu,
-    UnsupportedDimSnafu,
+    MetadataSnafu, NonNormalizableSnafu, Qwen3TokenizerSnafu, RequirementsOverflowSnafu, Result,
+    UnresolvedPromptRoleSnafu, UnsupportedDimSnafu,
 };
 
 const TOKENS: &str = "tokenizer.ggml.tokens";
@@ -43,6 +43,47 @@ pub struct Qwen3EmbeddingLimits {
     pub max_tokens: usize,
     /// Maximum input objects accepted by one bounded batch request.
     pub max_batch_items: usize,
+}
+
+/// Logical CPU `f32` payload requirements for the Qwen3 embedding adapter.
+///
+/// This report composes one artifact-bound decoder execution with sequential
+/// batch-result accumulation at the admitted setup limits. It counts requested
+/// `f32` payload backing only: allocator capacity and metadata, `Vec` headers,
+/// tokenizer/template state and intermediates, process memory, physical
+/// residency, and GPU memory are excluded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen3EmbeddingCpuRequirements {
+    decoder: Qwen3CpuRequirements,
+    max_batch_items: usize,
+    returned_output_bytes: u64,
+    logical_f32_upper_bound_bytes: u64,
+}
+
+impl Qwen3EmbeddingCpuRequirements {
+    /// Return the one-item artifact-bound decoder requirement report.
+    #[must_use]
+    pub const fn decoder_cpu_requirements(self) -> Qwen3CpuRequirements {
+        self.decoder
+    }
+
+    /// Return the trusted maximum number of sequential embedding results.
+    #[must_use]
+    pub const fn max_batch_items(self) -> usize {
+        self.max_batch_items
+    }
+
+    /// Return caller-retained full-width embedding `f32` payload bytes.
+    #[must_use]
+    pub const fn returned_output_bytes(self) -> u64 {
+        self.returned_output_bytes
+    }
+
+    /// Return the sequential-batch logical `f32` payload upper bound.
+    #[must_use]
+    pub const fn logical_f32_upper_bound_bytes(self) -> u64 {
+        self.logical_f32_upper_bound_bytes
+    }
 }
 
 /// Artifact-bound CPU Qwen3 embedding model with last-token pooling.
@@ -141,6 +182,50 @@ impl<'artifact> Qwen3EmbeddingModel<'artifact> {
             supported: [hidden],
         })
     }
+
+    /// Return logical CPU `f32` payload requirements at this model's trusted setup maxima.
+    ///
+    /// The embedded decoder report identifies immutable serialized backing
+    /// separately. This wrapper adds only sequential caller-result payloads;
+    /// it is not an allocator, process, physical-residency, or GPU budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when the admitted decoder requirement report or
+    /// checked sequential result composition cannot be represented.
+    pub fn cpu_requirements(&self) -> Result<Qwen3EmbeddingCpuRequirements> {
+        let decoder = self
+            .weights
+            .execution(self.max_tokens)
+            .context(DecodersSnafu)?
+            .cpu_requirements()
+            .context(DecodersSnafu)?;
+        let returned_output_bytes = multiply_bytes(
+            decoder.returned_output_bytes(),
+            self.max_batch_items,
+            "embedding batch returned output",
+        )?;
+        let prior_output_bytes = multiply_bytes(
+            decoder.returned_output_bytes(),
+            self.max_batch_items - 1,
+            "embedding prior batch output",
+        )?;
+        let logical_f32_upper_bound_bytes = prior_output_bytes
+            .checked_add(decoder.logical_f32_upper_bound_bytes())
+            .ok_or_else(|| {
+                RequirementsOverflowSnafu {
+                    target: "embedding sequential logical payload",
+                }
+                .build()
+            })?;
+        Ok(Qwen3EmbeddingCpuRequirements {
+            decoder,
+            max_batch_items: self.max_batch_items,
+            returned_output_bytes,
+            logical_f32_upper_bound_bytes,
+        })
+    }
+
     /// Encode with detailed native errors.
     pub fn encode_cpu(&self, text: &str, opts: &EncodeOpts) -> Result<Vec<f32>> {
         self.encode_with_policy(text, opts, self.request_policy(opts)?)
@@ -376,6 +461,13 @@ fn normalize(mut values: Vec<f32>) -> Result<Vec<f32>> {
     Ok(values)
 }
 
+fn multiply_bytes(bytes: u64, count: usize, target: &'static str) -> Result<u64> {
+    let count = u64::try_from(count).map_err(|_| RequirementsOverflowSnafu { target }.build())?;
+    bytes
+        .checked_mul(count)
+        .ok_or_else(|| RequirementsOverflowSnafu { target }.build())
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
@@ -607,6 +699,84 @@ mod tests {
         let vectors = EmbeddingModel::encode_batch(&model, &batch, &opts)?;
         assert_eq!(vectors.len(), 3);
         assert!(vectors.iter().flatten().all(|value| value.is_finite()));
+        Ok(())
+    }
+
+    #[test]
+    fn qwen3_cpu_requirements_compose_sequential_embedding_outputs()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let artifact = artifact(&fixture()?)?;
+        let single = Qwen3EmbeddingModel::from_verified_cpu(
+            &artifact,
+            verified_tokenizer(TokenizerModel::WordLevel)?,
+            Qwen3EmbeddingLimits {
+                max_text_bytes: 32,
+                max_tokens: 4,
+                max_batch_items: 1,
+            },
+            Qwen3RolePrefixes::default(),
+        )?
+        .cpu_requirements()?;
+        let batch = Qwen3EmbeddingModel::from_verified_cpu(
+            &artifact,
+            verified_tokenizer(TokenizerModel::WordLevel)?,
+            Qwen3EmbeddingLimits {
+                max_text_bytes: 32,
+                max_tokens: 4,
+                max_batch_items: 3,
+            },
+            Qwen3RolePrefixes::default(),
+        )?
+        .cpu_requirements()?;
+        let decoder = single.decoder_cpu_requirements();
+        let single_output = decoder.returned_output_bytes();
+        assert_eq!(single.max_batch_items(), 1);
+        assert_eq!(single.returned_output_bytes(), single_output);
+        assert_eq!(
+            single.logical_f32_upper_bound_bytes(),
+            decoder.logical_f32_upper_bound_bytes()
+        );
+        assert_eq!(batch.max_batch_items(), 3);
+        assert_eq!(
+            batch.returned_output_bytes(),
+            single_output
+                .checked_mul(3)
+                .ok_or("synthetic embedding output multiplication overflowed")?
+        );
+        assert_eq!(
+            batch.logical_f32_upper_bound_bytes(),
+            single_output
+                .checked_mul(2)
+                .and_then(|prior| prior.checked_add(decoder.logical_f32_upper_bound_bytes()))
+                .ok_or("synthetic embedding peak multiplication overflowed")?
+        );
+        assert_eq!(
+            decoder.returned_output_bytes(),
+            HIDDEN
+                .checked_mul(u64::try_from(std::mem::size_of::<f32>())?)
+                .ok_or("synthetic embedding hidden payload overflowed")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn qwen3_cpu_requirements_refuse_overflowing_batch_output()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let artifact = artifact(&fixture()?)?;
+        let model = Qwen3EmbeddingModel::from_verified_cpu(
+            &artifact,
+            verified_tokenizer(TokenizerModel::WordLevel)?,
+            Qwen3EmbeddingLimits {
+                max_text_bytes: 32,
+                max_tokens: 4,
+                max_batch_items: usize::MAX,
+            },
+            Qwen3RolePrefixes::default(),
+        )?;
+        assert!(matches!(
+            model.cpu_requirements(),
+            Err(crate::error::Error::RequirementsOverflow { .. })
+        ));
         Ok(())
     }
 
