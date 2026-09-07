@@ -160,14 +160,16 @@ fn malformed_artifact_metadata_and_tokenizer_cannot_bypass_admission() -> TestRe
     let (_directory, artifact) = verified_artifact(&raw)?;
     let error = reranker(&artifact, limits(128, 6, 1)?)
         .err()
-        .ok_or("reversed artifact vocabulary unexpectedly passed admission")?;
+        .ok_or("reversed artifact vocabulary unexpectedly passed admission")?
+        .downcast_ref::<Error>()
+        .ok_or("artifact vocabulary admission failure was not a rerank error")?;
     if !matches!(
-        &error,
+        error,
         Error::Qwen3Tokenizer {
             source: TokenizerError::VocabularyMismatch { id: 0, .. },
             ..
         }
-    ) || StdError::source(&error).is_none()
+    ) || StdError::source(error).is_none()
     {
         return Err("artifact vocabulary refusal lost its typed source chain".into());
     }
@@ -177,8 +179,10 @@ fn malformed_artifact_metadata_and_tokenizer_cannot_bypass_admission() -> TestRe
     let (_directory, artifact) = verified_artifact(&raw)?;
     let error = reranker(&artifact, limits(128, 6, 1)?)
         .err()
-        .ok_or("invalid artifact template unexpectedly passed admission")?;
-    if !matches!(&error, Error::Qwen3Template { .. }) || StdError::source(&error).is_none() {
+        .ok_or("invalid artifact template unexpectedly passed admission")?
+        .downcast_ref::<Error>()
+        .ok_or("artifact template admission failure was not a rerank error")?;
+    if !matches!(error, Error::Qwen3Template { .. }) || StdError::source(error).is_none() {
         return Err("template admission failure lost its typed source chain".into());
     }
 
@@ -648,8 +652,10 @@ fn assert_metadata_refusal(
     let (_directory, artifact) = verified_artifact(&raw)?;
     let error = reranker(&artifact, limits(128, 6, 1)?)
         .err()
-        .ok_or("malformed metadata unexpectedly passed rerank admission")?;
-    if !matches!(&error, Error::Qwen3Metadata { key: actual, .. } if *actual == key) {
+        .ok_or("malformed metadata unexpectedly passed rerank admission")?
+        .downcast_ref::<Error>()
+        .ok_or("malformed metadata admission failure was not a rerank error")?;
+    if !matches!(error, Error::Qwen3Metadata { key: actual, .. } if *actual == key) {
         return Err(format!("metadata key `{key}` was not precisely reported").into());
     }
     Ok(())
