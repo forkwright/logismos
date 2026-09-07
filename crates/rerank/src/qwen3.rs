@@ -26,6 +26,10 @@ const IM_START: &str = "<|im_start|>";
 const IM_END: &str = "<|im_end|>";
 
 /// Explicit CPU work limits for one Qwen3 reranker.
+///
+/// These limits bound accepted input and retained renderer output, not every
+/// tokenizer or template temporary allocation in the process. Requests that
+/// exceed them are refused rather than truncated.
 #[derive(Clone, Copy, Debug)]
 pub struct Qwen3RerankerLimits {
     /// Maximum checked UTF-8 bytes across instruction, query, and document.
@@ -42,7 +46,7 @@ pub struct Qwen3RerankerLimits {
 pub struct Qwen3Reranker<'artifact> {
     weights: Qwen3RankWeights<'artifact>,
     tokenizer: VerifiedTokenizer,
-    template: BoundedTemplate,
+    template: BoundedTemplate<'artifact>,
     instruction: String,
     max_pair_bytes: usize,
     max_tokens: usize,
@@ -70,6 +74,9 @@ impl<'artifact> Qwen3Reranker<'artifact> {
             }
             .fail();
         }
+        tokenizer
+            .verify_unpadded_untruncated()
+            .context(Qwen3TokenizerSnafu)?;
         let metadata = artifact.observation().metadata();
         let vocabulary = vocabulary(metadata)?;
         tokenizer
@@ -262,6 +269,13 @@ fn validate_batch(batch: &RerankBatch, limit: usize) -> Result<()> {
     if batch.items.is_empty() {
         return EmptyBatchSnafu.fail();
     }
+    if batch.items.len() > limit {
+        return Qwen3BatchTooLargeSnafu {
+            actual: batch.items.len(),
+            limit,
+        }
+        .fail();
+    }
     for (index, item) in batch.items.iter().enumerate() {
         if item.query.trim().is_empty() {
             return EmptyQuerySnafu { index }.fail();
@@ -269,13 +283,6 @@ fn validate_batch(batch: &RerankBatch, limit: usize) -> Result<()> {
         if item.document.trim().is_empty() {
             return EmptyDocumentSnafu { index }.fail();
         }
-    }
-    if batch.items.len() > limit {
-        return Qwen3BatchTooLargeSnafu {
-            actual: batch.items.len(),
-            limit,
-        }
-        .fail();
     }
     Ok(())
 }
