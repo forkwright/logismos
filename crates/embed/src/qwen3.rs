@@ -95,6 +95,9 @@ impl<'artifact> Qwen3EmbeddingModel<'artifact> {
                 }),
             )
             .context(Qwen3TokenizerSnafu)?;
+        tokenizer
+            .verify_unpadded_untruncated()
+            .context(Qwen3TokenizerSnafu)?;
         let insert_bos = flag(metadata, ADD_BOS)?;
         let append_eos = flag(metadata, ADD_EOS)?;
         let bos = id(metadata, BOS)?;
@@ -638,14 +641,70 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn qwen3_refuses_configured_tokenizer_padding_and_truncation()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let artifact = artifact(&fixture()?)?;
+        for (settings, expected) in [
+            (TokenizerSettings::ConfiguredPadding, "padding"),
+            (TokenizerSettings::ConfiguredTruncation, "truncation"),
+        ] {
+            let Err(error) = Qwen3EmbeddingModel::from_verified_cpu(
+                &artifact,
+                verified_tokenizer_with_settings(TokenizerModel::WordLevel, settings)?,
+                Qwen3EmbeddingLimits {
+                    max_text_bytes: 32,
+                    max_tokens: 4,
+                    max_batch_items: 4,
+                },
+                Qwen3RolePrefixes::default(),
+            ) else {
+                return Err(format!("configured tokenizer {expected} must be rejected").into());
+            };
+            let crate::error::Error::Qwen3Tokenizer { source, .. } = error else {
+                return Err(
+                    format!("configured tokenizer {expected} must retain its source").into(),
+                );
+            };
+            assert!(
+                matches!(
+                    (settings, source),
+                    (
+                        TokenizerSettings::ConfiguredPadding,
+                        tokenize::Error::ConfiguredPadding { .. }
+                    ) | (
+                        TokenizerSettings::ConfiguredTruncation,
+                        tokenize::Error::ConfiguredTruncation { .. }
+                    )
+                ),
+                "native Qwen3 setup must retain the typed {expected} refusal"
+            );
+        }
+        Ok(())
+    }
+
     #[derive(Clone, Copy)]
     enum TokenizerModel {
         WordLevel,
         WordPiece,
     }
 
+    #[derive(Clone, Copy)]
+    enum TokenizerSettings {
+        Null,
+        ConfiguredPadding,
+        ConfiguredTruncation,
+    }
+
     fn verified_tokenizer(
         kind: TokenizerModel,
+    ) -> std::result::Result<VerifiedTokenizer, Box<dyn StdError>> {
+        verified_tokenizer_with_settings(kind, TokenizerSettings::Null)
+    }
+
+    fn verified_tokenizer_with_settings(
+        kind: TokenizerModel,
+        settings: TokenizerSettings,
     ) -> std::result::Result<VerifiedTokenizer, Box<dyn StdError>> {
         let model = match kind {
             TokenizerModel::WordLevel => {
@@ -655,8 +714,19 @@ mod tests {
                 r###"{"type":"WordPiece","unk_token":"[UNK]","continuing_subword_prefix":"##","max_input_chars_per_word":100,"vocab":{"[BOS]":0,"[EOS]":1,"alice":2,"bob":3}}"###
             }
         };
+        let (truncation, padding) = match settings {
+            TokenizerSettings::Null => ("null", "null"),
+            TokenizerSettings::ConfiguredPadding => (
+                "null",
+                r#"{"strategy":{"Fixed":4},"direction":"Right","pad_to_multiple_of":null,"pad_id":0,"pad_type_id":0,"pad_token":"[BOS]"}"#,
+            ),
+            TokenizerSettings::ConfiguredTruncation => (
+                r#"{"direction":"Right","max_length":1,"strategy":"LongestFirst","stride":0}"#,
+                "null",
+            ),
+        };
         let json = format!(
-            r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{{"id":0,"content":"[BOS]","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}},{{"id":1,"content":"[EOS]","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}}],"normalizer":null,"pre_tokenizer":{{"type":"Whitespace"}},"post_processor":{{"type":"TemplateProcessing","single":[{{"Sequence":{{"id":"A","type_id":0}}}},{{"SpecialToken":{{"id":"[EOS]","type_id":0}}}}],"pair":[{{"Sequence":{{"id":"A","type_id":0}}}},{{"Sequence":{{"id":"B","type_id":1}}}},{{"SpecialToken":{{"id":"[EOS]","type_id":0}}}}],"special_tokens":{{"[EOS]":{{"id":"[EOS]","ids":[1],"tokens":["[EOS]"]}}}}}},"decoder":null,"model":{model}}}"#
+            r#"{{"version":"1.0","truncation":{truncation},"padding":{padding},"added_tokens":[{{"id":0,"content":"[BOS]","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}},{{"id":1,"content":"[EOS]","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}}],"normalizer":null,"pre_tokenizer":{{"type":"Whitespace"}},"post_processor":{{"type":"TemplateProcessing","single":[{{"Sequence":{{"id":"A","type_id":0}}}},{{"SpecialToken":{{"id":"[EOS]","type_id":0}}}}],"pair":[{{"Sequence":{{"id":"A","type_id":0}}}},{{"Sequence":{{"id":"B","type_id":1}}}},{{"SpecialToken":{{"id":"[EOS]","type_id":0}}}}],"special_tokens":{{"[EOS]":{{"id":"[EOS]","ids":[1],"tokens":["[EOS]"]}}}}}},"decoder":null,"model":{model}}}"#
         );
         let bytes = json.as_bytes();
         let length = NonZeroUsize::new(bytes.len()).ok_or("empty synthetic tokenizer")?;
