@@ -1,0 +1,17 @@
+[package]
+name = "templates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded format-neutral MiniJinja rendering."
+publish = false
+
+[dependencies]
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+snafu = { workspace = true }
+
+[lints]
+workspace = true

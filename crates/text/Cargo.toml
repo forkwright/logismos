@@ -12,9 +12,9 @@ decoders = { path = "../decoders" }
 decode = { path = "../decode" }
 loader = { path = "../loader", default-features = false }
 minijinja = { workspace = true }
-minijinja-contrib = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 snafu = { workspace = true }
+templates = { path = "../templates" }
 tokenize = { path = "../tokenize" }
 
 [lints]

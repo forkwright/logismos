@@ -1,7 +1,8 @@
 //! The reranker trait contract.
 //!
-//! Implementations live beside their backend: [`crate::cpu_reranker`] for
-//! the CPU cross-encoder, [`crate::gte`] for the preflight surface.
+//! Implementations live beside their backend: [`crate::qwen3`] for native
+//! Qwen3, `cpu_reranker` for feature-gated ModernBERT, and [`crate::gte`]
+//! for the preflight surface.
 
 use crate::batch::{Predictions, RerankBatch};
 use crate::error::Result;

@@ -67,6 +67,22 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// A verified tokenizer retains upstream padding configuration.
+    #[snafu(display("tokenizer retains configured upstream padding"))]
+    ConfiguredPadding {
+        /// Source code location where the refusal was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A verified tokenizer retains upstream truncation configuration.
+    #[snafu(display("tokenizer retains configured upstream truncation"))]
+    ConfiguredTruncation {
+        /// Source code location where the refusal was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// The expected vocabulary count differs from the tokenizer vocabulary count.
     #[snafu(display("tokenizer vocabulary has {actual} entries, expected {expected} entries"))]
     VocabularyLengthMismatch {

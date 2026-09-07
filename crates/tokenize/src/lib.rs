@@ -36,11 +36,11 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::error::{
-    ByteLengthMismatchSnafu, ByteLimitExceededSnafu, DigestMismatchSnafu,
-    ExpectedVocabularyLengthMismatchSnafu, InvalidByteLimitSnafu,
-    SpecialTokenEncodingMismatchSnafu, SpecialTokenIdOutOfRangeSnafu, SpecialTokenMissingSnafu,
-    SpecialTokenNotMarkedSnafu, UpstreamSnafu, VocabularyIdOutOfRangeSnafu,
-    VocabularyLengthMismatchSnafu, VocabularyMismatchSnafu,
+    ByteLengthMismatchSnafu, ByteLimitExceededSnafu, ConfiguredPaddingSnafu,
+    ConfiguredTruncationSnafu, DigestMismatchSnafu, ExpectedVocabularyLengthMismatchSnafu,
+    InvalidByteLimitSnafu, SpecialTokenEncodingMismatchSnafu, SpecialTokenIdOutOfRangeSnafu,
+    SpecialTokenMissingSnafu, SpecialTokenNotMarkedSnafu, UpstreamSnafu,
+    VocabularyIdOutOfRangeSnafu, VocabularyLengthMismatchSnafu, VocabularyMismatchSnafu,
 };
 
 pub use crate::error::{Error, Result};
@@ -193,6 +193,27 @@ impl VerifiedTokenizer {
     #[must_use]
     pub const fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
+    }
+
+    /// Refuse a tokenizer that can silently pad or truncate native input.
+    ///
+    /// Native text, embedding, and reranking boundaries own their explicit
+    /// request limits and special-token policies. This check leaves upstream
+    /// settings intact so ordinary tokenizer consumers retain their configured
+    /// behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfiguredPadding`] or [`Error::ConfiguredTruncation`]
+    /// when the verified upstream tokenizer retains either setting.
+    pub fn verify_unpadded_untruncated(&self) -> Result<()> {
+        if self.tokenizer.inner.get_padding().is_some() {
+            return ConfiguredPaddingSnafu.fail();
+        }
+        if self.tokenizer.inner.get_truncation().is_some() {
+            return ConfiguredTruncationSnafu.fail();
+        }
+        Ok(())
     }
 
     /// Verify an expected ordered vocabulary against this exact tokenizer.
@@ -501,11 +522,98 @@ mod tests {
       }
     }"#;
 
+    const CONFIGURED_TRUNCATION: &str = r#"{
+      "version": "1.0",
+      "truncation": {"direction":"Right","max_length":1,"strategy":"LongestFirst","stride":0},
+      "padding": null,
+      "added_tokens": [],
+      "normalizer": null,
+      "pre_tokenizer": { "type": "Whitespace" },
+      "post_processor": null,
+      "decoder": null,
+      "model": {
+        "type": "WordLevel",
+        "vocab": {"[UNK]":0,"hello":1,"world":2},
+        "unk_token": "[UNK]"
+      }
+    }"#;
+
+    const CONFIGURED_PADDING: &str = r#"{
+      "version": "1.0",
+      "truncation": null,
+      "padding": {"strategy":{"Fixed":4},"direction":"Right","pad_to_multiple_of":null,"pad_id":0,"pad_type_id":0,"pad_token":"[UNK]"},
+      "added_tokens": [],
+      "normalizer": null,
+      "pre_tokenizer": { "type": "Whitespace" },
+      "post_processor": null,
+      "decoder": null,
+      "model": {
+        "type": "WordLevel",
+        "vocab": {"[UNK]":0,"hello":1,"world":2},
+        "unk_token": "[UNK]"
+      }
+    }"#;
+
     fn verified_tokenizer(bytes: &[u8]) -> Result<VerifiedTokenizer> {
         let digest = TokenizerDigest::from_bytes(Sha256::digest(bytes).into());
         let identity = TokenizerIdentity::new(bytes.len(), digest);
         let limit = TokenizerByteLimit::try_new(bytes.len())?;
         VerifiedTokenizer::from_bytes(bytes, identity, limit)
+    }
+
+    #[test]
+    fn verified_tokenizer_accepts_null_padding_and_truncation() -> Result<()> {
+        verified_tokenizer(TRIVIAL_TOKENIZER.as_bytes())?.verify_unpadded_untruncated()
+    }
+
+    #[test]
+    fn verified_tokenizer_refuses_configured_truncation_without_mutating_it() -> Result<()> {
+        let ordinary = Tokenizer::from_bytes(CONFIGURED_TRUNCATION.as_bytes())?;
+        let ordinary_ids = ordinary.encode("hello world", false)?;
+        assert_eq!(
+            ordinary_ids,
+            vec![1],
+            "configured truncation must affect ordinary encode"
+        );
+        let verified = verified_tokenizer(CONFIGURED_TRUNCATION.as_bytes())?;
+        assert!(
+            matches!(
+                verified.verify_unpadded_untruncated(),
+                Err(Error::ConfiguredTruncation { .. })
+            ),
+            "verified tokenizer must refuse configured truncation"
+        );
+        assert_eq!(
+            verified.tokenizer().encode("hello world", false)?,
+            ordinary_ids,
+            "verification must not mutate ordinary tokenizer truncation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verified_tokenizer_refuses_configured_padding_without_mutating_it() -> Result<()> {
+        let ordinary = Tokenizer::from_bytes(CONFIGURED_PADDING.as_bytes())?;
+        let ordinary_ids = ordinary.encode("hello", false)?;
+        assert_eq!(
+            ordinary_ids.len(),
+            4,
+            "configured padding must affect ordinary encode"
+        );
+        let verified = verified_tokenizer(CONFIGURED_PADDING.as_bytes())?;
+        assert!(
+            matches!(
+                verified.verify_unpadded_untruncated(),
+                Err(Error::ConfiguredPadding { .. })
+            ),
+            "verified tokenizer must refuse configured padding"
+        );
+        assert_eq!(
+            verified.tokenizer().encode("hello", false)?,
+            ordinary_ids,
+            "verification must not mutate ordinary tokenizer padding"
+        );
+        Ok(())
     }
 
     /// Build a tiny WordLevel `tokenizer.json` on disk so the

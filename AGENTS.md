@@ -28,6 +28,8 @@ share `/data/target` across agent lanes. See
 the precise threat model. Ordinary compilation is not a hardware-test permit.
 Every Cargo invocation, including lockfile generation and formatting, uses the
 runner; an ambient compiler wrapper must not escape the isolated lane.
+Host CPU compile admission is separate: where required, the approved admission
+entrypoint wraps this runner rather than relying on ambient PATH shims.
 
 ## Key patterns
 
@@ -62,6 +64,7 @@ runner; an ambient compiler wrapper must not escape the isolated lane.
 | STT pipeline | `crates/ekphrasis/` |
 | Tokenizer | `crates/tokenize/` |
 | Native text request pipeline | `crates/text/` |
+| Shared bounded template rendering | `crates/templates/` |
 | Shared synthetic GGUF test data | `crates/test-fixtures/` (dev-only) |
 
 The private planning corpus governs future scope and sequencing. This repository's

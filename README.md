@@ -8,7 +8,7 @@ targeting AMD gfx1100, with owned HIP/WMMA kernels and progressively owned execu
 **Status:** HIP primitives, Stella CPU golden-fixture parity, action-free placement,
 process-local admission/residency coordination, and bounded instruction emulation exist.
 GGUF inspection, digest-bound mixed-weight CPU projections, bounded hybrid CPU
-text generation and native Qwen3 CPU embeddings are foundations, not serving or
+text generation and native Qwen3 CPU embeddings/reranking are foundations, not serving or
 hardware qualification. The W7900
 is available; the RX 7900 XTX is a
 planned second device and requires its own qualification. The experimental below-HIP
@@ -100,6 +100,21 @@ requests fail rather than truncate. Independent synthetic proofs do not
 establish exact deployed-artifact parity, retrieval quality or reindex authority.
 Direct `embed` consumers disable default features for the HIP-free native path;
 the default `stella` feature preserves the existing Stella API and dependencies.
+
+[`rerank`](crates/rerank/src/lib.rs) implements native Qwen3 CPU pair scoring
+through the existing `Reranker` contract. Its checked rank profile shares the
+causal decoder body without weakening embedding admission. The verified
+artifact supplies its template; setup supplies the instruction and independent
+byte/token/batch limits. Each input index receives one raw `yes - no` relevance
+logit, not a probability. Oversized requests fail without truncation.
+Direct native consumers disable default features; the default `modernbert`
+feature preserves the existing encoder implementation. Exact converted-model
+provenance, template/tokenizer parity and retrieval quality remain unqualified.
+
+[`templates`](crates/templates/src/lib.rs) owns bounded template rendering for
+text generation and reranking. It permits no host callbacks, loader or named
+template registration; output, recursion and fuel limits are operational
+controls, not a total-memory sandbox.
 
 [`contracts/runtime-scope.toml`](contracts/runtime-scope.toml) records this product boundary.
 Bounded adaptation remains absent unless a named consumer contract supplies an output owner,

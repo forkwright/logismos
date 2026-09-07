@@ -129,6 +129,115 @@ pub enum Error {
         #[snafu(implicit)]
         location: snafu::Location,
     },
+    /// Native Qwen3 rank decoder failure.
+    #[snafu(display("native Qwen3 rank decoder: {source}"))]
+    Qwen3Decoder {
+        /// Source decoder failure.
+        source: decoders::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Native Qwen3 tokenizer or artifact-token compatibility failure.
+    #[snafu(display("native Qwen3 rerank tokenize: {source}"))]
+    Qwen3Tokenizer {
+        /// Source tokenizer failure.
+        source: tokenize::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Artifact-owned Qwen3 rerank template failure.
+    #[snafu(display("native Qwen3 rerank template: {source}"))]
+    Qwen3Template {
+        /// Source bounded-template failure.
+        source: templates::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Required Qwen3 rerank metadata was absent or had an incompatible type.
+    #[snafu(display("invalid Qwen3 rerank metadata `{key}`"))]
+    Qwen3Metadata {
+        /// Exact GGUF metadata key.
+        key: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Qwen3 rerank setup limits were internally inconsistent.
+    #[snafu(display("invalid Qwen3 rerank limits: {rule}"))]
+    Qwen3Limits {
+        /// Violated setup-limit invariant.
+        rule: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// One framed Qwen3 rerank item exceeds its explicit byte bound.
+    #[snafu(display("Qwen3 rerank item {index} has {actual} input bytes, limit {limit}"))]
+    Qwen3InputBytesTooLong {
+        /// Batch item index.
+        index: usize,
+        /// Checked instruction, query, and document byte total.
+        actual: usize,
+        /// Trusted setup limit.
+        limit: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// One framed Qwen3 rerank item exceeds its explicit token bound.
+    #[snafu(display("Qwen3 rerank item {index} has {actual} tokens, limit {limit}"))]
+    Qwen3InputTokensTooLong {
+        /// Batch item index.
+        index: usize,
+        /// Encoded token count.
+        actual: usize,
+        /// Trusted setup limit.
+        limit: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Qwen3 rerank input lengths could not be represented together.
+    #[snafu(display("Qwen3 rerank input byte length overflowed usize"))]
+    Qwen3InputByteLengthOverflow {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// A Qwen3 rerank batch exceeds its explicit item bound.
+    #[snafu(display("Qwen3 rerank batch has {actual} items, limit {limit}"))]
+    Qwen3BatchTooLarge {
+        /// Number of submitted pairs.
+        actual: usize,
+        /// Trusted setup limit.
+        limit: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// A bounded Qwen3 rerank allocation could not be reserved.
+    #[snafu(display("Qwen3 rerank could not reserve bounded {target} storage"))]
+    Qwen3Allocation {
+        /// Allocation purpose.
+        target: &'static str,
+        /// Allocation failure returned by the standard library.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Qwen3 rerank raw logits could not produce one finite signed score.
+    #[snafu(display("Qwen3 rerank item {index} produced a non-finite relevance score"))]
+    Qwen3NonFiniteScore {
+        /// Batch item index.
+        index: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }
 
 /// Crate-local result alias.

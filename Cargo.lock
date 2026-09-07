@@ -992,11 +992,19 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "rerank"
 version = "1.0.11"
 dependencies = [
+ "decoders",
  "encoders",
  "kernels",
+ "loader",
+ "num-traits",
  "serde",
  "serde_json",
+ "sha2",
  "snafu",
+ "tempfile",
+ "templates",
+ "test-fixtures",
+ "tokenize",
  "transformers",
 ]
 
@@ -1215,6 +1223,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "templates"
+version = "1.0.11"
+dependencies = [
+ "minijinja",
+ "minijinja-contrib",
+ "serde",
+ "snafu",
+]
+
+[[package]]
 name = "test-fixtures"
 version = "1.0.11"
 dependencies = [
@@ -1230,11 +1248,11 @@ dependencies = [
  "decoders",
  "loader",
  "minijinja",
- "minijinja-contrib",
  "serde",
  "sha2",
  "snafu",
  "tempfile",
+ "templates",
  "test-fixtures",
  "tokenize",
 ]

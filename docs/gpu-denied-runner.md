@@ -13,6 +13,11 @@ The runner is intentionally non-interactive. Its standard descriptors must be
 pipes, `/dev/null`, or safe regular files as described below; redirect through
 a pipe when launching it from a terminal.
 
+GPU denial is separate from host CPU build admission. When the host requires
+compile admission, its approved entrypoint must wrap this runner. The runner's
+sanitized environment intentionally does not inherit ambient PATH shims, so a
+bare runner invocation cannot establish that separate admission contract.
+
 ## Lockfile maintenance
 
 Cargo runs inside the boundary even when resolving dependencies or checking

@@ -62,6 +62,16 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// A newer shared renderer failure has no text-specific legacy equivalent.
+    #[snafu(display("text template renderer failed: {source}"))]
+    TemplateRenderer {
+        /// Shared renderer failure retaining its error chain.
+        source: templates::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// Tokenizer parsing, encoding, or decoding failed.
     #[snafu(display("text tokenizer failed: {source}"))]
     Tokenizer {

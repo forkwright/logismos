@@ -127,7 +127,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
             exit 1
         fi
         # WHY: One package selection owns both graph and compiler witnesses.
-        set -- -p kernels -p transformers -p decoders -p text -p decode -p embed
+        set -- -p kernels -p transformers -p decoders -p text -p decode -p embed -p rerank -p templates
         cargo tree --offline --locked --no-default-features "$@" \
             --edges normal,build --prefix none --format "{p}" >"$out/cpu-dependencies.log"
         if grep -Eq "^(hipcore|taxis) " "$out/cpu-dependencies.log"; then

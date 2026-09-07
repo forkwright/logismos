@@ -23,21 +23,18 @@
 
 pub mod error;
 
-use std::io::{self, Write};
-
 use decoders::{Qwen35LogitSelection, Qwen35Weights};
 use loader::gguf::{MetaValue, VerifiedArtifact};
-use minijinja::{Environment, UndefinedBehavior, context};
-use minijinja_contrib::pycompat::unknown_method_callback;
 use serde::Serialize;
-use snafu::ResultExt;
+use snafu::{IntoError, ResultExt};
+use templates::{BoundedTemplate, TemplateLimits};
 use tokenize::{TokenizerByteLimit, TokenizerIdentity, VerifiedTokenizer};
 
 use crate::error::{
     AllocationSnafu, CancelledSnafu, DecodeSnafu, DecoderSnafu, EmptyPromptSnafu,
     InvalidConfigurationSnafu, LimitExceededSnafu, LogitShapeSnafu, MetadataSnafu,
-    RenderedUtf8Snafu, SpecialTokenPolicySnafu, TemplateSnafu, TokenizerSnafu,
-    VocabularyMismatchSnafu,
+    RenderedUtf8Snafu, SpecialTokenPolicySnafu, TemplateRendererSnafu, TemplateSnafu,
+    TokenizerSnafu, VocabularyMismatchSnafu,
 };
 
 pub use crate::error::{Error, Result};
@@ -104,28 +101,28 @@ pub struct PipelineLimits {
 }
 
 impl PipelineLimits {
-    fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<TemplateLimits> {
         if [
-            self.template_bytes,
             self.messages,
             self.message_bytes,
             self.prompt_bytes,
-            self.rendered_bytes,
             self.context_tokens,
             self.output_tokens,
             self.output_bytes,
-            self.template_recursion,
         ]
         .contains(&0)
-            || self.template_fuel == 0
-            || isize::try_from(self.template_fuel).is_err()
         {
             return InvalidConfigurationSnafu {
                 rule: "static limits must be non-zero and template fuel must fit isize",
             }
             .fail();
         }
-        Ok(())
+        template_limits(self).map_err(|_| {
+            InvalidConfigurationSnafu {
+                rule: "static limits must be non-zero and template fuel must fit isize",
+            }
+            .build()
+        })
     }
 }
 
@@ -268,8 +265,7 @@ struct SpecialTokenPolicy {
 pub struct TextPipeline<'artifact> {
     weights: Qwen35Weights<'artifact>,
     tokenizer: VerifiedTokenizer,
-    environment: Environment<'artifact>,
-    template: &'artifact str,
+    template: BoundedTemplate<'artifact>,
     special_tokens: SpecialTokenPolicy,
     limits: PipelineLimits,
 }
@@ -284,23 +280,26 @@ impl<'artifact> TextPipeline<'artifact> {
         companion: TokenizerCompanion<'_>,
         limits: PipelineLimits,
     ) -> Result<Self> {
-        limits.validate()?;
+        let template_limits = limits.validate()?;
         let tokenizer = VerifiedTokenizer::from_bytes(
             companion.bytes,
             companion.identity,
             limits.tokenizer_bytes,
         )
         .context(TokenizerSnafu)?;
+        tokenizer
+            .verify_unpadded_untruncated()
+            .context(TokenizerSnafu)?;
         let metadata = artifact.observation().metadata();
         let template = metadata_string(metadata, CHAT_TEMPLATE_KEY)?;
         check_limit("template bytes", template.len(), limits.template_bytes)?;
         let special_tokens = verify_vocabulary(metadata, &tokenizer)?;
-        let environment = compile_template(template, limits)?;
+        let template =
+            BoundedTemplate::new(template, template_limits).map_err(map_template_error)?;
         let weights = Qwen35Weights::try_from_verified(artifact).context(DecoderSnafu)?;
         Ok(Self {
             weights,
             tokenizer,
-            environment,
             template,
             special_tokens,
             limits,
@@ -446,25 +445,14 @@ impl<'artifact> TextPipeline<'artifact> {
     }
 
     fn render(&self, request: &GenerationRequest<'_>) -> Result<String> {
-        let template = self
-            .environment
-            .template_from_str(self.template)
-            .context(TemplateSnafu)?;
-        let mut output = ByteCappedWriter::new(self.limits.rendered_bytes)?;
-        let result = template.render_captured_to(
-            context!(messages => request.messages, add_generation_prompt => true, enable_thinking => request.enable_thinking, tools => Vec::<()>::new()),
-            &mut output,
-        );
-        if output.exceeded {
-            return LimitExceededSnafu {
-                field: "rendered template bytes",
-                actual: output.attempted,
-                limit: self.limits.rendered_bytes,
-            }
-            .fail();
-        }
-        result.context(TemplateSnafu)?;
-        output.into_string()
+        self.template
+            .render(RenderContext {
+                messages: request.messages,
+                add_generation_prompt: true,
+                enable_thinking: request.enable_thinking,
+                tools: Vec::<()>::new(),
+            })
+            .map_err(map_template_error)
     }
 
     fn encode_prompt(&self, rendered: &str) -> Result<Vec<u32>> {
@@ -492,22 +480,46 @@ impl<'artifact> TextPipeline<'artifact> {
     }
 }
 
-fn compile_template(template: &str, limits: PipelineLimits) -> Result<Environment<'_>> {
-    let mut environment = Environment::new();
-    environment.set_undefined_behavior(UndefinedBehavior::Strict);
-    environment.set_unknown_method_callback(unknown_method_callback);
-    environment.set_fuel(Some(limits.template_fuel));
-    environment.set_recursion_limit(limits.template_recursion);
-    if environment.recursion_limit() != limits.template_recursion {
-        return InvalidConfigurationSnafu {
-            rule: "requested template recursion limit is not supported by this runtime",
+#[derive(Serialize)]
+struct RenderContext<'messages> {
+    messages: &'messages [TextMessage],
+    add_generation_prompt: bool,
+    enable_thinking: bool,
+    tools: Vec<()>,
+}
+
+fn template_limits(limits: PipelineLimits) -> templates::Result<TemplateLimits> {
+    TemplateLimits::new(
+        limits.template_bytes,
+        limits.rendered_bytes,
+        limits.template_fuel,
+        limits.template_recursion,
+    )
+}
+
+fn map_template_error(error: templates::Error) -> Error {
+    match error {
+        templates::Error::Allocation { target, source, .. } => {
+            AllocationSnafu { target }.into_error(source)
         }
-        .fail();
+        templates::Error::Template { source, .. } => TemplateSnafu.into_error(source),
+        templates::Error::RenderedUtf8 { source, .. } => RenderedUtf8Snafu.into_error(source),
+        templates::Error::LimitExceeded {
+            field,
+            actual,
+            limit,
+            ..
+        } => LimitExceededSnafu {
+            field,
+            actual,
+            limit,
+        }
+        .build(),
+        templates::Error::InvalidConfiguration { rule, .. } => {
+            InvalidConfigurationSnafu { rule }.build()
+        }
+        _ => TemplateRendererSnafu.into_error(error),
     }
-    environment
-        .template_from_str(template)
-        .context(TemplateSnafu)?;
-    Ok(environment)
 }
 
 fn metadata_string<'metadata>(
@@ -729,50 +741,6 @@ fn check_cancelled(cancellation: &dyn Cancellation, boundary: &'static str) -> R
     Ok(())
 }
 
-struct ByteCappedWriter {
-    output: Vec<u8>,
-    maximum: usize,
-    attempted: usize,
-    exceeded: bool,
-}
-
-impl ByteCappedWriter {
-    fn new(maximum: usize) -> Result<Self> {
-        let mut output = Vec::new();
-        output.try_reserve_exact(maximum).context(AllocationSnafu {
-            target: "rendered template bytes",
-        })?;
-        Ok(Self {
-            output,
-            maximum,
-            attempted: 0,
-            exceeded: false,
-        })
-    }
-    fn into_string(self) -> Result<String> {
-        String::from_utf8(self.output).context(RenderedUtf8Snafu)
-    }
-}
-
-impl Write for ByteCappedWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let attempted = self.output.len().checked_add(buffer.len());
-        self.attempted = attempted.unwrap_or(usize::MAX);
-        if attempted.is_none_or(|value| value > self.maximum) {
-            self.exceeded = true;
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "output limit reached",
-            ));
-        }
-        self.output.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 const CRATE_NAME: &str = "text";
 
@@ -783,7 +751,6 @@ mod tests {
     use std::num::{NonZeroU64, NonZeroUsize};
 
     use loader::gguf::{ArtifactByteLimit, Sha256Digest};
-    use minijinja::ErrorKind;
     use sha2::{Digest, Sha256};
     use test_fixtures::{
         Qwen35FixtureConfig, RawGguf, RawMetadata, RawMetadataValue, SyntheticGguf,
@@ -1127,72 +1094,6 @@ mod tests {
         assert_eq!(env!("CARGO_PKG_NAME"), CRATE_NAME);
     }
     #[test]
-    fn capped_writer_refuses_overflow_without_partial_chunk() -> TestResult<()> {
-        let mut writer = ByteCappedWriter::new(3)?;
-        assert_eq!(writer.write(b"ok").ok(), Some(2));
-        assert!(writer.write(b"no").is_err());
-        assert_eq!(writer.output, b"ok");
-        Ok(())
-    }
-
-    #[test]
-    fn template_limits_refuse_fuel_overflow_and_silent_recursion_cap() -> TestResult<()> {
-        let mut limits = test_limits(1)?;
-        limits.template_fuel = u64::MAX;
-        assert!(matches!(
-            limits.validate(),
-            Err(Error::InvalidConfiguration { .. })
-        ));
-        limits.template_fuel = 1;
-        limits.template_recursion = usize::MAX;
-        assert!(matches!(
-            compile_template("hello", limits),
-            Err(Error::InvalidConfiguration { .. })
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn template_resolution_has_no_registered_or_host_loader_authority() -> TestResult<()> {
-        let environment = compile_template("hello", test_limits(1)?)?;
-        for source in [
-            "{% include 'missing' %}",
-            "{% set target = 'missing' %}{% include target %}",
-            "{% import 'missing' as imported %}",
-            "{% set target = 'missing' %}{% import target as imported %}",
-            "{% extends 'missing' %}{% block body %}x{% endblock %}",
-            "{% set target = 'missing' %}{% extends target %}{% block body %}x{% endblock %}",
-            "{% include '<string>' %}",
-            "{% import '<string>' as imported %}",
-            "{% extends '<string>' %}{% block body %}x{% endblock %}",
-            "{% include 'artifact-chat-template' %}",
-            "{% import 'artifact-chat-template' as imported %}",
-            "{% extends 'artifact-chat-template' %}{% block body %}x{% endblock %}",
-        ] {
-            let template = environment.template_from_str(source)?;
-            assert!(
-                matches!(
-                    template.render(()),
-                    Err(error) if error.kind() == ErrorKind::TemplateNotFound
-                ),
-                "source unexpectedly resolved: {source}"
-            );
-        }
-        let ignored = environment
-            .template_from_str("a{% include 'missing' ignore missing %}b")?
-            .render(())?;
-        assert_eq!(ignored, "ab");
-        assert!(
-            matches!(
-                environment.template_from_str("{{ missing }}")?.render(()),
-                Err(error) if error.kind() == ErrorKind::UndefinedError
-            ),
-            "the closed environment must also reject undefined values strictly"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn bos_and_eos_flags_define_exact_prompt_without_silent_deduplication() -> TestResult<()> {
         let tokenizer_json = tokenizer_json();
         let messages = [TextMessage::new(TextRole::User, "hello")];
@@ -1393,44 +1294,6 @@ mod tests {
     }
 
     #[test]
-    fn template_fuel_and_rendered_byte_caps_fail_at_the_configured_numbers() -> TestResult<()> {
-        let tokenizer_json = tokenizer_json();
-        let messages = [TextMessage::new(TextRole::User, "hello")];
-        let fuel_template = "{% for value in range(100) %}hello{% endfor %}";
-        let fuel_config = fixture_config(&TOKENS, 3, false, false, fuel_template);
-        let fixture = build_qwen35_fixture(&fuel_config)?;
-        let (_directory, artifact) = load_fixture(&fixture)?;
-        let mut limits = test_limits(tokenizer_json.len())?;
-        limits.rendered_bytes = 4_096;
-        limits.template_fuel = 1;
-        let pipeline = pipeline_result(&artifact, &tokenizer_json, limits)?;
-        let request = GenerationRequest::new(&messages, 1, false);
-        let error = text_error(pipeline.render(&request))?;
-        match error {
-            Error::Template { source, .. } => assert_eq!(
-                source.kind(),
-                ErrorKind::OutOfFuel,
-                "fuel exhaustion must retain MiniJinja's exact error kind"
-            ),
-            error => {
-                return Err(std::io::Error::other(format!(
-                    "expected template fuel exhaustion, received `{error}`"
-                ))
-                .into());
-            }
-        }
-
-        let cap_config = fixture_config(&TOKENS, 3, false, false, "12345");
-        let fixture = build_qwen35_fixture(&cap_config)?;
-        let (_directory, artifact) = load_fixture(&fixture)?;
-        let mut limits = test_limits(tokenizer_json.len())?;
-        limits.rendered_bytes = 4;
-        let pipeline = pipeline_result(&artifact, &tokenizer_json, limits)?;
-        expect_limit(pipeline.render(&request), "rendered template bytes", 5, 4)?;
-        Ok(())
-    }
-
-    #[test]
     fn tokenizer_template_and_message_input_caps_report_exact_dimensions() -> TestResult<()> {
         let tokenizer_json = tokenizer_json();
         let config = fixture_config(&TOKENS, 3, false, false, STARTSWITH_TEMPLATE);
@@ -1516,6 +1379,60 @@ mod tests {
             6,
             5,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn configured_tokenizer_padding_and_truncation_are_refused_in_native_setup() -> TestResult<()> {
+        let config = fixture_config(&TOKENS, 3, false, false, "hello");
+        let fixture = build_qwen35_fixture(&config)?;
+        let (_directory, artifact) = load_fixture(&fixture)?;
+        let ordinary = tokenizer_json();
+        let cases = [
+            (
+                ordinary.replace(
+                    "\"truncation\":null",
+                    "\"truncation\":{\"direction\":\"Right\",\"max_length\":1,\"strategy\":\"LongestFirst\",\"stride\":0}",
+                ),
+                "truncation",
+            ),
+            (
+                ordinary.replace(
+                    "\"padding\":null",
+                    "\"padding\":{\"strategy\":{\"Fixed\":4},\"direction\":\"Right\",\"pad_to_multiple_of\":null,\"pad_id\":0,\"pad_type_id\":0,\"pad_token\":\"[UNK]\"}",
+                ),
+                "padding",
+            ),
+        ];
+        for (configured, setting) in cases {
+            let error = text_error(pipeline_result(
+                &artifact,
+                &configured,
+                test_limits(configured.len())?,
+            ))?;
+            match (setting, error) {
+                (
+                    "truncation",
+                    Error::Tokenizer {
+                        source: tokenize::Error::ConfiguredTruncation { .. },
+                        ..
+                    },
+                )
+                | (
+                    "padding",
+                    Error::Tokenizer {
+                        source: tokenize::Error::ConfiguredPadding { .. },
+                        ..
+                    },
+                ) => {}
+                (_, error) => {
+                    return Err(std::io::Error::other(format!(
+                        "native text setup accepted or misreported configured tokenizer {setting}: {error}"
+                    ))
+                    .into());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1654,14 +1571,16 @@ mod tests {
     }
 
     #[test]
-    fn allocation_template_decode_and_utf8_failures_retain_typed_sources() -> TestResult<()> {
-        let allocation_error = text_error(ByteCappedWriter::new(usize::MAX))?;
-        assert!(
-            require_source(&allocation_error)?.is::<std::collections::TryReserveError>(),
-            "allocation wrapper must retain TryReserveError"
-        );
-
-        let template_error = text_error(compile_template("{% if", test_limits(1)?))?;
+    fn template_and_decode_failures_retain_typed_sources() -> TestResult<()> {
+        let tokenizer_json = tokenizer_json();
+        let config = fixture_config(&TOKENS, 3, false, false, "{% if");
+        let fixture = build_qwen35_fixture(&config)?;
+        let (_directory, artifact) = load_fixture(&fixture)?;
+        let template_error = text_error(pipeline_result(
+            &artifact,
+            &tokenizer_json,
+            test_limits(tokenizer_json.len())?,
+        ))?;
         assert!(
             require_source(&template_error)?.is::<minijinja::Error>(),
             "template wrapper must retain minijinja::Error"
@@ -1673,13 +1592,6 @@ mod tests {
             "greedy wrapper must retain decode::Error"
         );
 
-        let mut invalid_utf8 = ByteCappedWriter::new(1)?;
-        invalid_utf8.output.push(0xff);
-        let utf8_error = text_error(invalid_utf8.into_string())?;
-        assert!(
-            require_source(&utf8_error)?.is::<std::string::FromUtf8Error>(),
-            "UTF-8 wrapper must retain FromUtf8Error"
-        );
         Ok(())
     }
 
