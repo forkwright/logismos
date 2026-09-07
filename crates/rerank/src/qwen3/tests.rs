@@ -160,7 +160,8 @@ fn malformed_artifact_metadata_and_tokenizer_cannot_bypass_admission() -> TestRe
     let (_directory, artifact) = verified_artifact(&raw)?;
     let error = reranker(&artifact, limits(128, 6, 1)?)
         .err()
-        .ok_or("reversed artifact vocabulary unexpectedly passed admission")?
+        .ok_or("reversed artifact vocabulary unexpectedly passed admission")?;
+    let error = error
         .downcast_ref::<Error>()
         .ok_or("artifact vocabulary admission failure was not a rerank error")?;
     if !matches!(
@@ -179,7 +180,8 @@ fn malformed_artifact_metadata_and_tokenizer_cannot_bypass_admission() -> TestRe
     let (_directory, artifact) = verified_artifact(&raw)?;
     let error = reranker(&artifact, limits(128, 6, 1)?)
         .err()
-        .ok_or("invalid artifact template unexpectedly passed admission")?
+        .ok_or("invalid artifact template unexpectedly passed admission")?;
+    let error = error
         .downcast_ref::<Error>()
         .ok_or("artifact template admission failure was not a rerank error")?;
     if !matches!(error, Error::Qwen3Template { .. }) || StdError::source(error).is_none() {
@@ -652,7 +654,8 @@ fn assert_metadata_refusal(
     let (_directory, artifact) = verified_artifact(&raw)?;
     let error = reranker(&artifact, limits(128, 6, 1)?)
         .err()
-        .ok_or("malformed metadata unexpectedly passed rerank admission")?
+        .ok_or("malformed metadata unexpectedly passed rerank admission")?;
+    let error = error
         .downcast_ref::<Error>()
         .ok_or("malformed metadata admission failure was not a rerank error")?;
     if !matches!(error, Error::Qwen3Metadata { key: actual, .. } if *actual == key) {
