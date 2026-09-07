@@ -111,6 +111,13 @@ Direct native consumers disable default features; the default `modernbert`
 feature preserves the existing encoder implementation. Exact converted-model
 provenance, template/tokenizer parity and retrieval quality remain unqualified.
 
+Native Qwen3 executors and concrete embedding/reranking adapters expose
+`cpu_requirements()` for allocation-owner-derived logical `f32` backing. Adapter
+reports include sequential batch-result accumulation, not parallel workspace
+multiplication. These are not whole-process or GPU budgets; see
+[retrieval requirements ownership](ARCHITECTURE.md#native-retrieval-cpu-requirements)
+for output semantics, artifact binding and exclusions.
+
 [`templates`](crates/templates/src/lib.rs) owns bounded template rendering for
 text generation and reranking. It permits no host callbacks, loader or named
 template registration; output, recursion and fuel limits are operational
