@@ -12,7 +12,7 @@ use tokenize::{
     VerifiedTokenizer,
 };
 
-use super::{Qwen3Reranker, Qwen3RerankerLimits, signed_relevance_score};
+use super::{Qwen3Reranker, Qwen3RerankerLimits, multiply_bytes, signed_relevance_score};
 use crate::{Error, RerankBatch, RerankItem, Reranker};
 
 type TestResult<T> = std::result::Result<T, Box<dyn StdError>>;
@@ -295,8 +295,10 @@ fn late_head_refusal_returns_an_error_and_pristine_retry_remains_usable() -> Tes
 fn cpu_requirements_compose_sequential_scalar_score_rows() -> TestResult<()> {
     let raw = raw_rank_fixture()?;
     let (_directory, artifact) = verified_artifact(&raw)?;
-    let single = reranker(&artifact, limits(128, 6, 1)?)?.cpu_requirements()?;
-    let batch = reranker(&artifact, limits(128, 6, 3)?)?.cpu_requirements()?;
+    let single_model = reranker(&artifact, limits(128, 6, 1)?)?;
+    let single = single_model.cpu_requirements()?;
+    let batch_model = reranker(&artifact, limits(128, 6, 3)?)?;
+    let batch_requirements = batch_model.cpu_requirements()?;
     let decoder = single.decoder_cpu_requirements();
     let score_bytes = u64::try_from(std::mem::size_of::<f32>())?;
     assert_eq!(single.max_batch_items(), 1);
@@ -305,15 +307,15 @@ fn cpu_requirements_compose_sequential_scalar_score_rows() -> TestResult<()> {
         single.logical_f32_upper_bound_bytes(),
         score_bytes.max(decoder.workspace_upper_bound_bytes())
     );
-    assert_eq!(batch.max_batch_items(), 3);
+    assert_eq!(batch_requirements.max_batch_items(), 3);
     assert_eq!(
-        batch.returned_output_bytes(),
+        batch_requirements.returned_output_bytes(),
         score_bytes
             .checked_mul(3)
             .ok_or("synthetic rerank output multiplication overflowed")?
     );
     assert_eq!(
-        batch.logical_f32_upper_bound_bytes(),
+        batch_requirements.logical_f32_upper_bound_bytes(),
         score_bytes
             .checked_mul(3)
             .ok_or("synthetic rerank output multiplication overflowed")?
@@ -327,9 +329,28 @@ fn cpu_requirements_compose_sequential_scalar_score_rows() -> TestResult<()> {
     if decoder.returned_output_bytes() != 0 {
         return Err("rank decoder must classify terminal hidden output as workspace".into());
     }
+    let predictions = batch_model.predict(batch(vec![
+        (POSITIVE_QUERY, POSITIVE_DOCUMENT),
+        (NEGATIVE_QUERY, NEGATIVE_DOCUMENT),
+        (POSITIVE_QUERY, NEGATIVE_DOCUMENT),
+    ]))?;
+    let mut actual_output_bytes = 0_u64;
+    for scores in predictions.values() {
+        let row_bytes = u64::try_from(scores.len())?
+            .checked_mul(score_bytes)
+            .ok_or("synthetic rerank returned row overflowed")?;
+        actual_output_bytes = actual_output_bytes
+            .checked_add(row_bytes)
+            .ok_or("synthetic rerank returned output sum overflowed")?;
+    }
+    assert_eq!(
+        actual_output_bytes,
+        batch_requirements.returned_output_bytes()
+    );
     Ok(())
 }
 
+#[cfg(target_pointer_width = "64")]
 #[test]
 fn cpu_requirements_refuse_overflowing_scalar_batch_output() -> TestResult<()> {
     let raw = raw_rank_fixture()?;
@@ -337,6 +358,15 @@ fn cpu_requirements_refuse_overflowing_scalar_batch_output() -> TestResult<()> {
     let model = reranker(&artifact, limits(128, 6, usize::MAX)?)?;
     assert!(matches!(
         model.cpu_requirements(),
+        Err(Error::Qwen3RequirementsOverflow { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn cpu_requirements_refuse_portable_scalar_multiplication_overflow() -> TestResult<()> {
+    assert!(matches!(
+        multiply_bytes(u64::MAX, 2, "synthetic rerank overflow"),
         Err(Error::Qwen3RequirementsOverflow { .. })
     ));
     Ok(())

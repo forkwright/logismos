@@ -706,7 +706,7 @@ mod tests {
     fn qwen3_cpu_requirements_compose_sequential_embedding_outputs()
     -> std::result::Result<(), Box<dyn StdError>> {
         let artifact = artifact(&fixture()?)?;
-        let single = Qwen3EmbeddingModel::from_verified_cpu(
+        let single_model = Qwen3EmbeddingModel::from_verified_cpu(
             &artifact,
             verified_tokenizer(TokenizerModel::WordLevel)?,
             Qwen3EmbeddingLimits {
@@ -715,9 +715,9 @@ mod tests {
                 max_batch_items: 1,
             },
             Qwen3RolePrefixes::default(),
-        )?
-        .cpu_requirements()?;
-        let batch = Qwen3EmbeddingModel::from_verified_cpu(
+        )?;
+        let single = single_model.cpu_requirements()?;
+        let batch_model = Qwen3EmbeddingModel::from_verified_cpu(
             &artifact,
             verified_tokenizer(TokenizerModel::WordLevel)?,
             Qwen3EmbeddingLimits {
@@ -726,8 +726,8 @@ mod tests {
                 max_batch_items: 3,
             },
             Qwen3RolePrefixes::default(),
-        )?
-        .cpu_requirements()?;
+        )?;
+        let batch = batch_model.cpu_requirements()?;
         let decoder = single.decoder_cpu_requirements();
         let single_output = decoder.returned_output_bytes();
         assert_eq!(single.max_batch_items(), 1);
@@ -756,9 +756,25 @@ mod tests {
                 .checked_mul(u64::try_from(std::mem::size_of::<f32>())?)
                 .ok_or("synthetic embedding hidden payload overflowed")?
         );
+        let outputs = EmbeddingModel::encode_batch(
+            &batch_model,
+            &["alice", "bob", "alice"],
+            &EncodeOpts::default(),
+        )?;
+        let mut actual_output_bytes = 0_u64;
+        for output in outputs {
+            let output_bytes = u64::try_from(output.len())?
+                .checked_mul(u64::try_from(std::mem::size_of::<f32>())?)
+                .ok_or("synthetic embedding returned output overflowed")?;
+            actual_output_bytes = actual_output_bytes
+                .checked_add(output_bytes)
+                .ok_or("synthetic embedding returned output sum overflowed")?;
+        }
+        assert_eq!(actual_output_bytes, batch.returned_output_bytes());
         Ok(())
     }
 
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn qwen3_cpu_requirements_refuse_overflowing_batch_output()
     -> std::result::Result<(), Box<dyn StdError>> {
@@ -778,6 +794,14 @@ mod tests {
             Err(crate::error::Error::RequirementsOverflow { .. })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn qwen3_cpu_requirements_refuse_portable_multiplication_overflow() {
+        assert!(matches!(
+            multiply_bytes(u64::MAX, 2, "synthetic embedding overflow"),
+            Err(crate::error::Error::RequirementsOverflow { .. })
+        ));
     }
 
     #[test]
