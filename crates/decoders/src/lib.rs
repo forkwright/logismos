@@ -29,10 +29,12 @@ pub mod qwen35_recurrent;
 mod qwen35_requirements;
 pub mod qwen35_weights;
 pub mod qwen3_rank;
+mod qwen3_requirements;
 
 pub use crate::error::{Error, Result};
 pub use crate::qwen3::{Qwen3Execution, Qwen3Weights};
 pub use crate::qwen3_rank::{Qwen3RankExecution, Qwen3RankWeights};
+pub use crate::qwen3_requirements::Qwen3CpuRequirements;
 pub use crate::qwen35::Qwen35StructuralProfile;
 pub use crate::qwen35_execution::{Qwen35Execution, Qwen35ExecutionPlan, Qwen35LogitSelection};
 pub use crate::qwen35_recurrent::Qwen35RecurrentExecution;

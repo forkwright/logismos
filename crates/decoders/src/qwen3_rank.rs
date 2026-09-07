@@ -6,6 +6,7 @@ use crate::Result;
 use crate::error::{Qwen3ExecutionSnafu, Qwen3MetadataSnafu};
 use crate::matrix::CheckedMatrix;
 use crate::qwen3::{Qwen3BodyWeights, Qwen3Profile, RANK_HEAD, RANK_LABELS, RANK_LABELS_KEY};
+use crate::qwen3_requirements::Qwen3CpuRequirements;
 
 /// One verified Qwen3 rank payload with its checked causal body and two-row head.
 #[derive(Debug)]
@@ -93,6 +94,22 @@ impl Qwen3RankExecution<'_, '_> {
             }
         }
         Ok(logits)
+    }
+
+    /// Return the checked CPU allocation envelope for this executor's admitted context.
+    ///
+    /// Rank returns its two logits in a stack array; its report therefore
+    /// includes the transient classifier projection but no returned heap output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when the admitted allocation dimensions or
+    /// their logical byte totals cannot be represented safely.
+    pub fn cpu_requirements(&self) -> Result<Qwen3CpuRequirements> {
+        let max_context = self.body_execution.admitted_max_context();
+        let shape = self.body_execution.allocation_shape(max_context)?;
+        let inspection = self.weights.body.payload().observation().inspection();
+        Qwen3CpuRequirements::rank(inspection.digest, inspection.file_len, max_context, &shape)
     }
 }
 

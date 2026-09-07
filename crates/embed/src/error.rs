@@ -59,6 +59,15 @@ pub enum Error {
         #[snafu(implicit)]
         location: snafu::Location,
     },
+    /// Qwen3 embedding requirement composition overflowed its logical `f32` payload bounds.
+    #[snafu(display("Qwen3 embedding CPU requirements overflowed while composing {target}"))]
+    RequirementsOverflow {
+        /// Named requirement component whose checked byte arithmetic overflowed.
+        target: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// A bounded request-local allocation could not be reserved.
     #[snafu(display("Qwen3 embedding could not reserve {target}"))]
     Allocation {

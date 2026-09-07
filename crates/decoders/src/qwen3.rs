@@ -13,6 +13,7 @@ use crate::error::{
     Qwen3MetadataSnafu, Qwen3TensorSnafu,
 };
 use crate::matrix::CheckedMatrix;
+use crate::qwen3_requirements::{Qwen3AllocationShape, Qwen3CpuRequirements};
 
 const ARCHITECTURE: &str = "general.architecture";
 const BLOCK_COUNT: &str = "qwen3.block_count";
@@ -282,11 +283,9 @@ impl Qwen3Execution<'_, '_> {
             }
             .fail();
         }
+        let shape = self.allocation_shape(token_ids.len())?;
         let embedding = CheckedMatrix::from_payload(self.body.payload(), TOKEN_EMBEDDING)?;
-        let mut hidden = reserve(
-            "token hidden rows",
-            product(token_ids.len(), self.body.layout.hidden)?,
-        )?;
+        let mut hidden = reserve("token hidden rows", shape.hidden_rows)?;
         for token_id in token_ids {
             let token = usize::try_from(*token_id).map_err(|_| {
                 Qwen3ExecutionSnafu {
@@ -295,22 +294,29 @@ impl Qwen3Execution<'_, '_> {
                 }
                 .build()
             })?;
-            hidden.extend(embedding.decode_row(token)?);
+            let embedding_row = embedding.decode_row(token)?;
+            if embedding_row.len() != shape.decoded_embedding_row {
+                return Qwen3ExecutionSnafu {
+                    requested: embedding_row.len(),
+                    rule: "decoded embedding row must fit the checked Qwen3 allocation shape",
+                }
+                .fail();
+            }
+            hidden.extend(embedding_row);
         }
         for block in 0..self.body.layout.blocks {
-            self.run_block(block, &mut hidden)?;
+            self.run_block(block, &mut hidden, &shape)?;
         }
-        let final_norm =
-            read_f32_vector(self.body.payload(), OUTPUT_NORM, self.body.layout.hidden)?;
+        let final_norm = read_f32_vector(self.body.payload(), OUTPUT_NORM, shape.final_norm)?;
         let normalized = kernels::cpu_f32::rms_norm(
             &hidden,
             &final_norm,
-            token_ids.len(),
-            self.body.layout.hidden,
+            shape.tokens,
+            shape.hidden,
             self.body.layout.epsilon,
         )
         .context(Qwen3CpuSnafu)?;
-        let start = product(token_ids.len() - 1, self.body.layout.hidden)?;
+        let start = product(shape.tokens - 1, shape.hidden)?;
         let result = normalized.get(start..).ok_or_else(|| {
             Qwen3ExecutionSnafu {
                 requested: start,
@@ -319,32 +325,80 @@ impl Qwen3Execution<'_, '_> {
             .build()
         })?;
         finite(result, "final RMS norm")?;
-        let mut output = reserve("final hidden row", result.len())?;
+        if result.len() != shape.returned_hidden {
+            return Qwen3ExecutionSnafu {
+                requested: result.len(),
+                rule: "final hidden row must fit the checked Qwen3 allocation shape",
+            }
+            .fail();
+        }
+        let mut output = reserve("final hidden row", shape.returned_hidden)?;
         output.extend_from_slice(result);
         Ok(output)
+    }
+
+    /// Return the checked CPU allocation envelope for this executor's admitted context.
+    ///
+    /// The envelope is a logical `f32` backing bound, not allocator capacity,
+    /// process RSS, tokenizer storage, or GPU memory. Serialized GGUF backing
+    /// is reported separately; transient decoded norm vectors are workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when the admitted allocation dimensions or
+    /// their logical byte totals cannot be represented safely.
+    pub fn cpu_requirements(&self) -> Result<Qwen3CpuRequirements> {
+        let shape = self.allocation_shape(self.max_context)?;
+        let inspection = self.body.payload().observation().inspection();
+        Qwen3CpuRequirements::embedding(
+            inspection.digest,
+            inspection.file_len,
+            self.max_context,
+            &shape,
+        )
+    }
+
+    pub(crate) fn allocation_shape(&self, tokens: usize) -> Result<Qwen3AllocationShape> {
+        self.body.layout.allocation_shape(tokens)
+    }
+
+    pub(crate) const fn admitted_max_context(&self) -> usize {
+        self.max_context
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "the checked causal-attention and FFN order is one source-defined transformer block"
     )]
-    fn run_block(&self, block: usize, hidden: &mut [f32]) -> Result<()> {
+    fn run_block(
+        &self,
+        block: usize,
+        hidden: &mut [f32],
+        shape: &Qwen3AllocationShape,
+    ) -> Result<()> {
         let layout = self.body.layout;
-        let tokens = hidden.len() / layout.hidden;
+        if hidden.len() != shape.hidden_rows {
+            return Qwen3ExecutionSnafu {
+                requested: hidden.len(),
+                rule: "block hidden rows must fit the checked Qwen3 allocation shape",
+            }
+            .fail();
+        }
+        let tokens = shape.tokens;
         let attn_norm = read_f32_vector(
             self.body.payload(),
             &block_name(block, "attn_norm.weight"),
-            layout.hidden,
+            shape.attention_norm,
         )?;
         let q_norm = read_f32_vector(
             self.body.payload(),
             &block_name(block, "attn_q_norm.weight"),
-            layout.head_dim,
+            shape.query_norm,
         )?;
         let k_norm = read_f32_vector(
             self.body.payload(),
             &block_name(block, "attn_k_norm.weight"),
-            layout.head_dim,
+            shape.key_norm,
         )?;
         let q =
             CheckedMatrix::from_payload(self.body.payload(), &block_name(block, "attn_q.weight"))?;
@@ -356,33 +410,37 @@ impl Qwen3Execution<'_, '_> {
             self.body.payload(),
             &block_name(block, "attn_output.weight"),
         )?;
-        let key_cache_len = product(tokens, layout.kv_width)?;
-        let mut keys = reserve("causal key cache", key_cache_len)?;
-        let mut values = reserve("causal value cache", key_cache_len)?;
-        keys.resize(key_cache_len, 0.0);
-        values.resize(key_cache_len, 0.0);
-        let mut attention = reserve("attention residual", hidden.len())?;
+        let mut keys = reserve("causal key cache", shape.key_cache)?;
+        let mut values = reserve("causal value cache", shape.value_cache)?;
+        keys.resize(shape.key_cache, 0.0);
+        values.resize(shape.value_cache, 0.0);
+        let mut attention = reserve("attention residual", shape.attention_residual)?;
         for token in 0..tokens {
             let row = row(hidden, token, layout.hidden)?;
-            let normalized =
-                kernels::cpu_f32::rms_norm(row, &attn_norm, 1, layout.hidden, layout.epsilon)
-                    .context(Qwen3CpuSnafu)?;
+            let normalized = kernels::cpu_f32::rms_norm(
+                row,
+                &attn_norm,
+                1,
+                shape.attention_row_norm,
+                layout.epsilon,
+            )
+            .context(Qwen3CpuSnafu)?;
             let mut query = q.project(&normalized)?;
             let mut key = k.project(&normalized)?;
             let value = v.project(&normalized)?;
             query = kernels::cpu_f32::rms_norm(
                 &query,
                 &q_norm,
-                layout.heads,
-                layout.head_dim,
+                shape.heads,
+                shape.head_dim,
                 layout.epsilon,
             )
             .context(Qwen3CpuSnafu)?;
             key = kernels::cpu_f32::rms_norm(
                 &key,
                 &k_norm,
-                layout.kv_heads,
-                layout.head_dim,
+                shape.kv_heads,
+                shape.head_dim,
                 layout.epsilon,
             )
             .context(Qwen3CpuSnafu)?;
@@ -391,14 +449,14 @@ impl Qwen3Execution<'_, '_> {
             let cache_start = product(token, layout.kv_width)?;
             copy_into(&mut keys, cache_start, &key, "key cache")?;
             copy_into(&mut values, cache_start, &value, "value cache")?;
-            let merged = causal_attention(&query, &keys, &values, token + 1, layout)?;
+            let merged = causal_attention(&query, &keys, &values, token + 1, layout, shape)?;
             attention.extend(output.project(&merged)?);
         }
         add_in_place(hidden, &attention, "attention residual")?;
         let ffn_norm = read_f32_vector(
             self.body.payload(),
             &block_name(block, "ffn_norm.weight"),
-            layout.hidden,
+            shape.ffn_norm,
         )?;
         let gate = CheckedMatrix::from_payload(
             self.body.payload(),
@@ -410,13 +468,13 @@ impl Qwen3Execution<'_, '_> {
             self.body.payload(),
             &block_name(block, "ffn_down.weight"),
         )?;
-        let mut ffn = reserve("FFN residual", hidden.len())?;
+        let mut ffn = reserve("FFN residual", shape.ffn_residual)?;
         for token in 0..tokens {
             let normalized = kernels::cpu_f32::rms_norm(
                 row(hidden, token, layout.hidden)?,
                 &ffn_norm,
                 1,
-                layout.hidden,
+                shape.ffn_row_norm,
                 layout.epsilon,
             )
             .context(Qwen3CpuSnafu)?;
@@ -539,6 +597,20 @@ impl Layout {
             epsilon,
             rope_base,
         })
+    }
+
+    fn allocation_shape(self, tokens: usize) -> Result<Qwen3AllocationShape> {
+        Qwen3AllocationShape::new(
+            tokens,
+            self.hidden,
+            self.heads,
+            self.kv_heads,
+            self.head_dim,
+            self.q_width,
+            self.kv_width,
+            self.feed_forward,
+            RANK_LABELS.len(),
+        )
     }
 }
 
@@ -696,8 +768,10 @@ fn causal_attention(
     values: &[f32],
     tokens: usize,
     layout: Layout,
+    shape: &Qwen3AllocationShape,
 ) -> Result<Vec<f32>> {
-    let mut output = reserve("causal attention output", layout.q_width)?;
+    let prefix = shape.causal_prefix_elements(tokens)?;
+    let mut output = reserve("causal attention output", shape.causal_attention_output)?;
     let group = layout.heads / layout.kv_heads;
     let head_dim = layout.head_dim.to_f32().ok_or_else(|| {
         Qwen3ExecutionSnafu {
@@ -710,8 +784,8 @@ fn causal_attention(
     for head in 0..layout.heads {
         let q = row(query, head, layout.head_dim)?;
         let kv_head = head / group;
-        let mut scores = reserve("causal attention scores", tokens)?;
-        for token in 0..tokens {
+        let mut scores = reserve("causal attention scores", prefix)?;
+        for token in 0..prefix {
             let key = row(row(keys, token, layout.kv_width)?, kv_head, layout.head_dim)?;
             let score = q
                 .iter()
@@ -723,7 +797,7 @@ fn causal_attention(
             scores.push(score);
         }
         let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut exponents = reserve("causal attention exponentials", tokens)?;
+        let mut exponents = reserve("causal attention exponentials", prefix)?;
         for score in &scores {
             let exponent = (*score - max).exp();
             finite_one(exponent, "attention exponential", exponents.len())?;
@@ -1076,6 +1150,55 @@ mod tests {
     }
 
     #[test]
+    fn reports_the_executor_admitted_context_and_returned_hidden_vector()
+    -> std::result::Result<(), String> {
+        let raw = fixture()?;
+        let artifact = verify(&raw)?;
+        let weights =
+            Qwen3Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let execution = weights.execution(2).map_err(|error| error.to_string())?;
+        let inspection = artifact.observation().inspection();
+        let requirements = execution
+            .cpu_requirements()
+            .map_err(|error| error.to_string())?;
+        let repeated = execution
+            .cpu_requirements()
+            .map_err(|error| error.to_string())?;
+        if requirements != repeated {
+            return Err("requirements were not stable across repeated inspection".to_string());
+        }
+        if requirements.max_context() != 2 {
+            return Err("requirements did not retain the executor context bound".to_string());
+        }
+        if requirements.artifact_digest() != inspection.digest
+            || requirements.serialized_backing_bytes() != inspection.file_len
+        {
+            return Err("requirements did not bind the verified artifact inspection".to_string());
+        }
+        let hidden = execution
+            .last_hidden(&[0, 1])
+            .map_err(|error| error.to_string())?;
+        let returned_bytes = u64::try_from(std::mem::size_of_val(hidden.as_slice()))
+            .map_err(|error| error.to_string())?;
+        if requirements.returned_output_bytes() != returned_bytes {
+            return Err(
+                "requirements did not retain the actual final hidden Vec backing".to_string(),
+            );
+        }
+        if requirements.workspace_upper_bound_bytes() == 0 {
+            return Err("requirements omitted transient workspace".to_string());
+        }
+        if requirements.logical_f32_upper_bound_bytes()
+            != requirements.workspace_upper_bound_bytes() + requirements.returned_output_bytes()
+        {
+            return Err(
+                "embedding logical f32 total did not include the returned vector".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rejects_an_output_head_outside_the_embedding_profile() -> std::result::Result<(), String> {
         let mut raw = fixture()?;
         raw.tensors.push(tensor(
@@ -1286,10 +1409,29 @@ mod tests {
         {
             return Err("rank profile did not retain its artifact geometry".to_string());
         }
-        let logits = weights
-            .execution(usize::try_from(TEST_CONTEXT).map_err(|error| error.to_string())?)
-            .and_then(|execution| execution.last_logits(&[0, 1]))
+        let execution = weights.execution(2).map_err(|error| error.to_string())?;
+        let requirements = execution
+            .cpu_requirements()
             .map_err(|error| error.to_string())?;
+        let inspection = artifact.observation().inspection();
+        if requirements.max_context() != 2
+            || requirements.artifact_digest() != inspection.digest
+            || requirements.serialized_backing_bytes() != inspection.file_len
+        {
+            return Err(
+                "rank requirements did not bind the admitted verified executor".to_string(),
+            );
+        }
+        let logits = execution
+            .last_logits(&[0, 1])
+            .map_err(|error| error.to_string())?;
+        if requirements.returned_output_bytes() != 0
+            || std::mem::size_of_val(&logits) != 2 * std::mem::size_of::<f32>()
+        {
+            return Err(
+                "rank requirements did not preserve stack-array output semantics".to_string(),
+            );
+        }
         if !logits.iter().all(|value| value.is_finite())
             || logits[0].to_bits() == logits[1].to_bits()
         {

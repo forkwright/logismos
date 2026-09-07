@@ -174,6 +174,15 @@ pub enum Error {
         #[snafu(implicit)]
         location: snafu::Location,
     },
+    /// Qwen3 rerank requirement composition overflowed its logical `f32` payload bounds.
+    #[snafu(display("Qwen3 rerank CPU requirements overflowed while composing {target}"))]
+    Qwen3RequirementsOverflow {
+        /// Named requirement component whose checked byte arithmetic overflowed.
+        target: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// One framed Qwen3 rerank item exceeds its explicit byte bound.
     #[snafu(display("Qwen3 rerank item {index} has {actual} input bytes, limit {limit}"))]
     Qwen3InputBytesTooLong {

@@ -7,14 +7,14 @@ use snafu::ResultExt;
 use templates::{BoundedTemplate, TemplateLimits};
 use tokenize::VerifiedTokenizer;
 
-use decoders::Qwen3RankWeights;
+use decoders::{Qwen3CpuRequirements, Qwen3RankWeights};
 
 use crate::batch::{Predictions, RerankBatch};
 use crate::error::{
     EmptyBatchSnafu, EmptyDocumentSnafu, EmptyQuerySnafu, Qwen3BatchTooLargeSnafu,
     Qwen3DecoderSnafu, Qwen3InputByteLengthOverflowSnafu, Qwen3InputBytesTooLongSnafu,
     Qwen3InputTokensTooLongSnafu, Qwen3LimitsSnafu, Qwen3MetadataSnafu, Qwen3NonFiniteScoreSnafu,
-    Qwen3TemplateSnafu, Qwen3TokenizerSnafu, Result,
+    Qwen3RequirementsOverflowSnafu, Qwen3TemplateSnafu, Qwen3TokenizerSnafu, Result,
 };
 use crate::reranker::Reranker;
 
@@ -24,6 +24,7 @@ const ADD_BOS: &str = "tokenizer.ggml.add_bos_token";
 const ADD_EOS: &str = "tokenizer.ggml.add_eos_token";
 const IM_START: &str = "<|im_start|>";
 const IM_END: &str = "<|im_end|>";
+const SCORE_OUTPUT_ELEMENTS: usize = 1;
 
 /// Explicit CPU work limits for one Qwen3 reranker.
 ///
@@ -40,6 +41,46 @@ pub struct Qwen3RerankerLimits {
     pub max_batch_items: usize,
     /// Validated independent limits for artifact-owned template rendering.
     pub template: TemplateLimits,
+}
+
+/// Logical CPU `f32` payload requirements for the Qwen3 rerank adapter.
+///
+/// This report composes one artifact-bound rank execution with the sequential
+/// scalar result rows owned by the native reranker. It excludes B-tree nodes,
+/// `Vec` headers and allocator capacity, tokenizer/template data and
+/// intermediates, process memory, physical residency, and GPU memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen3RerankerCpuRequirements {
+    decoder: Qwen3CpuRequirements,
+    max_batch_items: usize,
+    returned_output_bytes: u64,
+    logical_f32_upper_bound_bytes: u64,
+}
+
+impl Qwen3RerankerCpuRequirements {
+    /// Return the one-item artifact-bound rank decoder requirement report.
+    #[must_use]
+    pub const fn decoder_cpu_requirements(self) -> Qwen3CpuRequirements {
+        self.decoder
+    }
+
+    /// Return the trusted maximum number of sequential score rows.
+    #[must_use]
+    pub const fn max_batch_items(self) -> usize {
+        self.max_batch_items
+    }
+
+    /// Return caller-retained scalar-score `f32` payload bytes.
+    #[must_use]
+    pub const fn returned_output_bytes(self) -> u64 {
+        self.returned_output_bytes
+    }
+
+    /// Return the sequential-batch logical `f32` payload upper bound.
+    #[must_use]
+    pub const fn logical_f32_upper_bound_bytes(self) -> u64 {
+        self.logical_f32_upper_bound_bytes
+    }
 }
 
 /// Artifact-bound native CPU Qwen3 reranker with one signed relevance score per pair.
@@ -115,6 +156,50 @@ impl<'artifact> Qwen3Reranker<'artifact> {
         })
     }
 
+    /// Return logical CPU `f32` payload requirements at this reranker's trusted setup maxima.
+    ///
+    /// The embedded decoder report carries immutable serialized backing
+    /// separately. This wrapper counts only requested scalar-score payloads;
+    /// it is not an allocator, process, physical-residency, or GPU budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when the admitted rank decoder report or the
+    /// checked sequential result composition cannot be represented.
+    pub fn cpu_requirements(&self) -> Result<Qwen3RerankerCpuRequirements> {
+        let decoder = self
+            .weights
+            .execution(self.max_tokens)
+            .context(Qwen3DecoderSnafu)?
+            .cpu_requirements()
+            .context(Qwen3DecoderSnafu)?;
+        let one_score_bytes = score_output_bytes()?;
+        let returned_output_bytes = multiply_bytes(
+            one_score_bytes,
+            self.max_batch_items,
+            "rerank batch returned scores",
+        )?;
+        let prior_output_bytes = multiply_bytes(
+            one_score_bytes,
+            self.max_batch_items - 1,
+            "rerank prior batch scores",
+        )?;
+        let in_flight_bytes = prior_output_bytes
+            .checked_add(decoder.workspace_upper_bound_bytes())
+            .ok_or_else(|| {
+                Qwen3RequirementsOverflowSnafu {
+                    target: "rerank sequential in-flight payload",
+                }
+                .build()
+            })?;
+        Ok(Qwen3RerankerCpuRequirements {
+            decoder,
+            max_batch_items: self.max_batch_items,
+            returned_output_bytes,
+            logical_f32_upper_bound_bytes: returned_output_bytes.max(in_flight_bytes),
+        })
+    }
+
     fn score_item(&self, index: usize, query: &str, document: &str) -> Result<f32> {
         let input_bytes = checked_input_bytes(&self.instruction, query, document)?;
         if input_bytes > self.max_pair_bytes {
@@ -158,7 +243,9 @@ impl Reranker for Qwen3Reranker<'_> {
         let mut predictions = Predictions::new();
         for (index, item) in batch.items.iter().enumerate() {
             let score = self.score_item(index, &item.query, &item.document)?;
-            predictions.insert(index, vec![score]);
+            let mut row = score_output()?;
+            row.push(score);
+            predictions.insert(index, row);
         }
         Ok(predictions)
     }
@@ -270,6 +357,45 @@ fn signed_relevance_score(index: usize, logits: [f32; 2]) -> Result<f32> {
         .to_f32()
         .filter(|score| score.is_finite())
         .ok_or_else(|| Qwen3NonFiniteScoreSnafu { index }.build())
+}
+
+fn score_output() -> Result<Vec<f32>> {
+    let mut scores = Vec::new();
+    scores.try_reserve_exact(SCORE_OUTPUT_ELEMENTS).context(
+        crate::error::Qwen3AllocationSnafu {
+            target: "rerank scalar score row",
+        },
+    )?;
+    Ok(scores)
+}
+
+fn score_output_bytes() -> Result<u64> {
+    let elements = u64::try_from(SCORE_OUTPUT_ELEMENTS).map_err(|_| {
+        Qwen3RequirementsOverflowSnafu {
+            target: "rerank scalar score elements",
+        }
+        .build()
+    })?;
+    let bytes = u64::try_from(std::mem::size_of::<f32>()).map_err(|_| {
+        Qwen3RequirementsOverflowSnafu {
+            target: "rerank scalar f32 bytes",
+        }
+        .build()
+    })?;
+    elements.checked_mul(bytes).ok_or_else(|| {
+        Qwen3RequirementsOverflowSnafu {
+            target: "rerank scalar score payload",
+        }
+        .build()
+    })
+}
+
+fn multiply_bytes(bytes: u64, count: usize, target: &'static str) -> Result<u64> {
+    let count =
+        u64::try_from(count).map_err(|_| Qwen3RequirementsOverflowSnafu { target }.build())?;
+    bytes
+        .checked_mul(count)
+        .ok_or_else(|| Qwen3RequirementsOverflowSnafu { target }.build())
 }
 
 fn validate_batch(batch: &RerankBatch, limit: usize) -> Result<()> {
