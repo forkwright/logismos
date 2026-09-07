@@ -218,6 +218,31 @@ These controls do not bound all tokenizer/template intermediates or total
 process memory. Synthetic execution does not resolve exact-artifact conversion
 provenance, template parity, retrieval quality, deployment or hardware gates.
 
+## Native retrieval CPU requirements
+
+`decoders::Qwen3CpuRequirements` binds a logical `f32` backing envelope to the
+verified artifact and the executor's context bound. The checked private Qwen3
+allocation shape is shared by execution and reporting. Its named phase sums
+include temporary replacement allocations and buffers that remain live through
+the FFN; sequential blocks do not multiply live workspace. Qwen3 execution is
+stateless, so there is no retained-session or transaction-copy term.
+
+Embedding reports separate the returned terminal hidden vector from workspace.
+Rank reports include the terminal hidden vector and temporary classifier
+projection, but the returned two-logit array occupies no heap backing. Concrete
+embedding and reranking adapters compose their decoder report with the trusted
+batch-item bound, accounting for previously returned vectors or scalar rows
+while the next item executes. They do not multiply per-item workspace by the
+batch count or change the stable consumer traits.
+
+These are checked upper bounds on requested `Vec<f32>` backing, not allocator
+capacity or physical reservations. Serialized GGUF bytes are identity-bound
+and reported separately. Stack and structure storage, allocator overhead,
+non-f32 buffers, tokenizer/template intermediates, process RSS and GPU memory
+are excluded. A digest identifies bytes, not publisher authenticity. Neither
+these reports nor the Qwen3.5 CPU report establish device requirements or
+authorize admission and residency integration.
+
 ## cfg flags
 
 - `logismos_no_gpu_kernels` - build path without compiled HIP kernels. Implemented GPU operations
