@@ -95,6 +95,7 @@ tokenize = { path = "crates/tokenize" }
 cache = { path = "crates/cache" }
 decode = { path = "crates/decode" }
 text = { path = "crates/text" }
+templates = { path = "crates/templates" }
 core = { path = "crates/core" }
 transformers = { path = "crates/transformers" }
 encoders = { path = "crates/encoders" }
