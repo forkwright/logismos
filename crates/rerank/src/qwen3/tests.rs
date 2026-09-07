@@ -364,12 +364,11 @@ fn cpu_requirements_refuse_overflowing_scalar_batch_output() -> TestResult<()> {
 }
 
 #[test]
-fn cpu_requirements_refuse_portable_scalar_multiplication_overflow() -> TestResult<()> {
+fn cpu_requirements_refuse_portable_scalar_multiplication_overflow() {
     assert!(matches!(
         multiply_bytes(u64::MAX, 2, "synthetic rerank overflow"),
         Err(Error::Qwen3RequirementsOverflow { .. })
     ));
-    Ok(())
 }
 
 #[test]
