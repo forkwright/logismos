@@ -378,10 +378,11 @@ mod tests {
             },
         )?
         .render(())
-        .expect_err("impossibly large bounded output must not allocate");
+        .err()
+        .ok_or("impossibly large bounded output must not allocate")?;
         assert!(
             StdError::source(&allocation_error)
-                .is_some_and(|source| source.is::<std::collections::TryReserveError>()),
+                .is_some_and(<dyn StdError>::is::<std::collections::TryReserveError>),
             "allocation wrapper must retain TryReserveError"
         );
 
@@ -389,10 +390,11 @@ mod tests {
         invalid_utf8.output.push(0xff);
         let utf8_error = invalid_utf8
             .into_string()
-            .expect_err("invalid byte must fail UTF-8 conversion");
+            .err()
+            .ok_or("invalid byte must fail UTF-8 conversion")?;
         assert!(
             StdError::source(&utf8_error)
-                .is_some_and(|source| source.is::<std::string::FromUtf8Error>()),
+                .is_some_and(<dyn StdError>::is::<std::string::FromUtf8Error>),
             "UTF-8 wrapper must retain FromUtf8Error"
         );
         Ok(())
