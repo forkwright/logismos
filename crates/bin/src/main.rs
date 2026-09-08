@@ -1,9 +1,11 @@
 //! # logismos binary
 //!
-//! The `plan` and `inspect` subcommands are CPU-only: they neither initialise
-//! HIP nor start a service. The minimal `cargo build -p bin` dependency graph
-//! also excludes HIP; broader workspace feature unification can produce a
-//! different linkage graph without changing that command behavior.
+//! The `plan`, `inspect`, and `prepare-text` subcommands are CPU-only: they
+//! neither initialise HIP nor start a service. The minimal `cargo build -p bin`
+//! dependency graph also excludes HIP; broader workspace feature unification
+//! can produce a different linkage graph without changing that command behavior.
+
+mod prepare_text;
 
 use std::{
     collections::HashMap,
@@ -32,6 +34,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(outcome) => write_outcome(&outcome),
         Err(CliError::Inspection(error)) => write_inspection_error(error),
+        Err(CliError::PrepareText(error)) => write_prepare_text_error(error),
         Err(error) => {
             eprintln!("{error}");
             ExitCode::from(2)
@@ -47,6 +50,9 @@ fn run() -> Result<CommandOutcome, CliError> {
         Some(command) if command == "inspect" => {
             inspect_command(arguments).map(|outcome| CommandOutcome::Inspection(Box::new(outcome)))
         }
+        Some(command) if command == "prepare-text" => prepare_text::command(arguments)
+            .map(|outcome| CommandOutcome::PreparedText(Box::new(outcome)))
+            .map_err(CliError::PrepareText),
         _ => Err(CliError::Usage),
     }
 }
@@ -54,6 +60,7 @@ fn run() -> Result<CommandOutcome, CliError> {
 enum CommandOutcome {
     Plan(placement::PlanOutcome),
     Inspection(Box<InspectionOutcome>),
+    PreparedText(Box<prepare_text::PreparedTextOutcome>),
 }
 
 enum InspectionOutcome {
@@ -159,7 +166,16 @@ fn write_outcome(outcome: &CommandOutcome) -> ExitCode {
     match outcome {
         CommandOutcome::Plan(outcome) => write_plan_outcome(outcome),
         CommandOutcome::Inspection(outcome) => write_inspection_outcome(outcome),
+        CommandOutcome::PreparedText(outcome) => write_prepared_text_outcome(outcome),
     }
+}
+
+fn write_prepared_text_outcome(outcome: &prepare_text::PreparedTextOutcome) -> ExitCode {
+    write_inspection_json(
+        outcome,
+        "unable to serialize prepared text receipt",
+        ExitCode::SUCCESS,
+    )
 }
 
 fn write_plan_outcome(outcome: &placement::PlanOutcome) -> ExitCode {
@@ -234,6 +250,20 @@ fn write_inspection_error(error: InspectionError) -> ExitCode {
         eprintln!("{diagnostic}");
     }
     exit_code
+}
+
+fn write_prepare_text_error(error: prepare_text::PrepareTextError) -> ExitCode {
+    let receipt = InspectionErrorReceipt {
+        schema_version: INSPECTION_SCHEMA_VERSION,
+        outcome: "error",
+        command: "prepare-text",
+        kind: error.kind(),
+    };
+    write_inspection_json(
+        &receipt,
+        "unable to serialize prepared text error",
+        ExitCode::from(2),
+    )
 }
 
 fn write_inspection_json(
@@ -582,6 +612,7 @@ enum CliError {
     Usage,
     Input(&'static str),
     Inspection(InspectionError),
+    PrepareText(prepare_text::PrepareTextError),
 }
 
 impl fmt::Display for CliError {
@@ -590,6 +621,7 @@ impl fmt::Display for CliError {
             Self::Usage => formatter.write_str(USAGE),
             Self::Input(message) => formatter.write_str(message),
             Self::Inspection(_) => formatter.write_str(INSPECTION_USAGE),
+            Self::PrepareText(_) => formatter.write_str(prepare_text::PREPARE_TEXT_USAGE),
         }
     }
 }
