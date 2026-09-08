@@ -285,11 +285,9 @@ mod tests {
 
     #[test]
     fn checked_shape_refuses_extents_outside_the_rust_allocation_domain() {
-        let too_large_for_f32 = usize::try_from(isize::MAX)
-            .expect("isize::MAX is non-negative")
-            .checked_div(core::mem::size_of::<f32>())
-            .and_then(|elements| elements.checked_add(1))
-            .expect("test platform has a representable layout boundary");
+        // Dividing the positive signed maximum by f32's size leaves room for
+        // one more element in usize, while exceeding Layout's byte bound.
+        let too_large_for_f32 = isize::MAX.unsigned_abs() / core::mem::size_of::<f32>() + 1;
         assert!(matches!(
             super::checked_layout::<f32>(too_large_for_f32, "test f32 extent"),
             Err(Error::UnsupportedShape { kernel: KERNEL, .. })
