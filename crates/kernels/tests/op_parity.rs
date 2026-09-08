@@ -13,7 +13,7 @@ use half::f16;
 use hipcore::{Device, DeviceBuffer, Stream};
 use kernels::rms_norm::{cpu as rms_cpu, launch_rms_norm_fp16};
 use kernels::rope::{cpu as rope_cpu, launch_rope_fp16_in_place};
-use kernels::softmax::{cpu as softmax_cpu, launch_softmax_fp16};
+use kernels::softmax::launch_softmax_fp16;
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
 
@@ -66,6 +66,55 @@ fn bytes_to_f16(v: &[u8]) -> Vec<f16> {
             f16::from_ne_bytes(bytes)
         })
         .collect()
+}
+
+/// Independent f64 softmax reference for the bounded finite inputs in the
+/// hardware-parity witness.
+///
+/// This deliberately uses the direct exponent expression rather than the
+/// production max-subtraction implementation. It is not a production masking
+/// policy: an all-negative-infinity row remains undefined here, so parity only
+/// supplies `[-1, 1]` finite logits from [`random_f16`].
+fn finite_softmax_fp16_oracle(x: &[f16], rows: usize, width: usize) -> Vec<f16> {
+    assert!(width > 0, "oracle requires a non-empty last axis");
+    let expected_len = rows
+        .checked_mul(width)
+        .expect("test-only oracle shape must fit usize");
+    assert_eq!(x.len(), expected_len, "oracle input shape");
+    assert!(
+        x.iter().all(|value| value.to_f32().is_finite()),
+        "oracle is only defined for finite parity logits"
+    );
+
+    let mut output = Vec::with_capacity(expected_len);
+    for row in x.chunks_exact(width) {
+        let denominator = row
+            .iter()
+            .map(|value| f64::from(value.to_f32()).exp())
+            .sum::<f64>();
+        output
+            .extend(row.iter().map(|value| {
+                f16::from_f32((f64::from(value.to_f32()).exp() / denominator) as f32)
+            }));
+    }
+    output
+}
+
+#[test]
+fn finite_softmax_oracle_matches_known_ratios() {
+    let logits = [
+        f16::from_f32(0.0),
+        f16::from_f32(std::f32::consts::LN_2),
+        f16::from_f32(2.0 * std::f32::consts::LN_2),
+    ];
+    let actual = finite_softmax_fp16_oracle(&logits, 1, 3);
+    let expected = [1.0_f32 / 7.0, 2.0 / 7.0, 4.0 / 7.0];
+    for (value, expected) in actual.iter().zip(expected) {
+        assert!(
+            (value.to_f32() - expected).abs() < 1e-3,
+            "got {value:?}, expected {expected}"
+        );
+    }
 }
 
 #[test]
@@ -121,7 +170,7 @@ fn softmax_parity() {
     let m = 4;
     let n = 512;
     let x = random_f16(m * n, 7);
-    let cpu = softmax_cpu::softmax_fp16_ref(&x, m, n).expect("shapes match by construction");
+    let cpu = finite_softmax_fp16_oracle(&x, m, n);
 
     let x_dev = DeviceBuffer::<u8>::from_host(&device, f16_bytes(&x)).expect("x");
     let y_dev = DeviceBuffer::<u8>::alloc(&device, m * n * 2).expect("y");
