@@ -318,6 +318,9 @@ impl<'pipeline, 'artifact> PreparedGeneration<'pipeline, 'artifact> {
                 break FinishReason::Length;
             }
             check_cancelled(cancellation, "next decoder step")?;
+            // Selection is complete; do not retain the old vocabulary row while
+            // the decoder allocates the next step's workspace and output.
+            drop(logits);
             logits = execution.step(&[next]).context(DecoderSnafu)?;
         };
         check_cancelled(cancellation, "collective output decoding")?;
