@@ -21,7 +21,7 @@
 //! directly, which agreed with the little-endian readers only on a
 //! little-endian host.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Range};
 
 use snafu::ResultExt;
 use taxis::{CpuStorage, DType, Shape, Tensor};
@@ -144,6 +144,12 @@ struct TensorBytes<'t> {
     bytes: Cow<'t, [u8]>,
 }
 
+/// Checked destination geometry for one atomic cache append.
+struct AppendGeometry {
+    next_len: usize,
+    byte_range: Range<usize>,
+}
+
 /// Flat KV cache.
 ///
 /// Invariants:
@@ -264,7 +270,7 @@ impl FlatKvCache {
         layer_idx: usize,
         current: usize,
         n_tokens: usize,
-    ) -> Result<(usize, usize, usize)> {
+    ) -> Result<AppendGeometry> {
         let next_len = current.checked_add(n_tokens).ok_or_else(|| {
             GeometryOverflowSnafu {
                 op: "FlatKvCache::put",
@@ -303,23 +309,30 @@ impl FlatKvCache {
             }
             .build()
         })?;
-        Ok((next_len, off, end))
+        Ok(AppendGeometry {
+            next_len,
+            byte_range: off..end,
+        })
     }
 
     fn write_append(
         &mut self,
         layer_idx: usize,
-        next_len: usize,
-        off: usize,
-        end: usize,
+        geometry: AppendGeometry,
         k_bytes: &[u8],
         v_bytes: &[u8],
     ) -> Result<()> {
+        let AppendGeometry {
+            next_len,
+            byte_range,
+        } = geometry;
         let buffer_err = || {
             ShapeMismatchSnafu {
                 msg: format!(
-                    "layer {layer_idx} buffer overflow (off={off}, end={end}, \
+                    "layer {layer_idx} buffer overflow (off={}, end={}, \
                      buf_bytes={})",
+                    byte_range.start,
+                    byte_range.end,
                     self.layout.buffer_bytes()
                 ),
             }
@@ -340,10 +353,8 @@ impl FlatKvCache {
             }
             .build()
         })?;
-        let k_dst = k_buf.get_mut(off..end).ok_or_else(buffer_err)?;
-        let v_dst = v_buf.get_mut(off..end).ok_or_else(buffer_err)?;
-        k_dst.copy_from_slice(k_bytes);
-        v_dst.copy_from_slice(v_bytes);
+        let k_dst = k_buf.get_mut(byte_range.clone()).ok_or_else(buffer_err)?;
+        let v_dst = v_buf.get_mut(byte_range).ok_or_else(buffer_err)?;
         let slot = self.lens.get_mut(layer_idx).ok_or_else(|| {
             LayerOutOfRangeSnafu {
                 layer_idx,
@@ -351,6 +362,8 @@ impl FlatKvCache {
             }
             .build()
         })?;
+        k_dst.copy_from_slice(k_bytes);
+        v_dst.copy_from_slice(v_bytes);
         *slot = next_len;
         Ok(())
     }
@@ -380,8 +393,8 @@ impl KvCache for FlatKvCache {
             }
             .build()
         })?;
-        let (next_len, off, end) = self.append_geometry(layer_idx, current, n_k)?;
-        self.write_append(layer_idx, next_len, off, end, &k_bytes, &v_bytes)
+        let geometry = self.append_geometry(layer_idx, current, n_k)?;
+        self.write_append(layer_idx, geometry, &k_bytes, &v_bytes)
     }
 
     fn get(&self, layer_idx: usize, len: usize) -> Result<(Tensor, Tensor)> {
@@ -496,35 +509,28 @@ fn le_bytes_of<T: Copy, const N: usize>(
     Ok(Cow::Owned(out))
 }
 
-#[cfg(target_endian = "little")]
 fn cpu_storage_bytes(s: &CpuStorage) -> Result<Cow<'_, [u8]>> {
-    match s {
-        CpuStorage::F32(v) => Ok(le_bytes_of(v, f32::to_le_bytes)),
-        CpuStorage::F16(v) => Ok(le_bytes_of(v, half::f16::to_le_bytes)),
-        CpuStorage::BF16(v) => Ok(le_bytes_of(v, half::bf16::to_le_bytes)),
-        CpuStorage::I32(v) => Ok(le_bytes_of(v, i32::to_le_bytes)),
-        CpuStorage::I8(v) => Ok(le_bytes_of(v, i8::to_le_bytes)),
-        CpuStorage::U8(v) => Ok(Cow::Borrowed(v.as_slice())),
-        _ => UnsupportedStorageSnafu {
-            msg: "unsupported future CpuStorage variant",
-        }
-        .fail(),
-    }
-}
-
-#[cfg(not(target_endian = "little"))]
-fn cpu_storage_bytes(s: &CpuStorage) -> Result<Cow<'_, [u8]>> {
-    match s {
+    let bytes = match s {
         CpuStorage::F32(v) => le_bytes_of(v, f32::to_le_bytes),
         CpuStorage::F16(v) => le_bytes_of(v, half::f16::to_le_bytes),
         CpuStorage::BF16(v) => le_bytes_of(v, half::bf16::to_le_bytes),
         CpuStorage::I32(v) => le_bytes_of(v, i32::to_le_bytes),
         CpuStorage::I8(v) => le_bytes_of(v, i8::to_le_bytes),
-        CpuStorage::U8(v) => Ok(Cow::Borrowed(v.as_slice())),
-        _ => UnsupportedStorageSnafu {
-            msg: "unsupported future CpuStorage variant",
+        CpuStorage::U8(v) => return Ok(Cow::Borrowed(v.as_slice())),
+        _ => {
+            return UnsupportedStorageSnafu {
+                msg: "unsupported future CpuStorage variant",
+            }
+            .fail();
         }
-        .fail(),
+    };
+    #[cfg(target_endian = "little")]
+    {
+        Ok(bytes)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        bytes
     }
 }
 
