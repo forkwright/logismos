@@ -233,7 +233,6 @@ impl MultiHeadRecurrentAllocationPlan {
     const fn head_allocations(self) -> RecurrentAllocationPlan {
         self.head
     }
-
 }
 
 /// Failures while admitting or evaluating the bounded GDN reference.
@@ -966,7 +965,8 @@ fn validate_gdn_step_launch(
         checked_device_span(g_f32, g_elements, "g")?,
         checked_device_span(state_in_f32, state_in_elements, "state_in")?,
     ];
-    let state_out = checked_device_span(state_out_f32.cast_const(), state_out_elements, "state_out")?;
+    let state_out =
+        checked_device_span(state_out_f32.cast_const(), state_out_elements, "state_out")?;
     let output = checked_device_span(output_f32.cast_const(), output_elements, "output")?;
     for input in inputs {
         reject_overlapping_gdn_step_spans(state_out, input)?;
@@ -994,7 +994,11 @@ fn validate_gdn_step_length(name: &'static str, actual: usize, expected: usize) 
 }
 
 #[cfg(feature = "gpu")]
-fn checked_device_span(pointer: *const f32, elements: usize, name: &'static str) -> Result<DeviceSpan> {
+fn checked_device_span(
+    pointer: *const f32,
+    elements: usize,
+    name: &'static str,
+) -> Result<DeviceSpan> {
     if pointer.is_null() {
         return unsupported_gdn_step_shape(format!("{name} must be non-null"));
     }
@@ -1450,22 +1454,8 @@ mod tests {
     fn one_token_grouped_and_pre_tiled_profiles_match_independent_f64_oracle() -> GdnResult<()> {
         for (key_head_count, value_head_count) in [(KEY_HEAD_COUNT, VALUE_HEAD_COUNT), (2, 2)] {
             let fixture = multi_head_fixture(key_head_count, value_head_count);
-            let q = head_major_token_window(
-                &fixture.q,
-                key_head_count,
-                TOKEN_COUNT,
-                KEY_DIM,
-                0,
-                1,
-            );
-            let k = head_major_token_window(
-                &fixture.k,
-                key_head_count,
-                TOKEN_COUNT,
-                KEY_DIM,
-                0,
-                1,
-            );
+            let q = head_major_token_window(&fixture.q, key_head_count, TOKEN_COUNT, KEY_DIM, 0, 1);
+            let k = head_major_token_window(&fixture.k, key_head_count, TOKEN_COUNT, KEY_DIM, 0, 1);
             let v = head_major_token_window(
                 &fixture.v,
                 value_head_count,
@@ -1474,22 +1464,9 @@ mod tests {
                 0,
                 1,
             );
-            let beta = head_major_token_window(
-                &fixture.beta,
-                value_head_count,
-                TOKEN_COUNT,
-                1,
-                0,
-                1,
-            );
-            let g = head_major_token_window(
-                &fixture.g,
-                value_head_count,
-                TOKEN_COUNT,
-                1,
-                0,
-                1,
-            );
+            let beta =
+                head_major_token_window(&fixture.beta, value_head_count, TOKEN_COUNT, 1, 0, 1);
+            let g = head_major_token_window(&fixture.g, value_head_count, TOKEN_COUNT, 1, 0, 1);
             let input = multi_head_input(
                 &q,
                 &k,
@@ -1526,10 +1503,11 @@ mod tests {
     #[cfg(feature = "gpu")]
     #[test]
     fn staged_gpu_step_refuses_unsupported_shape_alias_and_overflow() -> Result<()> {
-        let two_token_plan = match MultiHeadRecurrentAllocationPlan::try_from_dimensions(2, 1, 1, 1, 1) {
-            Ok(plan) => plan,
-            Err(error) => panic!("test dimensions are valid: {error}"),
-        };
+        let two_token_plan =
+            match MultiHeadRecurrentAllocationPlan::try_from_dimensions(2, 1, 1, 1, 1) {
+                Ok(plan) => plan,
+                Err(error) => panic!("test dimensions are valid: {error}"),
+            };
         assert!(matches!(
             validate_gdn_step_launch(
                 two_token_plan,
@@ -1625,8 +1603,8 @@ mod tests {
     #[cfg(feature = "gpu")]
     #[test]
     #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
-    fn reserved_device_grouped_step_matches_oracle_for_grouped_equal_and_continuation(
-    ) -> core::result::Result<(), String> {
+    fn reserved_device_grouped_step_matches_oracle_for_grouped_equal_and_continuation()
+    -> core::result::Result<(), String> {
         use hipcore::{Device, DeviceBuffer, Stream};
 
         let device = Device::new(0).map_err(|error| format!("open reserved device 0: {error}"))?;
@@ -1647,20 +1625,10 @@ mod tests {
             let state_in = DeviceBuffer::<f32>::from_host(&device, &fixture.state)
                 .map_err(|error| format!("upload initial state: {error}"))?;
 
-            let (first_output, first_state) = launch_reserved_device_step(
-                &device,
-                &stream,
-                plan,
-                &first,
-                &state_in,
-            )?;
-            let (second_output, second_state) = launch_reserved_device_step(
-                &device,
-                &stream,
-                plan,
-                &second,
-                &first_state,
-            )?;
+            let (first_output, first_state) =
+                launch_reserved_device_step(&device, &stream, plan, &first, &state_in)?;
+            let (second_output, second_state) =
+                launch_reserved_device_step(&device, &stream, plan, &second, &first_state)?;
             let actual_first_output = read_reserved_device_buffer(&first_output)?;
             let actual_first_state = read_reserved_device_buffer(&first_state)?;
             let actual_second_output = read_reserved_device_buffer(&second_output)?;
@@ -1679,22 +1647,8 @@ mod tests {
                 KEY_DIM,
                 MULTI_HEAD_VALUE_DIM,
             );
-            let q = head_major_token_window(
-                &fixture.q,
-                key_head_count,
-                TOKEN_COUNT,
-                KEY_DIM,
-                0,
-                2,
-            );
-            let k = head_major_token_window(
-                &fixture.k,
-                key_head_count,
-                TOKEN_COUNT,
-                KEY_DIM,
-                0,
-                2,
-            );
+            let q = head_major_token_window(&fixture.q, key_head_count, TOKEN_COUNT, KEY_DIM, 0, 2);
+            let k = head_major_token_window(&fixture.k, key_head_count, TOKEN_COUNT, KEY_DIM, 0, 2);
             let v = head_major_token_window(
                 &fixture.v,
                 value_head_count,
@@ -1703,22 +1657,9 @@ mod tests {
                 0,
                 2,
             );
-            let beta = head_major_token_window(
-                &fixture.beta,
-                value_head_count,
-                TOKEN_COUNT,
-                1,
-                0,
-                2,
-            );
-            let g = head_major_token_window(
-                &fixture.g,
-                value_head_count,
-                TOKEN_COUNT,
-                1,
-                0,
-                2,
-            );
+            let beta =
+                head_major_token_window(&fixture.beta, value_head_count, TOKEN_COUNT, 1, 0, 2);
+            let g = head_major_token_window(&fixture.g, value_head_count, TOKEN_COUNT, 1, 0, 2);
             let (expected_full_output, expected_full_state) = oracle_multi_head_recurrence(
                 &q,
                 &k,
@@ -1734,8 +1675,16 @@ mod tests {
                 MULTI_HEAD_VALUE_DIM,
             );
 
-            assert_close(&actual_first_output, &expected_first_output, "device one-token output");
-            assert_close(&actual_first_state, &expected_first_state, "device one-token next state");
+            assert_close(
+                &actual_first_output,
+                &expected_first_output,
+                "device one-token output",
+            );
+            assert_close(
+                &actual_first_state,
+                &expected_first_state,
+                "device one-token next state",
+            );
             let actual_full_output = join_head_major_outputs(
                 &actual_first_output,
                 &actual_second_output,
@@ -1744,8 +1693,16 @@ mod tests {
                 1,
                 MULTI_HEAD_VALUE_DIM,
             );
-            assert_close(&actual_full_output, &expected_full_output, "device continuation output");
-            assert_close(&actual_second_state, &expected_full_state, "device continuation next state");
+            assert_close(
+                &actual_full_output,
+                &expected_full_output,
+                "device continuation output",
+            );
+            assert_close(
+                &actual_second_state,
+                &expected_full_state,
+                "device continuation next state",
+            );
         }
         Ok(())
     }
@@ -2261,7 +2218,8 @@ mod tests {
         plan: MultiHeadRecurrentAllocationPlan,
         input: &GroupedTokenInputs,
         state_in: &hipcore::DeviceBuffer<f32>,
-    ) -> core::result::Result<(hipcore::DeviceBuffer<f32>, hipcore::DeviceBuffer<f32>), String> {
+    ) -> core::result::Result<(hipcore::DeviceBuffer<f32>, hipcore::DeviceBuffer<f32>), String>
+    {
         let q = hipcore::DeviceBuffer::<f32>::from_host(device, &input.q)
             .map_err(|error| format!("upload q: {error}"))?;
         let k = hipcore::DeviceBuffer::<f32>::from_host(device, &input.k)

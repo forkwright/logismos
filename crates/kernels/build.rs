@@ -154,9 +154,10 @@ fn compile_sources(
                 "-I",
             ])
             .arg(out_dir);
-        if src.file_name().is_some_and(|name| {
-            name == "q8_0_gemv.hip" || name == "gdn_step.hip"
-        }) {
+        if src
+            .file_name()
+            .is_some_and(|name| name == "q8_0_gemv.hip" || name == "gdn_step.hip")
+        {
             // WHY: these correctness baselines retain separately rounded f32
             // operations. Scope no-fast-math and no contraction to their
             // sources rather than changing the rest of the HIP archive.
