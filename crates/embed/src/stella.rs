@@ -314,11 +314,12 @@ impl EmbeddingModel for StellaModel {
             })?;
         check_token_limit(ids.len(), max_tokens)?;
         let mask = vec![1u8; ids.len()];
-        self.encode_raw(&ids, &mask, dim).map_err(map_compute_error)
+        self.encode_raw(&ids, &mask, dim)
+            .map_err(|error| map_compute_error(&error))
     }
 }
 
-fn map_compute_error(error: crate::error::Error) -> EmbeddingError {
+fn map_compute_error(error: &crate::error::Error) -> EmbeddingError {
     CoreComputeSnafu {
         message: error.to_string(),
     }
@@ -595,7 +596,7 @@ mod tests {
         );
         assert!(matches!(error, crate::error::Error::NonNormalizable { .. }));
         assert!(matches!(
-            map_compute_error(error),
+            map_compute_error(&error),
             EmbeddingError::Compute { message, .. } if message.contains("not normalizable")
         ));
     }
