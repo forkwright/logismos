@@ -172,6 +172,19 @@ Completed internal decoder steps are discarded with that private session, not
 undone in a shared session. These limits do not bound total template/tokenizer
 heap use or authenticate the selected model/tokenizer's publisher.
 
+`TextPipeline::prepare` returns an opaque `PreparedGeneration` that owns the
+rendered prompt and final token IDs, borrows the immutable pipeline, and retains
+one `Qwen35ExecutionPlan`. Its context is checked prompt plus output tokens;
+its maximum step is the nonempty prompt length. Configured limits are ceilings,
+while the actual request must fit the artifact. Read-only getters expose these
+exact inputs, tokenizer identity and decoder requirements. Preparation performs
+no decoder-session allocation or model operation. Consuming generation drops the
+rendered prompt and checks cancellation before allocating a fresh session;
+ordinary generation delegates to this same path. Cancellation is cooperative,
+so preparation may finish inertly if cancellation arrives during tokenization.
+The decoder report excludes rendered text, u32 prompt/generated IDs, tokenizer
+and decoded strings; it is not a whole-request estimate or admission grant.
+
 NextN, serving, exact-artifact quality, physical residency and admission
 integration remain separate requirements.
 Explicit CPU execution is not a fallback for a GPU operation.

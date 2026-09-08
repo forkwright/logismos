@@ -84,6 +84,13 @@ state and returns only a complete decoded result; cancellation or error exposes 
 or resumable state. Model/tokenizer identity expectations belong to trusted setup, not individual
 untrusted requests, and are content binding rather than publisher authentication.
 
+`TextPipeline::prepare` exposes the exact rendered prompt, final token IDs and
+artifact-bound decoder requirements without creating a decoder session or running
+the model. Its opaque result is consumed for execution; ordinary `generate` uses
+the same path. Context and prefill bounds derive from that request, not configured
+ceilings. These reports cover decoder f32 backing only, not prompt/tokenizer/text
+allocations, whole-request memory or admission.
+
 The private template environment has no loader or registered templates. Named imports, includes
 and inheritance cannot resolve another source; missing includes explicitly marked optional are
 no-ops. Fuel, recursion and rendered-output limits are operational bounds, not a hostile-template
