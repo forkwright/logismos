@@ -1642,6 +1642,38 @@ mod tests {
     }
 
     #[test]
+    fn retirement_cycles_reclaim_resident_admission_bound_without_grant_replacement()
+    -> Result<(), SchedulerError> {
+        let initial = request(&format!("[{}]", workload("initial", 4)), 20)?;
+        let mut scheduler = Scheduler::new(&initial, SchedulerLimits::try_new(1, 1, 1)?)?;
+        for profile in ["first", "second", "third"] {
+            let current = request(&format!("[{}]", workload(profile, 4)), 20)?;
+            let ticket = one_ticket(&mut scheduler, &current)?;
+            let load = poll_command(&mut scheduler)?;
+            scheduler.complete(RuntimeCompletion::Loaded {
+                operation: load.operation(),
+                resident: ResidentHandle::try_new(format!("resident-{profile}"))?,
+            })?;
+            let permit = scheduler.begin_use(&ticket)?;
+            scheduler.finish_use(&permit)?;
+            scheduler.request_retirement(&ticket)?;
+            let evict = poll_command(&mut scheduler)?;
+            scheduler.complete(RuntimeCompletion::Evicted {
+                operation: evict.operation(),
+            })?;
+            assert!(
+                scheduler.admissions.is_empty(),
+                "every resident cycle returns its lease before the next admission"
+            );
+        }
+        assert!(
+            !scheduler.revoked,
+            "selective retirement does not replace the grant"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn retirement_while_loading_reclaims_a_late_success_only_after_eviction()
     -> Result<(), SchedulerError> {
         let request = request(&format!("[{}]", workload("main", 4)), 20)?;
