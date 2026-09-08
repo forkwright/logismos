@@ -172,13 +172,13 @@ fn malformed_execution_payload_prepares_inertly_and_fails_only_when_consumed() -
     let error = text_error(prepared.generate(&NeverCancelled))?;
     assert!(
         matches!(
-            error,
+            &error,
             Error::Decoder {
-                source: decoders::Error::ExecutionArithmetic { .. },
+                source: decoders::Error::ProjectionRow { name, row, .. },
                 ..
-            }
+            } if name == "token_embd.weight" && *row == 3
         ),
-        "malformed execution data must remain inert until the preparation is consumed"
+        "malformed execution data must remain inert until the preparation is consumed: {error:?}"
     );
     Ok(())
 }
