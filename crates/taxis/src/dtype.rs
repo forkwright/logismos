@@ -67,7 +67,7 @@ impl DType {
                 }
                 .build()
             }),
-            None => Ok(elem_count / 2 + usize::from(elem_count % 2 != 0)),
+            None => Ok(elem_count.div_ceil(2)),
         }
     }
 
