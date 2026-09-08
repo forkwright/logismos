@@ -545,24 +545,29 @@ impl Scheduler {
         }
         self.revoked = true;
         for admission in self.admissions.values_mut() {
-            admission.state = match &admission.state {
-                AdmissionState::Reserved => AdmissionState::Draining {
-                    resident: None,
-                    loading: false,
-                },
-                AdmissionState::Loading => AdmissionState::Draining {
-                    resident: None,
-                    loading: true,
-                },
-                AdmissionState::Resident(resident) | AdmissionState::InUse(resident) => {
-                    AdmissionState::Draining {
-                        resident: Some(resident.clone()),
-                        loading: false,
-                    }
-                }
-                AdmissionState::Draining { .. } | AdmissionState::Evicting(_) => continue,
-            };
+            Self::transition_to_draining(admission);
         }
+        Ok(())
+    }
+
+    /// Request that one admission stop accepting new uses and release safely.
+    ///
+    /// The request denies new uses immediately. A reserved lease releases through
+    /// [`Self::poll_command`]; a loaded resident releases only after its trusted
+    /// eviction acknowledgement. Repeated requests for an active or already
+    /// released local admission are idempotent. This does not revoke the grant or
+    /// affect unrelated admissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without mutation for a foreign or stale ticket.
+    pub fn request_retirement(&mut self, ticket: &AdmissionTicket) -> Result<(), SchedulerError> {
+        self.ensure_local(&ticket.brand, "admission ticket")?;
+        self.ensure_current(ticket.generation)?;
+        let Some(admission) = self.admissions.get_mut(&ticket.admission_id) else {
+            return Ok(());
+        };
+        Self::transition_to_draining(admission);
         Ok(())
     }
 
@@ -716,7 +721,15 @@ impl Scheduler {
                         location: error_location(),
                     },
                 )?;
-                admission.state = if self.revoked {
+                let drain_after_load = self.revoked
+                    || matches!(
+                        &admission.state,
+                        AdmissionState::Draining {
+                            resident: None,
+                            loading: true,
+                        }
+                    );
+                admission.state = if drain_after_load {
                     AdmissionState::Draining {
                         resident: Some(resident),
                         loading: false,
@@ -918,6 +931,27 @@ impl Scheduler {
         } else {
             Ok(())
         }
+    }
+
+    fn transition_to_draining(admission: &mut Admission) {
+        let state = match &admission.state {
+            AdmissionState::Reserved => AdmissionState::Draining {
+                resident: None,
+                loading: false,
+            },
+            AdmissionState::Loading => AdmissionState::Draining {
+                resident: None,
+                loading: true,
+            },
+            AdmissionState::Resident(resident) | AdmissionState::InUse(resident) => {
+                AdmissionState::Draining {
+                    resident: Some(resident.clone()),
+                    loading: false,
+                }
+            }
+            AdmissionState::Draining { .. } | AdmissionState::Evicting(_) => return,
+        };
+        admission.state = state;
     }
 
     fn next_command(&self) -> Option<(u64, OperationKind)> {
@@ -1573,6 +1607,263 @@ mod tests {
                 Err(SchedulerError::UnknownUsePermit { .. })
             ),
             "duplicate permit cannot decrement use accounting twice"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_of_reserved_admissions_is_idempotent_and_recovers_the_bound()
+    -> Result<(), SchedulerError> {
+        let initial = request(&format!("[{}]", workload("initial", 4)), 20)?;
+        let mut scheduler = Scheduler::new(&initial, SchedulerLimits::try_new(1, 1, 1)?)?;
+        for profile in ["first", "second", "third"] {
+            let current = request(&format!("[{}]", workload(profile, 4)), 20)?;
+            let ticket = one_ticket(&mut scheduler, &current)?;
+            scheduler.request_retirement(&ticket)?;
+            scheduler.request_retirement(&ticket)?;
+            assert!(
+                matches!(
+                    scheduler.begin_use(&ticket),
+                    Err(SchedulerError::AdmissionNotResident { .. })
+                ),
+                "retirement closes a reserved admission before a load can issue"
+            );
+            assert!(
+                matches!(scheduler.poll_command()?, PollOutcome::Progressed),
+                "a reserved admission releases without a physical command"
+            );
+            scheduler.request_retirement(&ticket)?;
+            assert!(
+                scheduler.admissions.is_empty(),
+                "an already released local ticket remains an idempotent retirement request"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_while_loading_reclaims_a_late_success_only_after_eviction()
+    -> Result<(), SchedulerError> {
+        let request = request(&format!("[{}]", workload("main", 4)), 20)?;
+        let mut scheduler = Scheduler::new(&request, SchedulerLimits::try_new(2, 1, 2)?)?;
+        let ticket = one_ticket(&mut scheduler, &request)?;
+        let load = poll_command(&mut scheduler)?;
+        scheduler.request_retirement(&ticket)?;
+        scheduler.request_retirement(&ticket)?;
+        scheduler.complete(RuntimeCompletion::Loaded {
+            operation: load.operation(),
+            resident: ResidentHandle::try_new("resident-main")?,
+        })?;
+        assert!(
+            matches!(
+                scheduler.begin_use(&ticket),
+                Err(SchedulerError::AdmissionNotResident { .. })
+            ),
+            "a late successful load must remain retired under a live grant"
+        );
+        let evict = poll_command(&mut scheduler)?;
+        scheduler.request_retirement(&ticket)?;
+        scheduler.complete(RuntimeCompletion::Evicted {
+            operation: evict.operation(),
+        })?;
+        scheduler.request_retirement(&ticket)?;
+        assert!(
+            scheduler.admissions.is_empty(),
+            "only the eviction acknowledgement releases a late loaded resident"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_while_loading_releases_only_after_a_failed_load_acknowledgement()
+    -> Result<(), SchedulerError> {
+        let request = request(&format!("[{}]", workload("main", 4)), 20)?;
+        let mut scheduler = Scheduler::new(&request, SchedulerLimits::default())?;
+        let ticket = one_ticket(&mut scheduler, &request)?;
+        let load = poll_command(&mut scheduler)?;
+        scheduler.request_retirement(&ticket)?;
+        scheduler.complete(RuntimeCompletion::LoadFailed {
+            operation: load.operation(),
+        })?;
+        assert!(
+            scheduler.admissions.is_empty(),
+            "the trusted failed-load acknowledgement proves no allocation remains"
+        );
+        assert!(
+            matches!(
+                scheduler.complete(RuntimeCompletion::LoadFailed {
+                    operation: load.operation()
+                }),
+                Err(SchedulerError::UnknownOperation { .. })
+            ),
+            "a duplicate late load acknowledgement cannot release accounting twice"
+        );
+        scheduler.request_retirement(&ticket)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_retirement_eviction_retains_a_and_allows_b_load_and_use_progress()
+    -> Result<(), SchedulerError> {
+        let initial = request(&format!("[{}]", workload("alpha", 4)), 20)?;
+        let mut scheduler = Scheduler::new(&initial, SchedulerLimits::try_new(3, 1, 2)?)?;
+        let alpha = loaded_ticket(&mut scheduler)?;
+        let beta_request = request(&format!("[{}]", workload("beta", 4)), 20)?;
+        let beta = one_ticket(&mut scheduler, &beta_request)?;
+        scheduler.request_retirement(&alpha)?;
+        let failed_evict = poll_command(&mut scheduler)?;
+        scheduler.complete(RuntimeCompletion::EvictFailed {
+            operation: failed_evict.operation(),
+        })?;
+        assert_eq!(
+            scheduler.admissions.len(),
+            2,
+            "failed eviction keeps alpha's accounting lease"
+        );
+        let beta_load = poll_command(&mut scheduler)?;
+        assert!(
+            matches!(
+                beta_load.kind(),
+                RuntimeCommandKind::Load { profile_id, .. } if profile_id == "beta"
+            ),
+            "load-first dispatch lets unrelated reserved work progress after failed eviction"
+        );
+        scheduler.complete(RuntimeCompletion::Loaded {
+            operation: beta_load.operation(),
+            resident: ResidentHandle::try_new("resident-beta")?,
+        })?;
+        let beta_use = scheduler.begin_use(&beta)?;
+        scheduler.finish_use(&beta_use)?;
+        let retry = poll_command(&mut scheduler)?;
+        scheduler.complete(RuntimeCompletion::Evicted {
+            operation: retry.operation(),
+        })?;
+        let later_beta_use = scheduler.begin_use(&beta)?;
+        scheduler.finish_use(&later_beta_use)?;
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_waits_for_live_uses_and_a_dropped_permit_is_not_an_acknowledgement()
+    -> Result<(), SchedulerError> {
+        let request = request(&format!("[{}]", workload("main", 4)), 20)?;
+        let mut scheduler = Scheduler::new(&request, SchedulerLimits::default())?;
+        let ticket = loaded_ticket(&mut scheduler)?;
+        let first = scheduler.begin_use(&ticket)?;
+        let second = scheduler.begin_use(&ticket)?;
+        scheduler.request_retirement(&ticket)?;
+        assert!(
+            matches!(
+                scheduler.begin_use(&ticket),
+                Err(SchedulerError::AdmissionNotResident { .. })
+            ),
+            "retirement refuses every new use immediately"
+        );
+        scheduler.finish_use(&first)?;
+        assert!(
+            matches!(scheduler.poll_command()?, PollOutcome::Idle),
+            "one remaining live use retains the resident allocation"
+        );
+        scheduler.finish_use(&second)?;
+        let evict = poll_command(&mut scheduler)?;
+        scheduler.complete(RuntimeCompletion::Evicted {
+            operation: evict.operation(),
+        })?;
+
+        let ticket = loaded_ticket(&mut scheduler)?;
+        let abandoned = scheduler.begin_use(&ticket)?;
+        scheduler.request_retirement(&ticket)?;
+        drop(abandoned);
+        assert!(
+            matches!(scheduler.poll_command()?, PollOutcome::Idle),
+            "dropping a caller-held permit cannot falsely acknowledge physical use completion"
+        );
+        assert_eq!(
+            scheduler.admissions.len(),
+            1,
+            "the abandoned permit keeps its retired allocation accounted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_refuses_foreign_and_stale_tickets_without_mutation() -> Result<(), SchedulerError>
+    {
+        let grant = request(&format!("[{}]", workload("main", 4)), 20)?;
+        let mut first = Scheduler::new(&grant, SchedulerLimits::default())?;
+        let mut second = Scheduler::new(&grant, SchedulerLimits::default())?;
+        let foreign = one_ticket(&mut second, &grant)?;
+        assert!(
+            matches!(
+                first.request_retirement(&foreign),
+                Err(SchedulerError::ForeignCapability { .. })
+            ),
+            "a ticket from an identical but distinct controller cannot retire work"
+        );
+        assert!(
+            first.admissions.is_empty(),
+            "foreign retirement has no side effect"
+        );
+
+        let ticket = one_ticket(&mut first, &grant)?;
+        first.revoke(&first.generation())?;
+        assert!(matches!(first.poll_command()?, PollOutcome::Progressed));
+        let replacement = first.replace_grant(&grant)?;
+        assert!(
+            matches!(
+                first.request_retirement(&ticket),
+                Err(SchedulerError::StaleGeneration { .. })
+            ),
+            "a prior generation ticket cannot retire a new grant's admission"
+        );
+        assert!(
+            replacement.value > 1,
+            "replacement advanced the grant generation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn global_revoke_interleaves_with_selective_retirement_and_drains_all_admissions()
+    -> Result<(), SchedulerError> {
+        let grant = request(
+            &format!("[{},{}]", workload("alpha", 4), workload("beta", 4)),
+            20,
+        )?;
+        let mut scheduler = Scheduler::new(&grant, SchedulerLimits::try_new(3, 1, 2)?)?;
+        let prepared = scheduler.prepare(&grant)?;
+        let mut tickets = scheduler.commit(prepared)?;
+        let beta = tickets.pop().ok_or(SchedulerError::UnknownAdmission {
+            location: error_location(),
+        })?;
+        let alpha = tickets.pop().ok_or(SchedulerError::UnknownAdmission {
+            location: error_location(),
+        })?;
+        for resident in ["resident-alpha", "resident-beta"] {
+            let load = poll_command(&mut scheduler)?;
+            scheduler.complete(RuntimeCompletion::Loaded {
+                operation: load.operation(),
+                resident: ResidentHandle::try_new(resident)?,
+            })?;
+        }
+        scheduler.request_retirement(&alpha)?;
+        scheduler.revoke(&scheduler.generation())?;
+        assert!(
+            matches!(
+                scheduler.begin_use(&beta),
+                Err(SchedulerError::GrantRevoked { .. })
+            ),
+            "global revocation remains the stronger all-admission authority"
+        );
+        for _ in 0..2 {
+            let evict = poll_command(&mut scheduler)?;
+            scheduler.complete(RuntimeCompletion::Evicted {
+                operation: evict.operation(),
+            })?;
+        }
+        assert!(
+            scheduler.admissions.is_empty(),
+            "selective and global drains release every lease exactly once"
         );
         Ok(())
     }
