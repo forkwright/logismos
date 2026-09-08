@@ -41,6 +41,7 @@ unsafe extern "C" {
     ) -> u32;
 }
 
+/// Validated Q8_0 matrix/vector extents shared by CPU execution and HIP launch.
 #[derive(Clone, Copy, Debug)]
 pub struct Q8GemvShape {
     rows: usize,
@@ -186,9 +187,12 @@ fn checked_layout<T>(elements: usize, label: &str) -> Result<()> {
 ///
 /// `matrix_q8_0`, `activations_f32`, and `output_f32` must be non-null device
 /// buffers on `stream`'s device for the complete launch. Their exact byte or
-/// element lengths must match `shape`. Inputs must be finite, `output_f32`
-/// must not alias either input, and all buffers must outlive the stream's
-/// completion. This ABI has no per-row status channel, so it cannot reproduce
+/// element lengths must match `shape`, and f32 buffers must be aligned for f32.
+/// Inputs and every sequential product/accumulator must remain finite within
+/// the admitted numerical domain. Inputs must not be concurrently modified;
+/// `output_f32` must not alias either input or another concurrent access, and
+/// all buffers must outlive the stream's completion.
+/// This ABI has no per-row status channel, so it cannot reproduce
 /// the CPU reference's non-finite product or accumulator refusals.
 pub unsafe fn launch_q8_0_gemv_f32(
     shape: Q8GemvShape,
