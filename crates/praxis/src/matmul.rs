@@ -191,7 +191,7 @@ mod tests {
     /// driven end-to-end here; this pins the CPU-only arithmetic that
     /// CAN run, and CI confirms it on every push.
     #[test]
-    fn both_cpu_matmul_computes_expected_product() -> Result<()> {
+    fn both_cpu_matmul_computes_expected_product() -> crate::error::Result<()> {
         let a = f16_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2])?;
         let identity = f16_tensor(&[1.0, 0.0, 0.0, 1.0], &[2, 2])?;
         let out = matmul(&a, &identity)?;
