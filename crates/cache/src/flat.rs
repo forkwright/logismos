@@ -326,13 +326,15 @@ impl FlatKvCache {
             next_len,
             byte_range,
         } = geometry;
+        let range_start = byte_range.start;
+        let range_end = byte_range.end;
         let buffer_err = || {
             ShapeMismatchSnafu {
                 msg: format!(
                     "layer {layer_idx} buffer overflow (off={}, end={}, \
                      buf_bytes={})",
-                    byte_range.start,
-                    byte_range.end,
+                    range_start,
+                    range_end,
                     self.layout.buffer_bytes()
                 ),
             }
