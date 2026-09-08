@@ -22,14 +22,7 @@ use crate::error::{QuantSnafu, Result, UnsupportedShapeSnafu};
 
 const KERNEL: &str = "q8_0_gemv_f32";
 
-#[cfg(feature = "gpu")]
-#[cfg_attr(
-    logismos_no_gpu_kernels,
-    allow(
-        dead_code,
-        reason = "schema-contract: HIP kernel ABI declarations link only when GPU kernels are compiled"
-    )
-)]
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 unsafe extern "C" {
     fn logismos_launch_q8_0_gemv_f32(
         matrix_q8_0: *const c_void,
