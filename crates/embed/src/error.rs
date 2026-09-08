@@ -43,8 +43,8 @@ pub enum Error {
         #[snafu(implicit)]
         location: snafu::Location,
     },
-    /// The final hidden vector was not finite or had zero L2 norm.
-    #[snafu(display("native Qwen3 final hidden vector is not normalizable"))]
+    /// An embedding vector was not finite or had zero L2 norm.
+    #[snafu(display("embedding vector is not normalizable"))]
     NonNormalizable {
         /// Source code location where the error was reported.
         #[snafu(implicit)]

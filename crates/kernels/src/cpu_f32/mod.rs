@@ -22,9 +22,12 @@ use num_traits::ToPrimitive;
 use snafu::ResultExt;
 
 use crate::error::{
-    CpuF32AllocationSnafu, CpuF32ShapeSnafu, Result, RmsNormAllocationSnafu,
+    CpuF32AllocationSnafu, CpuF32ShapeSnafu, L2NormalizeNonFiniteSnafu, L2NormalizeNotUnitSnafu,
+    L2NormalizeStage, L2NormalizeZeroSnafu, Result, RmsNormAllocationSnafu,
     RmsNormInvalidDimensionSnafu, RmsNormInvalidParameterSnafu, RmsNormNonFiniteSnafu,
-    RmsNormShapeSnafu, RmsNormSizeOverflowSnafu, RmsNormStage,
+    RmsNormShapeSnafu, RmsNormSizeOverflowSnafu, RmsNormStage, SoftmaxAllocationSnafu,
+    SoftmaxInvalidDimensionSnafu, SoftmaxNonFiniteSnafu, SoftmaxShapeSnafu,
+    SoftmaxSizeOverflowSnafu, SoftmaxStage,
 };
 
 fn usize_to_f32(value: usize) -> f32 {
@@ -607,63 +610,131 @@ fn multiply_scalar(left: f32, right: f32) -> f32 {
     left * right
 }
 
+/// Return the exact logical output element count for checked row-wise softmax.
+///
+/// # Errors
+///
+/// [`crate::Error::SoftmaxInvalidDimension`] when the last axis is empty and
+/// [`crate::Error::SoftmaxSizeOverflow`] when the declared shape cannot fit in
+/// `usize`.
+pub fn softmax_output_elements(rows: usize, width: usize) -> Result<usize> {
+    if width == 0 {
+        return SoftmaxInvalidDimensionSnafu { rows, width }.fail();
+    }
+    rows.checked_mul(width)
+        .ok_or_else(|| SoftmaxSizeOverflowSnafu { rows, width }.build())
+}
+
 /// Row-wise softmax along the last axis (fp32 throughout).
 ///
-/// `x`: `[rows, n]`. Returns `[rows, n]`.
-#[must_use]
-pub fn softmax_last_dim(x: &[f32], rows: usize, n: usize) -> Vec<f32> {
-    debug_assert_eq!(x.len(), rows * n);
-    let mut y = vec![0.0f32; rows * n];
-    for r in 0..rows {
-        let row_start = r * n;
-        let row_end = (r + 1) * n;
-        let Some(row) = x.get(row_start..row_end) else {
-            continue;
-        };
-        let mut m = f32::NEG_INFINITY;
-        for &v in row {
-            if v > m {
-                m = v;
+/// `x`: `[rows, width]`. Exact all-negative-infinity rows are treated as
+/// fully masked and return a uniform distribution. NaN and positive infinity
+/// are rejected rather than being mistaken for that masking policy.
+///
+/// # Errors
+///
+/// Returns a typed [`crate::Error`] for malformed shapes, invalid logits,
+/// non-finite arithmetic, or allocation failure.
+pub fn softmax_last_dim(x: &[f32], rows: usize, width: usize) -> Result<Vec<f32>> {
+    let expected_len = softmax_output_elements(rows, width)?;
+    if x.len() != expected_len {
+        return SoftmaxShapeSnafu {
+            rows,
+            width,
+            expected_len,
+            actual_len: x.len(),
+        }
+        .fail();
+    }
+
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(expected_len)
+        .context(SoftmaxAllocationSnafu {
+            kernel: "softmax_last_dim",
+            requested_len: expected_len,
+        })?;
+    output.resize(expected_len, 0.0);
+
+    for (row_index, row) in x.chunks_exact(width).enumerate() {
+        let mut maximum = f32::NEG_INFINITY;
+        let mut has_finite_logit = false;
+        for (column, &value) in row.iter().enumerate() {
+            if value.is_nan() || value.is_sign_positive() && value.is_infinite() {
+                return SoftmaxNonFiniteSnafu {
+                    stage: SoftmaxStage::Input,
+                    row: row_index,
+                    column,
+                    value,
+                }
+                .fail();
+            }
+            if value.is_finite() {
+                has_finite_logit = true;
+                maximum = maximum.max(value);
             }
         }
-        if m.is_infinite() && m.is_sign_negative() {
-            // WHY(forkwright/logismos#30): every entry in this row is
-            // -inf (a fully-masked attention row, routine for padded-batch
-            // inference). `(v - m).exp()` would evaluate
-            // `(NEG_INFINITY - NEG_INFINITY).exp()` = `NaN.exp()` = `NaN`
-            // for every entry, and that `NaN` propagates silently through
-            // every downstream kernel. There is no informative
-            // distribution to recover for a row with no unmasked tokens,
-            // so fall back to uniform — finite output beats a
-            // silently-propagating NaN.
+
+        let output_row = &mut output[row_index * width..(row_index + 1) * width];
+        if !has_finite_logit {
             #[expect(
                 clippy::cast_precision_loss,
-                reason = "n is an attention sequence length, far below 2^24"
+                reason = "softmax width is a bounded attention sequence length"
             )]
-            let uniform = if n == 0 { 0.0 } else { 1.0 / n as f32 };
-            for j in 0..n {
-                if let Some(slot) = y.get_mut(row_start + j) {
-                    *slot = uniform;
-                }
+            let uniform = 1.0 / width as f32;
+            for slot in output_row {
+                *slot = uniform;
             }
             continue;
         }
-        let mut denom = 0.0f32;
-        for (j, &v) in row.iter().enumerate() {
-            let e = (v - m).exp();
-            if let Some(slot) = y.get_mut(row_start + j) {
-                *slot = e;
+
+        let mut denominator = 0.0_f32;
+        for (column, (&value, slot)) in row.iter().zip(output_row.iter_mut()).enumerate() {
+            let exponent = (value - maximum).exp();
+            if !exponent.is_finite() {
+                return SoftmaxNonFiniteSnafu {
+                    stage: SoftmaxStage::Exponent,
+                    row: row_index,
+                    column,
+                    value: exponent,
+                }
+                .fail();
             }
-            denom += e;
+            denominator += exponent;
+            if !denominator.is_finite() {
+                return SoftmaxNonFiniteSnafu {
+                    stage: SoftmaxStage::Denominator,
+                    row: row_index,
+                    column,
+                    value: denominator,
+                }
+                .fail();
+            }
+            *slot = exponent;
         }
-        let inv = denom.recip();
-        for j in 0..n {
-            if let Some(slot) = y.get_mut(row_start + j) {
-                *slot *= inv;
+        if denominator == 0.0 {
+            return SoftmaxNonFiniteSnafu {
+                stage: SoftmaxStage::Denominator,
+                row: row_index,
+                column: 0,
+                value: denominator,
+            }
+            .fail();
+        }
+        for (column, slot) in output_row.iter_mut().enumerate() {
+            *slot /= denominator;
+            if !slot.is_finite() {
+                return SoftmaxNonFiniteSnafu {
+                    stage: SoftmaxStage::Output,
+                    row: row_index,
+                    column,
+                    value: *slot,
+                }
+                .fail();
             }
         }
     }
-    y
+    Ok(output)
 }
 
 /// Apply an additive mask in place. `scores`: `[rows, n]`; `mask`: `[rows_mask, n]`
@@ -810,18 +881,94 @@ pub fn mean_pool_masked(h: &[f32], mask: &[u8], seq: usize, hidden: usize) -> Ve
     out
 }
 
-/// L2-normalise a `[hidden]` vector in place. Denominator is clamped to
-/// `1e-12` to avoid NaN on zero input (safety net; real Stella outputs are
-/// never zero).
-pub fn l2_normalize_in_place(v: &mut [f32]) {
-    let mut sq = 0.0f32;
-    for &x in v.iter() {
-        sq += x * x;
+const UNIT_NORM_TOLERANCE: f64 = 1e-6;
+
+/// L2-normalise a vector in place using scaled f64 accumulation.
+///
+/// # Errors
+///
+/// Returns a typed [`crate::Error`] when an input is non-finite, the vector is
+/// zero, an intermediate is non-finite, or the final fp32 result falls outside
+/// the unit-norm tolerance.
+pub fn l2_normalize_in_place(values: &mut [f32]) -> Result<()> {
+    let norm = l2_norm(values)?;
+    for (index, value) in values.iter_mut().enumerate() {
+        let normalized = f64::from(*value) / norm;
+        if !normalized.is_finite() {
+            return L2NormalizeNonFiniteSnafu {
+                stage: L2NormalizeStage::Output,
+                index,
+                value: normalized,
+            }
+            .fail();
+        }
+        *value = normalized as f32;
+        if !value.is_finite() {
+            return L2NormalizeNonFiniteSnafu {
+                stage: L2NormalizeStage::Output,
+                index,
+                value: f64::from(*value),
+            }
+            .fail();
+        }
     }
-    let inv = sq.sqrt().max(1e-12).recip();
-    for x in v.iter_mut() {
-        *x *= inv;
+    let output_norm = l2_norm(values)?;
+    if (output_norm - 1.0).abs() > UNIT_NORM_TOLERANCE {
+        return L2NormalizeNotUnitSnafu { norm: output_norm }.fail();
     }
+    Ok(())
+}
+
+fn l2_norm(values: &[f32]) -> Result<f64> {
+    let mut maximum = 0.0_f32;
+    for (index, &value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return L2NormalizeNonFiniteSnafu {
+                stage: L2NormalizeStage::Input,
+                index,
+                value: f64::from(value),
+            }
+            .fail();
+        }
+        maximum = maximum.max(value.abs());
+    }
+    if maximum == 0.0 {
+        return L2NormalizeZeroSnafu.fail();
+    }
+
+    let maximum = f64::from(maximum);
+    let mut sum = 0.0_f64;
+    for (index, &value) in values.iter().enumerate() {
+        let scaled = f64::from(value) / maximum;
+        let square = scaled * scaled;
+        if !square.is_finite() {
+            return L2NormalizeNonFiniteSnafu {
+                stage: L2NormalizeStage::Square,
+                index,
+                value: square,
+            }
+            .fail();
+        }
+        sum += square;
+        if !sum.is_finite() {
+            return L2NormalizeNonFiniteSnafu {
+                stage: L2NormalizeStage::Sum,
+                index,
+                value: sum,
+            }
+            .fail();
+        }
+    }
+    let norm = maximum * sum.sqrt();
+    if !norm.is_finite() {
+        return L2NormalizeNonFiniteSnafu {
+            stage: L2NormalizeStage::Norm,
+            index: 0,
+            value: norm,
+        }
+        .fail();
+    }
+    Ok(norm)
 }
 
 /// Build a Qwen2-style `(seq, head_dim/2)` cos+sin table. Returns

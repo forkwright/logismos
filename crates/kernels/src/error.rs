@@ -29,6 +29,38 @@ pub enum RmsNormStage {
     Output,
 }
 
+/// The checked step of the CPU softmax reference that rejected an input or result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SoftmaxStage {
+    /// An input logit before masking policy is applied.
+    Input,
+    /// An exponential intermediate.
+    Exponent,
+    /// The row denominator.
+    Denominator,
+    /// A normalized output probability.
+    Output,
+}
+
+/// The checked step of in-place CPU L2 normalization that rejected a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum L2NormalizeStage {
+    /// An input vector component.
+    Input,
+    /// A scaled squared component used for robust accumulation.
+    Square,
+    /// The scaled sum of squares.
+    Sum,
+    /// The derived vector norm.
+    Norm,
+    /// A normalized output component.
+    Output,
+    /// The final unit-norm postcondition.
+    Verification,
+}
+
 /// Errors surfaced by the kernel launchers and CPU references.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -84,6 +116,114 @@ pub enum Error {
         kernel: &'static str,
         /// Description.
         msg: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU softmax rejects an empty last axis.
+    #[snafu(display("softmax rejects rows={rows}, width={width}"))]
+    SoftmaxInvalidDimension {
+        /// Declared row count.
+        rows: usize,
+        /// Declared row width.
+        width: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU softmax's declared element count overflowed `usize`.
+    #[snafu(display("softmax element count overflows for rows={rows}, width={width}"))]
+    SoftmaxSizeOverflow {
+        /// Declared row count.
+        rows: usize,
+        /// Declared row width.
+        width: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU softmax's supplied slice length did not match its declared shape.
+    #[snafu(display(
+        "softmax input length {actual_len} does not equal expected {expected_len} for rows={rows}, width={width}"
+    ))]
+    SoftmaxShape {
+        /// Declared row count.
+        rows: usize,
+        /// Declared row width.
+        width: usize,
+        /// Computed required length.
+        expected_len: usize,
+        /// Supplied slice length.
+        actual_len: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU softmax observed a non-finite value outside the all-negative-infinity mask policy.
+    #[snafu(display(
+        "softmax {stage:?} produced or received non-finite value {value} at row {row}, column {column}"
+    ))]
+    SoftmaxNonFinite {
+        /// Checked softmax stage.
+        stage: SoftmaxStage,
+        /// Row containing the rejected value.
+        row: usize,
+        /// Column containing the rejected value.
+        column: usize,
+        /// Rejected non-finite value.
+        value: f32,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU softmax could not reserve checked output backing.
+    #[snafu(display("softmax {kernel} output allocation for {requested_len} elements failed"))]
+    SoftmaxAllocation {
+        /// Symbolic CPU reference name.
+        kernel: &'static str,
+        /// Exact requested output element count.
+        requested_len: usize,
+        /// Allocation failure.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU L2 normalization rejected a vector with no nonzero component.
+    #[snafu(display("L2 normalization rejects a zero vector"))]
+    L2NormalizeZero {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU L2 normalization observed a non-finite input or intermediate value.
+    #[snafu(display(
+        "L2 normalization {stage:?} produced or received non-finite value {value} at index {index}"
+    ))]
+    L2NormalizeNonFinite {
+        /// Checked normalization stage.
+        stage: L2NormalizeStage,
+        /// Component associated with the rejected value.
+        index: usize,
+        /// Rejected non-finite value.
+        value: f64,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU L2 normalization produced a finite result outside its unit-norm tolerance.
+    #[snafu(display("L2 normalization output norm {norm} is outside unit tolerance"))]
+    L2NormalizeNotUnit {
+        /// Observed output L2 norm.
+        norm: f64,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,

@@ -15,8 +15,9 @@
 
 use kernels::cpu_f32;
 use num_traits::ToPrimitive;
+use snafu::ResultExt;
 
-use crate::error::{Result, ShapeSnafu};
+use crate::error::{KernelSnafu, Result, ShapeSnafu};
 use crate::rope::RopeTable;
 
 /// Attention config shared between Qwen2 and Stella.
@@ -117,8 +118,9 @@ impl QwenAttention {
     ///
     /// # Errors
     ///
-    /// [`Error::Shape`] on input-shape disagreement with the config, or if
-    /// any internal head-slicing range falls outside an allocated buffer.
+    /// [`Error::Shape`] on input-shape disagreement with the config or an
+    /// internal head-slicing range, and [`Error::Kernel`] when checked softmax
+    /// rejects invalid logits.
     pub fn forward(&self, x: &[f32], mask: &[u8], rope: &RopeTable) -> Result<Vec<f32>> {
         let cfg = self.cfg;
         let hidden = cfg.hidden;
@@ -275,7 +277,7 @@ impl QwenAttention {
             let start = h * seq * seq;
             let end = (h + 1) * seq * seq;
             let head = checked_slice_mut(&mut scores, start, end, "attention scores head")?;
-            let sm = cpu_f32::softmax_last_dim(head, seq, seq);
+            let sm = cpu_f32::softmax_last_dim(head, seq, seq).context(KernelSnafu)?;
             head.copy_from_slice(&sm);
         }
 
@@ -517,6 +519,39 @@ mod tests {
             out.iter().all(|v| v.is_finite()),
             "forward output contains NaN/Inf for a fully-masked row: {out:?}"
         );
+    }
+
+    #[test]
+    fn forward_preserves_invalid_logits_as_a_typed_kernel_error() {
+        let cfg = QwenAttentionConfig {
+            hidden: 4,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 2,
+        };
+        let weights = QwenAttentionWeights {
+            wq: vec![0.1; 16],
+            bq: vec![0.0; 4],
+            wk: vec![0.1; 8],
+            bk: vec![0.0; 2],
+            wv: vec![0.1; 8],
+            bv: vec![0.0; 2],
+            wo: vec![0.1; 16],
+        };
+        let attention = QwenAttention::new(cfg, weights).expect("attention");
+        let rope = RopeTable::new(1, 2, 1_000_000.0);
+
+        let result = attention.forward(&[f32::NAN, 2.0, 3.0, 4.0], &[1], &rope);
+        assert!(matches!(
+            result,
+            Err(crate::Error::Kernel {
+                source: kernels::Error::SoftmaxNonFinite {
+                    stage: kernels::error::SoftmaxStage::Input,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use logismos_core::{
 };
 use tokenize::Tokenizer;
 
-use crate::error::{IoSnafu, Result, UnsupportedDimSnafu};
+use crate::error::{IoSnafu, NonNormalizableSnafu, Result, UnsupportedDimSnafu};
 
 /// Matryoshka output dimensionality for Stella.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -217,7 +217,7 @@ impl StellaModel {
     ///
     /// # Errors
     ///
-    /// Propagates encoder / shape failures.
+    /// Propagates encoder, shape, and checked normalization failures.
     pub(crate) fn encode_raw(&self, ids: &[u32], mask: &[u8], dim: usize) -> Result<Vec<f32>> {
         let head = self
             .heads
@@ -229,23 +229,21 @@ impl StellaModel {
 
         // Mean pool
         let pooled = cpu_f32::mean_pool_masked(&hidden_states, mask, ids.len(), self.cfg.hidden);
-        // L2-normalise pooled (matches sentence-transformers pipeline).
         let mut pooled_n = pooled;
-        cpu_f32::l2_normalize_in_place(&mut pooled_n);
-
-        // Dense head projection (fp32).
-        let mut y = cpu_f32::linear_t(
-            &pooled_n,
-            &head.weight,
-            Some(&head.bias),
-            1,
-            head.dim,
-            self.cfg.hidden,
-        );
-        // Final L2-normalise.
-        cpu_f32::l2_normalize_in_place(&mut y);
-        Ok(y)
+        normalize_embedding(&mut pooled_n)?;
+        project_embedding(&pooled_n, head, self.cfg.hidden)
     }
+}
+
+fn project_embedding(pooled: &[f32], head: &DenseHead, hidden: usize) -> Result<Vec<f32>> {
+    let mut projected =
+        cpu_f32::linear_t(pooled, &head.weight, Some(&head.bias), 1, head.dim, hidden);
+    normalize_embedding(&mut projected)?;
+    Ok(projected)
+}
+
+fn normalize_embedding(values: &mut [f32]) -> Result<()> {
+    cpu_f32::l2_normalize_in_place(values).map_err(|_| NonNormalizableSnafu.build())
 }
 
 impl EmbeddingModel for StellaModel {
@@ -316,13 +314,15 @@ impl EmbeddingModel for StellaModel {
             })?;
         check_token_limit(ids.len(), max_tokens)?;
         let mask = vec![1u8; ids.len()];
-        self.encode_raw(&ids, &mask, dim).map_err(|e| {
-            CoreComputeSnafu {
-                message: e.to_string(),
-            }
-            .build()
-        })
+        self.encode_raw(&ids, &mask, dim).map_err(map_compute_error)
     }
+}
+
+fn map_compute_error(error: crate::error::Error) -> EmbeddingError {
+    CoreComputeSnafu {
+        message: error.to_string(),
+    }
+    .build()
 }
 
 /// Resolve `opts.prompt` against the checkpoint's loaded prompt map.
@@ -572,6 +572,33 @@ mod tests {
     #![expect(clippy::expect_used, reason = "test assertions use expect() directly")]
 
     use super::*;
+
+    #[test]
+    fn tiny_stella_head_preserves_unit_output_and_maps_refusal_to_public_compute_error() {
+        let identity_head = DenseHead {
+            weight: vec![1.0, 0.0, 0.0, 1.0],
+            bias: vec![0.0, 0.0],
+            dim: 2,
+        };
+        let output = project_embedding(&[3.0, 4.0], &identity_head, 2)
+            .expect("finite tiny head must produce a unit embedding");
+        assert!((output[0] - 0.6).abs() < 1e-6);
+        assert!((output[1] - 0.8).abs() < 1e-6);
+
+        let zero_head = DenseHead {
+            weight: vec![0.0; 4],
+            bias: vec![0.0; 2],
+            dim: 2,
+        };
+        let error = project_embedding(&[3.0, 4.0], &zero_head, 2).expect_err(
+            "a zero dense-head output cannot satisfy EmbeddingModel's unit-norm contract",
+        );
+        assert!(matches!(error, crate::error::Error::NonNormalizable { .. }));
+        assert!(matches!(
+            map_compute_error(error),
+            EmbeddingError::Compute { message, .. } if message.contains("not normalizable")
+        ));
+    }
 
     #[test]
     fn extract_json_string_field_happy_path_escapes() {

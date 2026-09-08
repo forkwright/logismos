@@ -1,6 +1,7 @@
 //! Bounded CPU Qwen3 retrieval embeddings.
 
 use decoders::{Qwen3CpuRequirements, Qwen3Weights};
+use kernels::cpu_f32;
 use loader::gguf::{MetaValue, VerifiedArtifact};
 use logismos_core::{
     ComputeSnafu as CoreComputeSnafu, EmbeddingError, EmbeddingModel, EncodeOpts,
@@ -23,7 +24,6 @@ const BOS: &str = "tokenizer.ggml.bos_token_id";
 const EOS: &str = "tokenizer.ggml.eos_token_id";
 const ADD_BOS: &str = "tokenizer.ggml.add_bos_token";
 const ADD_EOS: &str = "tokenizer.ggml.add_eos_token";
-const UNIT_NORM_TOLERANCE: f64 = 1e-6;
 
 /// Trusted instructions for semantic retrieval roles.
 #[derive(Clone, Debug, Default)]
@@ -430,34 +430,7 @@ fn prefix(
     Ok(combined)
 }
 fn normalize(mut values: Vec<f32>) -> Result<Vec<f32>> {
-    let sum = values.iter().try_fold(0_f64, |sum, value| {
-        if value.is_finite() {
-            Ok(sum + f64::from(*value) * f64::from(*value))
-        } else {
-            Err(())
-        }
-    });
-    let Ok(sum) = sum else {
-        return NonNormalizableSnafu.fail();
-    };
-    let norm = sum.sqrt();
-    if !norm.is_finite() || norm == 0.0 {
-        return NonNormalizableSnafu.fail();
-    }
-    for value in &mut values {
-        *value = (f64::from(*value) / norm) as f32;
-    }
-    if values.iter().any(|value| !value.is_finite()) {
-        return NonNormalizableSnafu.fail();
-    }
-    let output_norm = values
-        .iter()
-        .map(|value| f64::from(*value) * f64::from(*value))
-        .sum::<f64>()
-        .sqrt();
-    if !output_norm.is_finite() || (output_norm - 1.0).abs() > UNIT_NORM_TOLERANCE {
-        return NonNormalizableSnafu.fail();
-    }
+    cpu_f32::l2_normalize_in_place(&mut values).map_err(|_| NonNormalizableSnafu.build())?;
     Ok(values)
 }
 
@@ -520,20 +493,32 @@ mod tests {
 
     #[test]
     fn normalization_returns_finite_unit_vectors_and_refuses_invalid_input() -> Result<()> {
-        let values = normalize(vec![3.0, 4.0])?;
-        let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 1e-6,
-            "normalization must produce a unit vector"
-        );
+        for values in [
+            vec![3.0, 4.0],
+            vec![1.0e20_f32, -1.0e20_f32],
+            vec![1.0e-20_f32, -1.0e-20_f32],
+        ] {
+            let values = normalize(values)?;
+            let norm = values
+                .iter()
+                .map(|value| f64::from(*value) * f64::from(*value))
+                .sum::<f64>()
+                .sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-6,
+                "normalization must produce a unit vector, got {norm}"
+            );
+        }
         assert!(matches!(
             normalize(vec![0.0, 0.0]),
             Err(crate::error::Error::NonNormalizable { .. })
         ));
-        assert!(matches!(
-            normalize(vec![f32::NAN]),
-            Err(crate::error::Error::NonNormalizable { .. })
-        ));
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(matches!(
+                normalize(vec![value]),
+                Err(crate::error::Error::NonNormalizable { .. })
+            ));
+        }
         Ok(())
     }
 

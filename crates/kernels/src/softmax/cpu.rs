@@ -1,77 +1,49 @@
 //! CPU reference for row-wise softmax.
 
 use half::f16;
+use snafu::ResultExt;
+
+use crate::cpu_f32::{softmax_last_dim, softmax_output_elements};
+use crate::error::SoftmaxAllocationSnafu;
 
 /// Row-wise softmax. fp16 in, fp16 out, fp32 internal.
 ///
+/// Shares the fp32 boundary validation and all-negative-infinity masking policy,
+/// then rounds its checked probabilities to fp16.
+///
 /// # Errors
 ///
-/// [`crate::error::Error::UnsupportedShape`] when `x.len() != m * n`.
-/// Previously this was only checked by `debug_assert`, stripped in
-/// release, and the loop below silently skipped the affected row via
-/// `.get(..).else { continue }` — a shape-mismatch bug upstream
-/// produced an all-zero output row instead of a diagnosable failure.
+/// Propagates the shared typed softmax refusal or an output allocation failure.
 pub fn softmax_fp16_ref(x: &[f16], m: usize, n: usize) -> crate::error::Result<Vec<f16>> {
-    let expected_len = m * n;
+    let expected_len = softmax_output_elements(m, n)?;
     if x.len() != expected_len {
-        return crate::error::UnsupportedShapeSnafu {
-            kernel: "softmax_fp16_ref",
-            msg: format!("x.len()={} != m*n={expected_len}", x.len()),
+        return crate::error::SoftmaxShapeSnafu {
+            rows: m,
+            width: n,
+            expected_len,
+            actual_len: x.len(),
         }
         .fail();
     }
-    let mut y = vec![f16::from_f32(0.0); m * n];
-    for row in 0..m {
-        let start = row * n;
-        // INVARIANT: `x.len() == m * n` was checked above and `row <
-        // m`, so this slice is always in range — `.get()` + `continue`
-        // stays as defense-in-depth rather than indexing directly,
-        // matching this module's checked-access convention.
-        let Some(slice) = x.get(start..start + n) else {
-            continue;
-        };
-        let mut max_v: f32 = f32::NEG_INFINITY;
-        for &v in slice {
-            let f = v.to_f32();
-            if f > max_v {
-                max_v = f;
-            }
-        }
-        if max_v.is_infinite() && max_v.is_sign_negative() {
-            // WHY(forkwright/logismos#59): every entry in this row is
-            // -inf (a fully-masked attention row). `(v - max_v).exp()`
-            // would evaluate `(NEG_INFINITY - NEG_INFINITY).exp()` =
-            // `NaN.exp()` = `NaN` for every entry, propagating silently
-            // through every downstream consumer. Mirrors the same
-            // guard in `cpu_f32::softmax_last_dim` (both trace to the
-            // same all-`-inf`-row defect class).
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "n is an attention sequence length, far below 2^24"
-            )]
-            let uniform = if n == 0 { 0.0 } else { 1.0 / n as f32 };
-            for j in 0..n {
-                if let Some(slot) = y.get_mut(start + j) {
-                    *slot = f16::from_f32(uniform);
-                }
-            }
-            continue;
-        }
-        let mut denom: f32 = 0.0;
-        let mut exps: Vec<f32> = Vec::with_capacity(n);
-        for &v in slice {
-            let e = (v.to_f32() - max_v).exp();
-            denom += e;
-            exps.push(e);
-        }
-        let inv = denom.recip();
-        for (j, &exp) in exps.iter().enumerate().take(n) {
-            if let Some(slot) = y.get_mut(start + j) {
-                *slot = f16::from_f32(exp * inv);
-            }
-        }
-    }
-    Ok(y)
+    let mut logits = Vec::new();
+    logits
+        .try_reserve_exact(expected_len)
+        .context(SoftmaxAllocationSnafu {
+            kernel: "softmax_fp16_ref logits",
+            requested_len: expected_len,
+        })?;
+    logits.extend(x.iter().map(|value| value.to_f32()));
+    let probabilities = softmax_last_dim(&logits, m, n)?;
+
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(expected_len)
+        .context(SoftmaxAllocationSnafu {
+            kernel: "softmax_fp16_ref",
+            requested_len: expected_len,
+        })?;
+    output.extend(probabilities.into_iter().map(f16::from_f32));
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -97,20 +69,44 @@ mod tests {
 
     #[test]
     fn length_mismatch_is_rejected() {
-        // WHY(forkwright/logismos#59): before this fix, `x.len() != m*n`
-        // was only checked by `debug_assert`, stripped in release; the
-        // affected row's `.get(..).else { continue }` then silently
-        // left it zero-filled instead of erroring. This fails against
-        // that prior behaviour (no error to unwrap) and passes against
-        // the validated version.
         let x = vec![f16::from_f32(1.0); 9]; // m*n=10, only 9 present
         let result = softmax_fp16_ref(&x, 2, 5);
         assert!(matches!(
             result,
-            Err(crate::error::Error::UnsupportedShape {
-                kernel: "softmax_fp16_ref",
+            Err(crate::error::Error::SoftmaxShape {
+                rows: 2,
+                width: 5,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn invalid_logits_are_not_classified_as_fully_masked() {
+        for logits in [
+            [f16::NAN, f16::NAN],
+            [f16::NAN, f16::NEG_INFINITY],
+            [f16::from_f32(0.0), f16::INFINITY],
+        ] {
+            assert!(matches!(
+                softmax_fp16_ref(&logits, 1, 2),
+                Err(crate::error::Error::SoftmaxNonFinite {
+                    stage: crate::error::SoftmaxStage::Input,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn empty_axis_and_overflow_are_rejected() {
+        assert!(matches!(
+            softmax_fp16_ref(&[], 0, 0),
+            Err(crate::error::Error::SoftmaxInvalidDimension { .. })
+        ));
+        assert!(matches!(
+            softmax_fp16_ref(&[], usize::MAX, 2),
+            Err(crate::error::Error::SoftmaxSizeOverflow { .. })
         ));
     }
 

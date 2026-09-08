@@ -9,8 +9,9 @@
 //! Transformers `AutoModel` golden vectors.
 
 use kernels::cpu_f32;
+use snafu::ResultExt;
 
-use crate::error::{Result, ShapeSnafu};
+use crate::error::{KernelSnafu, Result, ShapeSnafu};
 use crate::rope::RopeTable;
 
 // ---------------------------------------------------------------------------
@@ -341,7 +342,8 @@ impl ModernBertAttention {
     ///
     /// # Errors
     ///
-    /// [`Error::Shape`] on size disagreement.
+    /// [`Error::Shape`] on size disagreement or [`Error::Kernel`] when the
+    /// checked softmax rejects invalid logits.
     pub fn forward(
         &self,
         x: &[f32],
@@ -427,7 +429,7 @@ impl ModernBertAttention {
         }
         // Softmax per row per head
         for head in scores.chunks_exact_mut(seq * seq) {
-            let sm = cpu_f32::softmax_last_dim(head, seq, seq);
+            let sm = cpu_f32::softmax_last_dim(head, seq, seq).context(KernelSnafu)?;
             head.copy_from_slice(&sm);
         }
         // Attention output: [n_h, seq, d] = softmax @ V
@@ -652,5 +654,38 @@ mod tests {
         let mask = vec![1u8; seq];
         let out = attn.forward(&x, &rope, &positions, &mask).unwrap();
         assert_eq!(out.len(), seq * hidden);
+    }
+
+    #[test]
+    fn attention_forward_preserves_invalid_logits_as_a_typed_kernel_error() {
+        let hidden = 4;
+        let cfg = ModernBertAttentionConfig {
+            hidden,
+            n_heads: 2,
+            head_dim: 2,
+            local_window: 2,
+            is_global: true,
+            attention_bias: false,
+        };
+        let weights = ModernBertAttentionWeights {
+            wqkv: vec![0.1; 3 * hidden * hidden],
+            bqkv: vec![],
+            wo: vec![0.1; hidden * hidden],
+            bo: vec![],
+        };
+        let attention = ModernBertAttention::new(cfg, weights).unwrap();
+        let rope = RopeTable::new(2, 2, 10_000.0);
+        let result = attention.forward(&[f32::NAN; 4], &rope, &[0], &[1]);
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::Kernel {
+                source: kernels::Error::SoftmaxNonFinite {
+                    stage: kernels::error::SoftmaxStage::Input,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 }
