@@ -49,7 +49,7 @@ entrypoint wraps this runner rather than relying on ambient PATH shims.
 
 | Task | Location |
 |------|----------|
-| New HIP kernel | `crates/kernels/src/<family>/` + `crates/hipcore` for FFI surface |
+| New HIP kernel | `crates/kernels/src/<family>/`, including its private launch shim; `hipcore` interface changes still require approval |
 | Quantization scheme | `crates/quant/` |
 | Sampler / decode policy | `crates/decode/` |
 | New transformer family | `crates/transformers/src/<family>/` |
