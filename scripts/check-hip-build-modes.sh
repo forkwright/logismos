@@ -146,6 +146,14 @@ OUT="$ROOT/target/hip-build-mode-witness"
             cargo test --offline --locked --no-default-features "$@" --lib --jobs 4
         env -u LOGISMOS_HIP_BUILD HIPCC=/not-a-hipcc \
             cargo test --offline --locked --release --no-default-features "$@" --lib --jobs 4
+        # WHY: `--lib` deliberately omits the CPU-only CLI binary and its
+        # end-to-end fixture. Keep that proof distinct from the shared library
+        # package selection above instead of widening it with an ineffective
+        # target flag.
+        env -u LOGISMOS_HIP_BUILD HIPCC=/not-a-hipcc \
+            cargo check --offline --locked --no-default-features -p bin --bin logismos --jobs 4
+        env -u LOGISMOS_HIP_BUILD HIPCC=/not-a-hipcc \
+            cargo test --offline --locked --no-default-features -p bin --test prepare_text_cli --jobs 4
     ' /bin/sh "$ROOT" "$OUT" </dev/null
 } 2>&1 | /usr/bin/cat
 
