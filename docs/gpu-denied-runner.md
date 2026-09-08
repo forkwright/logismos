@@ -67,6 +67,28 @@ constant, so callers and receipts never need the private host path. The
 `inspect` JSON receipts intentionally expose selected parsed model facts and a
 digest, but no input path.
 
+For a native text qualification that needs an explicitly selected model and
+tokenizer companion, use the pair form instead. Both flags are required exactly
+once, cannot be combined with `--ro-input-file`, and must name distinct files.
+There is deliberately no generic repeated-file form: the fixed model and
+tokenizer roles prevent callers from silently swapping companion meanings.
+
+```bash
+scripts/gpu-denied-runner.sh \
+  --ro-model-file /canonical/path/to/model.gguf \
+  --ro-tokenizer-file /canonical/path/to/tokenizer.json -- \
+  /bin/sh -ceu 'test -r "$LOGISMOS_GPU_DENIED_MODEL"; \
+    test -r "$LOGISMOS_GPU_DENIED_TOKENIZER"'
+```
+
+The pair exposes only `/mnt/gpu-denied-input/model` and
+`/mnt/gpu-denied-input/tokenizer` inside the sandbox through the corresponding
+environment variables. It does not set `LOGISMOS_GPU_DENIED_INPUT`; conversely,
+the single-file form sets only that legacy variable. The same canonical-path,
+single-link regular-file, protected-root, mount-point, and readability checks
+apply independently to each pair member before their device/inode identities
+are required to differ.
+
 This is not host-path confidentiality. The exact-file bind can expose source
 root/name metadata in `/proc/self/mountinfo`, and the Bubblewrap PID-1 command
 line currently retains its host source argument. Those details, and arbitrary

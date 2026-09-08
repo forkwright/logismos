@@ -6,19 +6,27 @@ PATH=/usr/bin:/bin
 unset CDPATH LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME PYTHONPATH
 
 usage() {
-    builtin printf 'usage: %s [--ro-input-file FILE] -- COMMAND [ARG...]\n' "$0" >&2
+    builtin printf 'usage: %s [--ro-input-file FILE | --ro-model-file FILE --ro-tokenizer-file FILE] -- COMMAND [ARG...]\n' "$0" >&2
 }
 
-read_only_input=()
-if [[ "${1:-}" == '--ro-input-file' ]]; then
-    if [[ "$#" -lt 4 || -z "${2:-}" ]]; then
-        usage
-        exit 64
-    fi
-    read_only_input=(--ro-input-file "$2")
-    shift 2
-fi
-if [[ "${1:-}" != "--" || "$#" -eq 1 ]]; then
+read_only_inputs=()
+while [[ "$#" -gt 0 && "${1:-}" != '--' ]]; do
+    case "$1" in
+        --ro-input-file|--ro-model-file|--ro-tokenizer-file)
+            if [[ "$#" -lt 2 || -z "${2:-}" ]]; then
+                usage
+                exit 64
+            fi
+            read_only_inputs+=("$1" "$2")
+            shift 2
+            ;;
+        *)
+            usage
+            exit 64
+            ;;
+    esac
+done
+if [[ "${1:-}" != '--' || "$#" -eq 1 ]]; then
     usage
     exit 64
 fi
@@ -54,4 +62,4 @@ if [[ ! -x /usr/bin/python3 || ! -f "$SUPERVISOR" ]]; then
     exit 69
 fi
 
-builtin exec /usr/bin/python3 -I "$SUPERVISOR" "$ROOT" "${read_only_input[@]}" -- "$@"
+builtin exec /usr/bin/python3 -I "$SUPERVISOR" "$ROOT" "${read_only_inputs[@]}" -- "$@"

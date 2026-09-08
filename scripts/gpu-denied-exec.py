@@ -9,6 +9,7 @@ import re
 import stat
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 BWRAP = Path('/usr/bin/bwrap')
 SETPRIV = Path('/usr/bin/setpriv')
@@ -16,8 +17,7 @@ UNSHARE = Path('/usr/bin/unshare')
 SANDBOX_CARGO_HOME = Path('/tmp/cargo')
 SANDBOX_HOME = Path('/tmp/home')
 SANDBOX_RUST_ROOT = Path('/opt/gpu-denied')
-SANDBOX_READ_ONLY_INPUT = Path('/mnt/gpu-denied-input/artifact')
-READ_ONLY_INPUT_ENVIRONMENT = 'LOGISMOS_GPU_DENIED_INPUT'
+SANDBOX_READ_ONLY_INPUT_DIRECTORY = Path('/mnt/gpu-denied-input')
 SYSTEM_PATH = '/opt/rocm/bin:/opt/gpu-denied/cargo/bin:/usr/local/bin:/usr/bin:/bin'
 BLOCKED_MOUNT_ROOTS = (
     Path('/dev'),
@@ -37,6 +37,46 @@ VERSION_COMPONENTS = re.compile(r'[0-9]+(?:\.[0-9]+)*')
 
 class BoundaryError(Exception):
     """A condition that requires the runner to fail closed."""
+
+
+class ReadOnlyInputTarget(NamedTuple):
+    """One fixed synthetic destination and its sole environment variable."""
+
+    sandbox_path: Path
+    environment: str
+
+
+class ReadOnlyInputRequest(NamedTuple):
+    """One unvalidated caller path assigned to a fixed input role."""
+
+    source_argument: str
+    target: ReadOnlyInputTarget
+
+
+class ValidatedReadOnlyInput(NamedTuple):
+    """One canonical host file that passed the shared input policy."""
+
+    source: Path
+    identity: tuple[int, int]
+
+
+class AdmittedReadOnlyInput(NamedTuple):
+    """One immutable admission value consumed by environment and mount setup."""
+
+    source: Path
+    identity: tuple[int, int]
+    target: ReadOnlyInputTarget
+
+
+LEGACY_INPUT_TARGET = ReadOnlyInputTarget(
+    SANDBOX_READ_ONLY_INPUT_DIRECTORY / 'artifact', 'LOGISMOS_GPU_DENIED_INPUT'
+)
+MODEL_INPUT_TARGET = ReadOnlyInputTarget(
+    SANDBOX_READ_ONLY_INPUT_DIRECTORY / 'model', 'LOGISMOS_GPU_DENIED_MODEL'
+)
+TOKENIZER_INPUT_TARGET = ReadOnlyInputTarget(
+    SANDBOX_READ_ONLY_INPUT_DIRECTORY / 'tokenizer', 'LOGISMOS_GPU_DENIED_TOKENIZER'
+)
 
 
 def _decode_mount_path(value: str) -> Path:
@@ -233,7 +273,7 @@ def _prepare_worktree(root_argument: str) -> tuple[Path, Path]:
 
 def _prepare_read_only_input(
     input_argument: str, root: Path, target: Path
-) -> Path:
+) -> ValidatedReadOnlyInput:
     input_path = Path(input_argument)
     if not input_path.is_absolute():
         raise BoundaryError('read-only input path must be canonical and absolute')
@@ -264,7 +304,25 @@ def _prepare_read_only_input(
         raise BoundaryError('read-only input must not be a host mount point')
     if not os.access(resolved, os.R_OK):
         raise BoundaryError('read-only input is not readable by the runner account')
-    return resolved
+    return ValidatedReadOnlyInput(resolved, (metadata.st_dev, metadata.st_ino))
+
+
+def _admit_read_only_inputs(
+    requests: tuple[ReadOnlyInputRequest, ...], root: Path, target: Path
+) -> tuple[AdmittedReadOnlyInput, ...]:
+    admitted: list[AdmittedReadOnlyInput] = []
+    for request in requests:
+        validated = _prepare_read_only_input(request.source_argument, root, target)
+        admitted.append(
+            AdmittedReadOnlyInput(
+                source=validated.source,
+                identity=validated.identity,
+                target=request.target,
+            )
+        )
+    if len({input_file.identity for input_file in admitted}) != len(admitted):
+        raise BoundaryError('read-only model and tokenizer inputs must name distinct files')
+    return tuple(admitted)
 
 
 def _reject_read_only_input_tree_alias(input_metadata: os.stat_result, root: Path) -> None:
@@ -387,7 +445,10 @@ def _compiler_alias_mount_args() -> list[str]:
 
 
 def _sandbox_args(
-    root: Path, target: Path, read_only_input: Path | None, command: list[str]
+    root: Path,
+    target: Path,
+    read_only_inputs: tuple[AdmittedReadOnlyInput, ...],
+    command: list[str],
 ) -> list[str]:
     toolchain_args, toolchain_environment = _toolchain_mount_args()
     compiler_alias_args = _compiler_alias_mount_args()
@@ -405,19 +466,22 @@ def _sandbox_args(
         *_clang_environment(),
     ]
     input_mount_args: list[str] = []
-    if read_only_input is not None:
-        environment.append((READ_ONLY_INPUT_ENVIRONMENT, str(SANDBOX_READ_ONLY_INPUT)))
+    if read_only_inputs:
         input_mount_args.extend(
             (
                 '--dir',
-                str(SANDBOX_READ_ONLY_INPUT.parent.parent),
+                str(SANDBOX_READ_ONLY_INPUT_DIRECTORY.parent),
                 '--dir',
-                str(SANDBOX_READ_ONLY_INPUT.parent),
-                '--ro-bind',
-                str(read_only_input),
-                str(SANDBOX_READ_ONLY_INPUT),
+                str(SANDBOX_READ_ONLY_INPUT_DIRECTORY),
             )
         )
+        for input_file in read_only_inputs:
+            environment.append(
+                (input_file.target.environment, str(input_file.target.sandbox_path))
+            )
+            input_mount_args.extend(
+                ('--ro-bind', str(input_file.source), str(input_file.target.sandbox_path))
+            )
     mounts = ['--tmpfs', '/', '--ro-bind', '/usr', '/usr']
     rocm_root = Path('/opt/rocm')
     if rocm_root.exists():
@@ -516,31 +580,58 @@ def _namespace_launcher_args(sandbox_args: list[str]) -> list[str]:
     ]
 
 
+def _parse_input_requests(
+    arguments: list[str],
+) -> tuple[tuple[ReadOnlyInputRequest, ...], list[str]] | None:
+    requests_by_flag: dict[str, ReadOnlyInputRequest] = {}
+    input_targets = {
+        '--ro-input-file': LEGACY_INPUT_TARGET,
+        '--ro-model-file': MODEL_INPUT_TARGET,
+        '--ro-tokenizer-file': TOKENIZER_INPUT_TARGET,
+    }
+    next_argument = 0
+    while next_argument < len(arguments) and arguments[next_argument] != '--':
+        flag = arguments[next_argument]
+        target = input_targets.get(flag)
+        if target is None or next_argument + 1 >= len(arguments):
+            return None
+        source_argument = arguments[next_argument + 1]
+        if not source_argument or flag in requests_by_flag:
+            return None
+        requests_by_flag[flag] = ReadOnlyInputRequest(source_argument, target)
+        next_argument += 2
+    if next_argument >= len(arguments) or arguments[next_argument] != '--':
+        return None
+    command = arguments[next_argument + 1 :]
+    if not command:
+        return None
+
+    has_legacy = '--ro-input-file' in requests_by_flag
+    has_pair_member = (
+        '--ro-model-file' in requests_by_flag or '--ro-tokenizer-file' in requests_by_flag
+    )
+    if has_legacy and has_pair_member:
+        return None
+    if has_pair_member and {
+        '--ro-model-file',
+        '--ro-tokenizer-file',
+    } != requests_by_flag.keys():
+        return None
+
+    return tuple(requests_by_flag.values()), command
+
+
 def main() -> int:
-    if len(sys.argv) < 4:
+    parsed = _parse_input_requests(sys.argv[2:])
+    if parsed is None:
         print(
-            'usage: gpu-denied-exec.py ROOT [--ro-input-file FILE] -- COMMAND [ARG...]',
+            'usage: gpu-denied-exec.py ROOT [--ro-input-file FILE | '
+            '--ro-model-file FILE --ro-tokenizer-file FILE] -- COMMAND [ARG...]',
             file=sys.stderr,
         )
         return 64
     root_argument = sys.argv[1]
-    next_argument = 2
-    input_argument: str | None = None
-    if sys.argv[next_argument] == '--ro-input-file':
-        if len(sys.argv) < 6:
-            print(
-                'usage: gpu-denied-exec.py ROOT [--ro-input-file FILE] -- COMMAND [ARG...]',
-                file=sys.stderr,
-            )
-            return 64
-        input_argument = sys.argv[next_argument + 1]
-        next_argument += 2
-    if sys.argv[next_argument] != '--' or next_argument + 1 == len(sys.argv):
-        print(
-            'usage: gpu-denied-exec.py ROOT [--ro-input-file FILE] -- COMMAND [ARG...]',
-            file=sys.stderr,
-        )
-        return 64
+    requests, command = parsed
     if not BWRAP.is_file() or not os.access(BWRAP, os.X_OK):
         print('gpu-denied runner requires /usr/bin/bwrap; refusing to execute', file=sys.stderr)
         return 69
@@ -558,17 +649,13 @@ def main() -> int:
         return 69
     try:
         root, target = _prepare_worktree(root_argument)
-        read_only_input = (
-            _prepare_read_only_input(input_argument, root, target)
-            if input_argument is not None
-            else None
-        )
+        read_only_inputs = _admit_read_only_inputs(requests, root, target)
         _validate_standard_descriptors(root)
         _close_inherited_descriptors()
         os.execv(
             UNSHARE,
             _namespace_launcher_args(
-                _sandbox_args(root, target, read_only_input, sys.argv[next_argument + 1:])
+                _sandbox_args(root, target, read_only_inputs, command)
             ),
         )
     except BoundaryError as error:
