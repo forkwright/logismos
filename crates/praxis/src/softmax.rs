@@ -78,10 +78,10 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
     } else {
         let x_host = x.to_host_f16()?;
         let y = kernels::softmax::cpu::softmax_fp16_ref(&x_host, m, n)?;
-        Ok(Tensor::from_cpu(
+        Ok(Tensor::try_from_cpu(
             taxis::CpuStorage::F16(y),
             x.shape().clone(),
-        ))
+        )?)
     }
 }
 
@@ -100,15 +100,15 @@ mod tests {
     /// `crates/praxis/tests/end_to_end.rs::praxis_softmax_runs`, which
     /// skips entirely when no HIP device is visible — always runs.
     #[test]
-    fn cpu_path_rows_sum_to_one() {
+    fn cpu_path_rows_sum_to_one() -> Result<()> {
         let (m, n) = (3_usize, 17_usize);
         let x_host: Vec<f16> = (0..(m * n))
             .map(|i| f16::from_f32((i % 7) as f32 - 3.0))
             .collect();
-        let x = Tensor::from_cpu(CpuStorage::F16(x_host), Shape::new(&[m, n]));
+        let x = Tensor::try_from_cpu(CpuStorage::F16(x_host), Shape::new(&[m, n]))?;
 
-        let y = softmax(&x).expect("cpu softmax");
-        let host = y.to_host_f16().expect("host readback");
+        let y = softmax(&x)?;
+        let host = y.to_host_f16()?;
 
         for row in 0..m {
             let sum: f32 = host[row * n..(row + 1) * n]
@@ -117,5 +117,6 @@ mod tests {
                 .sum();
             assert!((sum - 1.0).abs() < 1e-3, "row {row} sum = {sum}");
         }
+        Ok(())
     }
 }

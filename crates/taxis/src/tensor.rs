@@ -32,17 +32,32 @@ struct TensorInner {
 impl Tensor {
     /// Construct a CPU tensor from a typed `Vec`.
     ///
-    /// Does **not** validate `storage.len() == shape.elem_count()` — a
-    /// mismatched pair silently produces a `Tensor` whose declared
-    /// shape disagrees with its backing storage, through safe API,
-    /// with no error. The caller must uphold the invariant itself.
-    /// Prefer [`Self::try_from_cpu`] whenever the storage/shape pairing
-    /// is not already guaranteed correct by construction — e.g. data
-    /// copied from an external archive.
-    #[must_use]
-    pub fn from_cpu(storage: CpuStorage, shape: Shape) -> Self {
+    /// This public constructor validates the complete storage/shape pair.
+    /// The former infallible `from_cpu` constructor was retired: callers must
+    /// migrate to this checked owner and propagate its [`Result`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ShapeMismatch`] when storage length differs from the shape,
+    /// or [`Error::GeometryOverflow`] when the shape cannot be represented.
+    pub fn try_from_cpu(storage: CpuStorage, shape: Shape) -> Result<Self> {
+        let layout = Layout::try_contiguous(shape)?;
+        if storage.len() != layout.elem_count() {
+            return ShapeMismatchSnafu {
+                op: "Tensor::try_from_cpu",
+                msg: format!(
+                    "storage.len()={} != shape.elem_count()={}",
+                    storage.len(),
+                    layout.elem_count()
+                ),
+            }
+            .fail();
+        }
+        Ok(Self::from_cpu_validated(storage, layout))
+    }
+
+    fn from_cpu_validated(storage: CpuStorage, layout: Layout) -> Self {
         let dtype = storage.dtype();
-        let layout = Layout::contiguous(shape);
         Self {
             inner: Arc::new(TensorInner {
                 dtype,
@@ -50,27 +65,6 @@ impl Tensor {
                 layout,
             }),
         }
-    }
-
-    /// Construct a CPU tensor from a typed `Vec`, validating that the
-    /// storage's element count matches the shape's.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::ShapeMismatch`] when `storage.len() != shape.elem_count()`.
-    pub fn try_from_cpu(storage: CpuStorage, shape: Shape) -> Result<Self> {
-        let elem_count = shape.elem_count();
-        if storage.len() != elem_count {
-            return ShapeMismatchSnafu {
-                op: "try_from_cpu",
-                msg: format!(
-                    "storage.len()={} != shape.elem_count()={elem_count}",
-                    storage.len()
-                ),
-            }
-            .fail();
-        }
-        Ok(Self::from_cpu(storage, shape))
     }
 
     /// Construct a HIP tensor from a host slice of `f32`.
@@ -107,19 +101,19 @@ impl Tensor {
         shape: Shape,
         dtype: DType,
     ) -> Result<Self> {
-        if data.len() != shape.elem_count() {
+        let layout = Layout::try_contiguous(shape)?;
+        if data.len() != layout.elem_count() {
             return ShapeMismatchSnafu {
                 op: "from_host_typed",
                 msg: format!(
                     "data.len()={} != shape.elem_count()={}",
                     data.len(),
-                    shape.elem_count()
+                    layout.elem_count()
                 ),
             }
             .fail();
         }
         let storage = HipStorage::from_host(device, dtype, data)?;
-        let layout = Layout::contiguous(shape);
         Ok(Self {
             inner: Arc::new(TensorInner {
                 dtype,
@@ -135,9 +129,8 @@ impl Tensor {
     ///
     /// [`Error::Hip`] on allocation or zero-fill failure.
     pub fn zeros_hip(device: &Device, dtype: DType, shape: Shape) -> Result<Self> {
-        let elem = shape.elem_count();
-        let storage = HipStorage::alloc(device, dtype, elem)?;
-        let layout = Layout::contiguous(shape);
+        let layout = Layout::try_contiguous(shape)?;
+        let storage = HipStorage::alloc(device, dtype, layout.elem_count())?;
         Ok(Self {
             inner: Arc::new(TensorInner {
                 dtype,
@@ -296,15 +289,16 @@ mod tests {
     use crate::error::Error;
 
     #[test]
-    fn cpu_tensor_constructs() {
-        let t = Tensor::from_cpu(
+    fn cpu_tensor_constructs() -> Result<()> {
+        let t = Tensor::try_from_cpu(
             CpuStorage::F32(vec![1.0, 2.0, 3.0, 4.0]),
             Shape::new(&[2, 2]),
-        );
+        )?;
         assert_eq!(t.dims(), &[2, 2]);
         assert_eq!(t.dtype(), DType::F32);
         assert!(t.is_contiguous());
         assert!(!t.is_on_device());
+        Ok(())
     }
 
     // INVARIANT: `zeros_hip` must produce an all-zero buffer (forkwright/logismos#26).

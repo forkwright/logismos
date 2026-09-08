@@ -119,10 +119,10 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
             let x_host = x.to_host_f16()?;
             let w_host = weight.to_host_f16()?;
             let y = kernels::rms_norm::cpu::rms_norm_fp16_ref(&x_host, &w_host, m, n, eps);
-            Ok(Tensor::from_cpu(
+            Ok(Tensor::try_from_cpu(
                 taxis::CpuStorage::F16(y),
                 x.shape().clone(),
-            ))
+            )?)
         }
         // WHY(forkwright/logismos#38): a mixed pair used to fall through
         // the old wildcard arm into the CPU path above, silently
@@ -153,7 +153,8 @@ mod tests {
 
     fn f16_tensor(values: &[f32], shape: &[usize]) -> Tensor {
         let data: Vec<f16> = values.iter().copied().map(f16::from_f32).collect();
-        Tensor::from_cpu(CpuStorage::F16(data), Shape::new(shape))
+        Tensor::try_from_cpu(CpuStorage::F16(data), Shape::new(shape))
+            .expect("test tensor shape and backing length are constructed together")
     }
 
     /// WHY: exercises the `DevicePlacement::BothCpu` arm through the

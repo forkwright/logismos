@@ -43,6 +43,18 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// Geometry cannot be represented by this platform's address space.
+    #[snafu(display("geometry overflow in {op}: {msg}"))]
+    GeometryOverflow {
+        /// Operation that derived the overflowing geometry.
+        op: &'static str,
+        /// Inputs or derived quantity that could not be represented.
+        msg: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// Broadcasting rule could not be applied.
     #[snafu(display("broadcast failed: {lhs:?} vs {rhs:?}"))]
     BroadcastFailed {

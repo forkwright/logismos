@@ -199,10 +199,10 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
                 heads,
                 head_dim,
             )?;
-            Ok(Tensor::from_cpu(
+            Ok(Tensor::try_from_cpu(
                 taxis::CpuStorage::F16(host),
                 qk.shape().clone(),
-            ))
+            )?)
         }
     }
 }
@@ -244,10 +244,11 @@ mod tests {
     #[test]
     fn rope_apply_rejects_odd_head_dim() {
         let (batch, seq, heads, head_dim) = (1_usize, 2_usize, 1_usize, 5_usize);
-        let qk = Tensor::from_cpu(
+        let qk = Tensor::try_from_cpu(
             CpuStorage::F16(vec![f16::from_f32(0.0); batch * seq * heads * head_dim]),
             Shape::new(&[batch, seq, heads, head_dim]),
-        );
+        )
+        .expect("test tensor shape and backing length are constructed together");
         // Bypass `CosSinTable::new` — its CPU table builder
         // debug_asserts an even `head_dim` itself, which would panic
         // before `rope_apply`'s own validation ever ran. Constructing

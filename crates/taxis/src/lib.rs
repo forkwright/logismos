@@ -45,7 +45,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dtype_byte_count_rounds_subbyte_storage() {
-        assert_eq!(DType::I4.byte_count(3), 2);
+    fn dtype_byte_count_rounds_subbyte_storage() -> Result<()> {
+        assert_eq!(DType::I4.byte_count(3)?, 2);
+        Ok(())
     }
 }

@@ -4,19 +4,17 @@ use super::*;
 // directly.
 use crate::error::Error;
 
-fn layout_small() -> CacheLayout {
-    CacheLayout {
-        num_layers: 4,
-        num_kv_heads: 2,
-        head_dim: 3,
-        max_seq_len: 8,
-        dtype: DType::F32,
-    }
+fn layout_small() -> Result<CacheLayout> {
+    CacheLayout::try_new(4, 2, 3, 8, DType::F32)
 }
 
-fn one_row_tensor(val: f32, layout: &CacheLayout) -> Tensor {
+fn layout_with_dtype(dtype: DType) -> Result<CacheLayout> {
+    CacheLayout::try_new(4, 2, 3, 8, dtype)
+}
+
+fn one_row_tensor(val: f32, layout: &CacheLayout) -> Result<Tensor> {
     let row = vec![val; layout.row_elems()];
-    Tensor::from_cpu(CpuStorage::F32(row), Shape::new(&[1, layout.row_elems()]))
+    Tensor::try_from_cpu(CpuStorage::F32(row), Shape::new(&[1, layout.row_elems()]))
 }
 
 fn host_f32(t: &Tensor) -> Vec<f32> {
@@ -28,10 +26,10 @@ fn host_f32(t: &Tensor) -> Vec<f32> {
 
 #[test]
 fn put_then_get_round_trip() -> Result<()> {
-    let layout = layout_small();
-    let mut c = FlatKvCache::new(layout);
-    let k = one_row_tensor(1.5, &layout);
-    let v = one_row_tensor(2.5, &layout);
+    let layout = layout_small()?;
+    let mut c = FlatKvCache::try_new(layout.clone())?;
+    let k = one_row_tensor(1.5, &layout)?;
+    let v = one_row_tensor(2.5, &layout)?;
     c.put(0, &k, &v)?;
     assert_eq!(c.len_of(0), Some(1));
     let (k_out, v_out) = c.get(0, 1)?;
@@ -54,18 +52,15 @@ fn put_then_get_round_trip_f16() -> Result<()> {
     // only DType::F32. F16 goes through `chunks_to_f16` on read and
     // a native-endian raw-byte reinterpret on write — a path never
     // exercised before this test.
-    let layout = CacheLayout {
-        dtype: DType::F16,
-        ..layout_small()
-    };
-    let mut c = FlatKvCache::new(layout);
+    let layout = layout_with_dtype(DType::F16)?;
+    let mut c = FlatKvCache::try_new(layout.clone())?;
     let val = half::f16::from_f32(1.5);
     let row = vec![val; layout.row_elems()];
-    let k = Tensor::from_cpu(
+    let k = Tensor::try_from_cpu(
         CpuStorage::F16(row.clone()),
         Shape::new(&[1, layout.row_elems()]),
-    );
-    let v = Tensor::from_cpu(CpuStorage::F16(row), Shape::new(&[1, layout.row_elems()]));
+    )?;
+    let v = Tensor::try_from_cpu(CpuStorage::F16(row), Shape::new(&[1, layout.row_elems()]))?;
     c.put(0, &k, &v)?;
     let (k_out, v_out) = c.get(0, 1)?;
     let Some(CpuStorage::F16(k_host)) = k_out.cpu_storage() else {
@@ -87,18 +82,15 @@ fn put_then_get_round_trip_f16() -> Result<()> {
 
 #[test]
 fn put_then_get_round_trip_bf16() -> Result<()> {
-    let layout = CacheLayout {
-        dtype: DType::BF16,
-        ..layout_small()
-    };
-    let mut c = FlatKvCache::new(layout);
+    let layout = layout_with_dtype(DType::BF16)?;
+    let mut c = FlatKvCache::try_new(layout.clone())?;
     let val = half::bf16::from_f32(-2.25);
     let row = vec![val; layout.row_elems()];
-    let k = Tensor::from_cpu(
+    let k = Tensor::try_from_cpu(
         CpuStorage::BF16(row.clone()),
         Shape::new(&[1, layout.row_elems()]),
-    );
-    let v = Tensor::from_cpu(CpuStorage::BF16(row), Shape::new(&[1, layout.row_elems()]));
+    )?;
+    let v = Tensor::try_from_cpu(CpuStorage::BF16(row), Shape::new(&[1, layout.row_elems()]))?;
     c.put(0, &k, &v)?;
     let (k_out, v_out) = c.get(0, 1)?;
     let Some(CpuStorage::BF16(k_host)) = k_out.cpu_storage() else {
@@ -120,21 +112,18 @@ fn put_then_get_round_trip_bf16() -> Result<()> {
 
 #[test]
 fn put_then_get_round_trip_i32() -> Result<()> {
-    let layout = CacheLayout {
-        dtype: DType::I32,
-        ..layout_small()
-    };
-    let mut c = FlatKvCache::new(layout);
+    let layout = layout_with_dtype(DType::I32)?;
+    let mut c = FlatKvCache::try_new(layout.clone())?;
     let row_k = vec![7_i32; layout.row_elems()];
     let row_v = vec![-3_i32; layout.row_elems()];
-    let k = Tensor::from_cpu(
+    let k = Tensor::try_from_cpu(
         CpuStorage::I32(row_k.clone()),
         Shape::new(&[1, layout.row_elems()]),
-    );
-    let v = Tensor::from_cpu(
+    )?;
+    let v = Tensor::try_from_cpu(
         CpuStorage::I32(row_v.clone()),
         Shape::new(&[1, layout.row_elems()]),
-    );
+    )?;
     c.put(0, &k, &v)?;
     let (k_out, v_out) = c.get(0, 1)?;
     let Some(CpuStorage::I32(k_host)) = k_out.cpu_storage() else {
@@ -160,21 +149,18 @@ fn put_then_get_round_trip_i8() -> Result<()> {
     // used `from_ne_bytes` instead of the little-endian convention
     // every other reader uses — a quantized (I8) on-device model is
     // exactly the path this cache exists to serve.
-    let layout = CacheLayout {
-        dtype: DType::I8,
-        ..layout_small()
-    };
-    let mut c = FlatKvCache::new(layout);
+    let layout = layout_with_dtype(DType::I8)?;
+    let mut c = FlatKvCache::try_new(layout.clone())?;
     let row_k = vec![i8::MIN; layout.row_elems()];
     let row_v = vec![i8::MAX; layout.row_elems()];
-    let k = Tensor::from_cpu(
+    let k = Tensor::try_from_cpu(
         CpuStorage::I8(row_k.clone()),
         Shape::new(&[1, layout.row_elems()]),
-    );
-    let v = Tensor::from_cpu(
+    )?;
+    let v = Tensor::try_from_cpu(
         CpuStorage::I8(row_v.clone()),
         Shape::new(&[1, layout.row_elems()]),
-    );
+    )?;
     c.put(0, &k, &v)?;
     let (k_out, v_out) = c.get(0, 1)?;
     let Some(CpuStorage::I8(k_host)) = k_out.cpu_storage() else {
@@ -196,21 +182,18 @@ fn put_then_get_round_trip_i8() -> Result<()> {
 
 #[test]
 fn put_then_get_round_trip_u8() -> Result<()> {
-    let layout = CacheLayout {
-        dtype: DType::U8,
-        ..layout_small()
-    };
-    let mut c = FlatKvCache::new(layout);
+    let layout = layout_with_dtype(DType::U8)?;
+    let mut c = FlatKvCache::try_new(layout.clone())?;
     let row_k = vec![200_u8; layout.row_elems()];
     let row_v = vec![1_u8; layout.row_elems()];
-    let k = Tensor::from_cpu(
+    let k = Tensor::try_from_cpu(
         CpuStorage::U8(row_k.clone()),
         Shape::new(&[1, layout.row_elems()]),
-    );
-    let v = Tensor::from_cpu(
+    )?;
+    let v = Tensor::try_from_cpu(
         CpuStorage::U8(row_v.clone()),
         Shape::new(&[1, layout.row_elems()]),
-    );
+    )?;
     c.put(0, &k, &v)?;
     let (k_out, v_out) = c.get(0, 1)?;
     let Some(CpuStorage::U8(k_host)) = k_out.cpu_storage() else {
@@ -232,16 +215,16 @@ fn put_then_get_round_trip_u8() -> Result<()> {
 
 #[test]
 fn grows_monotonically_across_layers() -> Result<()> {
-    let layout = layout_small();
-    let mut c = FlatKvCache::new(layout);
+    let layout = layout_small()?;
+    let mut c = FlatKvCache::try_new(layout.clone())?;
     for _ in 0..3 {
-        for layer in 0..layout.num_layers {
-            let k = one_row_tensor(0.1, &layout);
-            let v = one_row_tensor(0.2, &layout);
+        for layer in 0..layout.num_layers() {
+            let k = one_row_tensor(0.1, &layout)?;
+            let v = one_row_tensor(0.2, &layout)?;
             c.put(layer, &k, &v)?;
         }
     }
-    for layer in 0..layout.num_layers {
+    for layer in 0..layout.num_layers() {
         assert_eq!(c.len_of(layer), Some(3));
     }
     Ok(())
@@ -249,10 +232,10 @@ fn grows_monotonically_across_layers() -> Result<()> {
 
 #[test]
 fn reset_zeros_lengths() -> Result<()> {
-    let layout = layout_small();
-    let mut c = FlatKvCache::new(layout);
-    let k = one_row_tensor(1.0, &layout);
-    let v = one_row_tensor(1.0, &layout);
+    let layout = layout_small()?;
+    let mut c = FlatKvCache::try_new(layout.clone())?;
+    let k = one_row_tensor(1.0, &layout)?;
+    let v = one_row_tensor(1.0, &layout)?;
     c.put(0, &k, &v)?;
     c.put(1, &k, &v)?;
     c.reset();
@@ -266,16 +249,10 @@ fn reset_zeros_lengths() -> Result<()> {
 
 #[test]
 fn overflow_errors_cleanly() -> Result<()> {
-    let layout = CacheLayout {
-        num_layers: 1,
-        num_kv_heads: 1,
-        head_dim: 1,
-        max_seq_len: 2,
-        dtype: DType::F32,
-    };
-    let mut c = FlatKvCache::new(layout);
-    let k = one_row_tensor(1.0, &layout);
-    let v = one_row_tensor(1.0, &layout);
+    let layout = CacheLayout::try_new(1, 1, 1, 2, DType::F32)?;
+    let mut c = FlatKvCache::try_new(layout.clone())?;
+    let k = one_row_tensor(1.0, &layout)?;
+    let v = one_row_tensor(1.0, &layout)?;
     c.put(0, &k, &v)?;
     c.put(0, &k, &v)?;
     let err = c.put(0, &k, &v);
@@ -284,19 +261,21 @@ fn overflow_errors_cleanly() -> Result<()> {
 }
 
 #[test]
-fn read_beyond_written_errors() {
-    let layout = layout_small();
-    let c = FlatKvCache::new(layout);
+fn read_beyond_written_errors() -> Result<()> {
+    let layout = layout_small()?;
+    let c = FlatKvCache::try_new(layout)?;
     let err = c.get(0, 1);
     assert!(matches!(err, Err(Error::ReadBeyondWritten { .. })));
+    Ok(())
 }
 
 #[test]
-fn layer_out_of_range_errors() {
-    let layout = layout_small();
-    let c = FlatKvCache::new(layout);
+fn layer_out_of_range_errors() -> Result<()> {
+    let layout = layout_small()?;
+    let c = FlatKvCache::try_new(layout)?;
     let err = c.get(99, 0);
     assert!(matches!(err, Err(Error::LayerOutOfRange { .. })));
+    Ok(())
 }
 
 #[test]
@@ -312,14 +291,14 @@ fn put_multi_token_batch_verifies_values() -> Result<()> {
     // a different path: one contiguous multi-row `tensor_as_bytes`
     // slice copied in one `copy_from_slice`, not several single-row
     // writes landing at the same offset.
-    let layout = layout_small();
-    let mut c = FlatKvCache::new(layout);
+    let layout = layout_small()?;
+    let mut c = FlatKvCache::try_new(layout.clone())?;
     let row = layout.row_elems();
     let n = 3;
     let k_data: Vec<f32> = (0..n * row).map(|i| i as f32).collect();
     let v_data: Vec<f32> = (0..n * row).map(|i| -(i as f32) - 1.0).collect();
-    let k = Tensor::from_cpu(CpuStorage::F32(k_data.clone()), Shape::new(&[n, row]));
-    let v = Tensor::from_cpu(CpuStorage::F32(v_data.clone()), Shape::new(&[n, row]));
+    let k = Tensor::try_from_cpu(CpuStorage::F32(k_data.clone()), Shape::new(&[n, row]))?;
+    let v = Tensor::try_from_cpu(CpuStorage::F32(v_data.clone()), Shape::new(&[n, row]))?;
     c.put(0, &k, &v)?;
     assert_eq!(c.len_of(0), Some(n));
     let (k_out, v_out) = c.get(0, n)?;
@@ -335,8 +314,8 @@ fn get_zero_len_returns_empty_tensor() -> Result<()> {
     // tests cover past-written-length (`read_beyond_written_errors`)
     // and out-of-range layer (`layer_out_of_range_errors`); neither
     // exercises the in-range success path of asking for zero rows.
-    let layout = layout_small();
-    let c = FlatKvCache::new(layout);
+    let layout = layout_small()?;
+    let c = FlatKvCache::try_new(layout.clone())?;
     let (k, v) = c.get(0, 0)?;
     assert_eq!(k.dims(), &[0, layout.row_elems()]);
     assert_eq!(v.dims(), &[0, layout.row_elems()]);
@@ -346,17 +325,18 @@ fn get_zero_len_returns_empty_tensor() -> Result<()> {
 }
 
 #[test]
-fn len_of_distinguishes_out_of_range_from_unwritten() {
+fn len_of_distinguishes_out_of_range_from_unwritten() -> Result<()> {
     // WHY(forkwright/logismos-archive#70): the pre-fix `len_of`
     // returned plain `0` for both an unwritten in-range layer and an
     // out-of-range one (`.unwrap_or(0)`), indistinguishable from the
     // caller's side. `Some(0)` vs `None` makes the two cases distinct
     // at the type level.
-    let layout = layout_small();
-    let c = FlatKvCache::new(layout);
+    let layout = layout_small()?;
+    let c = FlatKvCache::try_new(layout.clone())?;
     assert_eq!(c.len_of(0), Some(0));
-    assert_eq!(c.len_of(layout.num_layers), None);
+    assert_eq!(c.len_of(layout.num_layers()), None);
     assert_eq!(c.len_of(9999), None);
+    Ok(())
 }
 
 #[test]
@@ -404,10 +384,34 @@ fn cpu_storage_bytes_pins_little_endian_encoding() -> Result<()> {
 }
 
 #[test]
-fn buffer_bytes_computed_correctly() {
-    let layout = layout_small();
+fn buffer_bytes_computed_correctly() -> Result<()> {
+    let layout = layout_small()?;
     // dtype F32 (4B) × 2 heads × 3 head_dim × 8 max_seq = 192 B
     assert_eq!(layout.buffer_bytes(), 192);
     assert_eq!(layout.row_elems(), 6);
     assert_eq!(layout.row_bytes(), 24);
+    Ok(())
+}
+
+#[test]
+fn cache_layout_rejects_nonempty_overflow_before_allocation() {
+    let error = CacheLayout::try_new(1, 1usize << (usize::BITS - 1), 2, 1, DType::U8);
+    assert!(matches!(error, Err(Error::GeometryOverflow { .. })));
+}
+
+#[test]
+fn rejected_append_leaves_existing_data_and_length_unchanged() -> Result<()> {
+    let layout = CacheLayout::try_new(1, 1, 1, 1, DType::F32)?;
+    let mut cache = FlatKvCache::try_new(layout.clone())?;
+    let first = one_row_tensor(1.0, &layout)?;
+    let replacement = one_row_tensor(2.0, &layout)?;
+    cache.put(0, &first, &first)?;
+
+    let error = cache.put(0, &replacement, &replacement);
+    assert!(matches!(error, Err(Error::LenOverflow { .. })));
+    assert_eq!(cache.len_of(0), Some(1));
+    let (k, v) = cache.get(0, 1)?;
+    assert_eq!(host_f32(&k), vec![1.0]);
+    assert_eq!(host_f32(&v), vec![1.0]);
+    Ok(())
 }

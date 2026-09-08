@@ -95,8 +95,8 @@ impl<'a> TensorView<'a> {
         use taxis::{CpuStorage, Shape, Tensor};
 
         let shape = Shape::new(&self.shape);
-        let elem_count = shape.elem_count();
-        let expected_bytes = self.dtype.byte_count(elem_count);
+        let elem_count = shape.checked_elem_count()?;
+        let expected_bytes = self.dtype.byte_count(elem_count)?;
         if self.bytes.len() != expected_bytes {
             return ShapeMismatchSnafu {
                 name: self.name.to_string(),
@@ -124,7 +124,7 @@ impl<'a> TensorView<'a> {
             }
         };
 
-        Ok(Tensor::from_cpu(storage, shape))
+        Ok(Tensor::try_from_cpu(storage, shape)?)
     }
 }
 

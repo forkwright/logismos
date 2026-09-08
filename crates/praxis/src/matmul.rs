@@ -146,10 +146,10 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             let a_host = a.to_host_f16()?;
             let b_host = b.to_host_f16()?;
             let out = kernels::matmul::cpu::matmul_fp16_ref(&a_host, &b_host, m, n, ka);
-            Ok(Tensor::from_cpu(
+            Ok(Tensor::try_from_cpu(
                 taxis::CpuStorage::F16(out),
                 Shape::new(&[m, n]),
-            ))
+            )?)
         }
         // WHY(forkwright/logismos#39): a mixed pair used to fall through
         // the old wildcard arm — commented "CPU fallback — both on
@@ -179,9 +179,9 @@ mod tests {
 
     use super::matmul;
 
-    fn f16_tensor(values: &[f32], shape: &[usize]) -> Tensor {
+    fn f16_tensor(values: &[f32], shape: &[usize]) -> taxis::Result<Tensor> {
         let data: Vec<f16> = values.iter().copied().map(f16::from_f32).collect();
-        Tensor::from_cpu(CpuStorage::F16(data), Shape::new(shape))
+        Tensor::try_from_cpu(CpuStorage::F16(data), Shape::new(shape))
     }
 
     /// WHY: exercises the `DevicePlacement::BothCpu` arm through the
@@ -191,15 +191,16 @@ mod tests {
     /// driven end-to-end here; this pins the CPU-only arithmetic that
     /// CAN run, and CI confirms it on every push.
     #[test]
-    fn both_cpu_matmul_computes_expected_product() {
-        let a = f16_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
-        let identity = f16_tensor(&[1.0, 0.0, 0.0, 1.0], &[2, 2]);
-        let out = matmul(&a, &identity).expect("both-CPU matmul must still succeed");
-        let got = out.to_host_f16().expect("to_host_f16");
+    fn both_cpu_matmul_computes_expected_product() -> Result<()> {
+        let a = f16_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2])?;
+        let identity = f16_tensor(&[1.0, 0.0, 0.0, 1.0], &[2, 2])?;
+        let out = matmul(&a, &identity)?;
+        let got = out.to_host_f16()?;
         let want: Vec<f16> = [1.0_f32, 2.0, 3.0, 4.0]
             .into_iter()
             .map(f16::from_f32)
             .collect();
         assert_eq!(got, want, "A @ I must equal A");
+        Ok(())
     }
 }

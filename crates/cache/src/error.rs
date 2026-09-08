@@ -17,6 +17,30 @@ pub enum Error {
         source: taxis::Error,
     },
 
+    /// Cache geometry cannot be represented without overflow.
+    #[snafu(display("cache geometry overflow in {op}: {msg}"))]
+    GeometryOverflow {
+        /// Operation deriving the geometry.
+        op: &'static str,
+        /// Inputs or quantity that could not be represented.
+        msg: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Cache storage could not reserve the validated capacity.
+    #[snafu(display("cache allocation failed for {what}: {bytes} bytes"))]
+    Allocation {
+        /// Buffer or collection that could not reserve capacity.
+        what: &'static str,
+        /// Number of bytes requested for the allocation.
+        bytes: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// Layer index out of range for this cache.
     #[snafu(display("cache: layer {layer_idx} out of bounds (num_layers={num_layers})"))]
     LayerOutOfRange {

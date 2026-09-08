@@ -86,14 +86,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_layout_row_elems_multiplies_heads_by_width() {
-        let layout = CacheLayout {
-            num_layers: 2,
-            num_kv_heads: 4,
-            head_dim: 8,
-            max_seq_len: 16,
-            dtype: taxis::DType::F16,
-        };
+    fn cache_layout_row_elems_multiplies_heads_by_width() -> Result<()> {
+        let layout = CacheLayout::try_new(2, 4, 8, 16, taxis::DType::F16)?;
         assert_eq!(layout.row_elems(), 32);
+        Ok(())
     }
 }

@@ -15,6 +15,14 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
+    /// Tensor construction or allocation geometry failure.
+    #[cfg(feature = "tensor")]
+    #[snafu(transparent)]
+    Taxis {
+        /// Source tensor error.
+        source: taxis::Error,
+    },
+
     /// Filesystem / mmap failure.
     #[snafu(display("io error: {source}"), context(false))]
     Io {
