@@ -130,16 +130,18 @@ mod tests {
         assert!(matches!(
             q8_0_gemv_f32(&matrix, &[f32::NAN; VALUES_PER_BLOCK], shape),
             Err(crate::Error::Quant {
-                source: quant::Error::NonFiniteRowActivation { .. }
+                source: quant::Error::NonFiniteRowActivation { .. },
+                ..
             })
         ));
         assert!(matches!(
             q8_0_gemv_f32(&matrix, &[f32::MAX; VALUES_PER_BLOCK], shape),
             Err(crate::Error::Quant {
                 source: quant::Error::NonFiniteRowArithmetic {
-                    stage: quant::RowArithmeticStage::Product,
+                    stage: quant::error::RowArithmeticStage::Product,
                     ..
-                }
+                },
+                ..
             })
         ));
 
@@ -149,9 +151,10 @@ mod tests {
             q8_0_gemv_f32(&matrix, &accumulation_activations, shape),
             Err(crate::Error::Quant {
                 source: quant::Error::NonFiniteRowArithmetic {
-                    stage: quant::RowArithmeticStage::Accumulation,
+                    stage: quant::error::RowArithmeticStage::Accumulation,
                     ..
-                }
+                },
+                ..
             })
         ));
         Ok(())
