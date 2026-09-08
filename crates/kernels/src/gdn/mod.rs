@@ -1,8 +1,8 @@
 //! Bounded CPU references for single-head and grouped Gated Delta Rule recurrence.
 //!
 //! This module accepts dense single-head and grouped multi-head recurrent input.
-//! It is a correctness oracle for a future device kernel, not a model adapter or
-//! a permissive fallback for unsupported GDN variants.
+//! It provides a correctness oracle plus a staged device step, not a model
+//! adapter or a permissive fallback for unsupported GDN variants.
 //! Bounds describe admitted shapes and exact logical `f32` requests. Every
 //! owned output or scratch vector is reserved fallibly; this is not a process
 //! RSS, allocator-overhead, or physical-memory guarantee.
@@ -773,7 +773,7 @@ pub fn multi_head_recurrent_fwd(
 /// the CPU reference's non-finite-input or arithmetic refusals.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the nine buffers, scale, and stream are the fixed staged GDN step ABI"
+    reason = "the eight buffers, scale, and stream are the fixed staged GDN step ABI"
 )]
 pub unsafe fn launch_multi_head_recurrent_step_f32(
     plan: MultiHeadRecurrentAllocationPlan,
@@ -944,7 +944,8 @@ fn validate_gdn_step_launch(
     }
     if !(scale == 0.0 || scale.is_normal()) {
         return unsupported_gdn_step_shape(
-            "scale must be zero or normal finite f32 for the qualified GPU domain".to_string(),
+            "scale must be zero or normal finite f32 for the declared device-input domain"
+                .to_string(),
         );
     }
 
