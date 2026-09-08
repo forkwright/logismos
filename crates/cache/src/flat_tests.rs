@@ -14,7 +14,10 @@ fn layout_with_dtype(dtype: DType) -> Result<CacheLayout> {
 
 fn one_row_tensor(val: f32, layout: &CacheLayout) -> Result<Tensor> {
     let row = vec![val; layout.row_elems()];
-    Tensor::try_from_cpu(CpuStorage::F32(row), Shape::new(&[1, layout.row_elems()]))
+    Ok(Tensor::try_from_cpu(
+        CpuStorage::F32(row),
+        Shape::new(&[1, layout.row_elems()]),
+    )?)
 }
 
 fn host_f32(t: &Tensor) -> Vec<f32> {

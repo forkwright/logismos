@@ -23,6 +23,7 @@
 
 use std::borrow::Cow;
 
+use snafu::ResultExt;
 use taxis::{CpuStorage, DType, Shape, Tensor};
 
 use crate::KvCache;
@@ -503,13 +504,9 @@ fn try_reserve_vec<T>(requested_elements: usize, what: &'static str) -> Result<V
     let mut buffer = Vec::new();
     buffer
         .try_reserve_exact(requested_elements)
-        .map_err(|source| {
-            AllocationSnafu {
-                what,
-                requested_elements,
-                source,
-            }
-            .build()
+        .context(AllocationSnafu {
+            what,
+            requested_elements,
         })?;
     Ok(buffer)
 }
@@ -530,7 +527,7 @@ fn cpu_tensor_from_bytes(dtype: DType, bytes: &[u8], shape: Shape) -> Result<Ten
             .fail();
         }
     };
-    Tensor::try_from_cpu(storage, shape).map_err(Into::into)
+    Ok(Tensor::try_from_cpu(storage, shape)?)
 }
 
 /// Postcondition on every `chunks_exact`-based decoder: `chunks_exact`
