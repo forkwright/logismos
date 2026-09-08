@@ -258,6 +258,102 @@ impl FlatKvCache {
         }
         Ok(())
     }
+
+    fn append_geometry(
+        &self,
+        layer_idx: usize,
+        current: usize,
+        n_tokens: usize,
+    ) -> Result<(usize, usize, usize)> {
+        let next_len = current.checked_add(n_tokens).ok_or_else(|| {
+            GeometryOverflowSnafu {
+                op: "FlatKvCache::put",
+                msg: format!("current {current} + n_tokens {n_tokens} overflows"),
+            }
+            .build()
+        })?;
+        if next_len > self.layout.max_seq_len() {
+            return LenOverflowSnafu {
+                layer_idx,
+                current,
+                n_new: n_tokens,
+                max_seq_len: self.layout.max_seq_len(),
+            }
+            .fail();
+        }
+        let row_bytes = self.layout.row_bytes();
+        let off = current.checked_mul(row_bytes).ok_or_else(|| {
+            GeometryOverflowSnafu {
+                op: "FlatKvCache::put",
+                msg: format!("current {current} × row_bytes {row_bytes} overflows"),
+            }
+            .build()
+        })?;
+        let write_bytes = n_tokens.checked_mul(row_bytes).ok_or_else(|| {
+            GeometryOverflowSnafu {
+                op: "FlatKvCache::put",
+                msg: format!("n_tokens {n_tokens} × row_bytes {row_bytes} overflows"),
+            }
+            .build()
+        })?;
+        let end = off.checked_add(write_bytes).ok_or_else(|| {
+            GeometryOverflowSnafu {
+                op: "FlatKvCache::put",
+                msg: "write range end overflows".to_string(),
+            }
+            .build()
+        })?;
+        Ok((next_len, off, end))
+    }
+
+    fn write_append(
+        &mut self,
+        layer_idx: usize,
+        next_len: usize,
+        off: usize,
+        end: usize,
+        k_bytes: &[u8],
+        v_bytes: &[u8],
+    ) -> Result<()> {
+        let buffer_err = || {
+            ShapeMismatchSnafu {
+                msg: format!(
+                    "layer {layer_idx} buffer overflow (off={off}, end={end}, \
+                     buf_bytes={})",
+                    self.layout.buffer_bytes()
+                ),
+            }
+            .build()
+        };
+        let num_layers = self.layout.num_layers();
+        let k_buf = self.k_buffers.get_mut(layer_idx).ok_or_else(|| {
+            LayerOutOfRangeSnafu {
+                layer_idx,
+                num_layers,
+            }
+            .build()
+        })?;
+        let v_buf = self.v_buffers.get_mut(layer_idx).ok_or_else(|| {
+            LayerOutOfRangeSnafu {
+                layer_idx,
+                num_layers,
+            }
+            .build()
+        })?;
+        let k_dst = k_buf.get_mut(off..end).ok_or_else(buffer_err)?;
+        let v_dst = v_buf.get_mut(off..end).ok_or_else(buffer_err)?;
+        k_dst.copy_from_slice(k_bytes);
+        v_dst.copy_from_slice(v_bytes);
+        let slot = self.lens.get_mut(layer_idx).ok_or_else(|| {
+            LayerOutOfRangeSnafu {
+                layer_idx,
+                num_layers,
+            }
+            .build()
+        })?;
+        *slot = next_len;
+        Ok(())
+    }
 }
 
 impl KvCache for FlatKvCache {
@@ -284,82 +380,8 @@ impl KvCache for FlatKvCache {
             }
             .build()
         })?;
-        let next_len = current.checked_add(n_k).ok_or_else(|| {
-            GeometryOverflowSnafu {
-                op: "FlatKvCache::put",
-                msg: format!("current {current} + n_tokens {n_k} overflows"),
-            }
-            .build()
-        })?;
-        if next_len > self.layout.max_seq_len() {
-            return LenOverflowSnafu {
-                layer_idx,
-                current,
-                n_new: n_k,
-                max_seq_len: self.layout.max_seq_len(),
-            }
-            .fail();
-        }
-        let row_bytes = self.layout.row_bytes();
-        let off = current.checked_mul(row_bytes).ok_or_else(|| {
-            GeometryOverflowSnafu {
-                op: "FlatKvCache::put",
-                msg: format!("current {current} × row_bytes {row_bytes} overflows"),
-            }
-            .build()
-        })?;
-        let write_bytes = n_k.checked_mul(row_bytes).ok_or_else(|| {
-            GeometryOverflowSnafu {
-                op: "FlatKvCache::put",
-                msg: format!("n_tokens {n_k} × row_bytes {row_bytes} overflows"),
-            }
-            .build()
-        })?;
-        let end = off.checked_add(write_bytes).ok_or_else(|| {
-            GeometryOverflowSnafu {
-                op: "FlatKvCache::put",
-                msg: "write range end overflows".to_string(),
-            }
-            .build()
-        })?;
-        let shape_err = || {
-            ShapeMismatchSnafu {
-                msg: format!(
-                    "layer {layer_idx} buffer overflow (off={off}, end={end}, \
-                     buf_bytes={})",
-                    self.layout.buffer_bytes()
-                ),
-            }
-            .build()
-        };
-        let num_layers = self.layout.num_layers();
-        let k_buf = self.k_buffers.get_mut(layer_idx).ok_or_else(|| {
-            LayerOutOfRangeSnafu {
-                layer_idx,
-                num_layers,
-            }
-            .build()
-        })?;
-        let v_buf = self.v_buffers.get_mut(layer_idx).ok_or_else(|| {
-            LayerOutOfRangeSnafu {
-                layer_idx,
-                num_layers,
-            }
-            .build()
-        })?;
-        let k_dst = k_buf.get_mut(off..end).ok_or_else(shape_err)?;
-        let v_dst = v_buf.get_mut(off..end).ok_or_else(shape_err)?;
-        k_dst.copy_from_slice(&k_bytes);
-        v_dst.copy_from_slice(&v_bytes);
-        let slot = self.lens.get_mut(layer_idx).ok_or_else(|| {
-            LayerOutOfRangeSnafu {
-                layer_idx,
-                num_layers,
-            }
-            .build()
-        })?;
-        *slot = next_len;
-        Ok(())
+        let (next_len, off, end) = self.append_geometry(layer_idx, current, n_k)?;
+        self.write_append(layer_idx, next_len, off, end, &k_bytes, &v_bytes)
     }
 
     fn get(&self, layer_idx: usize, len: usize) -> Result<(Tensor, Tensor)> {
@@ -438,14 +460,9 @@ impl KvCache for FlatKvCache {
 /// Little-endian byte view of `v` — the write-side half of this crate's
 /// byte-marshalling convention (see the module doc). Zero-copy: on a
 /// little-endian target, an element's native in-memory layout already IS
-/// its little-endian encoding, so `_to_le` goes unused by construction —
-/// kept in the signature so this and its big-endian sibling below share
-/// one call-site shape.
+/// its little-endian encoding, so `_to_le` goes unused by construction.
 #[cfg(target_endian = "little")]
-fn le_bytes_of<T: Copy, const N: usize>(
-    v: &[T],
-    _to_le: impl Fn(T) -> [u8; N],
-) -> Result<Cow<'_, [u8]>> {
+fn le_bytes_of<T: Copy, const N: usize>(v: &[T], _to_le: impl Fn(T) -> [u8; N]) -> Cow<'_, [u8]> {
     // SAFETY: `T` is `Copy` + every bit pattern is valid
     // (f32/f16/bf16/i32/i8), and on this little-endian target the native
     // representation already equals the little-endian encoding `_to_le`
@@ -453,7 +470,7 @@ fn le_bytes_of<T: Copy, const N: usize>(
     // calling `_to_le` on every element.
     let bytes =
         unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v)) };
-    Ok(Cow::Borrowed(bytes))
+    Cow::Borrowed(bytes)
 }
 
 /// Little-endian byte view of `v`, explicit-encode fallback for a
@@ -479,6 +496,23 @@ fn le_bytes_of<T: Copy, const N: usize>(
     Ok(Cow::Owned(out))
 }
 
+#[cfg(target_endian = "little")]
+fn cpu_storage_bytes(s: &CpuStorage) -> Result<Cow<'_, [u8]>> {
+    match s {
+        CpuStorage::F32(v) => Ok(le_bytes_of(v, f32::to_le_bytes)),
+        CpuStorage::F16(v) => Ok(le_bytes_of(v, half::f16::to_le_bytes)),
+        CpuStorage::BF16(v) => Ok(le_bytes_of(v, half::bf16::to_le_bytes)),
+        CpuStorage::I32(v) => Ok(le_bytes_of(v, i32::to_le_bytes)),
+        CpuStorage::I8(v) => Ok(le_bytes_of(v, i8::to_le_bytes)),
+        CpuStorage::U8(v) => Ok(Cow::Borrowed(v.as_slice())),
+        _ => UnsupportedStorageSnafu {
+            msg: "unsupported future CpuStorage variant",
+        }
+        .fail(),
+    }
+}
+
+#[cfg(not(target_endian = "little"))]
 fn cpu_storage_bytes(s: &CpuStorage) -> Result<Cow<'_, [u8]>> {
     match s {
         CpuStorage::F32(v) => le_bytes_of(v, f32::to_le_bytes),
