@@ -167,33 +167,9 @@ impl FlatKvCache {
     /// this result; no allocation path silently wraps or substitutes empty
     /// buffers.
     pub fn try_new(layout: CacheLayout) -> Result<Self> {
-        let mut k_buffers = Vec::new();
-        let mut v_buffers = Vec::new();
-        let mut lens = Vec::new();
-        for (what, buffers) in [
-            ("K buffer list", &mut k_buffers),
-            ("V buffer list", &mut v_buffers),
-        ] {
-            buffers
-                .try_reserve_exact(layout.num_layers())
-                .map_err(|source| {
-                    AllocationSnafu {
-                        what,
-                        requested_elements: layout.num_layers(),
-                        source,
-                    }
-                    .build()
-                })?;
-        }
-        lens.try_reserve_exact(layout.num_layers())
-            .map_err(|source| {
-                AllocationSnafu {
-                    what: "length list",
-                    requested_elements: layout.num_layers(),
-                    source,
-                }
-                .build()
-            })?;
+        let mut k_buffers: Vec<Vec<u8>> = try_reserve_vec(layout.num_layers(), "K buffer list")?;
+        let mut v_buffers: Vec<Vec<u8>> = try_reserve_vec(layout.num_layers(), "V buffer list")?;
+        let mut lens: Vec<usize> = try_reserve_vec(layout.num_layers(), "length list")?;
         for _ in 0..layout.num_layers() {
             k_buffers.push(allocate_zeroed(layout.buffer_bytes(), "K buffer")?);
             v_buffers.push(allocate_zeroed(layout.buffer_bytes(), "V buffer")?);
@@ -465,7 +441,10 @@ impl KvCache for FlatKvCache {
 /// kept in the signature so this and its big-endian sibling below share
 /// one call-site shape.
 #[cfg(target_endian = "little")]
-fn le_bytes_of<T: Copy, const N: usize>(v: &[T], _to_le: impl Fn(T) -> [u8; N]) -> Cow<'_, [u8]> {
+fn le_bytes_of<T: Copy, const N: usize>(
+    v: &[T],
+    _to_le: impl Fn(T) -> [u8; N],
+) -> Result<Cow<'_, [u8]>> {
     // SAFETY: `T` is `Copy` + every bit pattern is valid
     // (f32/f16/bf16/i32/i8), and on this little-endian target the native
     // representation already equals the little-endian encoding `_to_le`
@@ -473,7 +452,7 @@ fn le_bytes_of<T: Copy, const N: usize>(v: &[T], _to_le: impl Fn(T) -> [u8; N]) 
     // calling `_to_le` on every element.
     let bytes =
         unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v)) };
-    Cow::Borrowed(bytes)
+    Ok(Cow::Borrowed(bytes))
 }
 
 /// Little-endian byte view of `v`, explicit-encode fallback for a
@@ -481,21 +460,31 @@ fn le_bytes_of<T: Copy, const N: usize>(v: &[T], _to_le: impl Fn(T) -> [u8; N]) 
 /// endianness (see the little-endian sibling above for the zero-copy
 /// case, which covers every target this crate currently ships on).
 #[cfg(not(target_endian = "little"))]
-fn le_bytes_of<T: Copy, const N: usize>(v: &[T], to_le: impl Fn(T) -> [u8; N]) -> Cow<'_, [u8]> {
-    let mut out = Vec::with_capacity(v.len() * N);
+fn le_bytes_of<T: Copy, const N: usize>(
+    v: &[T],
+    to_le: impl Fn(T) -> [u8; N],
+) -> Result<Cow<'_, [u8]>> {
+    let byte_len = v.len().checked_mul(N).ok_or_else(|| {
+        GeometryOverflowSnafu {
+            op: "le_bytes_of",
+            msg: format!("{} elements × {N} bytes overflows", v.len()),
+        }
+        .build()
+    })?;
+    let mut out = try_reserve_vec(byte_len, "big-endian marshal buffer")?;
     for &x in v {
         out.extend_from_slice(&to_le(x));
     }
-    Cow::Owned(out)
+    Ok(Cow::Owned(out))
 }
 
 fn cpu_storage_bytes(s: &CpuStorage) -> Result<Cow<'_, [u8]>> {
     match s {
-        CpuStorage::F32(v) => Ok(le_bytes_of(v, f32::to_le_bytes)),
-        CpuStorage::F16(v) => Ok(le_bytes_of(v, half::f16::to_le_bytes)),
-        CpuStorage::BF16(v) => Ok(le_bytes_of(v, half::bf16::to_le_bytes)),
-        CpuStorage::I32(v) => Ok(le_bytes_of(v, i32::to_le_bytes)),
-        CpuStorage::I8(v) => Ok(le_bytes_of(v, i8::to_le_bytes)),
+        CpuStorage::F32(v) => le_bytes_of(v, f32::to_le_bytes),
+        CpuStorage::F16(v) => le_bytes_of(v, half::f16::to_le_bytes),
+        CpuStorage::BF16(v) => le_bytes_of(v, half::bf16::to_le_bytes),
+        CpuStorage::I32(v) => le_bytes_of(v, i32::to_le_bytes),
+        CpuStorage::I8(v) => le_bytes_of(v, i8::to_le_bytes),
         CpuStorage::U8(v) => Ok(Cow::Borrowed(v.as_slice())),
         _ => UnsupportedStorageSnafu {
             msg: "unsupported future CpuStorage variant",
@@ -505,16 +494,23 @@ fn cpu_storage_bytes(s: &CpuStorage) -> Result<Cow<'_, [u8]>> {
 }
 
 fn allocate_zeroed(len: usize, what: &'static str) -> Result<Vec<u8>> {
-    let mut buffer = Vec::new();
-    buffer.try_reserve_exact(len).map_err(|source| {
-        AllocationSnafu {
-            what,
-            requested_elements: len,
-            source,
-        }
-        .build()
-    })?;
+    let mut buffer = try_reserve_vec(len, what)?;
     buffer.resize(len, 0);
+    Ok(buffer)
+}
+
+fn try_reserve_vec<T>(requested_elements: usize, what: &'static str) -> Result<Vec<T>> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(requested_elements)
+        .map_err(|source| {
+            AllocationSnafu {
+                what,
+                requested_elements,
+                source,
+            }
+            .build()
+        })?;
     Ok(buffer)
 }
 
@@ -525,8 +521,8 @@ fn cpu_tensor_from_bytes(dtype: DType, bytes: &[u8], shape: Shape) -> Result<Ten
         DType::F16 => CpuStorage::F16(chunks_to_f16(bytes, elem_count)?),
         DType::BF16 => CpuStorage::BF16(chunks_to_bf16(bytes, elem_count)?),
         DType::I32 => CpuStorage::I32(chunks_to_i32(bytes, elem_count)?),
-        DType::I8 => CpuStorage::I8(bytes_to_i8(bytes)),
-        DType::U8 => CpuStorage::U8(bytes.to_vec()),
+        DType::I8 => CpuStorage::I8(bytes_to_i8(bytes)?),
+        DType::U8 => CpuStorage::U8(copy_bytes(bytes, "decoded U8 storage")?),
         other => {
             return MsgSnafu {
                 message: format!("dtype {other:?} not supported by Phase-2 FlatKvCache"),
@@ -555,8 +551,14 @@ fn check_decoded_len(produced: usize, expected: usize, byte_len: usize) -> Resul
     Ok(())
 }
 
-fn bytes_to_i8(bytes: &[u8]) -> Vec<i8> {
-    let mut out = Vec::with_capacity(bytes.len());
+fn copy_bytes(bytes: &[u8], what: &'static str) -> Result<Vec<u8>> {
+    let mut out = try_reserve_vec(bytes.len(), what)?;
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+fn bytes_to_i8(bytes: &[u8]) -> Result<Vec<i8>> {
+    let mut out = try_reserve_vec(bytes.len(), "decoded I8 storage")?;
     for c in bytes.chunks_exact(1) {
         let mut arr = [0u8; 1];
         arr.copy_from_slice(c);
@@ -569,11 +571,11 @@ fn bytes_to_i8(bytes: &[u8]) -> Vec<i8> {
         // `from_le_bytes` makes the convention uniform and explicit.
         out.push(i8::from_le_bytes(arr));
     }
-    out
+    Ok(out)
 }
 
 fn chunks_to_f32(bytes: &[u8], elem: usize) -> Result<Vec<f32>> {
-    let mut out = Vec::with_capacity(elem);
+    let mut out = try_reserve_vec(elem, "decoded F32 storage")?;
     for c in bytes.chunks_exact(4) {
         let mut b = [0u8; 4];
         b.copy_from_slice(c);
@@ -583,7 +585,7 @@ fn chunks_to_f32(bytes: &[u8], elem: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 fn chunks_to_i32(bytes: &[u8], elem: usize) -> Result<Vec<i32>> {
-    let mut out = Vec::with_capacity(elem);
+    let mut out = try_reserve_vec(elem, "decoded I32 storage")?;
     for c in bytes.chunks_exact(4) {
         let mut b = [0u8; 4];
         b.copy_from_slice(c);
@@ -593,7 +595,7 @@ fn chunks_to_i32(bytes: &[u8], elem: usize) -> Result<Vec<i32>> {
     Ok(out)
 }
 fn chunks_to_f16(bytes: &[u8], elem: usize) -> Result<Vec<half::f16>> {
-    let mut out = Vec::with_capacity(elem);
+    let mut out = try_reserve_vec(elem, "decoded F16 storage")?;
     for c in bytes.chunks_exact(2) {
         let mut b = [0u8; 2];
         b.copy_from_slice(c);
@@ -603,7 +605,7 @@ fn chunks_to_f16(bytes: &[u8], elem: usize) -> Result<Vec<half::f16>> {
     Ok(out)
 }
 fn chunks_to_bf16(bytes: &[u8], elem: usize) -> Result<Vec<half::bf16>> {
-    let mut out = Vec::with_capacity(elem);
+    let mut out = try_reserve_vec(elem, "decoded BF16 storage")?;
     for c in bytes.chunks_exact(2) {
         let mut b = [0u8; 2];
         b.copy_from_slice(c);

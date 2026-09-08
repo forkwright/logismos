@@ -415,3 +415,19 @@ fn rejected_append_leaves_existing_data_and_length_unchanged() -> Result<()> {
     assert_eq!(host_f32(&v), vec![1.0]);
     Ok(())
 }
+
+#[test]
+fn allocation_refusal_is_typed_without_attempting_a_large_allocation() {
+    // WHY: `usize::MAX` exceeds every supported Vec capacity, so
+    // `try_reserve_exact` rejects it before the allocator attempts a large
+    // allocation. This witnesses the cache's typed refusal path without a
+    // global allocator hook or memory-pressure fixture.
+    let error = try_reserve_vec::<u8>(usize::MAX, "capacity refusal fixture");
+    assert!(matches!(
+        error,
+        Err(Error::Allocation {
+            requested_elements: usize::MAX,
+            ..
+        })
+    ));
+}
