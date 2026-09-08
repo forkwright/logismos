@@ -1725,7 +1725,6 @@ mod tests {
 
     #[test]
     fn tokenizer_failures_retain_typed_sources() -> TestResult<()> {
-        let tokenizer_json = tokenizer_json();
         let config = fixture_config(&TOKENS, 3, false, false, "hello");
         let fixture = build_qwen35_fixture(&config)?;
         let (_directory, artifact) = load_fixture(&fixture)?;
