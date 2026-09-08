@@ -156,7 +156,8 @@ fn checked_layout<T>(elements: usize, label: &str) -> Result<()> {
             msg: format!("{label} {elements} exceeds the Rust allocation layout domain"),
         }
         .build()
-    })
+    })?;
+    Ok(())
 }
 
 #[cfg(feature = "gpu")]
