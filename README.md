@@ -16,7 +16,9 @@ provider remains unimplemented.
 
 The standalone [`Q8_0 GEMV`](crates/kernels/src/q8_0_gemv/mod.rs) primitive
 shares checked format geometry with `quant` and supplies an explicit CPU
-reference plus a HIP launcher. GPU compilation is not numerical or performance
+reference plus a HIP launcher. The GPU numerical domain excludes subnormal
+scales, operands and intermediates pending denormal-mode qualification.
+GPU compilation is not numerical or performance
 qualification; native text/retrieval execution is still CPU-only.
 
 ## Why

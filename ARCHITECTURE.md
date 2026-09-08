@@ -129,7 +129,9 @@ bounds. The CPU reference delegates each row to `quant`; the HIP implementation
 uses one sequential thread per row with source-specific floating-point controls.
 Its unsafe asynchronous launcher requires valid device buffers, lifetimes,
 nonaliasing and admitted finite arithmetic. CPU typed nonfinite refusals do not
-imply device-result validation. This is a correctness-oriented primitive, not a
+imply device-result validation. Its GPU domain requires zero-or-normal scales,
+operands and intermediates; CPU subnormal witnesses do not qualify GPU denormal
+modes. This is a correctness-oriented primitive, not a
 whole-model GPU path, performance result or hardware qualification.
 
 `loader::gguf::VerifiedArtifact` owns one immutable serialized backing, admitted

@@ -45,7 +45,6 @@ fn main() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed={HIP_BUILD_MODE_ENV}");
     println!("cargo:rerun-if-env-changed=LOGISMOS_SKIP_HIP_BUILD");
     println!("cargo:rerun-if-changed=../../contracts/gpu-target.txt");
-    println!("cargo:rerun-if-changed=../quant/src/q8_0.rs");
 
     if env::var("LOGISMOS_SKIP_HIP_BUILD").is_ok() {
         return Err(
@@ -114,7 +113,10 @@ fn write_q8_0_format_header(out_dir: &Path) -> Result<(), String> {
     let derived_block_bytes = scale_bytes.checked_add(value_bytes).ok_or_else(|| {
         "quant Q8_0 header fields overflow while deriving block bytes".to_string()
     })?;
-    if block_bytes != derived_block_bytes || value_bytes != values_per_block {
+    if block_bytes != derived_block_bytes
+        || value_bytes != values_per_block
+        || scale_bytes != std::mem::size_of::<u16>()
+    {
         return Err("quant Q8_0 constants violate their declared layout relation".to_string());
     }
     let header = format!(

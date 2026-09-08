@@ -11,6 +11,8 @@
 
 #include "q8_0_format.h"
 
+static_assert(LOGISMOS_Q8_0_SCALE_BYTES == sizeof(std::uint16_t));
+
 // WHY: `quant::q8_0::row_dot_f32` performs separate f32 decode, product, and
 // accumulation steps in serialized order. Fast contraction would turn the
 // latter two into FMA and change that correctness baseline, so disable it for
@@ -45,8 +47,12 @@ extern "C" __global__ void logismos_q8_0_gemv_f32_kernel(
         }
         const float scale = __half2float(__ushort_as_half(scale_bits));
         for (std::size_t lane = 0; lane < LOGISMOS_Q8_0_VALUES_PER_BLOCK; ++lane) {
-            const auto signed_value = static_cast<std::int8_t>(
-                block[LOGISMOS_Q8_0_SCALE_BYTES + lane]);
+            const auto byte = block[LOGISMOS_Q8_0_SCALE_BYTES + lane];
+            // GGML stores two's-complement bytes. Keep the conversion defined
+            // even in C++17, where an out-of-range uint8_t-to-int8_t cast is not.
+            const int signed_value = byte < 128U
+                ? static_cast<int>(byte)
+                : static_cast<int>(byte) - 256;
             const float decoded = scale * static_cast<float>(signed_value);
             const float product = decoded * activations_f32[
                 block_index * LOGISMOS_Q8_0_VALUES_PER_BLOCK + lane];

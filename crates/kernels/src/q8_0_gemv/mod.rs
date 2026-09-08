@@ -4,6 +4,8 @@
 //! order. It multiplies one finite f32 vector of `width` values and produces
 //! one f32 value per row. This is a correctness baseline, not a WMMA or
 //! whole-model execution path.
+//! The CPU reference admits finite subnormal values; the GPU domain excludes
+//! subnormal scales, operands and intermediates pending denormal-mode qualification.
 
 pub mod cpu;
 
@@ -167,7 +169,8 @@ fn checked_layout<T>(elements: usize, label: &str) -> Result<()> {
 /// each lane computes `scale * signed_i8`, then one f32 product and one f32
 /// accumulation in serialized block/lane order. It does not validate finite
 /// device inputs or device results; callers must complete that admission
-/// before crossing this unsafe boundary.
+/// before crossing this unsafe boundary. GPU subnormal preservation is not
+/// qualified: CPU subnormal witnesses do not extend the GPU numerical domain.
 ///
 /// # Errors
 ///
@@ -182,8 +185,10 @@ fn checked_layout<T>(elements: usize, label: &str) -> Result<()> {
 /// `matrix_q8_0`, `activations_f32`, and `output_f32` must be non-null device
 /// buffers on `stream`'s device for the complete launch. Their exact byte or
 /// element lengths must match `shape`, and f32 buffers must be aligned for f32.
-/// Inputs and every sequential product/accumulator must remain finite within
-/// the admitted numerical domain. Inputs must not be concurrently modified;
+/// Scales (in f16), activations and every converted scale, decoded value,
+/// product and accumulator (in f32) must be finite and either zero or normal.
+/// The GPU domain excludes subnormal-dependent semantics until the compiler
+/// and device denormal modes are qualified. Inputs must not be concurrently modified;
 /// `output_f32` must not alias either input or another concurrent access, and
 /// all buffers must outlive the stream's completion.
 /// This ABI has no per-row status channel, so it cannot reproduce
