@@ -1740,18 +1740,22 @@ mod tests {
         let initial = request(&format!("[{}]", workload("alpha", 4)), 20)?;
         let mut scheduler = Scheduler::new(&initial, SchedulerLimits::try_new(3, 1, 2)?)?;
         let alpha = loaded_ticket(&mut scheduler)?;
-        let beta_request = request(&format!("[{}]", workload("beta", 4)), 20)?;
-        let beta = one_ticket(&mut scheduler, &beta_request)?;
         scheduler.request_retirement(&alpha)?;
         let failed_evict = poll_command(&mut scheduler)?;
+        assert!(
+            matches!(failed_evict.kind(), RuntimeCommandKind::Evict { .. }),
+            "the retired resident issues its eviction before unrelated work is admitted"
+        );
         scheduler.complete(RuntimeCompletion::EvictFailed {
             operation: failed_evict.operation(),
         })?;
         assert_eq!(
             scheduler.admissions.len(),
-            2,
+            1,
             "failed eviction keeps alpha's accounting lease"
         );
+        let beta_request = request(&format!("[{}]", workload("beta", 4)), 20)?;
+        let beta = one_ticket(&mut scheduler, &beta_request)?;
         let beta_load = poll_command(&mut scheduler)?;
         assert!(
             matches!(
@@ -1767,6 +1771,10 @@ mod tests {
         let beta_use = scheduler.begin_use(&beta)?;
         scheduler.finish_use(&beta_use)?;
         let retry = poll_command(&mut scheduler)?;
+        assert!(
+            matches!(retry.kind(), RuntimeCommandKind::Evict { .. }),
+            "the retained failed eviction becomes retryable after beta's load completes"
+        );
         scheduler.complete(RuntimeCompletion::Evicted {
             operation: retry.operation(),
         })?;
