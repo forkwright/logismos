@@ -11,7 +11,7 @@ publish = false
 # WHY: Preserve the established Stella API and its accelerator-capable graph for
 # ordinary embed users. Native Qwen3 retrieval selects only CPU-safe edges.
 default = ["stella"]
-stella = ["dep:encoders", "dep:kernels", "loader/tensor", "dep:rayon", "dep:taxis"]
+stella = ["dep:encoders", "loader/tensor", "dep:rayon", "dep:taxis"]
 
 [[bench]]
 name = "stella_throughput"
@@ -23,7 +23,8 @@ required-features = ["stella"]
 logismos-core = { path = "../core", package = "core" }
 decoders = { path = "../decoders" }
 encoders = { path = "../encoders", optional = true }
-kernels = { workspace = true, default-features = false, optional = true }
+# WHY: Every embedding path shares the checked CPU-only normalization owner.
+kernels = { workspace = true, default-features = false }
 loader = { path = "../loader", default-features = false }
 rayon = { workspace = true, optional = true }
 taxis = { workspace = true, optional = true }
