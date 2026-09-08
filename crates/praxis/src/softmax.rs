@@ -87,8 +87,6 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
 
 #[cfg(test)]
 mod tests {
-    #![expect(clippy::expect_used, reason = "test assertions use expect() directly")]
-
     use half::f16;
     use taxis::{CpuStorage, Shape};
 

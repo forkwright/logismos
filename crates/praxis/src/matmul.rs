@@ -169,11 +169,6 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::expect_used,
-        reason = "test assertions use expect()/expect_err() directly"
-    )]
-
     use half::f16;
     use taxis::{CpuStorage, Shape, Tensor};
 
