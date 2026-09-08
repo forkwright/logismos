@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "logismos placement-planning and GGUF-inspection CLI with CPU-only commands."
+description = "logismos placement-planning, GGUF-inspection, and text-preparation CLI with CPU-only commands."
 publish = false
 
 [dependencies]

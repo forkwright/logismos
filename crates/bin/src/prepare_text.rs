@@ -2,6 +2,7 @@
 
 use std::{
     ffi::OsString,
+    fmt,
     fs::File,
     io::{Read, Take},
     num::NonZeroU64,
@@ -40,10 +41,7 @@ pub(crate) fn command(
     .map_err(|source| PrepareTextError::Model { source })?;
     let observed_model_bytes = artifact.observation().inspection().file_len;
     if observed_model_bytes != arguments.model_bytes.get() {
-        return Err(PrepareTextError::ModelLengthMismatch {
-            expected: arguments.model_bytes.get(),
-            actual: observed_model_bytes,
-        });
+        return Err(PrepareTextError::ModelLengthMismatch);
     }
 
     let tokenizer_bytes = read_tokenizer(&arguments.tokenizer_path, arguments.tokenizer_bytes)?;
@@ -83,9 +81,7 @@ pub(crate) enum PrepareTextError {
     InvalidRequest {
         source: serde_json::Error,
     },
-    RequestExceedsByteLimit {
-        actual: usize,
-    },
+    RequestExceedsByteLimit,
     IntegerOverflow,
     TokenizerOpen {
         source: std::io::Error,
@@ -96,19 +92,14 @@ pub(crate) enum PrepareTextError {
     TokenizerAllocation {
         source: std::collections::TryReserveError,
     },
-    TokenizerInputExceedsExpected {
-        expected: usize,
-    },
+    TokenizerInputExceedsExpected,
     TokenizerConfiguration {
         source: tokenize::Error,
     },
     Model {
         source: loader::Error,
     },
-    ModelLengthMismatch {
-        expected: u64,
-        actual: u64,
-    },
+    ModelLengthMismatch,
     Pipeline {
         source: text::Error,
     },
@@ -123,15 +114,42 @@ impl PrepareTextError {
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::InvalidArguments | Self::IntegerOverflow => "invalid_arguments",
-            Self::InvalidRequest { .. } | Self::RequestExceedsByteLimit { .. } => "invalid_request",
+            Self::InvalidRequest { .. } | Self::RequestExceedsByteLimit => "invalid_request",
             Self::TokenizerOpen { .. } | Self::TokenizerRead { .. } => "unreadable_tokenizer",
             Self::TokenizerAllocation { .. } | Self::ReceiptAllocation { .. } => "allocation",
-            Self::TokenizerInputExceedsExpected { .. } => "tokenizer_identity_mismatch",
+            Self::TokenizerInputExceedsExpected => "tokenizer_identity_mismatch",
             Self::TokenizerConfiguration { source } => tokenizer_error_kind(source),
             Self::Model { source } => model_error_kind(source),
-            Self::ModelLengthMismatch { .. } => "model_identity_mismatch",
+            Self::ModelLengthMismatch => "model_identity_mismatch",
             Self::Pipeline { source } => pipeline_error_kind(source),
             Self::InternalIdentity => "internal",
+        }
+    }
+}
+
+impl fmt::Display for PrepareTextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.kind())
+    }
+}
+
+impl std::error::Error for PrepareTextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidRequest { source } => Some(source),
+            Self::TokenizerOpen { source } | Self::TokenizerRead { source } => Some(source),
+            Self::TokenizerAllocation { source } | Self::ReceiptAllocation { source } => {
+                Some(source)
+            }
+            Self::TokenizerConfiguration { source } => Some(source),
+            Self::Model { source } => Some(source),
+            Self::Pipeline { source } => Some(source),
+            Self::InvalidArguments
+            | Self::RequestExceedsByteLimit
+            | Self::IntegerOverflow
+            | Self::TokenizerInputExceedsExpected
+            | Self::ModelLengthMismatch
+            | Self::InternalIdentity => None,
         }
     }
 }
@@ -208,9 +226,7 @@ impl CommandArguments {
             .into_string()
             .map_err(|_| PrepareTextError::InvalidArguments)?;
         if request_json.len() > MAX_PLAN_INPUT_BYTES {
-            return Err(PrepareTextError::RequestExceedsByteLimit {
-                actual: request_json.len(),
-            });
+            return Err(PrepareTextError::RequestExceedsByteLimit);
         }
         if arguments.next().is_some() {
             return Err(PrepareTextError::InvalidArguments);
@@ -291,7 +307,7 @@ fn read_tokenizer(path: &Path, expected: usize) -> Result<Vec<u8>, PrepareTextEr
         .read_to_end(&mut bytes)
         .map_err(|source| PrepareTextError::TokenizerRead { source })?;
     if bytes.len() > expected {
-        return Err(PrepareTextError::TokenizerInputExceedsExpected { expected });
+        return Err(PrepareTextError::TokenizerInputExceedsExpected);
     }
     Ok(bytes)
 }

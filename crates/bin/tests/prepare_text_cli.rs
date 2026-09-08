@@ -19,6 +19,10 @@ use test_fixtures::{
 };
 
 const TOKENS: [&str; 5] = ["[UNK]", "<bos>", "<eos>", "hello", "assistant"];
+const BOS_TOKEN_ID: u32 = 1;
+const EOS_TOKEN_ID: u32 = 2;
+const F32_BYTES: usize = size_of::<f32>();
+const HELLO_TOKEN_ID: u32 = 3;
 
 fn command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_logismos"))
@@ -41,12 +45,12 @@ fn tokenizer_json() -> String {
 fn fixture_config(template: &str) -> Qwen35FixtureConfig {
     Qwen35FixtureConfig {
         tokens: TOKENS.iter().map(|token| (*token).to_owned()).collect(),
-        bos_token_id: 1,
-        eos_token_id: 2,
+        bos_token_id: BOS_TOKEN_ID,
+        eos_token_id: EOS_TOKEN_ID,
         add_bos: true,
         add_eos: false,
         chat_template: template.to_owned(),
-        greedy_token_id: 3,
+        greedy_token_id: HELLO_TOKEN_ID,
     }
 }
 
@@ -92,7 +96,20 @@ fn nan_embedding_fixture() -> FixtureInput {
         .iter_mut()
         .find(|tensor| tensor.name == "token_embd.weight")
         .expect("raw fixture must include token embedding");
-    embedding.payload[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+    let hidden = usize::try_from(embedding.dims[0]).expect("hidden width must fit usize");
+    let hello_row = usize::try_from(HELLO_TOKEN_ID).expect("hello token id must fit usize");
+    let row_start = hello_row
+        .checked_mul(hidden)
+        .and_then(|elements| elements.checked_mul(F32_BYTES))
+        .expect("consumed embedding row offset must fit usize");
+    let row_end = row_start
+        .checked_add(F32_BYTES)
+        .expect("consumed embedding row end must fit usize");
+    let poisoned = embedding
+        .payload
+        .get_mut(row_start..row_end)
+        .expect("consumed embedding row must fit its declared payload");
+    poisoned.copy_from_slice(&f32::NAN.to_le_bytes());
     write_fixture(
         serialize_raw_gguf(&raw).expect("mutated fixture must serialize"),
         tokenizer_json(),
@@ -100,14 +117,17 @@ fn nan_embedding_fixture() -> FixtureInput {
 }
 
 fn request_json(context_tokens: usize) -> String {
-    format!(concat!(
-        "{{\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}],",
-        "\"max_output_tokens\":1,\"enable_thinking\":false,\"limits\":{{",
-        "\"template_bytes\":4096,\"messages\":4,\"message_bytes\":128,",
-        "\"prompt_bytes\":256,\"rendered_bytes\":256,\"context_tokens\":{context_tokens},",
-        "\"output_tokens\":2,\"output_bytes\":128,\"template_fuel\":10000,",
-        "\"template_recursion\":16}}}}"
-    ))
+    format!(
+        concat!(
+            "{{\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}],",
+            "\"max_output_tokens\":1,\"enable_thinking\":false,\"limits\":{{",
+            "\"template_bytes\":4096,\"messages\":4,\"message_bytes\":128,",
+            "\"prompt_bytes\":256,\"rendered_bytes\":256,\"context_tokens\":{context_tokens},",
+            "\"output_tokens\":2,\"output_bytes\":128,\"template_fuel\":10000,",
+            "\"template_recursion\":16}}}}"
+        ),
+        context_tokens = context_tokens
+    )
 }
 
 fn run(
@@ -243,6 +263,17 @@ fn prepare_text_refuses_model_and_tokenizer_identity_or_length_mismatches() {
         &run(
             &fixture,
             &fixture.model_digest,
+            fixture.model_bytes + 1,
+            &fixture.tokenizer_digest,
+            fixture.tokenizer_bytes,
+            &request,
+        ),
+        "model_identity_mismatch",
+    );
+    assert_error(
+        &run(
+            &fixture,
+            &fixture.model_digest,
             fixture.model_bytes,
             &wrong_digest,
             fixture.tokenizer_bytes,
@@ -257,6 +288,17 @@ fn prepare_text_refuses_model_and_tokenizer_identity_or_length_mismatches() {
             fixture.model_bytes,
             &fixture.tokenizer_digest,
             fixture.tokenizer_bytes - 1,
+            &request,
+        ),
+        "tokenizer_identity_mismatch",
+    );
+    assert_error(
+        &run(
+            &fixture,
+            &fixture.model_digest,
+            fixture.model_bytes,
+            &fixture.tokenizer_digest,
+            fixture.tokenizer_bytes + 1,
             &request,
         ),
         "tokenizer_identity_mismatch",
@@ -359,6 +401,11 @@ fn prepare_text_refuses_actual_artifact_context_and_never_executes_nan_weights()
         output.status.code(),
         Some(0),
         "preparation must not consume malformed numerical payloads"
+    );
+    assert_eq!(
+        json(&output)["prompt_token_ids"],
+        serde_json::json!([BOS_TOKEN_ID, HELLO_TOKEN_ID]),
+        "preparation must retain the exact prompt whose consumed hello row is poisoned"
     );
 }
 
