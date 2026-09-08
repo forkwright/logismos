@@ -904,9 +904,11 @@ mod tests {
         ["[UNK]", "<bos>", "<eos>", "hello", "<0xC3>", "<0xA9>"];
     const STARTSWITH_TEMPLATE: &str =
         "{% if messages[0].content.startswith('h') %}hello{% endif %}";
-    type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+    pub(super) type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-    fn test_limits(tokenizer_bytes: usize) -> std::result::Result<PipelineLimits, std::io::Error> {
+    pub(super) fn test_limits(
+        tokenizer_bytes: usize,
+    ) -> std::result::Result<PipelineLimits, std::io::Error> {
         let tokenizer_bytes = NonZeroUsize::new(tokenizer_bytes).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty tokenizer fixture")
         })?;
@@ -925,7 +927,7 @@ mod tests {
         })
     }
 
-    fn tokenizer_json() -> String {
+    pub(super) fn tokenizer_json() -> String {
         r#"{
           "version":"1.0", "truncation":null, "padding":null,
           "added_tokens":[
@@ -968,7 +970,7 @@ mod tests {
         }"#.to_owned()
     }
 
-    fn fixture_config(
+    pub(super) fn fixture_config(
         tokens: &[&str],
         greedy_token_id: u32,
         prepend_beginning: bool,
@@ -986,7 +988,9 @@ mod tests {
         }
     }
 
-    fn load_fixture(fixture: &SyntheticGguf) -> TestResult<(tempfile::TempDir, VerifiedArtifact)> {
+    pub(super) fn load_fixture(
+        fixture: &SyntheticGguf,
+    ) -> TestResult<(tempfile::TempDir, VerifiedArtifact)> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("synthetic.gguf");
         std::fs::write(&path, &fixture.bytes)?;
@@ -1000,7 +1004,7 @@ mod tests {
         Ok((directory, artifact))
     }
 
-    fn mutated_artifact(
+    pub(super) fn mutated_artifact(
         config: &Qwen35FixtureConfig,
         mutate: impl FnOnce(&mut RawGguf) -> TestResult<()>,
     ) -> TestResult<(tempfile::TempDir, VerifiedArtifact)> {
@@ -1041,7 +1045,12 @@ mod tests {
         Ok(&mut tensor.payload)
     }
 
-    fn set_f32_row(raw: &mut RawGguf, name: &str, row: usize, values: &[f32]) -> TestResult<()> {
+    pub(super) fn set_f32_row(
+        raw: &mut RawGguf,
+        name: &str,
+        row: usize,
+        values: &[f32],
+    ) -> TestResult<()> {
         let tensor = raw
             .tensors
             .iter_mut()
@@ -1086,7 +1095,7 @@ mod tests {
         Ok(())
     }
 
-    fn verified_artifact(
+    pub(super) fn verified_artifact(
         greedy_token_id: u32,
         prepend_beginning: bool,
         append_ending: bool,
@@ -1107,7 +1116,7 @@ mod tests {
         pipeline_with_tokenizer(artifact, &tokenizer_json)
     }
 
-    fn pipeline_with_tokenizer<'artifact>(
+    pub(super) fn pipeline_with_tokenizer<'artifact>(
         artifact: &'artifact VerifiedArtifact,
         tokenizer_json: &str,
     ) -> TestResult<TextPipeline<'artifact>> {
@@ -1115,7 +1124,7 @@ mod tests {
         Ok(pipeline_result(artifact, tokenizer_json, limits)?)
     }
 
-    fn pipeline_result<'artifact>(
+    pub(super) fn pipeline_result<'artifact>(
         artifact: &'artifact VerifiedArtifact,
         tokenizer_json: &str,
         limits: PipelineLimits,
@@ -1976,3 +1985,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "prepared_tests.rs"]
+mod prepared_tests;
