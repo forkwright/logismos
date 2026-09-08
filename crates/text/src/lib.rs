@@ -234,7 +234,7 @@ pub struct PreparedGeneration<'pipeline, 'artifact> {
     max_output_tokens: usize,
 }
 
-impl<'pipeline, 'artifact> PreparedGeneration<'pipeline, 'artifact> {
+impl PreparedGeneration<'_, '_> {
     /// Borrow the exact template rendering bound to this prepared request.
     ///
     /// WHY: qualification evidence must be the rendering that will be decoded.
