@@ -617,7 +617,7 @@ fn multiply_scalar(left: f32, right: f32) -> f32 {
 /// [`crate::Error::SoftmaxInvalidDimension`] when the last axis is empty and
 /// [`crate::Error::SoftmaxSizeOverflow`] when the declared shape cannot fit in
 /// `usize`.
-pub fn softmax_output_elements(rows: usize, width: usize) -> Result<usize> {
+pub(crate) fn softmax_output_elements(rows: usize, width: usize) -> Result<usize> {
     if width == 0 {
         return SoftmaxInvalidDimensionSnafu { rows, width }.fail();
     }
@@ -716,7 +716,7 @@ pub fn softmax_last_dim(x: &[f32], rows: usize, width: usize) -> Result<Vec<f32>
             return SoftmaxNonFiniteSnafu {
                 stage: SoftmaxStage::Denominator,
                 row: row_index,
-                column: 0,
+                column: 0_usize,
                 value: denominator,
             }
             .fail();
@@ -963,7 +963,7 @@ fn l2_norm(values: &[f32]) -> Result<f64> {
     if !norm.is_finite() {
         return L2NormalizeNonFiniteSnafu {
             stage: L2NormalizeStage::Norm,
-            index: 0,
+            index: 0_usize,
             value: norm,
         }
         .fail();

@@ -123,6 +123,26 @@ and outside the inference runtime's authority.
 
 ## Native payload ownership
 
+### Checked legacy CPU and tensor APIs
+
+The retained CPU attention path uses fallible softmax. NaN and positive
+infinity refuse; an exactly all-negative-infinity row retains its explicit
+uniform masking policy. Stella and Qwen3 share one checked scaled-f64
+unit-normalization owner; zero and non-finite vectors cannot become successful
+embeddings. Model pooling and projection order remain model-owned.
+
+Legacy Rust callers migrate to checked APIs: `Tensor::try_from_cpu` replaces
+the removed unchecked constructor; explicit layouts use
+`Layout::try_from_parts`; shapes expose `checked_elem_count`; dtype byte
+sizing returns a result; and `CacheLayout::try_new` plus
+`FlatKvCache::try_new` validate geometry before allocation. Cached geometry
+is immutable, and failed cache writes cannot advance logical lengths.
+These are source-breaking legacy API corrections, not changes to the stable
+`core` traits or `hipcore` FFI. Checked logical geometry is not a host grant
+or a qualified physical memory budget.
+
+### Artifact-bound native operations
+
 The standalone Q8_0 GEMV primitive accepts raw row-major quantized matrix bytes
 and f32 activations/output. A checked opaque shape owns exact extents and ABI
 bounds. The CPU reference delegates each row to `quant`; the HIP implementation
