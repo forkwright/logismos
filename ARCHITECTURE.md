@@ -80,6 +80,11 @@ semantically respects that boundary.
   `transformers` selects that CPU-only graph, while `praxis` explicitly enables
   GPU launchers. Direct `kernels` users retain the default GPU feature. The
   crate does not depend on `core`.
+- `kernels::q8_0_gemv` depends on `quant` as the lower format owner. Its checked
+  shape and CPU reference reuse Q8_0 row geometry and execution; its build
+  dependency generates HIP layout constants from that same authority. This
+  within-tier edge replaces duplicate format definitions and remains HIP-free
+  when GPU features are disabled.
 - Cross-tier deps must be justified. Within-tier deps are code smell.
 
 ## Key invariants
@@ -117,6 +122,15 @@ model-memory formula. Host inventories, external GPU consumers and operator poli
 and outside the inference runtime's authority.
 
 ## Native payload ownership
+
+The standalone Q8_0 GEMV primitive accepts raw row-major quantized matrix bytes
+and f32 activations/output. A checked opaque shape owns exact extents and ABI
+bounds. The CPU reference delegates each row to `quant`; the HIP implementation
+uses one sequential thread per row with source-specific floating-point controls.
+Its unsafe asynchronous launcher requires valid device buffers, lifetimes,
+nonaliasing and admitted finite arithmetic. CPU typed nonfinite refusals do not
+imply device-result validation. This is a correctness-oriented primitive, not a
+whole-model GPU path, performance result or hardware qualification.
 
 `loader::gguf::VerifiedArtifact` owns one immutable serialized backing, admitted
 under an explicit byte limit and matched against a required SHA-256 expectation.

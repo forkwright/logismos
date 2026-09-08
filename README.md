@@ -14,6 +14,11 @@ is available; the RX 7900 XTX is a
 planned second device and requires its own qualification. The experimental below-HIP
 provider remains unimplemented.
 
+The standalone [`Q8_0 GEMV`](crates/kernels/src/q8_0_gemv/mod.rs) primitive
+shares checked format geometry with `quant` and supplies an explicit CPU
+reference plus a HIP launcher. GPU compilation is not numerical or performance
+qualification; native text/retrieval execution is still CPU-only.
+
 ## Why
 
 Aletheia knows what work needs doing; Logismos owns how inference uses the resources granted
