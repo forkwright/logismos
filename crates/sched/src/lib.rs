@@ -1887,6 +1887,8 @@ mod tests {
             })?;
         }
         scheduler.request_retirement(&alpha)?;
+        let beta_use = scheduler.begin_use(&beta)?;
+        scheduler.finish_use(&beta_use)?;
         scheduler.revoke(&scheduler.generation())?;
         assert!(
             matches!(
