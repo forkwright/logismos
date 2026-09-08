@@ -176,21 +176,24 @@ impl FlatKvCache {
         ] {
             buffers
                 .try_reserve_exact(layout.num_layers())
-                .map_err(|_| {
+                .map_err(|source| {
                     AllocationSnafu {
                         what,
-                        bytes: layout.num_layers(),
+                        requested_elements: layout.num_layers(),
+                        source,
                     }
                     .build()
                 })?;
         }
-        lens.try_reserve_exact(layout.num_layers()).map_err(|_| {
-            AllocationSnafu {
-                what: "length list",
-                bytes: layout.num_layers(),
-            }
-            .build()
-        })?;
+        lens.try_reserve_exact(layout.num_layers())
+            .map_err(|source| {
+                AllocationSnafu {
+                    what: "length list",
+                    requested_elements: layout.num_layers(),
+                    source,
+                }
+                .build()
+            })?;
         for _ in 0..layout.num_layers() {
             k_buffers.push(allocate_zeroed(layout.buffer_bytes(), "K buffer")?);
             v_buffers.push(allocate_zeroed(layout.buffer_bytes(), "V buffer")?);
@@ -503,9 +506,14 @@ fn cpu_storage_bytes(s: &CpuStorage) -> Result<Cow<'_, [u8]>> {
 
 fn allocate_zeroed(len: usize, what: &'static str) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
-    buffer
-        .try_reserve_exact(len)
-        .map_err(|_| AllocationSnafu { what, bytes: len }.build())?;
+    buffer.try_reserve_exact(len).map_err(|source| {
+        AllocationSnafu {
+            what,
+            requested_elements: len,
+            source,
+        }
+        .build()
+    })?;
     buffer.resize(len, 0);
     Ok(buffer)
 }

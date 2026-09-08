@@ -30,12 +30,16 @@ pub enum Error {
     },
 
     /// Cache storage could not reserve the validated capacity.
-    #[snafu(display("cache allocation failed for {what}: {bytes} bytes"))]
+    #[snafu(display(
+        "cache allocation failed for {what}: reserving {requested_elements} elements: {source}"
+    ))]
     Allocation {
         /// Buffer or collection that could not reserve capacity.
         what: &'static str,
-        /// Number of bytes requested for the allocation.
-        bytes: usize,
+        /// Number of elements requested from the destination collection.
+        requested_elements: usize,
+        /// Allocator refusal returned by the collection reservation.
+        source: std::collections::TryReserveError,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
