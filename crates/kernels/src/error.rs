@@ -51,10 +51,13 @@ pub enum Error {
     },
 
     /// Propagated checked Q8_0 row-format failure.
-    #[snafu(transparent)]
+    #[snafu(display("Q8_0 projection format failure: {source}"))]
     Quant {
         /// Source quantization error.
         source: quant::Error,
+        /// Source code location where the error was propagated.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 
     #[cfg(feature = "gpu")]
