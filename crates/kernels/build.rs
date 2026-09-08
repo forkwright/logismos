@@ -64,6 +64,10 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
+    let out_dir = match env::var("OUT_DIR") {
+        Ok(directory) => PathBuf::from(directory),
+        Err(error) => return Err(format!("OUT_DIR is set by cargo: {error}")),
+    };
     if matches!(hip_build.mode, HipBuildMode::CpuOnly) {
         println!("cargo:warning=HIP kernel compile disabled (LOGISMOS_HIP_BUILD=cpu-only)");
         println!("cargo:rustc-cfg=logismos_no_gpu_kernels");
@@ -78,10 +82,6 @@ fn main() -> Result<(), String> {
         ));
     }
 
-    let out_dir = match env::var("OUT_DIR") {
-        Ok(d) => PathBuf::from(d),
-        Err(e) => return Err(format!("OUT_DIR is set by cargo: {e}")),
-    };
     let hip_sources = walk_with_ext(&PathBuf::from("src"), "hip");
     let cpp_sources = walk_with_ext(&PathBuf::from("src"), "cpp");
 
@@ -92,6 +92,7 @@ fn main() -> Result<(), String> {
         ));
     }
 
+    write_q8_0_format_header(&out_dir)?;
     compile_sources(&hipcc, &out_dir, &hip_sources, &cpp_sources)?;
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
@@ -102,6 +103,27 @@ fn main() -> Result<(), String> {
     println!("cargo:rustc-link-lib=dylib=stdc++");
 
     Ok(())
+}
+
+fn write_q8_0_format_header(out_dir: &Path) -> Result<(), String> {
+    let values_per_block = quant::q8_0::Q8_0_VALUES_PER_BLOCK;
+    let scale_bytes = quant::q8_0::Q8_0_SCALE_BYTES;
+    let value_bytes = quant::q8_0::Q8_0_VALUE_BYTES;
+    let block_bytes = quant::q8_0::Q8_0_BLOCK_BYTES;
+    let derived_block_bytes = scale_bytes.checked_add(value_bytes).ok_or_else(|| {
+        "quant Q8_0 header fields overflow while deriving block bytes".to_string()
+    })?;
+    if block_bytes != derived_block_bytes
+        || value_bytes != values_per_block
+        || scale_bytes != std::mem::size_of::<u16>()
+    {
+        return Err("quant Q8_0 constants violate their declared layout relation".to_string());
+    }
+    let header = format!(
+        "#pragma once\n\n#include <cstddef>\n\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUES_PER_BLOCK = {values_per_block};\ninline constexpr std::size_t LOGISMOS_Q8_0_SCALE_BYTES = {scale_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUE_BYTES = {value_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_BLOCK_BYTES = {block_bytes};\n"
+    );
+    std::fs::write(out_dir.join("q8_0_format.h"), header)
+        .map_err(|error| format!("write generated Q8_0 format header: {error}"))
 }
 
 fn compile_sources(
@@ -118,7 +140,8 @@ fn compile_sources(
             src.file_name().and_then(|s| s.to_str()).unwrap_or("anon")
         ));
         // kanon:ignore RUST/no-direct-process-command -- invoking hipcc is the build script's purpose
-        let status = match Command::new(hipcc)
+        let mut command = Command::new(hipcc);
+        command
             .args([
                 &format!("--offload-arch={HIP_TARGET}"),
                 "-O3",
@@ -128,13 +151,18 @@ fn compile_sources(
                 // §3.3 + §7.4). RDNA3 defaults to wave32 anyway; this
                 // makes the choice audit-visible.
                 "-mno-wavefrontsize64",
-                "-c",
+                "-I",
             ])
-            .arg(src)
-            .arg("-o")
-            .arg(&obj)
-            .status()
-        {
+            .arg(out_dir);
+        if src.file_name().is_some_and(|name| name == "q8_0_gemv.hip") {
+            // This correctness baseline must retain separately rounded
+            // decode/product/add operations. Scope the no-fast-math and no
+            // contraction rules to this source, rather than changing the
+            // numerical contract of the rest of the HIP archive.
+            command.args(["-fno-fast-math", "-ffp-contract=off"]);
+        }
+        // kanon:ignore RUST/no-direct-process-command -- invoking hipcc is the build script's purpose
+        let status = match command.arg("-c").arg(src).arg("-o").arg(&obj).status() {
             Ok(s) => s,
             Err(e) => return Err(format!("invoke hipcc on {}: {e}", src.display())),
         };

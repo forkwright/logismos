@@ -171,8 +171,7 @@ main() {
         fail "code-object inspection did not prove target $target"
     fi
 
-    build_script="$witness_target/kernels-build-script"
-    rustc "$ROOT/crates/kernels/build.rs" -o "$build_script"
+    build_script=$(/usr/bin/bash "$ROOT/scripts/find-kernels-build-script.sh" "$cargo_target") || exit $?
     for source in "${hip_sources[@]}"; do
         fixture_root=$(mktemp -d "$scratch/logismos-hip-syntax.XXXXXX")
         verify_syntax_rejection "$build_script" "$hipcc" "$source" "$fixture_root"

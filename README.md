@@ -14,6 +14,13 @@ is available; the RX 7900 XTX is a
 planned second device and requires its own qualification. The experimental below-HIP
 provider remains unimplemented.
 
+The standalone [`Q8_0 GEMV`](crates/kernels/src/q8_0_gemv/mod.rs) primitive
+shares checked format geometry with `quant` and supplies an explicit CPU
+reference plus a HIP launcher. The GPU numerical domain excludes subnormal
+scales, operands and intermediates pending denormal-mode qualification.
+GPU compilation is not numerical or performance
+qualification; native text/retrieval execution is still CPU-only.
+
 ## Why
 
 Aletheia knows what work needs doing; Logismos owns how inference uses the resources granted
@@ -83,6 +90,13 @@ Typed text-only requests have byte, context and output bounds. Each request owns
 state and returns only a complete decoded result; cancellation or error exposes no partial text
 or resumable state. Model/tokenizer identity expectations belong to trusted setup, not individual
 untrusted requests, and are content binding rather than publisher authentication.
+
+`TextPipeline::prepare` exposes the exact rendered prompt, final token IDs and
+artifact-bound decoder requirements without creating a decoder session or running
+the model. Its opaque result is consumed for execution; ordinary `generate` uses
+the same path. Context and prefill bounds derive from that request, not configured
+ceilings. These reports cover decoder f32 backing only, not prompt/tokenizer/text
+allocations, whole-request memory or admission.
 
 The private template environment has no loader or registered templates. Named imports, includes
 and inheritance cannot resolve another source; missing includes explicitly marked optional are

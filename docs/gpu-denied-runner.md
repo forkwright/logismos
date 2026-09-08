@@ -18,6 +18,12 @@ compile admission, its approved entrypoint must wrap this runner. The runner's
 sanitized environment intentionally does not inherit ambient PATH shims, so a
 bare runner invocation cannot establish that separate admission contract.
 
+The HIP build-mode and code-object witnesses execute the exact Cargo-built
+`kernels` build-script artifact, selected only when the resolved target has
+exactly one executable match. This lets fixture invocations retain resolved
+build dependencies while still proving the build script rejects their intended
+bad source or mode inputs.
+
 ## Lockfile maintenance
 
 Cargo runs inside the boundary even when resolving dependencies or checking

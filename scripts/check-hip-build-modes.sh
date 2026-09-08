@@ -19,16 +19,20 @@ OUT="$ROOT/target/hip-build-mode-witness"
         root=$1
         out=$2
         mkdir -p "$out"
-        rustc "$root/crates/kernels/build.rs" -o "$out/kernels-build"
+        cd "$root"
+        env -u CARGO_FEATURE_GPU -u LOGISMOS_HIP_BUILD -u LOGISMOS_SKIP_HIP_BUILD \
+            HIPCC=/not-a-hipcc \
+            cargo build --offline --locked --no-default-features -p kernels --target-dir "$out/cargo"
+        kernels_build=$(/usr/bin/bash "$root/scripts/find-kernels-build-script.sh" "$out/cargo")
 
         mkdir -p "$out/cpu"
-        CARGO_FEATURE_GPU=1 LOGISMOS_HIP_BUILD=cpu-only OUT_DIR="$out/cpu" "$out/kernels-build" >"$out/cpu.log"
+        CARGO_FEATURE_GPU=1 LOGISMOS_HIP_BUILD=cpu-only OUT_DIR="$out/cpu" "$kernels_build" >"$out/cpu.log"
         grep -F "cargo:rustc-cfg=logismos_no_gpu_kernels" "$out/cpu.log"
 
         mkdir -p "$out/empty-cpu"
         (
             cd "$out/empty-cpu"
-            CARGO_FEATURE_GPU=1 LOGISMOS_HIP_BUILD=cpu-only OUT_DIR="$out/empty-cpu/out" "$out/kernels-build"
+            CARGO_FEATURE_GPU=1 LOGISMOS_HIP_BUILD=cpu-only OUT_DIR="$out/empty-cpu/out" "$kernels_build"
         ) >"$out/empty-cpu.log"
         grep -F "cargo:rustc-cfg=logismos_no_gpu_kernels" "$out/empty-cpu.log"
         if [ -e "$out/empty-cpu/out/liblogismos_kernels.a" ]; then
@@ -40,7 +44,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
         if (
             cd "$out/empty-required"
             CARGO_FEATURE_GPU=1 LOGISMOS_HIP_BUILD=required HIPCC=/bin/true OUT_DIR="$out/empty-required/out" \
-                "$out/kernels-build"
+                "$kernels_build"
         ) >"$out/empty-required.log" 2>&1; then
             echo "required HIP mode accepted an empty HIP/CPP source tree" >&2
             exit 1
@@ -50,7 +54,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
 
         mkdir -p "$out/required"
         if CARGO_FEATURE_GPU=1 LOGISMOS_HIP_BUILD=required HIPCC=/not-a-hipcc OUT_DIR="$out/required" \
-            "$out/kernels-build" >"$out/required.log" 2>&1; then
+            "$kernels_build" >"$out/required.log" 2>&1; then
             echo "required HIP mode accepted a missing compiler" >&2
             exit 1
         fi
@@ -58,7 +62,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
 
         mkdir -p "$out/default"
         if env -u LOGISMOS_HIP_BUILD CARGO_FEATURE_GPU=1 HIPCC=/not-a-hipcc OUT_DIR="$out/default" \
-            "$out/kernels-build" >"$out/default.log" 2>&1; then
+            "$kernels_build" >"$out/default.log" 2>&1; then
             echo "unset HIP mode accepted a missing compiler" >&2
             exit 1
         fi
@@ -66,7 +70,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
 
         mkdir -p "$out/retired"
         if CARGO_FEATURE_GPU=1 LOGISMOS_SKIP_HIP_BUILD=1 OUT_DIR="$out/retired" \
-            "$out/kernels-build" >"$out/retired.log" 2>&1; then
+            "$kernels_build" >"$out/retired.log" 2>&1; then
             echo "retired HIP skip variable was accepted" >&2
             exit 1
         fi
@@ -74,7 +78,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
 
         mkdir -p "$out/no-gpu-cpu"
         if env -u CARGO_FEATURE_GPU LOGISMOS_HIP_BUILD=cpu-only OUT_DIR="$out/no-gpu-cpu" \
-            "$out/kernels-build" >"$out/no-gpu-cpu.log" 2>&1; then
+            "$kernels_build" >"$out/no-gpu-cpu.log" 2>&1; then
             if grep -Fq "cargo:rustc-cfg=logismos_no_gpu_kernels" "$out/no-gpu-cpu.log"; then
                 echo "GPU-disabled build emitted a GPU launcher cfg" >&2
                 exit 1
@@ -86,7 +90,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
 
         mkdir -p "$out/no-gpu-default"
         env -u CARGO_FEATURE_GPU -u LOGISMOS_HIP_BUILD HIPCC=/not-a-hipcc \
-            OUT_DIR="$out/no-gpu-default" "$out/kernels-build" >"$out/no-gpu-default.log" 2>&1
+            OUT_DIR="$out/no-gpu-default" "$kernels_build" >"$out/no-gpu-default.log" 2>&1
         if grep -Eq "cargo:rustc-(cfg=logismos_no_gpu_kernels|link-lib=)" "$out/no-gpu-default.log"; then
             echo "GPU-disabled default build emitted GPU compilation or linkage" >&2
             exit 1
@@ -94,7 +98,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
 
         mkdir -p "$out/no-gpu-required"
         if env -u CARGO_FEATURE_GPU LOGISMOS_HIP_BUILD=required OUT_DIR="$out/no-gpu-required" \
-            "$out/kernels-build" >"$out/no-gpu-required.log" 2>&1; then
+            "$kernels_build" >"$out/no-gpu-required.log" 2>&1; then
             echo "GPU-disabled build accepted an explicit required HIP request" >&2
             exit 1
         fi
@@ -103,7 +107,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
 
         mkdir -p "$out/no-gpu-invalid"
         if env -u CARGO_FEATURE_GPU LOGISMOS_HIP_BUILD=unsupported OUT_DIR="$out/no-gpu-invalid" \
-            "$out/kernels-build" >"$out/no-gpu-invalid.log" 2>&1; then
+            "$kernels_build" >"$out/no-gpu-invalid.log" 2>&1; then
             echo "GPU-disabled build accepted an unsupported HIP mode" >&2
             exit 1
         fi
@@ -111,7 +115,7 @@ OUT="$ROOT/target/hip-build-mode-witness"
 
         mkdir -p "$out/no-gpu-retired"
         if env -u CARGO_FEATURE_GPU LOGISMOS_SKIP_HIP_BUILD=1 OUT_DIR="$out/no-gpu-retired" \
-            "$out/kernels-build" >"$out/no-gpu-retired.log" 2>&1; then
+            "$kernels_build" >"$out/no-gpu-retired.log" 2>&1; then
             echo "GPU-disabled build accepted the retired HIP skip variable" >&2
             exit 1
         fi

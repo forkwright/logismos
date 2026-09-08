@@ -23,7 +23,7 @@
 
 pub mod error;
 
-use decoders::{Qwen35LogitSelection, Qwen35Weights};
+use decoders::{Qwen35CpuRequirements, Qwen35ExecutionPlan, Qwen35LogitSelection, Qwen35Weights};
 use loader::gguf::{MetaValue, VerifiedArtifact};
 use serde::Serialize;
 use snafu::{IntoError, ResultExt};
@@ -215,6 +215,134 @@ pub struct Generation {
     finish_reason: FinishReason,
 }
 
+/// One immutable prepared text request awaiting a single decoder session.
+///
+/// Preparation binds the artifact-derived chat rendering, final prompt IDs,
+/// request-specific execution plan, and output cap. It does not allocate a
+/// decoder session or execute model operations. The decoder requirement view
+/// counts only decoder-owned logical `f32` storage; it excludes retained prompt
+/// IDs, rendered text, template/tokenizer storage, process RSS, GPU memory, and
+/// physical reservations.
+///
+/// WHY: qualification callers must inspect the exact artifact-bound request
+/// without gaining a mutable prompt or a second execution path.
+pub struct PreparedGeneration<'pipeline, 'artifact> {
+    pipeline: &'pipeline TextPipeline<'artifact>,
+    plan: Qwen35ExecutionPlan<'pipeline, 'artifact>,
+    rendered_prompt: String,
+    prompt_token_ids: Vec<u32>,
+    max_output_tokens: usize,
+}
+
+impl PreparedGeneration<'_, '_> {
+    /// Borrow the exact template rendering bound to this prepared request.
+    ///
+    /// WHY: qualification evidence must be the rendering that will be decoded.
+    #[must_use]
+    pub fn rendered_prompt(&self) -> &str {
+        &self.rendered_prompt
+    }
+
+    /// Borrow the final model prompt IDs, including artifact-selected specials.
+    ///
+    /// WHY: callers need token-level evidence without permission to alter it.
+    #[must_use]
+    pub fn prompt_token_ids(&self) -> &[u32] {
+        &self.prompt_token_ids
+    }
+
+    /// Return the verified identity of the tokenizer bound to this request.
+    ///
+    /// WHY: prompt IDs only have meaning with their verified tokenizer bytes.
+    #[must_use]
+    pub const fn tokenizer_identity(&self) -> TokenizerIdentity {
+        self.pipeline.tokenizer.identity()
+    }
+
+    /// Return the request-specific decoder-owned logical CPU requirements.
+    ///
+    /// WHY: callers can assess the exact decoder allocation shape before execution.
+    #[must_use]
+    pub const fn decoder_cpu_requirements(&self) -> Qwen35CpuRequirements {
+        self.plan.cpu_requirements()
+    }
+
+    /// Return the prepared request's checked generated-token cap.
+    ///
+    /// WHY: the cap is part of the plan's context admission and execution contract.
+    #[must_use]
+    pub const fn max_output_tokens(&self) -> usize {
+        self.max_output_tokens
+    }
+
+    /// Construct one decoder session and generate from this exact prepared prompt.
+    ///
+    /// This consumes the prepared request so callers cannot alter or reuse its
+    /// prompt IDs with another pipeline or execution plan. A cancellation or
+    /// later failure returns no partial text.
+    ///
+    /// WHY: consuming the preparation preserves the inspected prompt, decoder
+    /// plan, and execution as one inseparable request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed cancellation, allocation, decoder, tokenizer, or output
+    /// limit error. No partial response is published on failure.
+    pub fn generate(self, cancellation: &dyn Cancellation) -> Result<Generation> {
+        let Self {
+            pipeline,
+            plan,
+            rendered_prompt,
+            prompt_token_ids,
+            max_output_tokens,
+        } = self;
+        drop(rendered_prompt);
+        check_cancelled(cancellation, "decoder session construction")?;
+        let mut execution = plan.execution().context(DecoderSnafu)?;
+        check_cancelled(cancellation, "prompt decoder step")?;
+        let mut logits = execution.step(&prompt_token_ids).context(DecoderSnafu)?;
+        let mut generated = Vec::new();
+        generated
+            .try_reserve_exact(max_output_tokens)
+            .context(AllocationSnafu {
+                target: "generated token IDs",
+            })?;
+        let finish_reason = loop {
+            check_cancelled(cancellation, "greedy selection")?;
+            let next = greedy_last_logits(&logits, pipeline.tokenizer.tokenizer().vocab_size())?;
+            if pipeline.special_tokens.stop_ids.contains(&next) {
+                break FinishReason::EndOfSequence;
+            }
+            generated.push(next);
+            if generated.len() == max_output_tokens {
+                break FinishReason::Length;
+            }
+            check_cancelled(cancellation, "next decoder step")?;
+            // Selection is complete; do not retain the old vocabulary row while
+            // the decoder allocates the next step's workspace and output.
+            drop(logits);
+            logits = execution.step(&[next]).context(DecoderSnafu)?;
+        };
+        check_cancelled(cancellation, "collective output decoding")?;
+        let text = pipeline
+            .tokenizer
+            .tokenizer()
+            .decode(&generated, false)
+            .context(TokenizerSnafu)?;
+        check_limit(
+            "decoded output bytes",
+            text.len(),
+            pipeline.limits.output_bytes,
+        )?;
+        check_cancelled(cancellation, "publishing completed response")?;
+        Ok(Generation {
+            text,
+            token_ids: generated,
+            finish_reason,
+        })
+    }
+}
+
 impl Generation {
     /// Borrow collective decoded generated text.
     #[must_use]
@@ -306,18 +434,47 @@ impl<'artifact> TextPipeline<'artifact> {
         })
     }
 
-    /// Generate greedily in one fresh private decoder session.
+    /// Prepare and generate greedily in one fresh private decoder session.
     ///
     /// A cancellation or later failure returns no partial text. Any completed
     /// decoder `step` remains committed only inside the private session that is
     /// immediately dropped; this method does not offer decoder rollback.
     /// Cancellation is cooperative at the named boundaries: template rendering,
     /// tokenizer work, and one complete decoder step are not preempted midway.
+    ///
+    /// WHY: the legacy one-call API must remain behaviorally identical while
+    /// sharing the inspectable preparation boundary.
+    ///
+    /// # Errors
+    ///
+    /// Propagates preparation and generation errors; no partial response is
+    /// published on cancellation or failure.
     pub fn generate(
         &self,
         request: GenerationRequest<'_>,
         cancellation: &dyn Cancellation,
     ) -> Result<Generation> {
+        self.prepare(request, cancellation)?.generate(cancellation)
+    }
+
+    /// Render and tokenize one request into an immutable decoder execution plan.
+    ///
+    /// This performs no decoder-session allocation or model operation. Its plan
+    /// uses the exact prompt-plus-output context and prompt-step width rather
+    /// than the pipeline's configured ceilings.
+    ///
+    /// WHY: callers can qualify a concrete artifact-bound request before any
+    /// mutable decoder state or model computation exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, validation, rendering, tokenizer, limit, or
+    /// decoder-plan-admission errors.
+    pub fn prepare(
+        &self,
+        request: GenerationRequest<'_>,
+        cancellation: &dyn Cancellation,
+    ) -> Result<PreparedGeneration<'_, 'artifact>> {
         check_cancelled(cancellation, "template rendering")?;
         self.validate_request(&request)?;
         let rendered = self.render(&request)?;
@@ -340,49 +497,20 @@ impl<'artifact> TextPipeline<'artifact> {
             requested_context,
             self.limits.context_tokens,
         )?;
-        let vocabulary = self.tokenizer.tokenizer().vocab_size();
         let plan = self
             .weights
             .execution_plan(
-                self.limits.context_tokens,
-                self.limits.context_tokens,
+                requested_context,
+                prompt.len(),
                 Qwen35LogitSelection::LastToken,
             )
             .context(DecoderSnafu)?;
-        let mut execution = plan.execution().context(DecoderSnafu)?;
-        check_cancelled(cancellation, "prompt decoder step")?;
-        let mut logits = execution.step(&prompt).context(DecoderSnafu)?;
-        let mut generated = Vec::new();
-        generated
-            .try_reserve_exact(request.max_output_tokens)
-            .context(AllocationSnafu {
-                target: "generated token IDs",
-            })?;
-        let finish_reason = loop {
-            check_cancelled(cancellation, "greedy selection")?;
-            let next = greedy_last_logits(&logits, vocabulary)?;
-            if self.special_tokens.stop_ids.contains(&next) {
-                break FinishReason::EndOfSequence;
-            }
-            generated.push(next);
-            if generated.len() == request.max_output_tokens {
-                break FinishReason::Length;
-            }
-            check_cancelled(cancellation, "next decoder step")?;
-            logits = execution.step(&[next]).context(DecoderSnafu)?;
-        };
-        check_cancelled(cancellation, "collective output decoding")?;
-        let text = self
-            .tokenizer
-            .tokenizer()
-            .decode(&generated, false)
-            .context(TokenizerSnafu)?;
-        check_limit("decoded output bytes", text.len(), self.limits.output_bytes)?;
-        check_cancelled(cancellation, "publishing completed response")?;
-        Ok(Generation {
-            text,
-            token_ids: generated,
-            finish_reason,
+        Ok(PreparedGeneration {
+            pipeline: self,
+            plan,
+            rendered_prompt: rendered,
+            prompt_token_ids: prompt,
+            max_output_tokens: request.max_output_tokens,
         })
     }
 
@@ -776,9 +904,11 @@ mod tests {
         ["[UNK]", "<bos>", "<eos>", "hello", "<0xC3>", "<0xA9>"];
     const STARTSWITH_TEMPLATE: &str =
         "{% if messages[0].content.startswith('h') %}hello{% endif %}";
-    type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+    pub(super) type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-    fn test_limits(tokenizer_bytes: usize) -> std::result::Result<PipelineLimits, std::io::Error> {
+    pub(super) fn test_limits(
+        tokenizer_bytes: usize,
+    ) -> std::result::Result<PipelineLimits, std::io::Error> {
         let tokenizer_bytes = NonZeroUsize::new(tokenizer_bytes).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty tokenizer fixture")
         })?;
@@ -797,7 +927,7 @@ mod tests {
         })
     }
 
-    fn tokenizer_json() -> String {
+    pub(super) fn tokenizer_json() -> String {
         r#"{
           "version":"1.0", "truncation":null, "padding":null,
           "added_tokens":[
@@ -840,7 +970,7 @@ mod tests {
         }"#.to_owned()
     }
 
-    fn fixture_config(
+    pub(super) fn fixture_config(
         tokens: &[&str],
         greedy_token_id: u32,
         prepend_beginning: bool,
@@ -858,7 +988,9 @@ mod tests {
         }
     }
 
-    fn load_fixture(fixture: &SyntheticGguf) -> TestResult<(tempfile::TempDir, VerifiedArtifact)> {
+    pub(super) fn load_fixture(
+        fixture: &SyntheticGguf,
+    ) -> TestResult<(tempfile::TempDir, VerifiedArtifact)> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("synthetic.gguf");
         std::fs::write(&path, &fixture.bytes)?;
@@ -872,7 +1004,7 @@ mod tests {
         Ok((directory, artifact))
     }
 
-    fn mutated_artifact(
+    pub(super) fn mutated_artifact(
         config: &Qwen35FixtureConfig,
         mutate: impl FnOnce(&mut RawGguf) -> TestResult<()>,
     ) -> TestResult<(tempfile::TempDir, VerifiedArtifact)> {
@@ -913,7 +1045,12 @@ mod tests {
         Ok(&mut tensor.payload)
     }
 
-    fn set_f32_row(raw: &mut RawGguf, name: &str, row: usize, values: &[f32]) -> TestResult<()> {
+    pub(super) fn set_f32_row(
+        raw: &mut RawGguf,
+        name: &str,
+        row: usize,
+        values: &[f32],
+    ) -> TestResult<()> {
         let tensor = raw
             .tensors
             .iter_mut()
@@ -958,7 +1095,7 @@ mod tests {
         Ok(())
     }
 
-    fn verified_artifact(
+    pub(super) fn verified_artifact(
         greedy_token_id: u32,
         prepend_beginning: bool,
         append_ending: bool,
@@ -979,7 +1116,7 @@ mod tests {
         pipeline_with_tokenizer(artifact, &tokenizer_json)
     }
 
-    fn pipeline_with_tokenizer<'artifact>(
+    pub(super) fn pipeline_with_tokenizer<'artifact>(
         artifact: &'artifact VerifiedArtifact,
         tokenizer_json: &str,
     ) -> TestResult<TextPipeline<'artifact>> {
@@ -987,7 +1124,7 @@ mod tests {
         Ok(pipeline_result(artifact, tokenizer_json, limits)?)
     }
 
-    fn pipeline_result<'artifact>(
+    pub(super) fn pipeline_result<'artifact>(
         artifact: &'artifact VerifiedArtifact,
         tokenizer_json: &str,
         limits: PipelineLimits,
@@ -1596,8 +1733,7 @@ mod tests {
     }
 
     #[test]
-    fn tokenizer_and_decoder_failures_retain_typed_sources() -> TestResult<()> {
-        let tokenizer_json = tokenizer_json();
+    fn tokenizer_failures_retain_typed_sources() -> TestResult<()> {
         let config = fixture_config(&TOKENS, 3, false, false, "hello");
         let fixture = build_qwen35_fixture(&config)?;
         let (_directory, artifact) = load_fixture(&fixture)?;
@@ -1610,17 +1746,6 @@ mod tests {
             "tokenizer wrapper must retain tokenize::Error"
         );
 
-        let mut limits = test_limits(tokenizer_json.len())?;
-        limits.context_tokens = 9;
-        let pipeline = pipeline_result(&artifact, &tokenizer_json, limits)?;
-        let messages = [TextMessage::new(TextRole::User, "hello")];
-        let decoder_error = text_error(
-            pipeline.generate(GenerationRequest::new(&messages, 1, false), &NeverCancelled),
-        )?;
-        assert!(
-            require_source(&decoder_error)?.is::<decoders::Error>(),
-            "decoder wrapper must retain decoders::Error"
-        );
         Ok(())
     }
 
@@ -1634,6 +1759,101 @@ mod tests {
         assert_eq!(generation.text(), "hello");
         assert_eq!(generation.token_ids(), &[3]);
         assert_eq!(generation.finish_reason(), FinishReason::Length);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_generation_binds_direct_generation_to_the_same_prompt_and_result() -> TestResult<()>
+    {
+        let (_directory, artifact) = verified_artifact(3, true, false)?;
+        let prepared_pipeline = pipeline_for(&artifact)?;
+        let direct_pipeline = pipeline_for(&artifact)?;
+        let messages = [TextMessage::new(TextRole::User, "hello")];
+        let request = GenerationRequest::new(&messages, 1, false);
+        let prepared = prepared_pipeline.prepare(request, &NeverCancelled)?;
+        assert_eq!(
+            prepared.rendered_prompt(),
+            "hello",
+            "preparation must expose the artifact-rendered prompt"
+        );
+        assert_eq!(
+            prepared.prompt_token_ids(),
+            [1, 3],
+            "preparation must expose the exact special-token-aware prompt IDs"
+        );
+        assert_eq!(
+            prepared.tokenizer_identity(),
+            direct_pipeline.tokenizer.identity(),
+            "prepared requests must retain their verified tokenizer identity"
+        );
+        assert_eq!(
+            prepared.max_output_tokens(),
+            1,
+            "preparation must retain the checked request output cap"
+        );
+        let prepared_generation = prepared.generate(&NeverCancelled)?;
+        let direct_generation = direct_pipeline.generate(request, &NeverCancelled)?;
+        assert_eq!(
+            prepared_generation, direct_generation,
+            "direct generation must consume the same preparation path"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_generation_uses_request_specific_decoder_bounds() -> TestResult<()> {
+        let (_directory, artifact) = verified_artifact(3, true, false)?;
+        let pipeline = pipeline_for(&artifact)?;
+        let messages = [TextMessage::new(TextRole::User, "hello")];
+        let prepared =
+            pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+        let requirements = prepared.decoder_cpu_requirements();
+        assert_eq!(
+            requirements.max_context(),
+            3,
+            "request context must be prompt plus requested output, not the ceiling"
+        );
+        assert_eq!(
+            requirements.max_step_tokens(),
+            2,
+            "the initial last-token decoder step must use the prompt width"
+        );
+        assert!(
+            requirements.max_context() < pipeline.limits.context_tokens,
+            "the prepared context should remain narrower than the configured ceiling"
+        );
+        assert!(
+            requirements.max_step_tokens() < pipeline.limits.context_tokens,
+            "the prepared step should remain narrower than the configured ceiling"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_generation_checks_cancellation_before_decoder_session_construction()
+    -> TestResult<()> {
+        let (_directory, artifact) = verified_artifact(3, true, false)?;
+        let pipeline = pipeline_for(&artifact)?;
+        let messages = [TextMessage::new(TextRole::User, "hello")];
+        let prepared =
+            pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+        let cancelled = CancelOnCheck::new(0);
+        let error = text_error(prepared.generate(&cancelled))?;
+        assert!(
+            matches!(
+                error,
+                Error::Cancelled {
+                    boundary: "decoder session construction",
+                    ..
+                }
+            ),
+            "prepared generation must check cancellation before session allocation"
+        );
+        assert_eq!(
+            cancelled.checks(),
+            1,
+            "the new boundary must be the first observation after preparation"
+        );
         Ok(())
     }
 
@@ -1676,7 +1896,7 @@ mod tests {
         let messages = [TextMessage::new(TextRole::User, "hello")];
         let expected =
             pristine.generate(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
-        let cancelled = CancelOnCheck::new(3);
+        let cancelled = CancelOnCheck::new(4);
         let error =
             text_error(pipeline.generate(GenerationRequest::new(&messages, 1, false), &cancelled))?;
         assert!(
@@ -1687,12 +1907,12 @@ mod tests {
                     ..
                 }
             ),
-            "check 3 must observe cancellation after the complete prompt decoder step"
+            "check 4 must observe cancellation after the complete prompt decoder step"
         );
         assert_eq!(
             cancelled.checks(),
-            4,
-            "the prompt step must sit between cancellation checks 2 and 3"
+            5,
+            "the session-construction checkpoint must precede the prompt decoder step"
         );
         let retry =
             pipeline.generate(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
@@ -1738,7 +1958,7 @@ mod tests {
         let messages = [TextMessage::new(TextRole::User, "hello")];
         let expected =
             pristine.generate(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
-        let cancelled = CancelOnCheck::new(5);
+        let cancelled = CancelOnCheck::new(6);
         let error =
             text_error(pipeline.generate(GenerationRequest::new(&messages, 1, false), &cancelled))?;
         assert!(
@@ -1753,7 +1973,7 @@ mod tests {
         );
         assert_eq!(
             cancelled.checks(),
-            6,
+            7,
             "publication cancellation must follow the collective-decode check"
         );
         let retry =
@@ -1765,3 +1985,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "prepared_tests.rs"]
+mod prepared_tests;

@@ -50,6 +50,16 @@ pub enum Error {
         source: taxis::Error,
     },
 
+    /// Propagated checked Q8_0 row-format failure.
+    #[snafu(display("Q8_0 projection format failure: {source}"))]
+    Quant {
+        /// Source quantization error.
+        source: quant::Error,
+        /// Source code location where the error was propagated.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     #[cfg(feature = "gpu")]
     /// Kernel launch failed — HIP reported a non-success status after
     /// kernel submission.
@@ -186,6 +196,18 @@ pub enum Error {
         left: usize,
         /// Right operand length.
         right: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU Q8_0 GEMV could not reserve its checked output backing.
+    #[snafu(display("Q8_0 GEMV output allocation for {requested_len} rows failed"))]
+    Q8GemvAllocation {
+        /// Exact requested output row count.
+        requested_len: usize,
+        /// Allocation failure.
+        source: std::collections::TryReserveError,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,

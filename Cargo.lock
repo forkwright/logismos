@@ -569,6 +569,7 @@ dependencies = [
  "hipcore",
  "matrixmultiply",
  "num-traits",
+ "quant",
  "rand 0.10.2",
  "snafu",
  "taxis",
