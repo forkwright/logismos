@@ -21,7 +21,6 @@ pub struct Layout {
 
 impl Layout {
     /// Canonical row-major contiguous layout for `shape`.
-    #[must_use]
     pub(crate) fn try_contiguous(shape: Shape) -> Result<Self> {
         let dims = shape.dims();
         let mut stride: SmallVec<[usize; 6]> = SmallVec::with_capacity(dims.len());
