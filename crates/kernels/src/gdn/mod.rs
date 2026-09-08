@@ -7,7 +7,7 @@
 //! owned output or scratch vector is reserved fallibly; this is not a process
 //! RSS, allocator-overhead, or physical-memory guarantee.
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 use std::ffi::c_void;
 
 #[cfg(feature = "gpu")]
@@ -19,12 +19,14 @@ use crate::error::LaunchSnafu;
 #[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
 use crate::error::NoGpuBuildSnafu;
 #[cfg(feature = "gpu")]
-use crate::error::{Result, UnsupportedShapeSnafu};
+use crate::error::Result;
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+use crate::error::UnsupportedShapeSnafu;
 
 const GDN_RECURRENCE: &str = "gdn_recurrent_fwd";
 #[cfg(feature = "gpu")]
 const GDN_GROUPED_STEP_KERNEL: &str = "gdn_grouped_step_f32";
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 const MAX_GDN_VALUE_DIM: usize = 1024;
 
 #[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
@@ -762,7 +764,9 @@ pub fn multi_head_recurrent_fwd(
 /// Each pointer must designate a live allocation on `stream`'s device for the
 /// exact declared `f32` element count through stream completion. The two
 /// writable spans must not alias each other or any input; inputs may alias
-/// other inputs. No producer may modify any input during the launch.
+/// other inputs. Both writable spans require exclusive access through stream
+/// completion: no other GPU command or host alias may read or write either
+/// span. No producer may modify any input during the launch.
 ///
 /// Device contents are not inspectable at this boundary. Callers must ensure
 /// every input, `scale`, and every recurrence intermediate is finite and
@@ -887,7 +891,7 @@ fn no_gpu_gdn_step_refusal() -> Result<()> {
     .fail()
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 #[derive(Clone, Copy)]
 struct GdnStepAbi {
     key_head_count: u32,
@@ -896,7 +900,7 @@ struct GdnStepAbi {
     value_dim: u32,
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 #[derive(Clone, Copy)]
 struct DeviceSpan {
     start: usize,
@@ -904,7 +908,7 @@ struct DeviceSpan {
     name: &'static str,
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 #[expect(
     clippy::too_many_arguments,
     reason = "validation receives the fixed raw staged GDN step ABI without constructing a second shape owner"
@@ -982,7 +986,7 @@ fn validate_gdn_step_launch(
     })
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 fn validate_gdn_step_length(name: &'static str, actual: usize, expected: usize) -> Result<()> {
     if actual == expected {
         Ok(())
@@ -993,7 +997,7 @@ fn validate_gdn_step_length(name: &'static str, actual: usize, expected: usize) 
     }
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 fn checked_device_span(
     pointer: *const f32,
     elements: usize,
@@ -1023,7 +1027,7 @@ fn checked_device_span(
     Ok(DeviceSpan { start, end, name })
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 fn reject_overlapping_gdn_step_spans(left: DeviceSpan, right: DeviceSpan) -> Result<()> {
     if left.start < right.end && right.start < left.end {
         unsupported_gdn_step_shape(format!(
@@ -1035,7 +1039,7 @@ fn reject_overlapping_gdn_step_spans(left: DeviceSpan, right: DeviceSpan) -> Res
     }
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 fn gdn_step_u32(name: &'static str, value: usize) -> Result<u32> {
     u32::try_from(value).map_err(|_| {
         UnsupportedShapeSnafu {
@@ -1046,8 +1050,8 @@ fn gdn_step_u32(name: &'static str, value: usize) -> Result<u32> {
     })
 }
 
-#[cfg(feature = "gpu")]
-fn unsupported_gdn_step_shape(msg: String) -> Result<()> {
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn unsupported_gdn_step_shape<T>(msg: String) -> Result<T> {
     UnsupportedShapeSnafu {
         kernel: GDN_GROUPED_STEP_KERNEL,
         msg,
@@ -1543,6 +1547,48 @@ mod tests {
         let g = [0.0_f32];
         let state = [0.0_f32];
         let mut output = [0.0_f32];
+        let grouped_plan = match MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 2, 4, 3, 2) {
+            Ok(plan) => plan,
+            Err(error) => panic!("test dimensions are valid: {error}"),
+        };
+        let grouped_q = vec![1.0_f32; grouped_plan.query_and_key_elements()];
+        let grouped_k = vec![1.0_f32; grouped_plan.query_and_key_elements()];
+        let grouped_v = vec![1.0_f32; grouped_plan.output_elements()];
+        let grouped_beta = vec![1.0_f32; grouped_plan.scalar_elements()];
+        let grouped_g = vec![0.0_f32; grouped_plan.scalar_elements()];
+        let grouped_state_in = vec![0.0_f32; grouped_plan.state_elements()];
+        let mut grouped_state_out = vec![0.0_f32; grouped_plan.state_elements()];
+        let mut grouped_output = vec![0.0_f32; grouped_plan.output_elements()];
+        let abi = validate_gdn_step_launch(
+            grouped_plan,
+            grouped_q.as_ptr(),
+            grouped_q.len(),
+            grouped_k.as_ptr(),
+            grouped_k.len(),
+            grouped_v.as_ptr(),
+            grouped_v.len(),
+            grouped_beta.as_ptr(),
+            grouped_beta.len(),
+            grouped_g.as_ptr(),
+            grouped_g.len(),
+            1.0,
+            grouped_state_in.as_ptr(),
+            grouped_state_in.len(),
+            grouped_state_out.as_mut_ptr(),
+            grouped_state_out.len(),
+            grouped_output.as_mut_ptr(),
+            grouped_output.len(),
+        )?;
+        assert_eq!(
+            (
+                abi.key_head_count,
+                abi.value_head_count,
+                abi.key_dim,
+                abi.value_dim,
+            ),
+            (2, 4, 3, 2),
+            "the checked ABI must preserve the allocation owner's grouped geometry"
+        );
         assert!(matches!(
             validate_gdn_step_launch(
                 plan,
