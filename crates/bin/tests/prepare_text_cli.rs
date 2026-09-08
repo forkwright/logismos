@@ -55,7 +55,7 @@ fn fixture_config(template: &str) -> Qwen35FixtureConfig {
 }
 
 struct FixtureInput {
-    _directory: TempDir,
+    directory: TempDir,
     model_path: PathBuf,
     model_digest: String,
     model_bytes: u64,
@@ -64,7 +64,7 @@ struct FixtureInput {
     tokenizer_bytes: usize,
 }
 
-fn write_fixture(fixture: SyntheticGguf, tokenizer: String) -> FixtureInput {
+fn write_fixture(fixture: SyntheticGguf, tokenizer: &str) -> FixtureInput {
     let directory = tempfile::tempdir().expect("temporary directory must be created");
     let model_path = directory.path().join("model.gguf");
     fs::write(&model_path, fixture.bytes).expect("synthetic GGUF must be written");
@@ -72,7 +72,7 @@ fn write_fixture(fixture: SyntheticGguf, tokenizer: String) -> FixtureInput {
     fs::write(&tokenizer_path, tokenizer.as_bytes()).expect("synthetic tokenizer must be written");
     let tokenizer_sha256: [u8; 32] = Sha256::digest(tokenizer.as_bytes()).into();
     FixtureInput {
-        _directory: directory,
+        directory,
         model_path,
         model_digest: hex_digest(&fixture.sha256),
         model_bytes: fixture.byte_len,
@@ -83,9 +83,10 @@ fn write_fixture(fixture: SyntheticGguf, tokenizer: String) -> FixtureInput {
 }
 
 fn standard_fixture(template: &str) -> FixtureInput {
+    let tokenizer = tokenizer_json();
     write_fixture(
         build_qwen35_fixture(&fixture_config(template)).expect("fixture must serialize"),
-        tokenizer_json(),
+        &tokenizer,
     )
 }
 
@@ -110,9 +111,10 @@ fn nan_embedding_fixture() -> FixtureInput {
         .get_mut(row_start..row_end)
         .expect("consumed embedding row must fit its declared payload");
     poisoned.copy_from_slice(&f32::NAN.to_le_bytes());
+    let tokenizer = tokenizer_json();
     write_fixture(
         serialize_raw_gguf(&raw).expect("mutated fixture must serialize"),
-        tokenizer_json(),
+        &tokenizer,
     )
 }
 
@@ -356,7 +358,7 @@ fn prepare_text_strictly_refuses_unknown_request_fields_roles_and_configured_tok
     );
     let configured = write_fixture(
         build_qwen35_fixture(&fixture_config("hello")).expect("fixture must serialize"),
-        tokenizer,
+        &tokenizer,
     );
     assert_error(
         &run(
@@ -368,6 +370,27 @@ fn prepare_text_strictly_refuses_unknown_request_fields_roles_and_configured_tok
             &request,
         ),
         "tokenizer_configuration",
+    );
+}
+
+#[test]
+fn prepare_text_refuses_an_exact_identity_with_an_unequal_artifact_vocabulary() {
+    let tokenizer = tokenizer_json().replace("\"assistant\":4}", "\"assistant\":4,\"extra\":5}");
+    let fixture = write_fixture(
+        build_qwen35_fixture(&fixture_config("hello")).expect("fixture must serialize"),
+        &tokenizer,
+    );
+    let request = request_json(8);
+    assert_error(
+        &run(
+            &fixture,
+            &fixture.model_digest,
+            fixture.model_bytes,
+            &fixture.tokenizer_digest,
+            fixture.tokenizer_bytes,
+            &request,
+        ),
+        "artifact_tokenizer_mismatch",
     );
 }
 
@@ -412,7 +435,7 @@ fn prepare_text_refuses_actual_artifact_context_and_never_executes_nan_weights()
 #[test]
 fn prepare_text_errors_do_not_disclose_input_paths() {
     let fixture = standard_fixture("hello");
-    let absent = fixture._directory.path().join("not-present.gguf");
+    let absent = fixture.directory.path().join("not-present.gguf");
     let request = request_json(8);
     let output = command()
         .args([

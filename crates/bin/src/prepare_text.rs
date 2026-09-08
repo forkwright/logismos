@@ -195,6 +195,7 @@ fn pipeline_error_kind(error: &text::Error) -> &'static str {
         | text::Error::RenderedUtf8 { .. }
         | text::Error::EmptyPrompt { .. } => "template_refused",
         text::Error::VocabularyMismatch { .. }
+        | text::Error::VocabularyLengthMismatch { .. }
         | text::Error::Metadata { .. }
         | text::Error::SpecialTokenPolicy { .. } => "artifact_tokenizer_mismatch",
         _ => "text_refused",

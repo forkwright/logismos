@@ -42,6 +42,20 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// A tokenizer vocabulary has a different number of entries than the artifact table.
+    #[snafu(display(
+        "text tokenizer/artifact vocabulary length mismatch: expected {expected}, got {actual}"
+    ))]
+    VocabularyLengthMismatch {
+        /// Vocabulary entry count declared by the artifact token table.
+        expected: usize,
+        /// Vocabulary entry count observed in the verified tokenizer.
+        actual: usize,
+        /// Source code location where the refusal was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// The model's special-token policy was inconsistent with its token table.
     #[snafu(display("text artifact special-token policy is invalid: {rule}"))]
     SpecialTokenPolicy {
