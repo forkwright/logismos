@@ -145,7 +145,11 @@ if os.environ['CARGO_NET_OFFLINE'] != 'true':
     raise AssertionError('Cargo offline mode is missing')
 if os.environ['CARGO_TARGET_DIR'] != str(root / 'target'):
     raise AssertionError('Cargo target is not confined to the worktree target')
-if 'LOGISMOS_GPU_DENIED_INPUT' in os.environ:
+if any(name in os.environ for name in (
+    'LOGISMOS_GPU_DENIED_INPUT',
+    'LOGISMOS_GPU_DENIED_MODEL',
+    'LOGISMOS_GPU_DENIED_TOKENIZER',
+)):
     raise AssertionError('read-only input path is set without an explicit input file')
 
 source_marker = root / 'gpu-denied-source-write'

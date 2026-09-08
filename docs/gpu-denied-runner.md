@@ -266,9 +266,10 @@ host process racing trusted inputs before Bubblewrap enters the namespaces.
 It does not provide CPU, memory, process-count, wall-time, or target-disk
 quotas. The writable `target/` remains on the host and must be treated as
 untrusted build output after a run. Source confidentiality is not a goal: the
-command can read the worktree and mounted toolchain. The explicit single-file
-input is not a snapshot or source-provenance feature. A same-UID host writer
-can replace or rewrite the artifact after validation or while it is observed.
+command can read the worktree and mounted toolchain. Neither the single-file
+input nor the model/tokenizer pair is a snapshot or source-provenance feature.
+A same-UID host writer can replace or rewrite either admitted file after
+validation or while it is observed.
 The GGUF inspector's digest describes its observed byte stream, including its
 bounded owned prefix and streamed tail; it is not proof of an atomic artifact
 version. Use an externally immutable snapshot when that identity is required.
