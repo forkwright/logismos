@@ -145,7 +145,11 @@ if os.environ['CARGO_NET_OFFLINE'] != 'true':
     raise AssertionError('Cargo offline mode is missing')
 if os.environ['CARGO_TARGET_DIR'] != str(root / 'target'):
     raise AssertionError('Cargo target is not confined to the worktree target')
-if 'LOGISMOS_GPU_DENIED_INPUT' in os.environ:
+if any(name in os.environ for name in (
+    'LOGISMOS_GPU_DENIED_INPUT',
+    'LOGISMOS_GPU_DENIED_MODEL',
+    'LOGISMOS_GPU_DENIED_TOKENIZER',
+)):
     raise AssertionError('read-only input path is set without an explicit input file')
 
 source_marker = root / 'gpu-denied-source-write'
@@ -243,6 +247,8 @@ from pathlib import Path
 artifact = Path(os.environ['LOGISMOS_GPU_DENIED_INPUT'])
 assert artifact.read_bytes() == b'synthetic artifact bytes'
 assert list(artifact.parent.iterdir()) == [artifact]
+assert 'LOGISMOS_GPU_DENIED_MODEL' not in os.environ
+assert 'LOGISMOS_GPU_DENIED_TOKENIZER' not in os.environ
 assert not Path(sys.argv[1]).exists()
 failed = 0
 actions = (
@@ -265,6 +271,54 @@ assert failed == len(actions)
 )
 if positive_input_result.returncode != 0:
     raise AssertionError(positive_input_result.stderr.decode(errors='replace'))
+
+
+approved_model = fixture / 'approved-model'
+approved_tokenizer = fixture / 'approved-tokenizer'
+approved_model.write_bytes(b'synthetic model bytes')
+approved_tokenizer.write_bytes(b'synthetic tokenizer bytes')
+positive_pair_result = run(
+    [
+        str(runner),
+        '--ro-model-file',
+        str(approved_model),
+        '--ro-tokenizer-file',
+        str(approved_tokenizer),
+        '--',
+        '/usr/bin/python3',
+        '-c',
+        '''import os
+import sys
+from pathlib import Path
+
+model = Path(os.environ['LOGISMOS_GPU_DENIED_MODEL'])
+tokenizer = Path(os.environ['LOGISMOS_GPU_DENIED_TOKENIZER'])
+assert model.read_bytes() == b'synthetic model bytes'
+assert tokenizer.read_bytes() == b'synthetic tokenizer bytes'
+assert set(model.parent.iterdir()) == {model, tokenizer}
+assert 'LOGISMOS_GPU_DENIED_INPUT' not in os.environ
+assert not Path(sys.argv[1]).exists()
+for input_file in (model, tokenizer):
+    failed = 0
+    for action in (
+        lambda path=input_file: path.write_bytes(b'unexpected'),
+        lambda path=input_file: path.unlink(),
+        lambda path=input_file: os.chmod(path, 0o600),
+    ):
+        try:
+            action()
+        except OSError:
+            failed += 1
+    assert failed == 3
+''',
+        str(approved_model),
+    ],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+if positive_pair_result.returncode != 0:
+    raise AssertionError(positive_pair_result.stderr.decode(errors='replace'))
 
 
 # Match the documented outer/inner-shell pattern without claiming a normal
@@ -333,6 +387,39 @@ def assert_rejected_read_only_input(label: str, input_path: Path) -> None:
         raise AssertionError(f'{label} read-only input was not rejected without path disclosure')
 
 
+def assert_rejected_read_only_pair(
+    label: str, model_path: Path | str, tokenizer_path: Path | str
+) -> None:
+    result = run(
+        [
+            str(runner),
+            '--ro-model-file',
+            str(model_path),
+            '--ro-tokenizer-file',
+            str(tokenizer_path),
+            '--',
+            '/usr/bin/true',
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    forbidden = (str(model_path).encode(), str(tokenizer_path).encode())
+    if result.returncode != 69 or any(path in result.stderr for path in forbidden):
+        raise AssertionError(f'{label} read-only pair was not rejected without path disclosure')
+
+
+def assert_invalid_input_syntax(label: str, arguments: list[str]) -> None:
+    result = run(
+        [str(runner), *arguments, '--', '/usr/bin/true'],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 64:
+        raise AssertionError(f'{label} input syntax was not rejected')
+
+
 noncanonical_parent = fixture / 'noncanonical-parent'
 noncanonical_parent.mkdir()
 symlink_input = fixture / 'symlink-input'
@@ -369,6 +456,44 @@ try:
         ('sensitive root', Path('/etc/hosts')),
     ]:
         assert_rejected_read_only_input(label, path)
+        assert_rejected_read_only_pair(f'model {label}', path, approved_tokenizer)
+        assert_rejected_read_only_pair(f'tokenizer {label}', approved_model, path)
+    assert_rejected_read_only_pair('pair members alias', approved_model, approved_model)
+    assert_invalid_input_syntax('missing tokenizer', ['--ro-model-file', str(approved_model)])
+    assert_invalid_input_syntax('missing model', ['--ro-tokenizer-file', str(approved_tokenizer)])
+    assert_invalid_input_syntax(
+        'mixed legacy and pair',
+        [
+            '--ro-input-file',
+            str(approved_input),
+            '--ro-model-file',
+            str(approved_model),
+            '--ro-tokenizer-file',
+            str(approved_tokenizer),
+        ],
+    )
+    assert_invalid_input_syntax(
+        'repeated model',
+        [
+            '--ro-model-file',
+            str(approved_model),
+            '--ro-model-file',
+            str(approved_model),
+            '--ro-tokenizer-file',
+            str(approved_tokenizer),
+        ],
+    )
+    assert_invalid_input_syntax(
+        'repeated tokenizer',
+        [
+            '--ro-model-file',
+            str(approved_model),
+            '--ro-tokenizer-file',
+            str(approved_tokenizer),
+            '--ro-tokenizer-file',
+            str(approved_tokenizer),
+        ],
+    )
 finally:
     input_socket.close()
     socket_input.unlink(missing_ok=True)

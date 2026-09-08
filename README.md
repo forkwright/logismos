@@ -57,7 +57,8 @@ Supplied memory estimates are not yet artifact-derived requirements or measured 
 adds typed metadata (including empty-array element types and float bits) and source-order
 tensor extents from the same observation. Inspection does not prove conversion provenance,
 payload decoding, model support, or an atomic filesystem snapshot. The
-[GPU-denied runner](docs/gpu-denied-runner.md) can admit one exact read-only input for this work.
+[GPU-denied runner](docs/gpu-denied-runner.md) can admit one exact read-only input for this work,
+or an explicit model/tokenizer pair for native text preparation.
 
 [`decoders`](crates/decoders/src/lib.rs) derives a bounded Qwen3.5-family structural profile
 from an opaque observation: exact typed metadata determines tensor roles and shapes, and
@@ -97,6 +98,16 @@ the model. Its opaque result is consumed for execution; ordinary `generate` uses
 the same path. Context and prefill bounds derive from that request, not configured
 ceilings. These reports cover decoder f32 backing only, not prompt/tokenizer/text
 allocations, whole-request memory or admission.
+
+`logismos prepare-text` exposes that same preparation path through a HIP-free
+CLI. Trusted invocation selects both artifacts by path, expected SHA-256 and
+exact byte length; a bounded strict JSON argument supplies the typed request
+and pipeline limits. Its JSON receipt includes rendering, final token IDs,
+verified identities and decoder-only CPU requirements. It performs no model
+operation, but loading retains the full immutable model backing and tokenization
+has its own allocations: use a separately granted host budget for large inputs.
+Receipt agreement with an independent reference is a later qualification step;
+the command alone establishes neither numerical parity nor model quality.
 
 The private template environment has no loader or registered templates. Named imports, includes
 and inheritance cannot resolve another source; missing includes explicitly marked optional are

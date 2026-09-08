@@ -34,7 +34,7 @@ use crate::error::{
     AllocationSnafu, CancelledSnafu, DecodeSnafu, DecoderSnafu, EmptyPromptSnafu,
     InvalidConfigurationSnafu, LimitExceededSnafu, LogitShapeSnafu, MetadataSnafu,
     RenderedUtf8Snafu, SpecialTokenPolicySnafu, TemplateRendererSnafu, TemplateSnafu,
-    TokenizerSnafu, VocabularyMismatchSnafu,
+    TokenizerSnafu, VocabularyLengthMismatchSnafu, VocabularyMismatchSnafu,
 };
 
 pub use crate::error::{Error, Result};
@@ -748,10 +748,9 @@ fn verify_exact_vocabulary(values: &[MetaValue], tokenizer: &VerifiedTokenizer) 
         }),
     ) {
         Ok(()) => Ok(()),
-        Err(tokenize::Error::VocabularyLengthMismatch { .. }) => InvalidConfigurationSnafu {
-            rule: "artifact token table and tokenizer vocabulary length differ",
-        }
-        .fail(),
+        Err(tokenize::Error::VocabularyLengthMismatch {
+            expected, actual, ..
+        }) => VocabularyLengthMismatchSnafu { expected, actual }.fail(),
         Err(tokenize::Error::VocabularyMismatch { id, .. }) => {
             VocabularyMismatchSnafu { id }.fail()
         }

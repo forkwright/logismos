@@ -60,7 +60,7 @@ jobs:
             RUSTUP_TOOLCHAIN="$PINNED_TOOLCHAIN" \
             "$ci_cargo_home/bin/cargo" fetch --locked \
               --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
-      - name: Prove the minimal inspection graph is HIP-free
+      - name: Prove the minimal CPU-only CLI graph has no HIP runtime
         shell: bash
         run: |
           set -euo pipefail
@@ -69,7 +69,7 @@ jobs:
           dependency_graph=$(scripts/gpu-denied-runner.sh -- /bin/sh -ceu \
             'cargo tree --locked -p bin --edges normal,build --prefix none --format "{p}"')
           if printf '%s\n' "$dependency_graph" | \
-              grep -Eq '^(hipcore|kernels|taxis) v'; then
+              grep -Eq '^(hipcore|taxis) v'; then
             printf '%s\n' 'minimal bin graph unexpectedly contains a HIP dependency' >&2
             printf '%s\n' "$dependency_graph" >&2
             exit 1

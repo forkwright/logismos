@@ -67,6 +67,28 @@ constant, so callers and receipts never need the private host path. The
 `inspect` JSON receipts intentionally expose selected parsed model facts and a
 digest, but no input path.
 
+For a native text qualification that needs an explicitly selected model and
+tokenizer companion, use the pair form instead. Both flags are required exactly
+once, cannot be combined with `--ro-input-file`, and must name distinct files.
+There is deliberately no generic repeated-file form: the fixed model and
+tokenizer roles prevent callers from silently swapping companion meanings.
+
+```bash
+scripts/gpu-denied-runner.sh \
+  --ro-model-file /canonical/path/to/model.gguf \
+  --ro-tokenizer-file /canonical/path/to/tokenizer.json -- \
+  /bin/sh -ceu 'test -r "$LOGISMOS_GPU_DENIED_MODEL"; \
+    test -r "$LOGISMOS_GPU_DENIED_TOKENIZER"'
+```
+
+The pair exposes only `/mnt/gpu-denied-input/model` and
+`/mnt/gpu-denied-input/tokenizer` inside the sandbox through the corresponding
+environment variables. It does not set `LOGISMOS_GPU_DENIED_INPUT`; conversely,
+the single-file form sets only that legacy variable. The same canonical-path,
+single-link regular-file, protected-root, mount-point, and readability checks
+apply independently to each pair member before their device/inode identities
+are required to differ.
+
 This is not host-path confidentiality. The exact-file bind can expose source
 root/name metadata in `/proc/self/mountinfo`, and the Bubblewrap PID-1 command
 line currently retains its host source argument. Those details, and arbitrary
@@ -244,9 +266,10 @@ host process racing trusted inputs before Bubblewrap enters the namespaces.
 It does not provide CPU, memory, process-count, wall-time, or target-disk
 quotas. The writable `target/` remains on the host and must be treated as
 untrusted build output after a run. Source confidentiality is not a goal: the
-command can read the worktree and mounted toolchain. The explicit single-file
-input is not a snapshot or source-provenance feature. A same-UID host writer
-can replace or rewrite the artifact after validation or while it is observed.
+command can read the worktree and mounted toolchain. Neither the single-file
+input nor the model/tokenizer pair is a snapshot or source-provenance feature.
+A same-UID host writer can replace or rewrite either admitted file after
+validation or while it is observed.
 The GGUF inspector's digest describes its observed byte stream, including its
 bounded owned prefix and streamed tail; it is not proof of an atomic artifact
 version. Use an externally immutable snapshot when that identity is required.

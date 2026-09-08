@@ -37,8 +37,8 @@ semantically respects that boundary.
 - `hipcore`, `placement`, and `emulation` depend on `isa` so target-architecture
   identity and suffix syntax have one implementation.
 - `placement` and `sched` have no HIP/device-runtime dependency. `bin` consumes
-  `placement` for `plan` and metadata-only `loader` for `inspect` without
-  linking the device runtime.
+  `placement` for `plan`, `loader` for `inspect`, and `text` for `prepare-text`
+  without linking the device runtime.
 - `decoders` consumes `loader` without its tensor adapter and consumes `quant`
   for explicit CPU row projection, without linking HIP. Its recurrent-attention
   path uses the standalone CPU `kernels` graph. Structural profiles remain
@@ -200,6 +200,16 @@ ordinary generation delegates to this same path. Cancellation is cooperative,
 so preparation may finish inertly if cancellation arrives during tokenization.
 The decoder report excludes rendered text, u32 prompt/generated IDs, tokenizer
 and decoded strings; it is not a whole-request estimate or admission grant.
+
+The HIP-free binary's `prepare-text` adapter uses this same owner and never
+constructs a decoder session. Trusted CLI arguments supply exact model and
+tokenizer identity expectations, while a bounded strict JSON argument supplies
+the request and explicit limits. The adapter bounds tokenizer input by its
+expected serialized length and reuses the verified artifact's immutable
+backing; it does not replace that backing with an inspection receipt. Structured
+failures omit input paths. Successful receipts intentionally disclose rendering
+and token IDs and are not an independent correctness oracle. Neither the
+command nor the paired-file denied runner supplies a host resource reservation.
 
 NextN, serving, exact-artifact quality, physical residency and admission
 integration remain separate requirements.
