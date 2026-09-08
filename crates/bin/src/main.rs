@@ -34,7 +34,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(outcome) => write_outcome(&outcome),
         Err(CliError::Inspection(error)) => write_inspection_error(error),
-        Err(CliError::PrepareText(error)) => write_prepare_text_error(error),
+        Err(CliError::PrepareText(error)) => write_prepare_text_error(&error),
         Err(error) => {
             eprintln!("{error}");
             ExitCode::from(2)
@@ -252,7 +252,7 @@ fn write_inspection_error(error: InspectionError) -> ExitCode {
     exit_code
 }
 
-fn write_prepare_text_error(error: prepare_text::PrepareTextError) -> ExitCode {
+fn write_prepare_text_error(error: &prepare_text::PrepareTextError) -> ExitCode {
     let receipt = InspectionErrorReceipt {
         schema_version: INSPECTION_SCHEMA_VERSION,
         outcome: "error",

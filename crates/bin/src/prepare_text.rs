@@ -492,7 +492,6 @@ impl DecoderCpuRequirementsReceipt {
 fn artifact_digest_hex(digest: ArtifactDigest) -> Result<String, PrepareTextError> {
     match digest {
         ArtifactDigest::Sha256(digest) => hex_digest(digest.as_bytes()),
-        ArtifactDigest::NotComputed => Err(PrepareTextError::InternalIdentity),
         _ => Err(PrepareTextError::InternalIdentity),
     }
 }
