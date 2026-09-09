@@ -1561,8 +1561,8 @@ mod tests {
 
     #[cfg(feature = "gpu")]
     #[test]
-    fn staged_gpu_step_refuses_unsupported_shape_alias_and_overflow(
-    ) -> core::result::Result<(), Box<dyn std::error::Error>> {
+    fn staged_gpu_step_refuses_unsupported_shape_alias_and_overflow()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
         let two_token_plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(2, 1, 1, 1, 1)?;
         let mut two_token_buffers = ValidGdnStepBuffers::from_plan(two_token_plan);
         assert!(matches!(
