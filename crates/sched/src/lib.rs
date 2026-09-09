@@ -731,65 +731,16 @@ impl Scheduler {
         self.ensure_completion_state(admission_id, pending.kind)?;
         match completion {
             RuntimeCompletion::Loaded { resident, .. } => {
-                if self.resident_handle_in_custody(&resident) {
-                    return Err(SchedulerError::DuplicateResidentHandle {
-                        location: error_location(),
-                    });
-                }
-                self.operations.remove(&operation.value);
-                let admission = self.admissions.get_mut(&admission_id).ok_or(
-                    SchedulerError::UnknownAdmission {
-                        location: error_location(),
-                    },
-                )?;
-                let drain_after_load = self.revoked
-                    || matches!(
-                        &admission.state,
-                        AdmissionState::Draining {
-                            resident: None,
-                            loading: true,
-                        }
-                    );
-                admission.state = if drain_after_load {
-                    AdmissionState::Draining {
-                        resident: Some(resident),
-                        loading: false,
-                    }
-                } else {
-                    AdmissionState::Resident(resident)
-                };
+                self.complete_load(admission_id, resident)?;
             }
             RuntimeCompletion::LoadFailed { .. } | RuntimeCompletion::Evicted { .. } => {
                 self.release_admission(admission_id)?;
-                self.operations.remove(&operation.value);
             }
-            RuntimeCompletion::LoadQuarantined { .. } => {
-                self.operations.remove(&operation.value);
-                let admission = self.admissions.get_mut(&admission_id).ok_or(
-                    SchedulerError::UnknownAdmission {
-                        location: error_location(),
-                    },
-                )?;
-                admission.state = AdmissionState::Quarantined { resident: None };
-            }
-            RuntimeCompletion::EvictionQuarantined { .. } => {
-                self.operations.remove(&operation.value);
-                let admission = self.admissions.get_mut(&admission_id).ok_or(
-                    SchedulerError::UnknownAdmission {
-                        location: error_location(),
-                    },
-                )?;
-                let AdmissionState::Evicting(resident) = &admission.state else {
-                    return Err(SchedulerError::OperationStateMismatch {
-                        location: error_location(),
-                    });
-                };
-                admission.state = AdmissionState::Quarantined {
-                    resident: Some(resident.clone()),
-                };
+            RuntimeCompletion::LoadQuarantined { .. }
+            | RuntimeCompletion::EvictionQuarantined { .. } => {
+                self.quarantine_admission(admission_id)?;
             }
             RuntimeCompletion::EvictFailed { .. } => {
-                self.operations.remove(&operation.value);
                 let admission = self.admissions.get_mut(&admission_id).ok_or(
                     SchedulerError::UnknownAdmission {
                         location: error_location(),
@@ -807,6 +758,7 @@ impl Scheduler {
                 self.next_drain_cursor = admission_id.checked_add(1).unwrap_or(INITIAL_IDENTIFIER);
             }
         }
+        self.operations.remove(&operation.value);
         Ok(())
     }
 
@@ -1043,6 +995,65 @@ impl Scheduler {
             )
             .then_some(id)
         })
+    }
+
+    fn complete_load(
+        &mut self,
+        admission_id: u64,
+        resident: ResidentHandle,
+    ) -> Result<(), SchedulerError> {
+        if self.resident_handle_in_custody(&resident) {
+            return Err(SchedulerError::DuplicateResidentHandle {
+                location: error_location(),
+            });
+        }
+        let admission =
+            self.admissions
+                .get_mut(&admission_id)
+                .ok_or(SchedulerError::UnknownAdmission {
+                    location: error_location(),
+                })?;
+        let drain_after_load = self.revoked
+            || matches!(
+                &admission.state,
+                AdmissionState::Draining {
+                    resident: None,
+                    loading: true,
+                }
+            );
+        admission.state = if drain_after_load {
+            AdmissionState::Draining {
+                resident: Some(resident),
+                loading: false,
+            }
+        } else {
+            AdmissionState::Resident(resident)
+        };
+        Ok(())
+    }
+
+    fn quarantine_admission(&mut self, admission_id: u64) -> Result<(), SchedulerError> {
+        let admission =
+            self.admissions
+                .get_mut(&admission_id)
+                .ok_or(SchedulerError::UnknownAdmission {
+                    location: error_location(),
+                })?;
+        let resident = match &admission.state {
+            AdmissionState::Evicting(resident) => Some(resident.clone()),
+            AdmissionState::Loading
+            | AdmissionState::Draining {
+                resident: None,
+                loading: true,
+            } => None,
+            _ => {
+                return Err(SchedulerError::OperationStateMismatch {
+                    location: error_location(),
+                });
+            }
+        };
+        admission.state = AdmissionState::Quarantined { resident };
+        Ok(())
     }
 
     fn resident_handle_in_custody(&self, candidate: &ResidentHandle) -> bool {
