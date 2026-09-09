@@ -29,7 +29,28 @@ pub struct NativeTextResident {
 
 struct NativeTextResidentInner {
     pipeline: TextPipeline,
-    model: ManuallyDrop<Qwen35NativeExecutionModel>,
+    model: ExplicitReleaseOwner<Qwen35NativeExecutionModel>,
+}
+
+/// Keeps ordinary destruction unreachable until an explicit consuming path.
+struct ExplicitReleaseOwner<T> {
+    value: ManuallyDrop<T>,
+}
+
+impl<T> ExplicitReleaseOwner<T> {
+    const fn new(value: T) -> Self {
+        Self {
+            value: ManuallyDrop::new(value),
+        }
+    }
+
+    fn get(&self) -> &T {
+        &self.value
+    }
+
+    fn into_inner(self) -> T {
+        ManuallyDrop::into_inner(self.value)
+    }
 }
 
 /// Failure while creating a shared native text resident.
@@ -172,7 +193,7 @@ impl NativeTextResident {
         Ok(Self {
             inner: Arc::new(NativeTextResidentInner {
                 pipeline,
-                model: ManuallyDrop::new(model),
+                model: ExplicitReleaseOwner::new(model),
             }),
         })
     }
@@ -194,6 +215,7 @@ impl NativeTextResident {
         let session = self
             .inner
             .model
+            .get()
             .plan_session(prepared.context_tokens())
             .map_err(|source| NativeTextUsePlanFailure::NativePlan {
                 source,
@@ -211,24 +233,22 @@ impl NativeTextResident {
     pub fn close(self) -> NativeTextResidentClose {
         match Arc::try_unwrap(self.inner) {
             Err(inner) => NativeTextResidentClose::InUse(Self { inner }),
-            Ok(NativeTextResidentInner { pipeline, model }) => {
-                match ManuallyDrop::into_inner(model).close() {
-                    Qwen35NativeExecutionModelClose::InUse(model) => {
-                        NativeTextResidentClose::InUse(Self {
-                            inner: Arc::new(NativeTextResidentInner {
-                                pipeline,
-                                model: ManuallyDrop::new(model),
-                            }),
-                        })
-                    }
-                    Qwen35NativeExecutionModelClose::Teardown(inner) => {
-                        NativeTextResidentClose::Teardown(NativeTextResidentTeardown {
+            Ok(NativeTextResidentInner { pipeline, model }) => match model.into_inner().close() {
+                Qwen35NativeExecutionModelClose::InUse(model) => {
+                    NativeTextResidentClose::InUse(Self {
+                        inner: Arc::new(NativeTextResidentInner {
                             pipeline,
-                            inner,
-                        })
-                    }
+                            model: ExplicitReleaseOwner::new(model),
+                        }),
+                    })
                 }
-            }
+                Qwen35NativeExecutionModelClose::Teardown(inner) => {
+                    NativeTextResidentClose::Teardown(NativeTextResidentTeardown {
+                        pipeline,
+                        inner,
+                    })
+                }
+            },
         }
     }
 }
@@ -299,6 +319,9 @@ impl NativeTextUsePlan {
 
     /// Execute this exact planned use with caller-acquired recycled host storage.
     ///
+    /// Storage is validated and cancellation is observed before native session
+    /// construction can allocate any per-use resource.
+    ///
     /// Every native token output is explicitly released before another token is
     /// started. Generation is published only after both final output and session
     /// teardown are acknowledged; all other outcomes retain typed custody.
@@ -327,23 +350,61 @@ impl NativeTextUsePlan {
         }
         let Self {
             resident,
-            recycled_logits_plan: _,
+            recycled_logits_plan,
             session,
             prepared,
         } = self;
-        let session =
-            session
-                .into_session()
-                .map_err(|source| NativeTextGenerationFailure::Construction {
+        let construction = construct_unless_cancelled(
+            session,
+            cancellation,
+            Qwen35NativeExecutionSessionPlan::into_session,
+        );
+        match construction {
+            ConstructionAttempt::Cancelled(session) => {
+                Err(NativeTextGenerationFailure::Cancelled {
+                    plan: Box::new(Self {
+                        resident,
+                        recycled_logits_plan,
+                        session,
+                        prepared,
+                    }),
+                    storage,
+                })
+            }
+            ConstructionAttempt::Attempted(Err(source)) => {
+                Err(NativeTextGenerationFailure::Construction {
                     source: Box::new(source),
                     custody: NativeTextUseConstructionCustody {
                         _resident: resident,
                         _prepared: prepared,
                         _storage: storage,
                     },
-                })?;
-        // SAFETY: this method's contract supplies the per-token native qualification.
-        unsafe { generate_with_native_session(resident, prepared, session, storage, cancellation) }
+                })
+            }
+            ConstructionAttempt::Attempted(Ok(session)) => {
+                // SAFETY: this method's contract supplies the per-token native qualification.
+                unsafe {
+                    generate_with_native_session(resident, prepared, session, storage, cancellation)
+                }
+            }
+        }
+    }
+}
+
+enum ConstructionAttempt<Plan, Session, Error> {
+    Cancelled(Plan),
+    Attempted(Result<Session, Error>),
+}
+
+fn construct_unless_cancelled<Plan, Session, Error>(
+    plan: Plan,
+    cancellation: &dyn Cancellation,
+    construct: impl FnOnce(Plan) -> Result<Session, Error>,
+) -> ConstructionAttempt<Plan, Session, Error> {
+    if cancellation.is_cancelled() {
+        ConstructionAttempt::Cancelled(plan)
+    } else {
+        ConstructionAttempt::Attempted(construct(plan))
     }
 }
 
@@ -431,6 +492,61 @@ impl std::error::Error for NativeTextDriverError {
     }
 }
 
+impl NativeTextDriverError {
+    fn retry_release(self) -> Self {
+        match self {
+            Self::Copy { source, release } => Self::Copy {
+                source,
+                release: retry_buffer_release(release),
+            },
+            Self::OutputRelease { release } => Self::OutputRelease {
+                release: retry_buffer_release(release),
+            },
+            error => error,
+        }
+    }
+}
+
+enum RetryDisposition<Pending, Retained> {
+    Pending(Pending),
+    Retained(Retained),
+}
+
+impl<Pending, Retained> RetryDisposition<Pending, Retained> {
+    fn resolve<Output>(
+        self,
+        retry: impl FnOnce(Pending) -> Output,
+        retain: impl FnOnce(Retained) -> Output,
+    ) -> Output {
+        match self {
+            Self::Pending(pending) => retry(pending),
+            Self::Retained(retained) => retain(retained),
+        }
+    }
+}
+
+fn retry_buffer_release(release: BufferRelease) -> BufferRelease {
+    let disposition = match release {
+        BufferRelease::Pending(pending) => RetryDisposition::Pending(pending),
+        release => RetryDisposition::Retained(release),
+    };
+    disposition.resolve(
+        hipcore::PendingBufferTeardown::retry,
+        core::convert::identity,
+    )
+}
+
+fn retry_generation_source(
+    source: RecycledGenerationError<NativeTextDriverError>,
+) -> RecycledGenerationError<NativeTextDriverError> {
+    match source {
+        RecycledGenerationError::Driver { source } => RecycledGenerationError::Driver {
+            source: source.retry_release(),
+        },
+        source => source,
+    }
+}
+
 /// Explicit close custody for one native text use.
 #[must_use = "native session close retains its resident reference and teardown evidence"]
 pub struct NativeTextUseClose {
@@ -442,6 +558,43 @@ enum NativeTextUseCloseOutcome {
     Released,
     Teardown(Box<Qwen35NativeExecutionSessionTeardown>),
     Failed(decoders::Error),
+}
+
+trait ReleasedSessionTeardown: Sized {
+    fn consume_released(self) -> Result<(), Box<Self>>;
+}
+
+impl ReleasedSessionTeardown for Qwen35NativeExecutionSessionTeardown {
+    fn consume_released(self) -> Result<(), Box<Self>> {
+        match self.into_released_model() {
+            Ok(model) => {
+                drop(model);
+                Ok(())
+            }
+            Err(teardown) => Err(teardown),
+        }
+    }
+}
+
+enum SessionTeardownResolution<Resident, Teardown> {
+    Released(Resident),
+    Retained {
+        resident: Resident,
+        teardown: Box<Teardown>,
+    },
+}
+
+fn resolve_session_teardown<Resident, Teardown>(
+    resident: Resident,
+    teardown: Teardown,
+) -> SessionTeardownResolution<Resident, Teardown>
+where
+    Teardown: ReleasedSessionTeardown,
+{
+    match teardown.consume_released() {
+        Ok(()) => SessionTeardownResolution::Released(resident),
+        Err(teardown) => SessionTeardownResolution::Retained { resident, teardown },
+    }
 }
 
 impl NativeTextUseClose {
@@ -462,15 +615,17 @@ impl NativeTextUseClose {
         resident: Arc<NativeTextResidentInner>,
         teardown: Qwen35NativeExecutionSessionTeardown,
     ) -> Self {
-        if teardown.state() == Qwen35NativeExecutionSessionTeardownState::Released {
-            return Self {
+        // The outer resident stays owned across consumption of the session's
+        // recovered duplicate, so that duplicate can never be the last model.
+        match resolve_session_teardown(resident, teardown) {
+            SessionTeardownResolution::Released(resident) => Self {
                 resident,
                 outcome: NativeTextUseCloseOutcome::Released,
-            };
-        }
-        Self {
-            resident,
-            outcome: NativeTextUseCloseOutcome::Teardown(Box::new(teardown)),
+            },
+            SessionTeardownResolution::Retained { resident, teardown } => Self {
+                resident,
+                outcome: NativeTextUseCloseOutcome::Teardown(teardown),
+            },
         }
     }
 
@@ -601,7 +756,7 @@ impl NativeTextGenerationFailure {
     pub fn retry(self) -> Self {
         match self {
             Self::Execution { source, close } => Self::Execution {
-                source,
+                source: retry_generation_source(source),
                 close: close.retry(),
             },
             Self::Close { close } => Self::Close {
@@ -964,6 +1119,186 @@ mod tests {
         }
     }
 
+    struct DropProbe<'a> {
+        drops: &'a Cell<usize>,
+    }
+
+    impl Drop for DropProbe<'_> {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    struct SyntheticReleasedTeardown<'a> {
+        duplicate: DropProbe<'a>,
+    }
+
+    impl ReleasedSessionTeardown for SyntheticReleasedTeardown<'_> {
+        fn consume_released(self) -> Result<(), Box<Self>> {
+            drop(self.duplicate);
+            Ok(())
+        }
+    }
+
+    struct SyntheticClose<'a> {
+        released: bool,
+        drops: &'a Cell<usize>,
+    }
+
+    impl CloseAcknowledgement for SyntheticClose<'_> {
+        fn is_released(&self) -> bool {
+            self.released
+        }
+    }
+
+    impl Drop for SyntheticClose<'_> {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum SyntheticRelease {
+        Retried,
+        Quarantined,
+        Future,
+    }
+
+    #[test]
+    fn exact_pipeline_binding_refuses_a_sibling_preparation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_first_directory, first) = synthetic_pipeline(8)?;
+        let (_second_directory, second) = synthetic_pipeline(8)?;
+
+        assert!(bind_preparation(&first, prepared(&first)?).is_ok());
+        assert!(matches!(
+            bind_preparation(&first, prepared(&second)?),
+            Err(NativeTextUsePlanFailure::ForeignPreparation { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn preconstruction_cancellation_does_not_invoke_the_constructor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let calls = Cell::new(0);
+        let cancellation = CancelAt {
+            call: Cell::new(0),
+            cancelled_call: 0,
+        };
+        let attempt = construct_unless_cancelled(17_u32, &cancellation, |plan| {
+            calls.set(calls.get() + 1);
+            Ok::<u32, ()>(plan)
+        });
+        let ConstructionAttempt::Cancelled(plan) = attempt else {
+            return Err(std::io::Error::other("cancelled construction was attempted").into());
+        };
+
+        assert_eq!(plan, 17);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(cancellation.call.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn released_session_duplicate_is_consumed_while_resident_is_retained()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let resident_drops = Cell::new(0);
+        let duplicate_drops = Cell::new(0);
+        let resolution = resolve_session_teardown(
+            DropProbe {
+                drops: &resident_drops,
+            },
+            SyntheticReleasedTeardown {
+                duplicate: DropProbe {
+                    drops: &duplicate_drops,
+                },
+            },
+        );
+
+        assert_eq!(duplicate_drops.get(), 1);
+        assert_eq!(resident_drops.get(), 0);
+        let SessionTeardownResolution::Released(resident) = resolution else {
+            return Err(std::io::Error::other("released teardown remained retained").into());
+        };
+        drop(resident);
+        assert_eq!(resident_drops.get(), 1);
+        assert_eq!(duplicate_drops.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn nonreleased_close_withholds_output_and_retains_close()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let output_drops = Cell::new(0);
+        let close_drops = Cell::new(0);
+        let result = retain_before_publish::<_, (), _>(
+            Ok(DropProbe {
+                drops: &output_drops,
+            }),
+            SyntheticClose {
+                released: false,
+                drops: &close_drops,
+            },
+        );
+
+        assert_eq!(output_drops.get(), 1);
+        assert_eq!(close_drops.get(), 0);
+        let PublishAfterClose::Close { close } = result else {
+            return Err(std::io::Error::other("nonreleased close published output").into());
+        };
+        drop(close);
+        assert_eq!(close_drops.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn retry_transition_invokes_only_pending_release() {
+        let retries = Cell::new(0);
+        let retry = |_: ()| {
+            retries.set(retries.get() + 1);
+            SyntheticRelease::Retried
+        };
+
+        let pending = RetryDisposition::<(), SyntheticRelease>::Pending(());
+        assert_eq!(
+            pending.resolve(retry, core::convert::identity),
+            SyntheticRelease::Retried
+        );
+        let quarantine = RetryDisposition::<(), _>::Retained(SyntheticRelease::Quarantined);
+        assert_eq!(
+            quarantine.resolve(retry, core::convert::identity),
+            SyntheticRelease::Quarantined
+        );
+        let future = RetryDisposition::<(), _>::Retained(SyntheticRelease::Future);
+        assert_eq!(
+            future.resolve(retry, core::convert::identity),
+            SyntheticRelease::Future
+        );
+        assert_eq!(retries.get(), 1);
+    }
+
+    #[test]
+    fn shared_explicit_owner_never_drops_on_arc_abandonment() {
+        let abandoned_drops = Cell::new(0);
+        let owner = Arc::new(ExplicitReleaseOwner::new(DropProbe {
+            drops: &abandoned_drops,
+        }));
+        let sibling = Arc::clone(&owner);
+
+        drop(owner);
+        assert_eq!(abandoned_drops.get(), 0);
+        drop(sibling);
+        assert_eq!(abandoned_drops.get(), 0);
+
+        let released_drops = Cell::new(0);
+        let released = ExplicitReleaseOwner::new(DropProbe {
+            drops: &released_drops,
+        });
+        drop(released.into_inner());
+        assert_eq!(released_drops.get(), 1);
+    }
+
     #[test]
     fn prefill_releases_every_nonfinal_native_output() {
         let mut driver = SyntheticDriver::default();
@@ -1020,7 +1355,7 @@ mod tests {
     fn native_failure_keeps_later_outputs_unvisited() {
         let mut driver = SyntheticDriver {
             fails_on: Some(52),
-            ..Self::default()
+            ..SyntheticDriver::default()
         };
         let mut logits = [0.0];
         let cancellation = CancelAt {
