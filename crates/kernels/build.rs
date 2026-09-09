@@ -154,11 +154,13 @@ fn compile_sources(
                 "-I",
             ])
             .arg(out_dir);
-        if src.file_name().is_some_and(|name| name == "q8_0_gemv.hip") {
-            // This correctness baseline must retain separately rounded
-            // decode/product/add operations. Scope the no-fast-math and no
-            // contraction rules to this source, rather than changing the
-            // numerical contract of the rest of the HIP archive.
+        if src
+            .file_name()
+            .is_some_and(|name| name == "q8_0_gemv.hip" || name == "gdn_step.hip")
+        {
+            // WHY: these correctness baselines retain separately rounded f32
+            // operations. Scope no-fast-math and no contraction to their
+            // sources rather than changing the rest of the HIP archive.
             command.args(["-fno-fast-math", "-ffp-contract=off"]);
         }
         // kanon:ignore RUST/no-direct-process-command -- invoking hipcc is the build script's purpose

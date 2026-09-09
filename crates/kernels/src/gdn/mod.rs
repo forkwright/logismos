@@ -1,15 +1,53 @@
 //! Bounded CPU references for single-head and grouped Gated Delta Rule recurrence.
 //!
 //! This module accepts dense single-head and grouped multi-head recurrent input.
-//! It is a correctness oracle for a future device kernel, not a model adapter or
-//! a permissive fallback for unsupported GDN variants.
+//! It provides a correctness oracle plus a staged device step, not a model
+//! adapter or a permissive fallback for unsupported GDN variants.
 //! Bounds describe admitted shapes and exact logical `f32` requests. Every
 //! owned output or scratch vector is reserved fallibly; this is not a process
 //! RSS, allocator-overhead, or physical-memory guarantee.
 
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
+use std::ffi::c_void;
+
+#[cfg(feature = "gpu")]
+use hipcore::Stream;
 use snafu::{ResultExt, Snafu};
 
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
+use crate::error::LaunchSnafu;
+#[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
+use crate::error::NoGpuBuildSnafu;
+#[cfg(feature = "gpu")]
+use crate::error::Result;
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+use crate::error::UnsupportedShapeSnafu;
+
 const GDN_RECURRENCE: &str = "gdn_recurrent_fwd";
+#[cfg(feature = "gpu")]
+const GDN_GROUPED_STEP_KERNEL: &str = "gdn_grouped_step_f32";
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+const MAX_GDN_VALUE_DIM: usize = 1024;
+
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
+unsafe extern "C" {
+    fn logismos_launch_gdn_grouped_step_f32(
+        q_f32: *const c_void,
+        k_f32: *const c_void,
+        v_f32: *const c_void,
+        beta_f32: *const c_void,
+        g_f32: *const c_void,
+        state_in_f32: *const c_void,
+        state_out_f32: *mut c_void,
+        output_f32: *mut c_void,
+        scale: f32,
+        key_head_count: u32,
+        value_head_count: u32,
+        key_dim: u32,
+        value_dim: u32,
+        stream: *mut c_void,
+    ) -> u32;
+}
 
 /// Result alias for the bounded GDN reference.
 pub type GdnResult<T> = core::result::Result<T, GdnError>;
@@ -24,6 +62,11 @@ pub type GdnResult<T> = core::result::Result<T, GdnError>;
 /// its dimension arithmetic or inventing model-level coefficients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MultiHeadRecurrentAllocationPlan {
+    token_count: usize,
+    key_head_count: usize,
+    value_head_count: usize,
+    key_dim: usize,
+    value_dim: usize,
     query_and_key_elements: usize,
     output_elements: usize,
     scalar_elements: usize,
@@ -91,6 +134,11 @@ impl MultiHeadRecurrentAllocationPlan {
         .into_iter()
         .try_fold(0_usize, checked_allocation_sum)?;
         Ok(Self {
+            token_count,
+            key_head_count,
+            value_head_count,
+            key_dim,
+            value_dim,
             query_and_key_elements,
             output_elements,
             scalar_elements,
@@ -106,10 +154,52 @@ impl MultiHeadRecurrentAllocationPlan {
         self.output_elements
     }
 
+    /// Return the admitted token count.
+    #[must_use]
+    pub const fn token_count(self) -> usize {
+        self.token_count
+    }
+
+    /// Return the admitted key/query-head count.
+    #[must_use]
+    pub const fn key_head_count(self) -> usize {
+        self.key_head_count
+    }
+
+    /// Return the admitted value-head count.
+    #[must_use]
+    pub const fn value_head_count(self) -> usize {
+        self.value_head_count
+    }
+
+    /// Return the admitted per-head key/query width.
+    #[must_use]
+    pub const fn key_dim(self) -> usize {
+        self.key_dim
+    }
+
+    /// Return the admitted per-head value width.
+    #[must_use]
+    pub const fn value_dim(self) -> usize {
+        self.value_dim
+    }
+
     /// Return the aggregate final-state request.
     #[must_use]
     pub const fn state_elements(self) -> usize {
         self.state_elements
+    }
+
+    /// Return the aggregate head-major query/key request.
+    #[must_use]
+    pub const fn query_and_key_elements(self) -> usize {
+        self.query_and_key_elements
+    }
+
+    /// Return the aggregate head-major beta or gate request.
+    #[must_use]
+    pub const fn scalar_elements(self) -> usize {
+        self.scalar_elements
     }
 
     /// Return one concurrently evaluated head's output request.
@@ -144,14 +234,6 @@ impl MultiHeadRecurrentAllocationPlan {
 
     const fn head_allocations(self) -> RecurrentAllocationPlan {
         self.head
-    }
-
-    const fn query_and_key_elements(self) -> usize {
-        self.query_and_key_elements
-    }
-
-    const fn scalar_elements(self) -> usize {
-        self.scalar_elements
     }
 }
 
@@ -652,6 +734,331 @@ pub fn multi_head_recurrent_fwd(
     Ok(MultiHeadRecurrentOutput { output, state })
 }
 
+#[cfg(feature = "gpu")]
+/// Launch one staged, grouped, dense-f32 GDN decode step on `stream`.
+///
+/// `plan` owns the sole shape interpretation: the admitted step has `T = 1`,
+/// `q/k: [Hk, K]`, `v: [Hv, V]`, `beta/g: [Hv]`, `state_in/out: [Hv, K, V]`,
+/// and `output: [Hv, V]`. Value head `h` reads key/query head
+/// `h / (Hv / Hk)`. `state_in_f32` remains immutable; the kernel writes all
+/// of `state_out_f32` and `output_f32` as separate staged results. It is not a
+/// decoder, cache, or active-session integration path.
+///
+/// The one-thread-per-value-column implementation serializes the key axis.
+/// It uses natural `exp(g)` and, like [`recurrent_fwd`], adds
+/// `(state * q) * scale` for each key term rather than scaling a completed
+/// sum. The source-scoped HIP flags disable fast math and contraction.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedShape`] when `plan` is not a one-token
+/// dense-f32 step, the value width exceeds this baseline's one-block profile,
+/// a declared buffer length differs from `plan`, a span is null, unaligned,
+/// unrepresentable, overlaps a writable result, or a dimension cannot cross
+/// the `u32` HIP ABI. A CPU-only build returns [`crate::Error::NoGpuBuild`]
+/// without initializing HIP. It propagates stream-current failures and
+/// returns [`crate::Error::Launch`] when HIP rejects the kernel submission.
+///
+/// # Safety
+///
+/// Each pointer must designate a live allocation on `stream`'s device for the
+/// exact declared `f32` element count through stream completion. The two
+/// writable spans must not alias each other or any input; inputs may alias
+/// other inputs. Both writable spans require exclusive access through stream
+/// completion: no other GPU command or host alias may read or write either
+/// span. No producer may modify any input through stream completion.
+///
+/// Device contents are not inspectable at this boundary. Callers must ensure
+/// every input, `scale`, and every recurrence intermediate is finite and
+/// either zero or normal `f32`; in particular, `exp(g)`, next-state values,
+/// and output values must remain finite. Subnormal-dependent behavior is not
+/// qualified. The kernel has no status channel and therefore cannot reproduce
+/// the CPU reference's non-finite-input or arithmetic refusals.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the eight buffers, scale, and stream are the fixed staged GDN step ABI"
+)]
+pub unsafe fn launch_multi_head_recurrent_step_f32(
+    plan: MultiHeadRecurrentAllocationPlan,
+    q_f32: *const f32,
+    q_elements: usize,
+    k_f32: *const f32,
+    k_elements: usize,
+    v_f32: *const f32,
+    v_elements: usize,
+    beta_f32: *const f32,
+    beta_elements: usize,
+    g_f32: *const f32,
+    g_elements: usize,
+    scale: f32,
+    state_in_f32: *const f32,
+    state_in_elements: usize,
+    state_out_f32: *mut f32,
+    state_out_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = (
+            plan,
+            q_f32,
+            q_elements,
+            k_f32,
+            k_elements,
+            v_f32,
+            v_elements,
+            beta_f32,
+            beta_elements,
+            g_f32,
+            g_elements,
+            scale,
+            state_in_f32,
+            state_in_elements,
+            state_out_f32,
+            state_out_elements,
+            output_f32,
+            output_elements,
+            stream,
+        );
+        no_gpu_gdn_step_refusal()
+    }
+
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        let abi = validate_gdn_step_launch(
+            plan,
+            q_f32,
+            q_elements,
+            k_f32,
+            k_elements,
+            v_f32,
+            v_elements,
+            beta_f32,
+            beta_elements,
+            g_f32,
+            g_elements,
+            scale,
+            state_in_f32,
+            state_in_elements,
+            state_out_f32,
+            state_out_elements,
+            output_f32,
+            output_elements,
+        )?;
+        stream.make_current()?;
+        // SAFETY: the caller upholds device ownership, lifetime, concurrent
+        // access, and numerical-domain obligations documented above; checked
+        // spans and the allocation-plan owner established exact extents,
+        // alignment, non-aliasing results, and ABI dimensions.
+        let code = unsafe {
+            logismos_launch_gdn_grouped_step_f32(
+                q_f32.cast::<c_void>(),
+                k_f32.cast::<c_void>(),
+                v_f32.cast::<c_void>(),
+                beta_f32.cast::<c_void>(),
+                g_f32.cast::<c_void>(),
+                state_in_f32.cast::<c_void>(),
+                state_out_f32.cast::<c_void>(),
+                output_f32.cast::<c_void>(),
+                scale,
+                abi.key_head_count,
+                abi.value_head_count,
+                abi.key_dim,
+                abi.value_dim,
+                stream.raw().cast::<c_void>(),
+            )
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            LaunchSnafu {
+                kernel: GDN_GROUPED_STEP_KERNEL,
+                kind: hipcore::ErrorKind::from_raw(code),
+                code,
+            }
+            .fail()
+        }
+    }
+}
+
+#[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
+fn no_gpu_gdn_step_refusal() -> Result<()> {
+    NoGpuBuildSnafu {
+        kernel: GDN_GROUPED_STEP_KERNEL,
+    }
+    .fail()
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[derive(Clone, Copy)]
+struct GdnStepAbi {
+    key_head_count: u32,
+    value_head_count: u32,
+    key_dim: u32,
+    value_dim: u32,
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[derive(Clone, Copy)]
+struct DeviceSpan {
+    start: usize,
+    end: usize,
+    name: &'static str,
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validation receives the fixed raw staged GDN step ABI without constructing a second shape owner"
+)]
+fn validate_gdn_step_launch(
+    plan: MultiHeadRecurrentAllocationPlan,
+    q_f32: *const f32,
+    q_elements: usize,
+    k_f32: *const f32,
+    k_elements: usize,
+    v_f32: *const f32,
+    v_elements: usize,
+    beta_f32: *const f32,
+    beta_elements: usize,
+    g_f32: *const f32,
+    g_elements: usize,
+    scale: f32,
+    state_in_f32: *const f32,
+    state_in_elements: usize,
+    state_out_f32: *mut f32,
+    state_out_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+) -> Result<GdnStepAbi> {
+    if plan.token_count() != 1 {
+        return unsupported_gdn_step_shape(format!(
+            "only dense-f32 T=1 decode steps are supported, got T={}",
+            plan.token_count()
+        ));
+    }
+    if plan.value_dim() > MAX_GDN_VALUE_DIM {
+        return unsupported_gdn_step_shape(format!(
+            "value_dim {} exceeds the one-block dense-f32 profile limit {MAX_GDN_VALUE_DIM}",
+            plan.value_dim()
+        ));
+    }
+    if !(scale == 0.0 || scale.is_normal()) {
+        return unsupported_gdn_step_shape(
+            "scale must be zero or normal finite f32 for the declared device-input domain"
+                .to_string(),
+        );
+    }
+
+    validate_gdn_step_length("q", q_elements, plan.query_and_key_elements())?;
+    validate_gdn_step_length("k", k_elements, plan.query_and_key_elements())?;
+    validate_gdn_step_length("v", v_elements, plan.output_elements())?;
+    validate_gdn_step_length("beta", beta_elements, plan.scalar_elements())?;
+    validate_gdn_step_length("g", g_elements, plan.scalar_elements())?;
+    validate_gdn_step_length("state_in", state_in_elements, plan.state_elements())?;
+    validate_gdn_step_length("state_out", state_out_elements, plan.state_elements())?;
+    validate_gdn_step_length("output", output_elements, plan.output_elements())?;
+
+    let inputs = [
+        checked_device_span(q_f32, q_elements, "q")?,
+        checked_device_span(k_f32, k_elements, "k")?,
+        checked_device_span(v_f32, v_elements, "v")?,
+        checked_device_span(beta_f32, beta_elements, "beta")?,
+        checked_device_span(g_f32, g_elements, "g")?,
+        checked_device_span(state_in_f32, state_in_elements, "state_in")?,
+    ];
+    let state_out =
+        checked_device_span(state_out_f32.cast_const(), state_out_elements, "state_out")?;
+    let output = checked_device_span(output_f32.cast_const(), output_elements, "output")?;
+    for input in inputs {
+        reject_overlapping_gdn_step_spans(state_out, input)?;
+        reject_overlapping_gdn_step_spans(output, input)?;
+    }
+    reject_overlapping_gdn_step_spans(state_out, output)?;
+
+    Ok(GdnStepAbi {
+        key_head_count: gdn_step_u32("key_head_count", plan.key_head_count())?,
+        value_head_count: gdn_step_u32("value_head_count", plan.value_head_count())?,
+        key_dim: gdn_step_u32("key_dim", plan.key_dim())?,
+        value_dim: gdn_step_u32("value_dim", plan.value_dim())?,
+    })
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn validate_gdn_step_length(name: &'static str, actual: usize, expected: usize) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        unsupported_gdn_step_shape(format!(
+            "{name} length {actual} does not match allocation-plan extent {expected}"
+        ))
+    }
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn checked_device_span(
+    pointer: *const f32,
+    elements: usize,
+    name: &'static str,
+) -> Result<DeviceSpan> {
+    if pointer.is_null() {
+        return unsupported_gdn_step_shape(format!("{name} must be non-null"));
+    }
+    if !pointer.addr().is_multiple_of(core::mem::align_of::<f32>()) {
+        return unsupported_gdn_step_shape(format!("{name} must be aligned for f32"));
+    }
+    let layout = std::alloc::Layout::array::<f32>(elements).map_err(|_| {
+        UnsupportedShapeSnafu {
+            kernel: GDN_GROUPED_STEP_KERNEL,
+            msg: format!("{name} length {elements} exceeds the Rust allocation layout domain"),
+        }
+        .build()
+    })?;
+    let start = pointer.addr();
+    let end = start.checked_add(layout.size()).ok_or_else(|| {
+        UnsupportedShapeSnafu {
+            kernel: GDN_GROUPED_STEP_KERNEL,
+            msg: format!("{name} device span overflows the address domain"),
+        }
+        .build()
+    })?;
+    Ok(DeviceSpan { start, end, name })
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn reject_overlapping_gdn_step_spans(left: DeviceSpan, right: DeviceSpan) -> Result<()> {
+    if left.start < right.end && right.start < left.end {
+        unsupported_gdn_step_shape(format!(
+            "writable {} span aliases {} span",
+            left.name, right.name
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn gdn_step_u32(name: &'static str, value: usize) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        UnsupportedShapeSnafu {
+            kernel: GDN_GROUPED_STEP_KERNEL,
+            msg: format!("{name} {value} exceeds the HIP ABI u32 domain"),
+        }
+        .build()
+    })
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn unsupported_gdn_step_shape<T>(msg: String) -> Result<T> {
+    UnsupportedShapeSnafu {
+        kernel: GDN_GROUPED_STEP_KERNEL,
+        msg,
+    }
+    .fail()
+}
+
 fn checked_product(left: usize, right: usize, dimensions: &'static str) -> GdnResult<usize> {
     left.checked_mul(right)
         .ok_or_else(|| DimensionProductOverflowSnafu { dimensions }.build())
@@ -1045,6 +1452,351 @@ mod tests {
             assert_close(actual.state(), &expected_state, "multi-head state");
         }
         Ok(())
+    }
+
+    #[test]
+    fn one_token_grouped_and_pre_tiled_profiles_match_independent_f64_oracle() -> GdnResult<()> {
+        for (key_head_count, value_head_count) in [(KEY_HEAD_COUNT, VALUE_HEAD_COUNT), (2, 2)] {
+            let fixture = multi_head_fixture(key_head_count, value_head_count);
+            let q = head_major_token_window(&fixture.q, key_head_count, TOKEN_COUNT, KEY_DIM, 0, 1);
+            let k = head_major_token_window(&fixture.k, key_head_count, TOKEN_COUNT, KEY_DIM, 0, 1);
+            let v = head_major_token_window(
+                &fixture.v,
+                value_head_count,
+                TOKEN_COUNT,
+                MULTI_HEAD_VALUE_DIM,
+                0,
+                1,
+            );
+            let beta =
+                head_major_token_window(&fixture.beta, value_head_count, TOKEN_COUNT, 1, 0, 1);
+            let g = head_major_token_window(&fixture.g, value_head_count, TOKEN_COUNT, 1, 0, 1);
+            let input = multi_head_input(
+                &q,
+                &k,
+                &v,
+                &beta,
+                &g,
+                &fixture.state,
+                1,
+                key_head_count,
+                value_head_count,
+            )?;
+            let actual = multi_head_recurrent_fwd(&input)?;
+            let (expected_output, expected_state) = oracle_multi_head_recurrence(
+                &q,
+                &k,
+                &v,
+                &beta,
+                &g,
+                SCALE,
+                &fixture.state,
+                1,
+                key_head_count,
+                value_head_count,
+                KEY_DIM,
+                MULTI_HEAD_VALUE_DIM,
+            );
+
+            assert_close(actual.output(), &expected_output, "one-token output");
+            assert_close(actual.state(), &expected_state, "one-token next state");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    struct ValidGdnStepBuffers {
+        q: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        beta: Vec<f32>,
+        g: Vec<f32>,
+        state_in: Vec<f32>,
+        state_out: Vec<f32>,
+        output: Vec<f32>,
+    }
+
+    #[cfg(feature = "gpu")]
+    impl ValidGdnStepBuffers {
+        fn from_plan(plan: MultiHeadRecurrentAllocationPlan) -> Self {
+            Self {
+                q: vec![1.0_f32; plan.query_and_key_elements()],
+                k: vec![1.0_f32; plan.query_and_key_elements()],
+                v: vec![1.0_f32; plan.output_elements()],
+                beta: vec![1.0_f32; plan.scalar_elements()],
+                g: vec![0.0_f32; plan.scalar_elements()],
+                state_in: vec![0.0_f32; plan.state_elements()],
+                state_out: vec![0.0_f32; plan.state_elements()],
+                output: vec![0.0_f32; plan.output_elements()],
+            }
+        }
+
+        fn validate(
+            &mut self,
+            plan: MultiHeadRecurrentAllocationPlan,
+            scale: f32,
+        ) -> Result<GdnStepAbi> {
+            validate_gdn_step_launch(
+                plan,
+                self.q.as_ptr(),
+                self.q.len(),
+                self.k.as_ptr(),
+                self.k.len(),
+                self.v.as_ptr(),
+                self.v.len(),
+                self.beta.as_ptr(),
+                self.beta.len(),
+                self.g.as_ptr(),
+                self.g.len(),
+                scale,
+                self.state_in.as_ptr(),
+                self.state_in.len(),
+                self.state_out.as_mut_ptr(),
+                self.state_out.len(),
+                self.output.as_mut_ptr(),
+                self.output.len(),
+            )
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn staged_gpu_step_refuses_unsupported_shape_alias_and_overflow()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let two_token_plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(2, 1, 1, 1, 1)?;
+        let mut two_token_buffers = ValidGdnStepBuffers::from_plan(two_token_plan);
+        assert!(matches!(
+            two_token_buffers.validate(two_token_plan, 1.0),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+
+        let plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 1, 1, 1, 1)?;
+        let q = [1.0_f32];
+        let k = [1.0_f32];
+        let v = [1.0_f32];
+        let beta = [1.0_f32];
+        let g = [0.0_f32];
+        let state = [0.0_f32];
+        let mut output = [0.0_f32];
+        let grouped_plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 2, 4, 3, 2)?;
+        let mut grouped_buffers = ValidGdnStepBuffers::from_plan(grouped_plan);
+        let abi = grouped_buffers.validate(grouped_plan, 1.0)?;
+        assert_eq!(
+            (
+                abi.key_head_count,
+                abi.value_head_count,
+                abi.key_dim,
+                abi.value_dim,
+            ),
+            (2, 4, 3, 2),
+            "the checked ABI must preserve the allocation owner's grouped geometry"
+        );
+        let too_wide_plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(
+            1,
+            1,
+            1,
+            1,
+            MAX_GDN_VALUE_DIM + 1,
+        )?;
+        let mut too_wide_buffers = ValidGdnStepBuffers::from_plan(too_wide_plan);
+        assert!(matches!(
+            too_wide_buffers.validate(too_wide_plan, 1.0),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        for invalid_scale in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MIN_POSITIVE / 2.0,
+            -f32::MIN_POSITIVE / 2.0,
+        ] {
+            assert!(matches!(
+                grouped_buffers.validate(grouped_plan, invalid_scale),
+                Err(crate::Error::UnsupportedShape { .. })
+            ));
+        }
+        grouped_buffers.q.clear();
+        assert!(matches!(
+            grouped_buffers.validate(grouped_plan, 1.0),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        assert!(matches!(
+            validate_gdn_step_launch(
+                plan,
+                q.as_ptr(),
+                q.len(),
+                k.as_ptr(),
+                k.len(),
+                v.as_ptr(),
+                v.len(),
+                beta.as_ptr(),
+                beta.len(),
+                g.as_ptr(),
+                g.len(),
+                1.0,
+                state.as_ptr(),
+                state.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            ),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        assert!(matches!(
+            validate_gdn_step_launch(
+                plan,
+                q.as_ptr(),
+                q.len(),
+                k.as_ptr(),
+                k.len(),
+                v.as_ptr(),
+                v.len(),
+                beta.as_ptr(),
+                beta.len(),
+                g.as_ptr(),
+                g.len(),
+                1.0,
+                state.as_ptr(),
+                state.len(),
+                state.as_ptr().cast_mut(),
+                state.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            ),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        assert!(matches!(
+            checked_device_span(
+                core::ptr::NonNull::<f32>::dangling().as_ptr(),
+                usize::MAX,
+                "overflow"
+            ),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        if let Ok(abi_overflow) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(matches!(
+                gdn_step_u32("abi overflow", abi_overflow),
+                Err(crate::Error::UnsupportedShape { .. })
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
+    fn reserved_device_grouped_step_matches_oracle_for_grouped_equal_and_continuation()
+    -> core::result::Result<(), String> {
+        use hipcore::{Device, DeviceBuffer, Stream};
+
+        let device = Device::new(0).map_err(|error| format!("open reserved device 0: {error}"))?;
+        let stream = Stream::new(&device).map_err(|error| format!("create stream: {error}"))?;
+
+        for (key_head_count, value_head_count) in [(KEY_HEAD_COUNT, VALUE_HEAD_COUNT), (2, 2)] {
+            let fixture = multi_head_fixture(key_head_count, value_head_count);
+            let first = grouped_token_inputs(&fixture, key_head_count, value_head_count, 0);
+            let second = grouped_token_inputs(&fixture, key_head_count, value_head_count, 1);
+            let plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(
+                1,
+                key_head_count,
+                value_head_count,
+                KEY_DIM,
+                MULTI_HEAD_VALUE_DIM,
+            )
+            .map_err(|error| format!("build one-token plan: {error}"))?;
+            let state_in = DeviceBuffer::<f32>::from_host(&device, &fixture.state)
+                .map_err(|error| format!("upload initial state: {error}"))?;
+
+            let (first_output, first_state) =
+                launch_reserved_device_step(&device, &stream, plan, &first, &state_in)?;
+            let (second_output, second_state) =
+                launch_reserved_device_step(&device, &stream, plan, &second, &first_state)?;
+            let actual_first_output = read_reserved_device_buffer(&first_output)?;
+            let actual_first_state = read_reserved_device_buffer(&first_state)?;
+            let actual_second_output = read_reserved_device_buffer(&second_output)?;
+            let actual_second_state = read_reserved_device_buffer(&second_state)?;
+            let (expected_first_output, expected_first_state) = oracle_multi_head_recurrence(
+                &first.q,
+                &first.k,
+                &first.v,
+                &first.beta,
+                &first.g,
+                SCALE,
+                &fixture.state,
+                1,
+                key_head_count,
+                value_head_count,
+                KEY_DIM,
+                MULTI_HEAD_VALUE_DIM,
+            );
+            let q = head_major_token_window(&fixture.q, key_head_count, TOKEN_COUNT, KEY_DIM, 0, 2);
+            let k = head_major_token_window(&fixture.k, key_head_count, TOKEN_COUNT, KEY_DIM, 0, 2);
+            let v = head_major_token_window(
+                &fixture.v,
+                value_head_count,
+                TOKEN_COUNT,
+                MULTI_HEAD_VALUE_DIM,
+                0,
+                2,
+            );
+            let beta =
+                head_major_token_window(&fixture.beta, value_head_count, TOKEN_COUNT, 1, 0, 2);
+            let g = head_major_token_window(&fixture.g, value_head_count, TOKEN_COUNT, 1, 0, 2);
+            let (expected_full_output, expected_full_state) = oracle_multi_head_recurrence(
+                &q,
+                &k,
+                &v,
+                &beta,
+                &g,
+                SCALE,
+                &fixture.state,
+                2,
+                key_head_count,
+                value_head_count,
+                KEY_DIM,
+                MULTI_HEAD_VALUE_DIM,
+            );
+
+            assert_close(
+                &actual_first_output,
+                &expected_first_output,
+                "device one-token output",
+            );
+            assert_close(
+                &actual_first_state,
+                &expected_first_state,
+                "device one-token next state",
+            );
+            let actual_full_output = join_head_major_outputs(
+                &actual_first_output,
+                &actual_second_output,
+                value_head_count,
+                1,
+                1,
+                MULTI_HEAD_VALUE_DIM,
+            );
+            assert_close(
+                &actual_full_output,
+                &expected_full_output,
+                "device continuation output",
+            );
+            assert_close(
+                &actual_second_state,
+                &expected_full_state,
+                "device continuation next state",
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
+    #[test]
+    fn staged_gpu_step_cpu_only_witness_never_initializes_hip() {
+        assert!(matches!(
+            no_gpu_gdn_step_refusal(),
+            Err(crate::Error::NoGpuBuild { .. })
+        ));
     }
 
     #[test]
@@ -1481,6 +2233,133 @@ mod tests {
             g: gate_values(value_head_count * TOKEN_COUNT),
             state: fixture_values(value_head_count * KEY_DIM * MULTI_HEAD_VALUE_DIM, 0.125),
         }
+    }
+
+    struct GroupedTokenInputs {
+        q: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        beta: Vec<f32>,
+        g: Vec<f32>,
+    }
+
+    fn grouped_token_inputs(
+        fixture: &MultiHeadFixture,
+        key_head_count: usize,
+        value_head_count: usize,
+        token_index: usize,
+    ) -> GroupedTokenInputs {
+        let end_token = token_index + 1;
+        GroupedTokenInputs {
+            q: head_major_token_window(
+                &fixture.q,
+                key_head_count,
+                TOKEN_COUNT,
+                KEY_DIM,
+                token_index,
+                end_token,
+            ),
+            k: head_major_token_window(
+                &fixture.k,
+                key_head_count,
+                TOKEN_COUNT,
+                KEY_DIM,
+                token_index,
+                end_token,
+            ),
+            v: head_major_token_window(
+                &fixture.v,
+                value_head_count,
+                TOKEN_COUNT,
+                MULTI_HEAD_VALUE_DIM,
+                token_index,
+                end_token,
+            ),
+            beta: head_major_token_window(
+                &fixture.beta,
+                value_head_count,
+                TOKEN_COUNT,
+                1,
+                token_index,
+                end_token,
+            ),
+            g: head_major_token_window(
+                &fixture.g,
+                value_head_count,
+                TOKEN_COUNT,
+                1,
+                token_index,
+                end_token,
+            ),
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn launch_reserved_device_step(
+        device: &hipcore::Device,
+        stream: &hipcore::Stream,
+        plan: MultiHeadRecurrentAllocationPlan,
+        input: &GroupedTokenInputs,
+        state_in: &hipcore::DeviceBuffer<f32>,
+    ) -> core::result::Result<(hipcore::DeviceBuffer<f32>, hipcore::DeviceBuffer<f32>), String>
+    {
+        let q = hipcore::DeviceBuffer::<f32>::from_host(device, &input.q)
+            .map_err(|error| format!("upload q: {error}"))?;
+        let k = hipcore::DeviceBuffer::<f32>::from_host(device, &input.k)
+            .map_err(|error| format!("upload k: {error}"))?;
+        let v = hipcore::DeviceBuffer::<f32>::from_host(device, &input.v)
+            .map_err(|error| format!("upload v: {error}"))?;
+        let beta = hipcore::DeviceBuffer::<f32>::from_host(device, &input.beta)
+            .map_err(|error| format!("upload beta: {error}"))?;
+        let g = hipcore::DeviceBuffer::<f32>::from_host(device, &input.g)
+            .map_err(|error| format!("upload g: {error}"))?;
+        let state_out = hipcore::DeviceBuffer::<f32>::alloc(device, plan.state_elements())
+            .map_err(|error| format!("allocate next state: {error}"))?;
+        let output = hipcore::DeviceBuffer::<f32>::alloc(device, plan.output_elements())
+            .map_err(|error| format!("allocate output: {error}"))?;
+
+        // SAFETY: each typed device buffer has the allocation-plan-derived
+        // extent, stays live through synchronization, and writable buffers
+        // are distinct from every immutable input.
+        unsafe {
+            launch_multi_head_recurrent_step_f32(
+                plan,
+                q.as_device_ptr(),
+                q.len(),
+                k.as_device_ptr(),
+                k.len(),
+                v.as_device_ptr(),
+                v.len(),
+                beta.as_device_ptr(),
+                beta.len(),
+                g.as_device_ptr(),
+                g.len(),
+                SCALE,
+                state_in.as_device_ptr(),
+                state_in.len(),
+                state_out.as_device_ptr(),
+                state_out.len(),
+                output.as_device_ptr(),
+                output.len(),
+                stream,
+            )
+            .map_err(|error| format!("launch grouped GDN step: {error}"))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize grouped GDN step: {error}"))?;
+        Ok((output, state_out))
+    }
+
+    #[cfg(feature = "gpu")]
+    fn read_reserved_device_buffer(
+        buffer: &hipcore::DeviceBuffer<f32>,
+    ) -> core::result::Result<Vec<f32>, String> {
+        let mut host = vec![0.0_f32; buffer.len()];
+        buffer
+            .copy_to_host(&mut host)
+            .map_err(|error| format!("read staged device result: {error}"))?;
+        Ok(host)
     }
 
     fn fixture_values(element_count: usize, offset: f32) -> Vec<f32> {
