@@ -668,22 +668,70 @@ impl ReservationLedger {
         device_id: &str,
         bytes: RequestedDeviceBytes,
     ) -> Result<DeviceByteLease, DeviceByteReservationError> {
-        self.require_reservable_device(device_id)?;
-        let reservations = [(device_id, bytes.get())];
+        let (lease, _) = self.reserve_bytes_batch(device_id, bytes, None)?;
+        Ok(lease)
+    }
+
+    /// Atomically reserve one mandatory and one optional requested-byte extent.
+    ///
+    /// Both extents compete with every v1 and requested-byte lease in this
+    /// ledger. Every device and aggregate capacity check completes before any
+    /// reservation, lease identifier, or revision is mutated. This is
+    /// in-process requested accounting only; it neither allocates device
+    /// memory nor extends the placement JSON contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns one typed in-process refusal without mutating this ledger when
+    /// either extent is unknown, unavailable, unsupported, exhausted, or
+    /// cannot be represented by checked accounting.
+    pub fn reserve_bytes_batch(
+        &mut self,
+        first_device_id: &str,
+        first_bytes: RequestedDeviceBytes,
+        second: Option<(&str, RequestedDeviceBytes)>,
+    ) -> Result<(DeviceByteLease, Option<DeviceByteLease>), DeviceByteReservationError> {
+        self.require_reservable_device(first_device_id)?;
+        if let Some((device_id, _)) = second {
+            self.require_reservable_device(device_id)?;
+        }
+        let mut reservations = vec![(first_device_id, first_bytes.get())];
+        if let Some((device_id, bytes)) = second {
+            reservations.push((device_id, bytes.get()));
+        }
         let commit = self
             .prepare_reservation(&reservations)
             .map_err(DeviceByteReservationError::from)?;
-        let lease = LeaseCapability {
-            brand: Arc::clone(&self.brand),
-            lease_id: commit.first_lease_id,
-            device_id: device_id.to_owned(),
-            reserved_bytes: bytes.get(),
+        let first = DeviceByteLease {
+            lease: LeaseCapability {
+                brand: Arc::clone(&self.brand),
+                lease_id: commit.first_lease_id,
+                device_id: first_device_id.to_owned(),
+                reserved_bytes: first_bytes.get(),
+            },
+            requested_bytes: first_bytes,
+        };
+        let second = if let Some((device_id, bytes)) = second {
+            let lease_id = commit.first_lease_id.checked_add(1).ok_or(
+                DeviceByteReservationError::RequestedByteArithmeticOverflow {
+                    scope: "requested-byte batch lease identifier",
+                    location: error_location(),
+                },
+            )?;
+            Some(DeviceByteLease {
+                lease: LeaseCapability {
+                    brand: Arc::clone(&self.brand),
+                    lease_id,
+                    device_id: device_id.to_owned(),
+                    reserved_bytes: bytes.get(),
+                },
+                requested_bytes: bytes,
+            })
+        } else {
+            None
         };
         self.apply_reservation(commit, &reservations);
-        Ok(DeviceByteLease {
-            lease,
-            requested_bytes: bytes,
-        })
+        Ok((first, second))
     }
 
     /// Release one committed reservation.
@@ -1823,6 +1871,43 @@ mod contract_tests {
         ledger
             .release(v1_lease)
             .map_err(|failure| failure.into_parts().0)?;
+        assert!(ledger.dynamic_reserved.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn requested_byte_batch_is_atomic_and_returns_independent_leases()
+    -> Result<(), PlacementRefusal> {
+        let input = plan_input(
+            r#"[{"id":"w7900","gfx_isa":"gfx1100","total_bytes":10,"reserved_bytes":0,"availability":"available"}]"#,
+            "[]",
+            "[]",
+        );
+        let request = PlanRequest::from_json(&input)?;
+        let mut ledger = ReservationLedger::new(&request)?;
+        assert!(matches!(
+            ledger.reserve_bytes_batch("w7900", requested(4)?, Some(("w7900", requested(7)?))),
+            Err(DeviceByteReservationError::RequestedBytesExhausted { .. })
+        ));
+        assert!(ledger.dynamic_reserved.is_empty());
+        assert!(ledger.active_leases.is_empty());
+        assert!(matches!(
+            ledger.reserve_bytes_batch("w7900", requested(4)?, Some(("unknown", requested(1)?))),
+            Err(DeviceByteReservationError::UnknownRequestedDevice { .. })
+        ));
+        assert!(ledger.dynamic_reserved.is_empty());
+        assert!(ledger.active_leases.is_empty());
+        let (first, second) = ledger
+            .reserve_bytes_batch("w7900", requested(4)?, Some(("w7900", requested(6)?)))
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        let second = second.ok_or(PlacementRefusal::UnknownReservationLease)?;
+        ledger
+            .release_bytes(first)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        assert_eq!(ledger.dynamic_reserved.get("w7900"), Some(&6));
+        ledger
+            .release_bytes(second)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
         assert!(ledger.dynamic_reserved.is_empty());
         Ok(())
     }

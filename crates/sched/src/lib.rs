@@ -8,9 +8,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use placement::{PlacementRefusal, PlanRequest, PreparedPlan, ReservationLease, ReservationLedger};
+use placement::{
+    DeviceByteLease, DeviceByteReservationError, PlacementRefusal, PlanRequest, PreparedPlan,
+    RequestedDeviceBytes, ReservationLease, ReservationLedger,
+};
 use snafu::Snafu;
 
 const INITIAL_IDENTIFIER: u64 = 1;
@@ -66,6 +70,114 @@ pub struct OperationId {
 pub struct UsePermit {
     brand: Arc<ControllerBrand>,
     value: u64,
+}
+
+/// An opaque capability for one native resident load awaiting a trusted outcome.
+#[derive(Debug)]
+pub struct NativeLoadPermit {
+    brand: Arc<ControllerBrand>,
+    value: u64,
+}
+
+/// An opaque capability for one active native use with requested-byte custody.
+#[derive(Debug)]
+pub struct NativeUsePermit {
+    brand: Arc<ControllerBrand>,
+    value: u64,
+}
+
+/// An opaque capability retaining one completed native result's accounting.
+#[derive(Debug)]
+pub struct NativeResultLease {
+    brand: Arc<ControllerBrand>,
+    value: u64,
+}
+
+/// Requested host bytes retained by one native result.
+///
+/// This is a supplied accounting input, not a host grant, measured allocation,
+/// allocator-overhead estimate, or evidence of physical capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestedHostBytes(NonZeroU64);
+
+impl RequestedHostBytes {
+    /// Construct one nonzero requested host-byte extent.
+    #[must_use]
+    pub const fn new(bytes: NonZeroU64) -> Self {
+        Self(bytes)
+    }
+
+    /// Return the requested host-byte extent.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// A supplied controller-local ceiling for retained native host results.
+///
+/// This envelope is distinct from placement's declared device memory and is
+/// not an authoritative host grant or a qualified physical-memory claim.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeHostResultEnvelope {
+    retained_bytes: u64,
+}
+
+impl NativeHostResultEnvelope {
+    /// Construct an explicit retained-host-result accounting ceiling.
+    #[must_use]
+    pub const fn new(retained_bytes: u64) -> Self {
+        Self { retained_bytes }
+    }
+}
+
+/// Requested accounting for one native resident before its trusted load outcome.
+///
+/// These owner-derived requested bytes are not observed residency, allocator
+/// overhead, or physical admission evidence.
+#[derive(Debug, Clone)]
+pub struct NativeResidentRequest {
+    device_id: String,
+    resident_bytes: RequestedDeviceBytes,
+}
+
+impl NativeResidentRequest {
+    /// Bind one resident requested-byte charge to one declared device identity.
+    #[must_use]
+    pub fn new(device_id: impl Into<String>, resident_bytes: RequestedDeviceBytes) -> Self {
+        Self {
+            device_id: device_id.into(),
+            resident_bytes,
+        }
+    }
+}
+
+/// Requested accounting for one native use and its optional retained output.
+///
+/// Mutable bytes cover only the use-local peak. An optional device output and
+/// optional host output remain charged after trusted teardown until the result
+/// is explicitly discarded.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeUseRequest {
+    mutable_device_bytes: RequestedDeviceBytes,
+    retained_device_bytes: Option<RequestedDeviceBytes>,
+    retained_host_bytes: Option<RequestedHostBytes>,
+}
+
+impl NativeUseRequest {
+    /// Construct requested mutable and retained-result accounting for one use.
+    #[must_use]
+    pub const fn new(
+        mutable_device_bytes: RequestedDeviceBytes,
+        retained_device_bytes: Option<RequestedDeviceBytes>,
+        retained_host_bytes: Option<RequestedHostBytes>,
+    ) -> Self {
+        Self {
+            mutable_device_bytes,
+            retained_device_bytes,
+            retained_host_bytes,
+        }
+    }
 }
 
 /// A bounded executor-local identity for a successfully loaded resident.
@@ -174,6 +286,35 @@ pub enum SchedulerError {
         #[snafu(implicit)]
         location: snafu::Location,
     },
+    /// Requested device-byte accounting refused a native operation.
+    #[snafu(display("requested device-byte accounting refused the native operation: {source}"))]
+    NativeDeviceBytes {
+        /// Requested-byte accounting refusal.
+        source: DeviceByteReservationError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// A retained native host result would exceed its supplied accounting envelope.
+    #[snafu(display(
+        "retained native host result is exhausted: needs {required_bytes}, has {available_bytes}"
+    ))]
+    NativeHostResultExhausted {
+        /// Requested retained host bytes.
+        required_bytes: u64,
+        /// Available bytes in the supplied accounting envelope.
+        available_bytes: u64,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Checked retained-native-host accounting arithmetic overflowed.
+    #[snafu(display("retained native host result arithmetic overflowed"))]
+    NativeHostResultArithmeticOverflow {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// A bound was zero.
     #[snafu(display("scheduler limit {field} must be greater than zero"))]
     InvalidLimit {
@@ -230,6 +371,13 @@ pub enum SchedulerError {
     /// A new use would exceed the permit bound.
     #[snafu(display("active use limit would be exceeded"))]
     ActiveUseLimit {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// A new native load would exceed the pending-operation bound.
+    #[snafu(display("pending operation limit would be exceeded"))]
+    PendingOperationLimit {
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
@@ -318,9 +466,18 @@ pub struct Scheduler {
     admissions: BTreeMap<u64, Admission>,
     operations: BTreeMap<u64, PendingOperation>,
     permits: BTreeMap<u64, u64>,
+    native_loads: BTreeMap<u64, u64>,
+    native_uses: BTreeMap<u64, NativeUseRecord>,
+    native_quarantined_uses: BTreeMap<u64, NativeUseRecord>,
+    native_results: BTreeMap<u64, NativeResultRecord>,
+    host_result_envelope: NativeHostResultEnvelope,
+    host_result_reserved: u64,
     next_admission_id: u64,
     next_operation_id: u64,
     next_permit_id: u64,
+    next_native_load_id: u64,
+    next_native_use_id: u64,
+    next_native_result_id: u64,
     next_drain_cursor: u64,
 }
 
@@ -329,9 +486,37 @@ struct ControllerBrand;
 
 #[derive(Debug)]
 struct Admission {
-    lease: ReservationLease,
+    lease: AdmissionLease,
     state: AdmissionState,
     active_uses: usize,
+}
+
+#[derive(Debug)]
+enum AdmissionLease {
+    Legacy(ReservationLease),
+    Native {
+        resident: DeviceByteLease,
+        device_id: String,
+    },
+}
+
+#[derive(Debug)]
+struct NativeUseRecord {
+    admission_id: u64,
+    mutable_device: DeviceByteLease,
+    retained_device: Option<DeviceByteLease>,
+    retained_host: Option<HostResultLease>,
+}
+
+#[derive(Debug)]
+struct NativeResultRecord {
+    retained_device: Option<DeviceByteLease>,
+    retained_host: Option<HostResultLease>,
+}
+
+#[derive(Debug)]
+struct HostResultLease {
+    requested: RequestedHostBytes,
 }
 
 #[derive(Debug)]
@@ -450,6 +635,24 @@ impl Scheduler {
     /// Returns [`SchedulerError::Placement`] when the grant's static capacity
     /// and commitments cannot be represented by placement accounting.
     pub fn new(grant: &PlanRequest, limits: SchedulerLimits) -> Result<Self, SchedulerError> {
+        Self::new_with_native_host_results(grant, limits, NativeHostResultEnvelope::new(0))
+    }
+
+    /// Create a controller with an explicit supplied retained-host-result envelope.
+    ///
+    /// The envelope is independent of the declared device grant and supplies
+    /// accounting only; it does not establish host capacity or physical grant
+    /// authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerError::Placement`] when the grant's static capacity
+    /// and commitments cannot be represented by placement accounting.
+    pub fn new_with_native_host_results(
+        grant: &PlanRequest,
+        limits: SchedulerLimits,
+        host_result_envelope: NativeHostResultEnvelope,
+    ) -> Result<Self, SchedulerError> {
         let ledger = ReservationLedger::new(grant).map_err(placement_error)?;
         Ok(Self {
             brand: Arc::new(ControllerBrand),
@@ -460,9 +663,18 @@ impl Scheduler {
             admissions: BTreeMap::new(),
             operations: BTreeMap::new(),
             permits: BTreeMap::new(),
+            native_loads: BTreeMap::new(),
+            native_uses: BTreeMap::new(),
+            native_quarantined_uses: BTreeMap::new(),
+            native_results: BTreeMap::new(),
+            host_result_envelope,
+            host_result_reserved: 0,
             next_admission_id: INITIAL_IDENTIFIER,
             next_operation_id: INITIAL_IDENTIFIER,
             next_permit_id: INITIAL_IDENTIFIER,
+            next_native_load_id: INITIAL_IDENTIFIER,
+            next_native_use_id: INITIAL_IDENTIFIER,
+            next_native_result_id: INITIAL_IDENTIFIER,
             next_drain_cursor: INITIAL_IDENTIFIER,
         })
     }
@@ -530,7 +742,7 @@ impl Scheduler {
             self.admissions.insert(
                 admission_id,
                 Admission {
-                    lease,
+                    lease: AdmissionLease::Legacy(lease),
                     state: AdmissionState::Reserved,
                     active_uses: 0,
                 },
@@ -546,6 +758,148 @@ impl Scheduler {
         }
         self.next_admission_id = next_admission_id;
         Ok(tickets)
+    }
+
+    /// Reserve one native resident charge and issue its trusted-load capability.
+    ///
+    /// This non-serialized path shares the controller's existing placement
+    /// ledger but does not consume or add a v1 estimated placement lease.
+    /// The returned load permit remains charged if dropped; the private trusted
+    /// adapter must report a loaded, known-released, or quarantined outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without mutation when revoked, bounded, or when
+    /// the requested resident bytes cannot reserve against the shared ledger.
+    pub fn admit_native_resident(
+        &mut self,
+        request: NativeResidentRequest,
+    ) -> Result<(AdmissionTicket, NativeLoadPermit), SchedulerError> {
+        self.ensure_not_revoked()?;
+        self.ensure_admission_capacity(1)?;
+        self.ensure_pending_capacity()?;
+        let admission_id = self.next_admission_id;
+        let next_admission_id =
+            admission_id
+                .checked_add(1)
+                .ok_or(SchedulerError::IdentifierOverflow {
+                    kind: "admission",
+                    location: error_location(),
+                })?;
+        let load_id = self.next_native_load_id;
+        let next_load_id = load_id
+            .checked_add(1)
+            .ok_or(SchedulerError::IdentifierOverflow {
+                kind: "native load permit",
+                location: error_location(),
+            })?;
+        let resident = self
+            .ledger
+            .reserve_bytes(&request.device_id, request.resident_bytes)
+            .map_err(native_device_error)?;
+        self.admissions.insert(
+            admission_id,
+            Admission {
+                lease: AdmissionLease::Native {
+                    resident,
+                    device_id: request.device_id,
+                },
+                state: AdmissionState::Loading,
+                active_uses: 0,
+            },
+        );
+        self.native_loads.insert(load_id, admission_id);
+        self.next_admission_id = next_admission_id;
+        self.next_native_load_id = next_load_id;
+        Ok((
+            self.ticket(admission_id),
+            NativeLoadPermit {
+                brand: Arc::clone(&self.brand),
+                value: load_id,
+            },
+        ))
+    }
+
+    /// Acknowledge that a native resident load completed with this handle.
+    ///
+    /// The private trusted adapter calls this only after its actual load
+    /// completion. A duplicate handle leaves the load capability pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without mutation for foreign, late, duplicate,
+    /// or state-mismatched acknowledgement capabilities.
+    pub fn complete_native_load(
+        &mut self,
+        permit: &NativeLoadPermit,
+        resident: ResidentHandle,
+    ) -> Result<(), SchedulerError> {
+        self.ensure_local(&permit.brand, "native load permit")?;
+        let admission_id =
+            *self
+                .native_loads
+                .get(&permit.value)
+                .ok_or(SchedulerError::UnknownOperation {
+                    location: error_location(),
+                })?;
+        self.ensure_native_loading(admission_id)?;
+        self.complete_load(admission_id, resident)?;
+        self.native_loads.remove(&permit.value);
+        Ok(())
+    }
+
+    /// Acknowledge a native load that retained no device allocation.
+    ///
+    /// The private trusted adapter calls this only after it has established the
+    /// stated release outcome; dropping a load permit never releases bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without mutation for foreign, late, or
+    /// state-mismatched acknowledgement capabilities.
+    pub fn native_load_released(
+        &mut self,
+        permit: &NativeLoadPermit,
+    ) -> Result<(), SchedulerError> {
+        self.ensure_local(&permit.brand, "native load permit")?;
+        let admission_id =
+            *self
+                .native_loads
+                .get(&permit.value)
+                .ok_or(SchedulerError::UnknownOperation {
+                    location: error_location(),
+                })?;
+        self.ensure_native_loading(admission_id)?;
+        self.release_admission(admission_id)?;
+        self.native_loads.remove(&permit.value);
+        Ok(())
+    }
+
+    /// Retain a native load's resident charge after an uncertain outcome.
+    ///
+    /// This terminal accounting state deliberately permits neither use nor
+    /// automatic release. It is a trusted adapter report, not a physical proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without mutation for foreign, late, or
+    /// state-mismatched acknowledgement capabilities.
+    pub fn quarantine_native_load(
+        &mut self,
+        permit: &NativeLoadPermit,
+    ) -> Result<(), SchedulerError> {
+        self.ensure_local(&permit.brand, "native load permit")?;
+        let admission_id =
+            *self
+                .native_loads
+                .get(&permit.value)
+                .ok_or(SchedulerError::UnknownOperation {
+                    location: error_location(),
+                })?;
+        self.ensure_native_loading(admission_id)?;
+        self.quarantine_admission(admission_id)?;
+        self.native_loads.remove(&permit.value);
+        Ok(())
     }
 
     /// Revoke the current grant immediately and begin safe draining.
@@ -605,7 +959,15 @@ impl Scheduler {
                 location: error_location(),
             });
         }
-        if !self.admissions.is_empty() || !self.operations.is_empty() || !self.permits.is_empty() {
+        if !self.admissions.is_empty()
+            || !self.operations.is_empty()
+            || !self.permits.is_empty()
+            || !self.native_loads.is_empty()
+            || !self.native_uses.is_empty()
+            || !self.native_quarantined_uses.is_empty()
+            || !self.native_results.is_empty()
+            || self.host_result_reserved != 0
+        {
             return Err(SchedulerError::GrantNotDrained {
                 location: error_location(),
             });
@@ -640,7 +1002,7 @@ impl Scheduler {
             self.release_admission(admission_id)?;
             return Ok(PollOutcome::Progressed);
         }
-        if self.operations.len() >= self.limits.pending_operations {
+        if self.pending_operation_count()? >= self.limits.pending_operations {
             return Ok(PollOutcome::PendingLimit);
         }
         let Some((admission_id, operation_kind)) = self.next_command() else {
@@ -663,12 +1025,17 @@ impl Scheduler {
         let kind = match operation_kind {
             OperationKind::Load => {
                 admission.state = AdmissionState::Loading;
+                let AdmissionLease::Legacy(lease) = &admission.lease else {
+                    return Err(SchedulerError::OperationStateMismatch {
+                        location: error_location(),
+                    });
+                };
                 RuntimeCommandKind::Load {
-                    profile_id: admission.lease.profile_id().to_owned(),
-                    artifact_id: admission.lease.artifact_id().to_owned(),
-                    digest: admission.lease.digest().to_owned(),
-                    device_id: admission.lease.device_id().to_owned(),
-                    total_estimated_bytes: admission.lease.total_estimated_bytes(),
+                    profile_id: lease.profile_id().to_owned(),
+                    artifact_id: lease.artifact_id().to_owned(),
+                    digest: lease.digest().to_owned(),
+                    device_id: lease.device_id().to_owned(),
+                    total_estimated_bytes: lease.total_estimated_bytes(),
                 }
             }
             OperationKind::Evict => {
@@ -772,11 +1139,7 @@ impl Scheduler {
         self.ensure_local(&ticket.brand, "admission ticket")?;
         self.ensure_current(ticket.generation)?;
         self.ensure_not_revoked()?;
-        if self.permits.len() >= self.limits.uses {
-            return Err(SchedulerError::ActiveUseLimit {
-                location: error_location(),
-            });
-        }
+        self.ensure_custody_capacity()?;
         let permit_id = self.next_permit_id;
         let next_permit_id =
             permit_id
@@ -790,6 +1153,11 @@ impl Scheduler {
                 location: error_location(),
             },
         )?;
+        if !matches!(&admission.lease, AdmissionLease::Legacy(_)) {
+            return Err(SchedulerError::AdmissionNotResident {
+                location: error_location(),
+            });
+        }
         let resident = match &admission.state {
             AdmissionState::Resident(resident) | AdmissionState::InUse(resident) => {
                 resident.clone()
@@ -882,6 +1250,343 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Start one native use while reserving its mutable peak and retained output.
+    ///
+    /// The private adapter must retain this permit through actual native
+    /// teardown. Dropping it never releases requested bytes or decrements use
+    /// ownership; only [`Self::finish_native_use_after_teardown`] may do so.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without mutation for foreign, stale, revoked,
+    /// non-native, nonresident, over-limit, host-envelope, or shared-ledger
+    /// accounting failures.
+    pub fn begin_native_use(
+        &mut self,
+        ticket: &AdmissionTicket,
+        request: NativeUseRequest,
+    ) -> Result<NativeUsePermit, SchedulerError> {
+        self.ensure_local(&ticket.brand, "admission ticket")?;
+        self.ensure_current(ticket.generation)?;
+        self.ensure_not_revoked()?;
+        self.ensure_custody_capacity()?;
+        let use_id = self.next_native_use_id;
+        let next_use_id = use_id
+            .checked_add(1)
+            .ok_or(SchedulerError::IdentifierOverflow {
+                kind: "native use permit",
+                location: error_location(),
+            })?;
+        let requested_host_bytes = request
+            .retained_host_bytes
+            .map_or(0, RequestedHostBytes::get);
+        let next_host_reserved = self
+            .host_result_reserved
+            .checked_add(requested_host_bytes)
+            .ok_or(SchedulerError::NativeHostResultArithmeticOverflow {
+                location: error_location(),
+            })?;
+        if next_host_reserved > self.host_result_envelope.retained_bytes {
+            return Err(SchedulerError::NativeHostResultExhausted {
+                required_bytes: requested_host_bytes,
+                available_bytes: self
+                    .host_result_envelope
+                    .retained_bytes
+                    .saturating_sub(self.host_result_reserved),
+                location: error_location(),
+            });
+        }
+        let (device_id, next_uses, resident) =
+            {
+                let admission = self.admissions.get(&ticket.admission_id).ok_or(
+                    SchedulerError::UnknownAdmission {
+                        location: error_location(),
+                    },
+                )?;
+                let AdmissionLease::Native { device_id, .. } = &admission.lease else {
+                    return Err(SchedulerError::AdmissionNotResident {
+                        location: error_location(),
+                    });
+                };
+                let resident = match &admission.state {
+                    AdmissionState::Resident(resident) | AdmissionState::InUse(resident) => {
+                        resident.clone()
+                    }
+                    _ => {
+                        return Err(SchedulerError::AdmissionNotResident {
+                            location: error_location(),
+                        });
+                    }
+                };
+                let next_uses = admission.active_uses.checked_add(1).ok_or(
+                    SchedulerError::IdentifierOverflow {
+                        kind: "active native use",
+                        location: error_location(),
+                    },
+                )?;
+                (device_id.clone(), next_uses, resident)
+            };
+        let (mutable_device, retained_device) = self
+            .ledger
+            .reserve_bytes_batch(
+                &device_id,
+                request.mutable_device_bytes,
+                request
+                    .retained_device_bytes
+                    .map(|bytes| (device_id.as_str(), bytes)),
+            )
+            .map_err(native_device_error)?;
+        let admission = self.admissions.get_mut(&ticket.admission_id).ok_or(
+            SchedulerError::UnknownAdmission {
+                location: error_location(),
+            },
+        )?;
+        admission.active_uses = next_uses;
+        admission.state = AdmissionState::InUse(resident);
+        self.native_uses.insert(
+            use_id,
+            NativeUseRecord {
+                admission_id: ticket.admission_id,
+                mutable_device,
+                retained_device,
+                retained_host: request
+                    .retained_host_bytes
+                    .map(|requested| HostResultLease { requested }),
+            },
+        );
+        self.host_result_reserved = next_host_reserved;
+        self.next_native_use_id = next_use_id;
+        Ok(NativeUsePermit {
+            brand: Arc::clone(&self.brand),
+            value: use_id,
+        })
+    }
+
+    /// Finish one native use only after the private adapter acknowledges teardown.
+    ///
+    /// This releases the mutable requested-device charge and transfers any
+    /// retained device or host output charge into an opaque result capability.
+    /// It is not a cancellation acknowledgement and must not be called merely
+    /// because a command was abandoned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without mutation for foreign, late, or
+    /// state-mismatched permits. A device-release refusal restores the use and
+    /// its still-live charge for retry or truthful quarantine.
+    pub fn finish_native_use_after_teardown(
+        &mut self,
+        permit: &NativeUsePermit,
+    ) -> Result<Option<NativeResultLease>, SchedulerError> {
+        self.ensure_local(&permit.brand, "native use permit")?;
+        let record =
+            self.native_uses
+                .get(&permit.value)
+                .ok_or(SchedulerError::UnknownUsePermit {
+                    location: error_location(),
+                })?;
+        let creates_result = record.retained_device.is_some() || record.retained_host.is_some();
+        let result_id = if creates_result {
+            Some(self.next_native_result_id)
+        } else {
+            None
+        };
+        let next_result_id = if creates_result {
+            self.next_native_result_id
+                .checked_add(1)
+                .ok_or(SchedulerError::IdentifierOverflow {
+                    kind: "native result lease",
+                    location: error_location(),
+                })?
+        } else {
+            self.next_native_result_id
+        };
+        let admission =
+            self.admissions
+                .get(&record.admission_id)
+                .ok_or(SchedulerError::UnknownAdmission {
+                    location: error_location(),
+                })?;
+        let next_uses =
+            admission
+                .active_uses
+                .checked_sub(1)
+                .ok_or(SchedulerError::UnknownUsePermit {
+                    location: error_location(),
+                })?;
+        let next_state = native_finished_state(&admission.state, next_uses, self.revoked)?;
+        let mut record =
+            self.native_uses
+                .remove(&permit.value)
+                .ok_or(SchedulerError::UnknownUsePermit {
+                    location: error_location(),
+                })?;
+        match self.ledger.release_bytes(record.mutable_device) {
+            Ok(()) => {}
+            Err(failure) => {
+                let (reason, lease) = failure.into_parts();
+                record.mutable_device = lease;
+                self.native_uses.insert(permit.value, record);
+                return Err(native_device_error(reason));
+            }
+        }
+        let admission = self.admissions.get_mut(&record.admission_id).ok_or(
+            SchedulerError::UnknownAdmission {
+                location: error_location(),
+            },
+        )?;
+        admission.active_uses = next_uses;
+        admission.state = next_state;
+        self.next_native_result_id = next_result_id;
+        if let Some(result_id) = result_id {
+            self.native_results.insert(
+                result_id,
+                NativeResultRecord {
+                    retained_device: record.retained_device,
+                    retained_host: record.retained_host,
+                },
+            );
+            Ok(Some(NativeResultLease {
+                brand: Arc::clone(&self.brand),
+                value: result_id,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Retain all native-use charges after a teardown outcome becomes uncertain.
+    ///
+    /// This terminal quarantine disables use and automatic eviction while the
+    /// resident, mutable, and retained-output capabilities remain in custody.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without mutation for foreign, late, or
+    /// state-mismatched permits.
+    pub fn quarantine_native_use(
+        &mut self,
+        permit: &NativeUsePermit,
+    ) -> Result<(), SchedulerError> {
+        self.ensure_local(&permit.brand, "native use permit")?;
+        let record =
+            self.native_uses
+                .get(&permit.value)
+                .ok_or(SchedulerError::UnknownUsePermit {
+                    location: error_location(),
+                })?;
+        let resident =
+            self.admissions
+                .get(&record.admission_id)
+                .ok_or(SchedulerError::UnknownAdmission {
+                    location: error_location(),
+                })?;
+        let resident = match &resident.state {
+            AdmissionState::InUse(resident)
+            | AdmissionState::Draining {
+                resident: Some(resident),
+                ..
+            }
+            | AdmissionState::Quarantined {
+                resident: Some(resident),
+            } => Some(resident.clone()),
+            _ => {
+                return Err(SchedulerError::OperationStateMismatch {
+                    location: error_location(),
+                });
+            }
+        };
+        let record =
+            self.native_uses
+                .remove(&permit.value)
+                .ok_or(SchedulerError::UnknownUsePermit {
+                    location: error_location(),
+                })?;
+        let admission = self.admissions.get_mut(&record.admission_id).ok_or(
+            SchedulerError::UnknownAdmission {
+                location: error_location(),
+            },
+        )?;
+        admission.state = AdmissionState::Quarantined { resident };
+        self.native_quarantined_uses.insert(permit.value, record);
+        Ok(())
+    }
+
+    /// Discard one retained native result after its private owner releases it.
+    ///
+    /// The result capability remains charged if device release cannot be
+    /// acknowledged by the shared ledger; dropping it never releases bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without mutation for foreign or late result
+    /// capabilities.
+    pub fn discard_native_result(
+        &mut self,
+        result: &NativeResultLease,
+    ) -> Result<(), SchedulerError> {
+        self.ensure_local(&result.brand, "native result lease")?;
+        let record =
+            self.native_results
+                .get(&result.value)
+                .ok_or(SchedulerError::UnknownUsePermit {
+                    location: error_location(),
+                })?;
+        let released_host = record
+            .retained_host
+            .as_ref()
+            .map_or(0, |lease| lease.requested.get());
+        let next_host_reserved = self.host_result_reserved.checked_sub(released_host).ok_or(
+            SchedulerError::NativeHostResultArithmeticOverflow {
+                location: error_location(),
+            },
+        )?;
+        let record =
+            self.native_results
+                .remove(&result.value)
+                .ok_or(SchedulerError::UnknownUsePermit {
+                    location: error_location(),
+                })?;
+        if let Some(device) = record.retained_device {
+            if let Err(failure) = self.ledger.release_bytes(device) {
+                let (reason, device) = failure.into_parts();
+                self.native_results.insert(
+                    result.value,
+                    NativeResultRecord {
+                        retained_device: Some(device),
+                        retained_host: record.retained_host,
+                    },
+                );
+                return Err(native_device_error(reason));
+            }
+        }
+        self.host_result_reserved = next_host_reserved;
+        Ok(())
+    }
+
+    fn ensure_native_loading(&self, admission_id: u64) -> Result<(), SchedulerError> {
+        let admission =
+            self.admissions
+                .get(&admission_id)
+                .ok_or(SchedulerError::UnknownAdmission {
+                    location: error_location(),
+                })?;
+        if matches!(
+            &admission.state,
+            AdmissionState::Loading
+                | AdmissionState::Draining {
+                    resident: None,
+                    loading: true,
+                }
+        ) {
+            Ok(())
+        } else {
+            Err(SchedulerError::OperationStateMismatch {
+                location: error_location(),
+            })
+        }
+    }
+
     fn ensure_admission_capacity(&self, incoming: usize) -> Result<(), SchedulerError> {
         let total = self.admissions.len().checked_add(incoming).ok_or(
             SchedulerError::ActiveAdmissionLimit {
@@ -890,6 +1595,42 @@ impl Scheduler {
         )?;
         if total > self.limits.admissions {
             return Err(SchedulerError::ActiveAdmissionLimit {
+                location: error_location(),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_pending_capacity(&self) -> Result<(), SchedulerError> {
+        if self.pending_operation_count()? >= self.limits.pending_operations {
+            return Err(SchedulerError::PendingOperationLimit {
+                location: error_location(),
+            });
+        }
+        Ok(())
+    }
+
+    fn pending_operation_count(&self) -> Result<usize, SchedulerError> {
+        self.operations
+            .len()
+            .checked_add(self.native_loads.len())
+            .ok_or(SchedulerError::PendingOperationLimit {
+                location: error_location(),
+            })
+    }
+
+    fn ensure_custody_capacity(&self) -> Result<(), SchedulerError> {
+        let slots = self
+            .permits
+            .len()
+            .checked_add(self.native_uses.len())
+            .and_then(|value| value.checked_add(self.native_quarantined_uses.len()))
+            .and_then(|value| value.checked_add(self.native_results.len()))
+            .ok_or(SchedulerError::ActiveUseLimit {
+                location: error_location(),
+            })?;
+        if slots >= self.limits.uses {
+            return Err(SchedulerError::ActiveUseLimit {
                 location: error_location(),
             });
         }
@@ -1114,20 +1855,43 @@ impl Scheduler {
             state,
             active_uses,
         } = admission;
-        match self.ledger.release(lease) {
-            Ok(()) => Ok(()),
-            Err(failure) => {
-                let (reason, lease) = failure.into_parts();
-                self.admissions.insert(
-                    admission_id,
-                    Admission {
-                        lease,
-                        state,
-                        active_uses,
-                    },
-                );
-                Err(placement_error(reason))
-            }
+        match lease {
+            AdmissionLease::Legacy(lease) => match self.ledger.release(lease) {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    let (reason, lease) = failure.into_parts();
+                    self.admissions.insert(
+                        admission_id,
+                        Admission {
+                            lease: AdmissionLease::Legacy(lease),
+                            state,
+                            active_uses,
+                        },
+                    );
+                    Err(placement_error(reason))
+                }
+            },
+            AdmissionLease::Native {
+                resident,
+                device_id,
+            } => match self.ledger.release_bytes(resident) {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    let (reason, resident) = failure.into_parts();
+                    self.admissions.insert(
+                        admission_id,
+                        Admission {
+                            lease: AdmissionLease::Native {
+                                resident,
+                                device_id,
+                            },
+                            state,
+                            active_uses,
+                        },
+                    );
+                    Err(native_device_error(reason))
+                }
+            },
         }
     }
 
@@ -1137,6 +1901,45 @@ impl Scheduler {
             generation: self.generation,
             admission_id,
         }
+    }
+}
+
+fn native_finished_state(
+    state: &AdmissionState,
+    next_uses: usize,
+    revoked: bool,
+) -> Result<AdmissionState, SchedulerError> {
+    match state {
+        AdmissionState::InUse(resident) if next_uses == 0 && revoked => {
+            Ok(AdmissionState::Draining {
+                resident: Some(resident.clone()),
+                loading: false,
+            })
+        }
+        AdmissionState::InUse(resident) if next_uses == 0 => {
+            Ok(AdmissionState::Resident(resident.clone()))
+        }
+        AdmissionState::InUse(resident) => Ok(AdmissionState::InUse(resident.clone())),
+        AdmissionState::Draining {
+            resident: Some(resident),
+            loading: false,
+        } => Ok(AdmissionState::Draining {
+            resident: Some(resident.clone()),
+            loading: false,
+        }),
+        AdmissionState::Quarantined { resident } => Ok(AdmissionState::Quarantined {
+            resident: resident.clone(),
+        }),
+        _ => Err(SchedulerError::AdmissionNotResident {
+            location: error_location(),
+        }),
+    }
+}
+
+fn native_device_error(source: DeviceByteReservationError) -> SchedulerError {
+    SchedulerError::NativeDeviceBytes {
+        source,
+        location: error_location(),
     }
 }
 
@@ -1193,6 +1996,35 @@ mod tests {
         format!(
             r#"{{"profile_id":"{profile_id}","artifact_id":"model","memory_estimate":{{"weights_bytes":{bytes},"kv_cache_bytes":0,"workspace_bytes":0,"headroom_bytes":0}},"placement":{{"kind":"requested_device","device_id":"w7900"}}}}"#
         )
+    }
+
+    fn requested_device_bytes(bytes: u64) -> Result<RequestedDeviceBytes, SchedulerError> {
+        let bytes =
+            NonZeroU64::new(bytes).ok_or(SchedulerError::NativeHostResultArithmeticOverflow {
+                location: error_location(),
+            })?;
+        Ok(RequestedDeviceBytes::new(bytes))
+    }
+
+    fn requested_host_bytes(bytes: u64) -> Result<RequestedHostBytes, SchedulerError> {
+        let bytes =
+            NonZeroU64::new(bytes).ok_or(SchedulerError::NativeHostResultArithmeticOverflow {
+                location: error_location(),
+            })?;
+        Ok(RequestedHostBytes::new(bytes))
+    }
+
+    fn native_loaded(
+        scheduler: &mut Scheduler,
+        resident_bytes: u64,
+        resident: &str,
+    ) -> Result<AdmissionTicket, SchedulerError> {
+        let (ticket, load) = scheduler.admit_native_resident(NativeResidentRequest::new(
+            "w7900",
+            requested_device_bytes(resident_bytes)?,
+        ))?;
+        scheduler.complete_native_load(&load, ResidentHandle::try_new(resident)?)?;
+        Ok(ticket)
     }
 
     fn one_ticket(
@@ -2141,6 +2973,201 @@ mod tests {
             scheduler.admissions.is_empty(),
             "selective and global drains release every lease exactly once"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_resident_and_v1_leases_compete_without_double_charging() -> Result<(), SchedulerError>
+    {
+        let grant = request(&format!("[{}]", workload("legacy", 4)), 8)?;
+        let mut scheduler = Scheduler::new(&grant, SchedulerLimits::default())?;
+        let _legacy = one_ticket(&mut scheduler, &grant)?;
+        let _native = native_loaded(&mut scheduler, 4, "native-main")?;
+        assert!(matches!(
+            scheduler.admit_native_resident(NativeResidentRequest::new(
+                "w7900",
+                requested_device_bytes(1)?,
+            )),
+            Err(SchedulerError::NativeDeviceBytes { .. })
+        ));
+        assert_eq!(scheduler.admissions.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn native_capabilities_are_controller_local_and_load_quarantine_retains_charge()
+    -> Result<(), SchedulerError> {
+        let grant = request("[]", 4)?;
+        let mut first = Scheduler::new(&grant, SchedulerLimits::default())?;
+        let mut second = Scheduler::new(&grant, SchedulerLimits::default())?;
+        let (ticket, load) = first.admit_native_resident(NativeResidentRequest::new(
+            "w7900",
+            requested_device_bytes(4)?,
+        ))?;
+        assert!(matches!(
+            second.quarantine_native_load(&load),
+            Err(SchedulerError::ForeignCapability { .. })
+        ));
+        first.quarantine_native_load(&load)?;
+        assert!(matches!(
+            first.begin_native_use(
+                &ticket,
+                NativeUseRequest::new(requested_device_bytes(1)?, None, None),
+            ),
+            Err(SchedulerError::AdmissionNotResident { .. })
+        ));
+        assert!(matches!(first.poll_command()?, PollOutcome::Idle));
+        assert!(matches!(
+            first.admit_native_resident(NativeResidentRequest::new(
+                "w7900",
+                requested_device_bytes(1)?,
+            )),
+            Err(SchedulerError::NativeDeviceBytes { .. })
+        ));
+        first.revoke(&first.generation())?;
+        assert!(matches!(first.poll_command()?, PollOutcome::Idle));
+        Ok(())
+    }
+
+    #[test]
+    fn native_use_releases_mutable_peak_and_retains_host_result() -> Result<(), SchedulerError> {
+        let grant = request("[]", 12)?;
+        let mut scheduler = Scheduler::new_with_native_host_results(
+            &grant,
+            SchedulerLimits::try_new(64, 8, 1)?,
+            NativeHostResultEnvelope::new(4),
+        )?;
+        let ticket = native_loaded(&mut scheduler, 4, "native-main")?;
+        let first = scheduler.begin_native_use(
+            &ticket,
+            NativeUseRequest::new(
+                requested_device_bytes(6)?,
+                None,
+                Some(requested_host_bytes(4)?),
+            ),
+        )?;
+        assert!(matches!(
+            scheduler.begin_native_use(
+                &ticket,
+                NativeUseRequest::new(
+                    requested_device_bytes(1)?,
+                    None,
+                    Some(requested_host_bytes(1)?)
+                ),
+            ),
+            Err(SchedulerError::NativeHostResultExhausted { .. })
+        ));
+        let result = scheduler.finish_native_use_after_teardown(&first)?.ok_or(
+            SchedulerError::UnknownUsePermit {
+                location: error_location(),
+            },
+        )?;
+        assert!(matches!(
+            scheduler.begin_native_use(
+                &ticket,
+                NativeUseRequest::new(requested_device_bytes(6)?, None, None),
+            ),
+            Err(SchedulerError::ActiveUseLimit { .. })
+        ));
+        scheduler.discard_native_result(&result)?;
+        let second = scheduler.begin_native_use(
+            &ticket,
+            NativeUseRequest::new(requested_device_bytes(6)?, None, None),
+        )?;
+        assert!(
+            scheduler
+                .finish_native_use_after_teardown(&second)?
+                .is_none(),
+            "a use without retained output returns no result lease"
+        );
+        assert_eq!(scheduler.host_result_reserved, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_device_result_competes_until_explicit_discard() -> Result<(), SchedulerError> {
+        let grant = request("[]", 12)?;
+        let mut scheduler = Scheduler::new(&grant, SchedulerLimits::default())?;
+        let ticket = native_loaded(&mut scheduler, 4, "native-main")?;
+        let use_permit = scheduler.begin_native_use(
+            &ticket,
+            NativeUseRequest::new(
+                requested_device_bytes(4)?,
+                Some(requested_device_bytes(4)?),
+                None,
+            ),
+        )?;
+        let result = scheduler
+            .finish_native_use_after_teardown(&use_permit)?
+            .ok_or(SchedulerError::UnknownUsePermit {
+                location: error_location(),
+            })?;
+        assert!(matches!(
+            scheduler.begin_native_use(
+                &ticket,
+                NativeUseRequest::new(requested_device_bytes(5)?, None, None),
+            ),
+            Err(SchedulerError::NativeDeviceBytes { .. })
+        ));
+        scheduler.discard_native_result(&result)?;
+        let retry = scheduler.begin_native_use(
+            &ticket,
+            NativeUseRequest::new(requested_device_bytes(5)?, None, None),
+        )?;
+        assert!(
+            scheduler
+                .finish_native_use_after_teardown(&retry)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_or_quarantined_native_use_keeps_all_charges() -> Result<(), SchedulerError> {
+        let grant = request("[]", 12)?;
+        let mut scheduler = Scheduler::new(&grant, SchedulerLimits::default())?;
+        let ticket = native_loaded(&mut scheduler, 4, "native-main")?;
+        let abandoned = scheduler.begin_native_use(
+            &ticket,
+            NativeUseRequest::new(requested_device_bytes(8)?, None, None),
+        )?;
+        drop(abandoned);
+        assert!(matches!(scheduler.poll_command()?, PollOutcome::Idle));
+        assert!(matches!(
+            scheduler.begin_native_use(
+                &ticket,
+                NativeUseRequest::new(requested_device_bytes(1)?, None, None),
+            ),
+            Err(SchedulerError::NativeDeviceBytes { .. })
+        ));
+
+        let grant = request("[]", 12)?;
+        let mut quarantined = Scheduler::new(&grant, SchedulerLimits::default())?;
+        let ticket = native_loaded(&mut quarantined, 4, "native-quarantine")?;
+        let permit = quarantined.begin_native_use(
+            &ticket,
+            NativeUseRequest::new(requested_device_bytes(4)?, None, None),
+        )?;
+        let finished = quarantined.begin_native_use(
+            &ticket,
+            NativeUseRequest::new(requested_device_bytes(1)?, None, None),
+        )?;
+        quarantined.revoke(&quarantined.generation())?;
+        quarantined.quarantine_native_use(&permit)?;
+        assert!(
+            quarantined
+                .finish_native_use_after_teardown(&finished)?
+                .is_none(),
+            "a known-finished sibling use releases only its mutable charge"
+        );
+        assert!(matches!(
+            quarantined.begin_native_use(
+                &ticket,
+                NativeUseRequest::new(requested_device_bytes(1)?, None, None),
+            ),
+            Err(SchedulerError::AdmissionNotResident { .. })
+        ));
+        assert!(matches!(quarantined.poll_command()?, PollOutcome::Idle));
         Ok(())
     }
 
