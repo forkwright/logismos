@@ -648,6 +648,8 @@ fn compile_sources(
                 || name == "gdn_step.hip"
                 || name == "causal_conv_step.hip"
                 || name == "decoder_ops_f32.hip"
+                || name == "recurrent_layout_f32.hip"
+                || name == "recurrent_scalars_f32.hip"
         }) {
             // WHY: these correctness baselines retain separately rounded f32
             // operations. Scope no-fast-math and no contraction to their

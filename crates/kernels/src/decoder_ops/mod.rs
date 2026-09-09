@@ -1,4 +1,10 @@
-//! Checked native f32 primitives used by the Qwen full-attention block.
+//! Checked native f32 primitives for Qwen full-attention and recurrent composition.
+
+mod recurrent_layout;
+mod recurrent_scalars;
+
+pub use recurrent_layout::{RecurrentQkL2F32Plan, launch_recurrent_qk_l2_f32};
+pub use recurrent_scalars::{RecurrentScalarsF32Plan, launch_recurrent_scalars_f32};
 
 #[cfg(not(logismos_no_gpu_kernels))]
 use std::ffi::c_void;
