@@ -874,6 +874,64 @@ pub unsafe fn silu(
     output_elements: usize,
     stream: &Stream,
 ) -> Result<()> {
+    // SAFETY: this raw boundary retains its documented caller-owned numerical
+    // and device-lifetime obligations while selecting no sticky status word.
+    unsafe {
+        launch_silu_with_status(
+            plan,
+            input_f32,
+            input_elements,
+            output_f32,
+            output_elements,
+            stream,
+            None,
+        )
+    }
+}
+
+/// Launch `SiLU(input)` while recording explicit numerical failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through same-stream completion on the same
+/// device and must be read only after successful synchronization. Checked
+/// classification replaces the raw path's explicit finite normal-or-zero
+/// operand/intermediate obligation; it still requires the qualified compiler,
+/// denorm, math-library, and device profile.
+pub unsafe fn silu_checked(
+    plan: ElementwiseF32Plan,
+    input_f32: *const f32,
+    input_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: the checked boundary retains raw pointer/device ownership
+    // obligations and retains status through same-stream synchronization.
+    unsafe {
+        launch_silu_with_status(
+            plan,
+            input_f32,
+            input_elements,
+            output_f32,
+            output_elements,
+            stream,
+            Some(status),
+        )
+    }
+}
+
+unsafe fn launch_silu_with_status(
+    plan: ElementwiseF32Plan,
+    input_f32: *const f32,
+    input_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: Option<&NativeNumericalStatus>,
+) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (
@@ -883,6 +941,7 @@ pub unsafe fn silu(
             output_f32,
             output_elements,
             stream,
+            status,
         );
         no_gpu_refusal(SILU_KERNEL)
     }
@@ -897,69 +956,18 @@ pub unsafe fn silu(
             SILU_KERNEL,
         )?;
         stream.make_current()?;
-        // SAFETY: checked spans plus the caller's ownership and numerical-domain
-        // contract establish the private unary SiLU ABI preconditions.
-        let code = unsafe {
-            logismos_launch_decoder_silu_f32(
-                input_f32.cast::<c_void>(),
-                output_f32.cast::<c_void>(),
-                plan.elements_u32,
-                core::ptr::null_mut(),
-                stream.raw().cast::<c_void>(),
-            )
+        let numerical_status = match status {
+            Some(status) => unsafe { status.as_device_ptr().cast::<c_void>() },
+            None => core::ptr::null_mut(),
         };
-        launch_result(SILU_KERNEL, code)
-    }
-}
-
-/// Launch `SiLU(input)` while recording explicit numerical failures.
-///
-/// # Safety
-///
-/// The raw launcher's pointer, lifetime, ownership, and stream requirements
-/// apply. `status` must remain live through stream completion on the same device.
-pub unsafe fn silu_checked(
-    plan: ElementwiseF32Plan,
-    input_f32: *const f32,
-    input_elements: usize,
-    output_f32: *mut f32,
-    output_elements: usize,
-    stream: &Stream,
-    status: &NativeNumericalStatus,
-) -> Result<()> {
-    #[cfg(logismos_no_gpu_kernels)]
-    {
-        let _ = status;
-        // SAFETY: this forwards the unchanged raw arguments solely to retain its typed CPU refusal.
-        unsafe {
-            silu(
-                plan,
-                input_f32,
-                input_elements,
-                output_f32,
-                output_elements,
-                stream,
-            )
-        }
-    }
-    #[cfg(not(logismos_no_gpu_kernels))]
-    {
-        validate_unary_launch(
-            plan,
-            input_f32,
-            input_elements,
-            output_f32,
-            output_elements,
-            SILU_KERNEL,
-        )?;
-        stream.make_current()?;
-        // SAFETY: checked spans and the caller's status lifetime contract establish this private ABI.
+        // SAFETY: exact spans establish ABI extents; callers retain their
+        // device/lifetime contract and checked callers retain status through sync.
         let code = unsafe {
             logismos_launch_decoder_silu_f32(
                 input_f32.cast::<c_void>(),
                 output_f32.cast::<c_void>(),
                 plan.elements_u32,
-                status.as_device_ptr().cast::<c_void>(),
+                numerical_status,
                 stream.raw().cast::<c_void>(),
             )
         };
@@ -1771,6 +1779,26 @@ mod tests {
             (spurious_inactive_mean + epsilon).is_normal(),
             "the old all-lane denominator arithmetic could set a sticky subnormal bit even though the selected denominator is normal"
         );
+    }
+
+    #[test]
+    fn rms_tree_ignores_dead_lane_overflow() {
+        let contribution = f32::MAX * 0.75_f32;
+        let mut lanes = [0.0_f32; WAVE_SIZE];
+        lanes[WAVE_SIZE - 1] = contribution;
+
+        for offset in [16_usize, 8, 4, 2, 1] {
+            let prior = lanes;
+            for lane in 0..offset {
+                lanes[lane] += prior[lane + offset];
+            }
+        }
+        let inverse = (lanes[0] / WAVE_SIZE as f32 + 1.0e-5_f32).sqrt().recip();
+        let dead_lane_sum = contribution + contribution;
+
+        assert!(contribution.is_normal());
+        assert!(inverse.is_normal());
+        assert!(dead_lane_sum.is_infinite());
     }
 
     #[test]

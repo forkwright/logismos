@@ -1101,6 +1101,35 @@ mod tests {
     }
 
     #[test]
+    fn checked_native_tree_ignores_dead_lane_overflow() {
+        let contribution = f32::MAX * 0.75_f32;
+        let mut lanes = [0.0_f32; 32];
+        lanes[31] = contribution;
+
+        for offset in [16_usize, 8, 4, 2, 1] {
+            let prior = lanes;
+            for lane in 0..offset {
+                lanes[lane] += prior[lane + offset];
+            }
+        }
+        let score = lanes[0] * (1.0_f32 / 32.0_f32.sqrt());
+        let dead_lane_sum = contribution + contribution;
+
+        assert!(contribution.is_normal());
+        assert!(score.is_finite());
+        assert!(dead_lane_sum.is_infinite());
+        assert!(
+            arithmetic_status_bits(score) == 0,
+            "the live fixed-tree score is legitimate and must not inherit a dead lane's overflow"
+        );
+        assert_eq!(
+            arithmetic_status_bits(dead_lane_sum),
+            NativeNumericalStatusCategory::ArithmeticNonFinite.bit(),
+            "the unguarded dead-lane addition would have set a sticky fault"
+        );
+    }
+
+    #[test]
     fn checked_native_status_keeps_a_hidden_subnormal_product_sticky() {
         let left = 1.0e-20_f32;
         let right = 1.0e-20_f32;

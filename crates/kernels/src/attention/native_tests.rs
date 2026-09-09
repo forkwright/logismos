@@ -614,6 +614,56 @@ fn reserved_device_q1_paged_attention_matches_native_fixture()
 
 #[test]
 #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
+fn reserved_device_q1_paged_attention_keeps_dead_lane_overflow_unpublished()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hipcore::{Device, DeviceBuffer, Stream};
+
+    let logical = PagedDecodePlan::try_from_dimensions(1, 1, 1, 32)?;
+    let native = NativePagedDecodePlan::try_from_paged_decode(logical, 8, 1)?;
+    let device = Device::new(0)?;
+    let stream = Stream::new(&device)?;
+    let mut query_host = vec![0.0_f32; native.query_elements()];
+    query_host[31] = 1.0;
+    let query = DeviceBuffer::from_host(&device, &query_host)?;
+    let mut keys_host = vec![0.0_f32; native.key_value_elements()];
+    keys_host[31] = f32::MAX * 0.75;
+    let keys = DeviceBuffer::from_host(&device, &keys_host)?;
+    let values_host = vec![0.0_f32; native.key_value_elements()];
+    let values = DeviceBuffer::from_host(&device, &values_host)?;
+    let table = DeviceBuffer::from_host(&device, &[0_u32])?;
+    let output_host = vec![0.0_f32; native.output_elements()];
+    let output = DeviceBuffer::from_host(&device, &output_host)?;
+    let status = crate::numerical_status::NativeNumericalStatus::new(&device)?;
+
+    // SAFETY: all allocations have exact descriptor extents, stay live through
+    // synchronization, and page zero selects the initialized physical page.
+    unsafe {
+        launch_paged_decode_q1_f32_checked(
+            native,
+            query.as_device_ptr(),
+            query.len(),
+            keys.as_device_ptr(),
+            keys.len(),
+            values.as_device_ptr(),
+            values.len(),
+            table.as_device_ptr(),
+            table.len(),
+            output.as_device_ptr(),
+            output.len(),
+            &stream,
+            &status,
+        )?;
+    }
+    stream.synchronize()?;
+    status.read_after_synchronization()?;
+    let mut observed_output = vec![0.0_f32; output.len()];
+    output.copy_to_host(&mut observed_output)?;
+    assert!(observed_output.iter().all(|value| value.is_finite()));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
 fn reserved_device_q1_paged_attention_rejects_hidden_subnormal_product()
 -> Result<(), Box<dyn std::error::Error>> {
     use hipcore::{Device, DeviceBuffer, Stream};

@@ -77,7 +77,9 @@ extern "C" __global__ void logismos_paged_decode_q1_f32_kernel(
         // INVARIANT: the fixed tree is the native dot-reduction order.
         for (std::uint32_t offset = WAVE_WIDTH / 2U; offset > 0U; offset /= 2U) {
             const float shuffled = __shfl_down(partial_dot, offset, WAVE_WIDTH);
-            partial_dot = logismos_status_add(partial_dot, shuffled, numerical_status);
+            if (lane < offset) {
+                partial_dot = logismos_status_add(partial_dot, shuffled, numerical_status);
+            }
         }
         float score = lane == 0U ? logismos_status_mul(partial_dot, checked_scale, numerical_status) : 0.0f;
         score = __shfl(score, 0, WAVE_WIDTH);

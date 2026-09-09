@@ -32,11 +32,16 @@ __global__ void decoder_rms_norm_f32_kernel(
             logismos_status_mul(value, value, numerical_status),
             numerical_status);
     }
-    partial = logismos_status_add(partial, __shfl_down(partial, 16, kWaveSize), numerical_status);
-    partial = logismos_status_add(partial, __shfl_down(partial, 8, kWaveSize), numerical_status);
-    partial = logismos_status_add(partial, __shfl_down(partial, 4, kWaveSize), numerical_status);
-    partial = logismos_status_add(partial, __shfl_down(partial, 2, kWaveSize), numerical_status);
-    partial = logismos_status_add(partial, __shfl_down(partial, 1, kWaveSize), numerical_status);
+    const float shuffled16 = __shfl_down(partial, 16, kWaveSize);
+    if (lane < 16) partial = logismos_status_add(partial, shuffled16, numerical_status);
+    const float shuffled8 = __shfl_down(partial, 8, kWaveSize);
+    if (lane < 8) partial = logismos_status_add(partial, shuffled8, numerical_status);
+    const float shuffled4 = __shfl_down(partial, 4, kWaveSize);
+    if (lane < 4) partial = logismos_status_add(partial, shuffled4, numerical_status);
+    const float shuffled2 = __shfl_down(partial, 2, kWaveSize);
+    if (lane < 2) partial = logismos_status_add(partial, shuffled2, numerical_status);
+    const float shuffled1 = __shfl_down(partial, 1, kWaveSize);
+    if (lane < 1) partial = logismos_status_add(partial, shuffled1, numerical_status);
     float inverse = 0.0f;
     if (lane == 0) {
         logismos_status_input(epsilon, numerical_status);
