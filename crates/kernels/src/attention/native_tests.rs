@@ -565,11 +565,12 @@ fn reserved_device_q1_paged_attention_matches_native_fixture()
     let table = DeviceBuffer::from_host(&device, &fixture.table)?;
     let initialized_output = vec![0.0_f32; fixture.native.output_elements()];
     let output = DeviceBuffer::from_host(&device, &initialized_output)?;
+    let status = crate::numerical_status::NativeNumericalStatus::new(&device)?;
     // SAFETY: the fixture supplies distinct descriptor-sized buffers, keeps
     // them live through synchronization, and uses finite physical data with
     // in-range page-table entries.
     unsafe {
-        launch_paged_decode_q1_f32(
+        launch_paged_decode_q1_f32_checked(
             fixture.native,
             query.as_device_ptr(),
             query.len(),
@@ -582,9 +583,11 @@ fn reserved_device_q1_paged_attention_matches_native_fixture()
             output.as_device_ptr(),
             output.len(),
             &stream,
+            &status,
         )?;
     }
     stream.synchronize()?;
+    status.read_after_synchronization()?;
     let mut actual = vec![0.0_f32; output.len()];
     output.copy_to_host(&mut actual)?;
     for (index, value) in actual.iter().copied().enumerate() {
@@ -606,6 +609,64 @@ fn reserved_device_q1_paged_attention_matches_native_fixture()
         &expected,
         "reserved device output must match the independent logical fixture",
     )?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
+fn reserved_device_q1_paged_attention_rejects_hidden_subnormal_product()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hipcore::{Device, DeviceBuffer, Stream};
+
+    let logical = PagedDecodePlan::try_from_dimensions(1, 1, 1, 1)?;
+    let native = NativePagedDecodePlan::try_from_paged_decode(logical, 8, 1)?;
+    let device = Device::new(0)?;
+    let stream = Stream::new(&device)?;
+    let query = DeviceBuffer::from_host(&device, &[1.0e-20_f32])?;
+    let mut keys_host = vec![0.0_f32; native.key_value_elements()];
+    keys_host[0] = 1.0e-20_f32;
+    let keys = DeviceBuffer::from_host(&device, &keys_host)?;
+    let mut values_host = vec![0.0_f32; native.key_value_elements()];
+    values_host[0] = 1.0_f32;
+    let values = DeviceBuffer::from_host(&device, &values_host)?;
+    let table = DeviceBuffer::from_host(&device, &[0_u32])?;
+    let output = DeviceBuffer::from_host(&device, &[0.0_f32])?;
+    let status = crate::numerical_status::NativeNumericalStatus::new(&device)?;
+
+    // SAFETY: all device allocations have exact descriptor extents, remain live
+    // through synchronization, and the single table entry selects page zero.
+    unsafe {
+        launch_paged_decode_q1_f32_checked(
+            native,
+            query.as_device_ptr(),
+            query.len(),
+            keys.as_device_ptr(),
+            keys.len(),
+            values.as_device_ptr(),
+            values.len(),
+            table.as_device_ptr(),
+            table.len(),
+            output.as_device_ptr(),
+            output.len(),
+            &stream,
+            &status,
+        )?;
+    }
+    stream.synchronize()?;
+    match status.read_after_synchronization() {
+        Err(crate::Error::NumericalStatus {
+            source: crate::numerical_status::NativeNumericalStatusError::Observed { mask, .. },
+            ..
+        }) => {
+            assert!(mask.contains(
+                crate::numerical_status::NativeNumericalStatusCategory::ArithmeticSubnormal
+            ))
+        }
+        Err(error) => return Err(format!("unexpected native status failure: {error}").into()),
+        Ok(()) => {
+            return Err("hidden subnormal product must reject checked native attention".into());
+        }
+    }
     Ok(())
 }
 

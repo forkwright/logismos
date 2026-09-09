@@ -24,6 +24,8 @@ use crate::error::NoGpuBuildSnafu;
 use crate::error::Result as KernelResult;
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 use crate::error::UnsupportedShapeSnafu;
+#[cfg(feature = "gpu")]
+use crate::numerical_status::NativeNumericalStatus;
 
 const PAGED_DECODE: &str = "paged_decode";
 #[cfg(feature = "gpu")]
@@ -44,6 +46,7 @@ unsafe extern "C" {
         page_tokens: u32,
         physical_pages: u32,
         scale: f32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 }
@@ -816,6 +819,109 @@ pub unsafe fn launch_paged_decode_q1_f32(
     output_elements: usize,
     stream: &Stream,
 ) -> KernelResult<()> {
+    // SAFETY: this raw boundary retains its documented caller-owned device,
+    // aliasing, table, and numerical-domain obligations.
+    unsafe {
+        launch_paged_decode_q1_f32_with_status(
+            plan,
+            query_f32,
+            query_elements,
+            keys_f32,
+            key_elements,
+            values_f32,
+            value_elements,
+            page_table_u32,
+            page_table_entries,
+            output_f32,
+            output_elements,
+            stream,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+/// Launch checked all-query-head native Q=1 paged attention.
+///
+/// This shares the raw launcher's exact descriptor and span validation and
+/// numerical order. The session-owned status is read only after the same stream
+/// synchronizes; a sticky fault must prevent logical publication.
+///
+/// # Errors
+///
+/// Returns the raw launcher's validation, stream-current, and launch failures.
+/// The caller must separately read `status` after successful synchronization to
+/// surface any classified native numerical-domain violation.
+///
+/// # Safety
+///
+/// Each nonempty pointer must remain live on `stream`'s device through stream
+/// completion, and output must be exclusive and non-aliasing. The caller still
+/// guarantees the selected device's qualified compiler and floating-point
+/// profile, table bounds, and stream ordering. Checked classification removes
+/// the raw path's caller obligation to prove all explicit arithmetic operands
+/// and intermediates are finite normal-or-zero; it does not qualify math-library
+/// internals or physical device denorm behavior.
+#[cfg(feature = "gpu")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the checked path preserves the raw Q=1 ABI and appends its borrowed status owner"
+)]
+pub unsafe fn launch_paged_decode_q1_f32_checked(
+    plan: NativePagedDecodePlan,
+    query_f32: *const f32,
+    query_elements: usize,
+    keys_f32: *const f32,
+    key_elements: usize,
+    values_f32: *const f32,
+    value_elements: usize,
+    page_table_u32: *const u32,
+    page_table_entries: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> KernelResult<()> {
+    // SAFETY: the checked boundary retains raw pointer lifetime, aliasing, table,
+    // device-profile, and stream-ordering obligations; status remains owned by its session.
+    unsafe {
+        launch_paged_decode_q1_f32_with_status(
+            plan,
+            query_f32,
+            query_elements,
+            keys_f32,
+            key_elements,
+            values_f32,
+            value_elements,
+            page_table_u32,
+            page_table_entries,
+            output_f32,
+            output_elements,
+            stream,
+            status.as_device_ptr(),
+        )
+    }
+}
+
+#[cfg(feature = "gpu")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one shared implementation owns the fixed raw Q=1 ABI plus its nullable status pointer"
+)]
+unsafe fn launch_paged_decode_q1_f32_with_status(
+    plan: NativePagedDecodePlan,
+    query_f32: *const f32,
+    query_elements: usize,
+    keys_f32: *const f32,
+    key_elements: usize,
+    values_f32: *const f32,
+    value_elements: usize,
+    page_table_u32: *const u32,
+    page_table_entries: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    numerical_status: *mut u32,
+) -> KernelResult<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (
@@ -831,6 +937,7 @@ pub unsafe fn launch_paged_decode_q1_f32(
             output_f32,
             output_elements,
             stream,
+            numerical_status,
         );
         no_gpu_paged_decode_refusal()
     }
@@ -851,9 +958,11 @@ pub unsafe fn launch_paged_decode_q1_f32(
             output_elements,
         )?;
         stream.make_current()?;
-        // SAFETY: the caller upholds device ownership, lifetime, concurrent
-        // access, table-value, and numerical-domain obligations documented
-        // above; descriptor and span validation establish ABI extents.
+        // SAFETY: both paths uphold device ownership, lifetime, concurrent
+        // access, table-value, and stream-ordering obligations. The raw path
+        // additionally upholds its numerical-domain obligation; the checked
+        // path retains its status owner to same-stream synchronization.
+        // Descriptor and span validation establish ABI extents.
         let code = unsafe {
             logismos_launch_paged_decode_q1_f32(
                 query_f32.cast::<c_void>(),
@@ -868,6 +977,7 @@ pub unsafe fn launch_paged_decode_q1_f32(
                 abi.page_tokens,
                 abi.physical_pages,
                 plan.logical.scale,
+                numerical_status.cast::<c_void>(),
                 stream.raw().cast::<c_void>(),
             )
         };
@@ -976,6 +1086,52 @@ mod tests {
     use approx::assert_relative_eq;
 
     use super::*;
+    use crate::numerical_status::{NativeNumericalStatusCategory, NativeNumericalStatusMask};
+
+    #[test]
+    fn checked_native_first_token_maximum_sentinel_is_not_an_operand_failure() {
+        let score = 1.0_f32;
+        let maximum = f32::NEG_INFINITY.max(score);
+        let bits = arithmetic_status_bits(maximum);
+        let Some(mask) = NativeNumericalStatusMask::from_bits(bits) else {
+            panic!("independent normal sentinel witness must use known status bits");
+        };
+
+        assert!(mask.is_empty());
+    }
+
+    #[test]
+    fn checked_native_status_keeps_a_hidden_subnormal_product_sticky() {
+        let left = 1.0e-20_f32;
+        let right = 1.0e-20_f32;
+        assert!(left.is_normal());
+        assert!(right.is_normal());
+
+        let product = left * right;
+        let restored = product / left;
+        assert!(restored.is_finite());
+        assert!(restored.is_normal());
+
+        let bits = arithmetic_status_bits(product) | arithmetic_status_bits(restored);
+        let Some(mask) = NativeNumericalStatusMask::from_bits(bits) else {
+            panic!("independent hidden-intermediate witness must use known status bits");
+        };
+
+        assert!(mask.contains(NativeNumericalStatusCategory::ArithmeticSubnormal));
+    }
+
+    fn arithmetic_status_bits(value: f32) -> u32 {
+        const EXPONENT_MASK: u32 = 0x7f80_0000;
+        const SIGNIFICAND_MASK: u32 = 0x007f_ffff;
+        let bits = value.to_bits();
+        if bits & EXPONENT_MASK == 0 && bits & SIGNIFICAND_MASK != 0 {
+            return NativeNumericalStatusCategory::ArithmeticSubnormal.bit();
+        }
+        if bits & EXPONENT_MASK == EXPONENT_MASK {
+            return NativeNumericalStatusCategory::ArithmeticNonFinite.bit();
+        }
+        0
+    }
 
     #[test]
     fn materialized_cpu_matches_independent_f64_gqa_oracle()
