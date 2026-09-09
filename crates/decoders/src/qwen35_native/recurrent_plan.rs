@@ -308,7 +308,7 @@ impl RecurrentWorkspacePlan {
             kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(output_norm.elements())
                 .context(NativeKernelSnafu)?;
 
-        Self::from_operations(RecurrentOperationPlans {
+        Self::from_operations(&RecurrentOperationPlans {
             input_norm,
             convolution,
             recurrence,
@@ -320,8 +320,8 @@ impl RecurrentWorkspacePlan {
         })
     }
 
-    fn from_operations(operations: RecurrentOperationPlans) -> Result<Self> {
-        let (value_tail_offset, value_tail_elements) = validate_operations(&operations)?;
+    fn from_operations(operations: &RecurrentOperationPlans) -> Result<Self> {
+        let (value_tail_offset, value_tail_elements) = validate_operations(operations)?;
         let normalized_hidden = operations.input_norm.elements();
         let qkv = operations.convolution.output_elements();
         let z = operations.recurrence.output_elements();
@@ -507,7 +507,7 @@ mod tests {
             kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(output_norm.elements())
                 .map_err(|error| error.to_string())?;
 
-        let workspace = RecurrentWorkspacePlan::from_operations(RecurrentOperationPlans {
+        let workspace = RecurrentWorkspacePlan::from_operations(&RecurrentOperationPlans {
             input_norm,
             convolution,
             recurrence,

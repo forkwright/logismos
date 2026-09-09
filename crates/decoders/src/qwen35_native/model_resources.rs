@@ -28,12 +28,14 @@ struct ModelStep {
 }
 
 enum NativeModelLayer {
-    Full(NativeWeights),
-    Recurrent {
-        weights: Box<NativeRecurrentWeights>,
-        state: NativeRecurrentState,
-        finish: LayerFinishWeights,
-    },
+    Full(Box<NativeWeights>),
+    Recurrent(Box<NativeRecurrentLayerResources>),
+}
+
+struct NativeRecurrentLayerResources {
+    weights: NativeRecurrentWeights,
+    state: NativeRecurrentState,
+    finish: LayerFinishWeights,
 }
 
 /// One non-cloneable bundle retaining every native allocation through completion.
@@ -232,11 +234,7 @@ impl ModelDeviceResources {
                 }
                 (
                     NativeBlockPlan::Recurrent { plan, finish },
-                    NativeModelLayer::Recurrent {
-                        weights,
-                        state,
-                        finish: finish_weights,
-                    },
+                    NativeModelLayer::Recurrent(resources),
                 ) => {
                     let workspace = self.recurrent_workspace.as_ref().ok_or_else(|| {
                         NativeSessionStateSnafu {
@@ -246,13 +244,13 @@ impl ModelDeviceResources {
                     })?;
                     let deferred = DeferredRecurrent {
                         plan,
-                        weights,
+                        weights: &resources.weights,
                         workspace,
-                        state,
+                        state: &resources.state,
                         input,
                         output,
                         finish_plan: finish,
-                        finish_weights,
+                        finish_weights: &resources.finish,
                         finish_workspace: &self.finish_workspace,
                         stream: &self.stream,
                     };
@@ -305,8 +303,8 @@ impl ModelDeviceResources {
             }
         }
         for layer in &mut self.layers {
-            if let NativeModelLayer::Recurrent { state, .. } = layer {
-                state.publish_completed();
+            if let NativeModelLayer::Recurrent(resources) = layer {
+                resources.state.publish_completed();
             }
         }
         self.position = next_position;
@@ -364,13 +362,15 @@ fn upload_layers(
     for block in &plan.layers {
         let layer = match block {
             NativeBlockPlan::Full(plan) => {
-                NativeModelLayer::Full(NativeWeights::upload(weights, plan, device)?)
+                NativeModelLayer::Full(Box::new(NativeWeights::upload(weights, plan, device)?))
             }
-            NativeBlockPlan::Recurrent { plan, finish } => NativeModelLayer::Recurrent {
-                weights: Box::new(NativeRecurrentWeights::upload(weights, plan, device)?),
-                state: NativeRecurrentState::new(plan, device)?,
-                finish: LayerFinishWeights::upload(weights, finish, device)?,
-            },
+            NativeBlockPlan::Recurrent { plan, finish } => {
+                NativeModelLayer::Recurrent(Box::new(NativeRecurrentLayerResources {
+                    weights: NativeRecurrentWeights::upload(weights, plan, device)?,
+                    state: NativeRecurrentState::new(plan, device)?,
+                    finish: LayerFinishWeights::upload(weights, finish, device)?,
+                }))
+            }
         };
         layers.push(layer);
     }
