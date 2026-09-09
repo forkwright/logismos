@@ -1600,6 +1600,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn hidden_subnormal_projection_remains_a_counterexample_after_normal_state_and_output()
+    -> GdnResult<()> {
+        let state = [f32::MIN_POSITIVE];
+        let q = [1.0_f32];
+        let k = [0.5_f32];
+        let v = [1.0_f32];
+        let beta = [1.0_f32];
+        let g = [0.0_f32];
+        let projection_term = state[0] * k[0];
+        assert!(state[0].is_normal(), "state operand must begin normal");
+        assert!(k[0].is_normal(), "key operand must begin normal");
+        assert!(
+            projection_term.is_subnormal(),
+            "projection term must be subnormal"
+        );
+
+        let admitted =
+            MultiHeadRecurrentInput::new(&q, &k, &v, &beta, &g, 1.0, &state, 1, 1, 1, 1, 1)?;
+        let actual = multi_head_recurrent_fwd(&admitted)?;
+        assert_eq!(
+            actual.state(),
+            &[0.5],
+            "normal delta update overwrites the tiny state"
+        );
+        assert_eq!(
+            actual.output(),
+            &[0.5],
+            "the final CPU output remains normal"
+        );
+        assert!(actual.state()[0].is_normal());
+        assert!(actual.output()[0].is_normal());
+        Ok(())
+    }
+
     #[cfg(feature = "gpu")]
     struct ValidGdnStepBuffers {
         q: Vec<f32>,
@@ -1776,6 +1811,147 @@ mod tests {
                 gdn_step_u32("abi overflow", abi_overflow),
                 Err(crate::Error::UnsupportedShape { .. })
             ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
+    fn initialized_status_classifies_gdn_inputs_and_hidden_intermediates()
+    -> core::result::Result<(), String> {
+        use hipcore::{Device, DeviceBuffer, Stream};
+
+        let device = Device::new(0).map_err(|error| format!("open reserved device 0: {error}"))?;
+        let stream = Stream::new(&device).map_err(|error| format!("create stream: {error}"))?;
+        let plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 1, 1, 1, 1)
+            .map_err(|error| format!("build GDN status plan: {error}"))?;
+        let cases = [
+            ("clean", 1.0_f32, 1.0_f32, 0.0_f32, 0.0_f32, 0_u32),
+            (
+                "input subnormal",
+                f32::from_bits(1),
+                1.0_f32,
+                0.0_f32,
+                0.0_f32,
+                crate::numerical_status::NativeNumericalStatusCategory::InputSubnormal.bit()
+                    | crate::numerical_status::NativeNumericalStatusCategory::ArithmeticSubnormal
+                        .bit(),
+            ),
+            (
+                "hidden arithmetic underflow",
+                1.0_f32,
+                0.5_f32,
+                f32::MIN_POSITIVE,
+                0.0_f32,
+                crate::numerical_status::NativeNumericalStatusCategory::ArithmeticSubnormal.bit(),
+            ),
+            (
+                "input nonfinite",
+                f32::INFINITY,
+                1.0_f32,
+                0.0_f32,
+                0.0_f32,
+                crate::numerical_status::NativeNumericalStatusCategory::InputNonFinite.bit()
+                    | crate::numerical_status::NativeNumericalStatusCategory::ArithmeticNonFinite
+                        .bit(),
+            ),
+            (
+                "arithmetic overflow",
+                1.0_f32,
+                1.0_f32,
+                0.0_f32,
+                128.0_f32,
+                crate::numerical_status::NativeNumericalStatusCategory::ArithmeticNonFinite.bit(),
+            ),
+        ];
+
+        for (name, q_value, k_value, state_value, gate_value, expected_bits) in cases {
+            let q_host = [q_value];
+            let k_host = [k_value];
+            let v_host = [1.0_f32];
+            let beta_host = [1.0_f32];
+            let g_host = [gate_value];
+            let state_host = [state_value];
+            let q = DeviceBuffer::from_host(&device, &q_host)
+                .map_err(|error| format!("{name}: upload q: {error}"))?;
+            let k = DeviceBuffer::from_host(&device, &k_host)
+                .map_err(|error| format!("{name}: upload k: {error}"))?;
+            let v = DeviceBuffer::from_host(&device, &v_host)
+                .map_err(|error| format!("{name}: upload v: {error}"))?;
+            let beta = DeviceBuffer::from_host(&device, &beta_host)
+                .map_err(|error| format!("{name}: upload beta: {error}"))?;
+            let g = DeviceBuffer::from_host(&device, &g_host)
+                .map_err(|error| format!("{name}: upload g: {error}"))?;
+            let state_in = DeviceBuffer::from_host(&device, &state_host)
+                .map_err(|error| format!("{name}: upload state: {error}"))?;
+            let state_out = DeviceBuffer::from_host(&device, &[-1234.5_f32])
+                .map_err(|error| format!("{name}: initialize staged state: {error}"))?;
+            let output = DeviceBuffer::from_host(&device, &[-1234.5_f32])
+                .map_err(|error| format!("{name}: initialize staged output: {error}"))?;
+            let status = crate::numerical_status::NativeNumericalStatus::new(&device)
+                .map_err(|error| format!("{name}: initialize status: {error}"))?;
+            // SAFETY: exact owned device buffers are distinct where writable and retained through synchronization.
+            unsafe {
+                launch_multi_head_recurrent_step_f32_checked(
+                    plan,
+                    q.as_device_ptr(),
+                    q.len(),
+                    k.as_device_ptr(),
+                    k.len(),
+                    v.as_device_ptr(),
+                    v.len(),
+                    beta.as_device_ptr(),
+                    beta.len(),
+                    g.as_device_ptr(),
+                    g.len(),
+                    1.0,
+                    state_in.as_device_ptr(),
+                    state_in.len(),
+                    state_out.as_device_ptr(),
+                    state_out.len(),
+                    output.as_device_ptr(),
+                    output.len(),
+                    &stream,
+                    &status,
+                )
+            }
+            .map_err(|error| format!("{name}: launch checked GDN step: {error}"))?;
+            stream
+                .synchronize()
+                .map_err(|error| format!("{name}: synchronize: {error}"))?;
+            assert_eq!(
+                gdn_native_status_bits(&status)?,
+                expected_bits,
+                "{name}: initialized status must contain the exact typed mask"
+            );
+            assert_gdn_device_values(&q, &q_host, name, "q")?;
+            assert_gdn_device_values(&k, &k_host, name, "k")?;
+            assert_gdn_device_values(&v, &v_host, name, "v")?;
+            assert_gdn_device_values(&beta, &beta_host, name, "beta")?;
+            assert_gdn_device_values(&g, &g_host, name, "g")?;
+            assert_gdn_device_values(&state_in, &state_host, name, "state input")?;
+            if expected_bits == 0 {
+                let admitted = MultiHeadRecurrentInput::new(
+                    &q_host,
+                    &k_host,
+                    &v_host,
+                    &beta_host,
+                    &g_host,
+                    1.0,
+                    &state_host,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                )
+                .map_err(|error| format!("{name}: admit CPU oracle: {error}"))?;
+                let expected = multi_head_recurrent_fwd(&admitted)
+                    .map_err(|error| format!("{name}: evaluate CPU oracle: {error}"))?;
+                assert_gdn_device_values(&state_out, expected.state(), name, "clean state")?;
+                assert_gdn_device_values(&output, expected.output(), name, "clean output")?;
+            }
         }
         Ok(())
     }
@@ -2261,6 +2437,35 @@ mod tests {
         clippy::too_many_arguments,
         reason = "the independent oracle mirrors the fixed recurrence contract without sharing production validation helpers"
     )]
+    #[cfg(feature = "gpu")]
+    fn gdn_native_status_bits(
+        status: &crate::numerical_status::NativeNumericalStatus,
+    ) -> core::result::Result<u32, String> {
+        match status.read_after_synchronization() {
+            Ok(()) => Ok(0),
+            Err(crate::Error::NumericalStatus {
+                source: crate::numerical_status::NativeNumericalStatusError::Observed { mask },
+                ..
+            }) => Ok(mask.bits()),
+            Err(error) => Err(format!("read typed native status: {error}")),
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn assert_gdn_device_values(
+        buffer: &hipcore::DeviceBuffer<f32>,
+        expected: &[f32],
+        case: &str,
+        name: &str,
+    ) -> core::result::Result<(), String> {
+        let mut actual = vec![0.0_f32; buffer.len()];
+        buffer
+            .copy_to_host(&mut actual)
+            .map_err(|error| format!("{case}: read {name}: {error}"))?;
+        assert_eq!(actual, expected, "{case}: {name} must match exactly");
+        Ok(())
+    }
+
     fn oracle_recurrence(
         q: &[f32],
         k: &[f32],
