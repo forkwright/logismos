@@ -961,8 +961,10 @@ impl NativePagedKvPool {
     /// # Safety
     ///
     /// The caller owns the stream and every device allocation participating in
-    /// the complete layer. On any submission or completion uncertainty it must
-    /// retain that complete bundle and never reuse this pool.
+    /// the complete layer. `stream` must belong to this pool's device and be
+    /// the ordered stream used for every prepare, row, and attention operation
+    /// in this transaction. On any submission or completion uncertainty it
+    /// must retain that complete bundle and never reuse this pool.
     pub unsafe fn begin_append(
         &mut self,
         append_tokens: usize,
@@ -1061,8 +1063,10 @@ impl NativePagedAppend<'_> {
     /// # Safety
     ///
     /// Source rows must be live device allocations of the declared width on
-    /// `stream`'s device. The caller owns completion and must poison its whole
-    /// session if submission completion becomes uncertain.
+    /// this pool's device. `stream` must be the same ordered pool-device stream
+    /// passed to [`NativePagedKvPool::begin_append`]. The caller owns completion
+    /// and must poison its whole session if submission completion becomes
+    /// uncertain.
     pub unsafe fn write_layer_row(
         &mut self,
         layer: usize,
@@ -1122,7 +1126,16 @@ impl NativePagedAppend<'_> {
     }
 
     /// Publish host ledger state only after the caller has proved completion.
-    pub fn commit_after_completion(mut self) -> Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// The caller must have successfully synchronized the same ordered stream
+    /// used for this transaction's prepare, row, and attention submissions.
+    /// No read or write of the transaction's K/V, table, query, or output
+    /// buffers may remain pending. On any submission or completion failure,
+    /// the caller must drop this append, retain the complete native session,
+    /// and never reuse it.
+    pub unsafe fn commit_after_completion(mut self) -> Result<()> {
         self.pool.ensure_not_poisoned()?;
         self.pool.ledger.commit(&mut self.reservation)?;
         self.committed = true;
@@ -1166,6 +1179,8 @@ impl NativePagedLayerKv<'_> {
     ///
     /// The query/output buffers and stream must uphold the attention launcher's
     /// device lifetime, non-aliasing, and finite normal-or-zero obligations.
+    /// `stream` must be this pool's device stream and exactly the ordered
+    /// stream passed to begin/row submission for this transaction.
     pub unsafe fn launch_paged_decode(
         &self,
         plan: NativePagedDecodePlan,
@@ -1175,26 +1190,7 @@ impl NativePagedLayerKv<'_> {
         output_elements: usize,
         stream: &Stream,
     ) -> Result<()> {
-        let attention_row_width = plan
-            .logical()
-            .kv_heads()
-            .checked_mul(plan.logical().head_width())
-            .ok_or_else(|| {
-                PagedArithmeticSnafu {
-                    operation: "native paged-attention row width",
-                }
-                .build()
-            })?;
-        if self.tokens != plan.logical().visible_tokens()
-            || self.pool.plan.layout.physical_pages() != plan.physical_pages()
-            || self.pool.plan.layout.page_tokens() != plan.page_tokens().get()
-            || self.pool.plan.layout.row_width() != attention_row_width
-        {
-            return PagedLayoutSnafu {
-                operation: "native paged-attention descriptor binding",
-            }
-            .fail();
-        }
+        validate_native_attention_binding(self.pool.plan, self.tokens, plan)?;
         let layer_offset = self
             .layer
             .checked_mul(self.pool.plan.layout.layer_elements())
@@ -1225,6 +1221,27 @@ impl NativePagedLayerKv<'_> {
         };
         Ok(())
     }
+}
+
+#[cfg(feature = "gpu")]
+fn validate_native_attention_binding(
+    cache: NativePagedKvPlan,
+    visible_tokens: usize,
+    attention: NativePagedDecodePlan,
+) -> Result<()> {
+    let logical = attention.logical();
+    if visible_tokens != logical.visible_tokens()
+        || cache.layout.physical_pages() != attention.physical_pages()
+        || cache.layout.page_tokens() != attention.page_tokens().get()
+        || cache.kv_heads != logical.kv_heads()
+        || cache.head_width != logical.head_width()
+    {
+        return PagedLayoutSnafu {
+            operation: "native paged-attention descriptor binding",
+        }
+        .fail();
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1673,6 +1690,40 @@ mod tests {
             NativePagedKvPlan::try_from_geometry(geometry, 2, ROW_WIDTH, NativePageTokens::B8,)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn native_attention_binding_rejects_same_row_width_with_different_gqa_axes() -> Result<()> {
+        use kernels::attention::{NativePageTokens, PagedDecodePlan};
+
+        let cache = NativePagedKvPlan::try_from_geometry(
+            PagedKvGeometry {
+                layers: LAYERS,
+                row_width: 8,
+                max_context: 8,
+            },
+            1,
+            8,
+            NativePageTokens::B8,
+        )?;
+        let accepted = NativePagedDecodePlan::try_from_paged_decode(
+            PagedDecodePlan::try_from_dimensions(1, 2, 1, 8)?,
+            8,
+            cache.layout().physical_pages(),
+        )?;
+        assert!(validate_native_attention_binding(cache, 1, accepted).is_ok());
+
+        let remapped = NativePagedDecodePlan::try_from_paged_decode(
+            PagedDecodePlan::try_from_dimensions(1, 2, 2, 4)?,
+            8,
+            cache.layout().physical_pages(),
+        )?;
+        assert!(matches!(
+            validate_native_attention_binding(cache, 1, remapped),
+            Err(Error::PagedLayout { .. })
+        ));
         Ok(())
     }
     #[test]
