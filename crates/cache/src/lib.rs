@@ -2,7 +2,7 @@
 //!
 //! KV cache layouts for decoder inference.
 //!
-//! The legacy default feature ships [`FlatKvCache`] — a
+//! The legacy `flat` default feature ships `FlatKvCache` — a
 //! layer-indexed ring of CPU-backed `taxis::Tensor` slots with an
 //! append-style `put` + a `get` that slices the whole cached range
 //! for a given layer. No eviction, no sharing, no prefix reuse.
@@ -13,17 +13,15 @@
 //!
 //! ## Shape model
 //!
-//! [`CacheLayout`] carries the invariants a decoder needs:
+//! The flat feature's `CacheLayout` carries its tensor geometry:
 //! `{ num_layers, num_kv_heads, head_dim, max_seq_len, dtype }`.
-//! Phase 2 stores K and V separately per layer, as CPU tensors with
+//! It stores K and V separately per layer, as CPU tensors with
 //! shape `[max_seq_len, num_kv_heads * head_dim]`. Per-layer
 //! "written-length" state (`lens[layer]`) tracks how many rows have
 //! been appended. A subsequent `get_kv(layer, 0..len)` returns two
 //! sliced views.
-//!
-//! Phase 3 (Stella) runs on CPU at first. Phase 4 moves onto HIP.
-//! Switching the storage kind is a one-liner on `alloc_slot` once
-//! `taxis::Tensor` grows a device-side allocator backend.
+//! Paged geometry and transaction ownership are separate from this legacy
+//! tensor layout and do not initialize a device runtime.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -55,12 +53,11 @@ pub use crate::paged::{
     PagedLayerKv,
 };
 
-/// Abstract KV-cache contract.
+/// Legacy unshared tensor KV-cache contract.
 ///
-/// Kept as a trait so Phase 6 / 12 layouts can be substituted without
-/// touching the forward-pass code. Every concrete impl lives behind
-/// the same two primitive operations (put + get); the paged + radix
-/// variants add sharing / eviction as implementation details.
+/// Paged append transactions use their own explicit lifecycle, not this
+/// tensor-oriented put/get/reset interface. Sharing and eviction are not
+/// hidden implementation details of this trait.
 #[cfg(feature = "flat")]
 pub trait KvCache {
     /// Append `k` and `v` tensors to the given `layer_idx` slot.
