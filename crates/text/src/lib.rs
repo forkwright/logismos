@@ -10,9 +10,11 @@
 //! separate private adapter can reuse the same bounded greedy loop without
 //! making this crate a native execution or service authority.
 //!
-//! A failed pipeline call returns neither a session nor partial generated text.
-//! Its private execution is dropped, but a completed underlying decoder step is
-//! not rolled back before that drop.
+//! A failed CPU pipeline call returns neither a session nor partial generated
+//! text. Its private execution is dropped, but a completed underlying decoder
+//! step is not rolled back before that drop. A caller-owned
+//! [`GenerationDriver`] remains with its caller on success, cancellation, or
+//! error; this port does not acknowledge adapter-resource release.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -249,7 +251,7 @@ pub struct PreparedGeneration {
 /// Implementors are responsible for binding their private execution to the
 /// exact [`PreparedGeneration`] weights and context inspected before this port
 /// consumes the preparation. This port is not service authority, GPU-residency
-/// proof, or a release qualification for a native backend.
+/// proof, a release acknowledgement, or a qualification for a native backend.
 pub trait GenerationDriver {
     /// Execute one nonempty batch of prepared token IDs.
     ///
@@ -378,6 +380,12 @@ impl PreparedGeneration {
     /// with another driver. An adapter that internally pre-fills token by token
     /// receives the cancellation source for those boundaries.
     ///
+    /// This method checks cancellation at the legacy `decoder session
+    /// construction` boundary before invoking the driver. Because the driver
+    /// is caller-owned and already constructed, that check is not evidence that
+    /// an adapter allocation or submission was prevented; private adapters must
+    /// validate their own grant and cancellation before construction.
+    ///
     /// The caller must construct the adapter from [`Self::verified_weights`]
     /// and [`Self::context_tokens`] of this same preparation before consuming
     /// it. The port deliberately does not claim safe native inference, service
@@ -443,6 +451,9 @@ fn run_generation(
         drop(logits);
         logits = driver.step(&[next], cancellation)?;
     };
+    // The final vocabulary row is no longer needed once selection completes;
+    // release it before collective tokenizer output allocation and decoding.
+    drop(logits);
     check_cancelled(cancellation, "collective output decoding")?;
     let text = pipeline
         .profile
