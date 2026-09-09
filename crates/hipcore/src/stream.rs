@@ -1,11 +1,15 @@
 //! HIP streams and events.
 
 use core::mem::ManuallyDrop;
+use std::fmt;
 use std::io::{self, Write};
 use std::ptr;
 
+use crate::creation::{
+    CreationAttempt, CreationPort, CreationResolution, attempt_creation, resolve_creation,
+};
 use crate::device::Device;
-use crate::error::{Result, check, hipError_t_code};
+use crate::error::{Error, InternalSnafu, Result, check, hipError_t_code};
 use crate::ffi;
 use crate::teardown::{
     PendingOwner, QuiesceAttempt, ReleaseAttempt, ReleaseOwner, ReleaseReceipt, ResourceKind,
@@ -32,17 +36,68 @@ unsafe impl Send for Stream {}
 impl Stream {
     /// Create a new non-blocking stream on `device`.
     ///
+    /// This compatibility entry point returns the historical [`crate::Result`]
+    /// shape. It cannot return custody when a failed stream creation call
+    /// anomalously writes a non-null output handle. Construction transactions
+    /// that require truthful native ownership must use [`Self::new_tracked`].
+    ///
     /// # Errors
     ///
     /// [`crate::Error::Runtime`] on HIP failure.
     pub fn new(device: &Device) -> Result<Self> {
-        device.make_current()?;
-        let mut handle: ffi::hipStream_t = ptr::null_mut();
-        // SAFETY: FFI call; `&mut handle` valid.
-        check(
-            unsafe { ffi::hipStreamCreateWithFlags(&mut handle, ffi::hipStreamNonBlocking) },
-            "hipStreamCreateWithFlags",
-        )?;
+        match resolve_creation(
+            stream_creation_attempt(device),
+            |handle| Self::from_created_handle(device, handle),
+            |_, error| error,
+        ) {
+            CreationResolution::Created(stream) => Ok(stream),
+            CreationResolution::NoHandle(error) | CreationResolution::Quarantined(error) => {
+                Err(error)
+            }
+        }
+    }
+
+    /// Create a non-blocking stream with explicit output-handle custody.
+    ///
+    /// A preflight failure or HIP error whose output slot remains null returns
+    /// [`StreamCreationError::NoHandle`]. A HIP error accompanied by a non-null
+    /// output returns an opaque terminal [`StreamCreationQuarantine`]; the
+    /// handle is never exposed, destroyed, or retried because HIP did not
+    /// establish that it denotes an owned stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamCreationError`] for wrapper rejection or HIP failure.
+    pub fn new_tracked(device: &Device) -> core::result::Result<Self, StreamCreationError> {
+        match resolve_creation(
+            stream_creation_attempt(device),
+            |handle| Self::from_created_handle(device, handle),
+            |handle, error| StreamCreationQuarantine {
+                error,
+                resource: ResourceMetadata::new(
+                    ResourceKind::Stream,
+                    0,
+                    device.clone(),
+                    TeardownEntryId::Standalone,
+                ),
+                _handle: StreamTeardownHandle { handle },
+            },
+        ) {
+            CreationResolution::Created(stream) => Ok(stream),
+            CreationResolution::NoHandle(error) => Err(StreamCreationError::NoHandle(error)),
+            CreationResolution::Quarantined(quarantine) => {
+                Err(StreamCreationError::Quarantined(quarantine))
+            }
+        }
+    }
+
+    fn from_created_handle(device: &Device, handle: ffi::hipStream_t) -> Result<Self> {
+        if handle.is_null() {
+            return InternalSnafu {
+                message: "hipStreamCreateWithFlags returned success with null handle",
+            }
+            .fail();
+        }
         Ok(Self {
             handle,
             device: device.clone(),
@@ -149,6 +204,125 @@ impl Stream {
         let device = unsafe { core::ptr::read(&stream.device) };
         let metadata = ResourceMetadata::new(ResourceKind::Stream, 0, device, entry);
         Ok(ReleaseOwner::new(StreamTeardownHandle { handle }, metadata))
+    }
+}
+
+struct StreamCreationPort<'a> {
+    device: &'a Device,
+}
+
+impl CreationPort for StreamCreationPort<'_> {
+    type Handle = ffi::hipStream_t;
+
+    fn null_handle(&self) -> Self::Handle {
+        ptr::null_mut()
+    }
+
+    fn is_null(&self, handle: Self::Handle) -> bool {
+        handle.is_null()
+    }
+
+    fn preflight(&mut self) -> Result<()> {
+        self.device.make_current()
+    }
+
+    fn create(&mut self, output: &mut Self::Handle) -> Result<()> {
+        // SAFETY: `output` is a valid writable stream-handle slot.
+        check(
+            unsafe { ffi::hipStreamCreateWithFlags(output, ffi::hipStreamNonBlocking) },
+            "hipStreamCreateWithFlags",
+        )
+    }
+
+    fn success_with_null_error(&self) -> Error {
+        InternalSnafu {
+            message: "hipStreamCreateWithFlags returned success with null handle",
+        }
+        .build()
+    }
+}
+
+fn stream_creation_attempt(device: &Device) -> CreationAttempt<ffi::hipStream_t> {
+    let mut port = StreamCreationPort { device };
+    attempt_creation(&mut port)
+}
+
+/// Failure from an explicitly tracked stream creation attempt.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum StreamCreationError {
+    /// The call was rejected before creation or its output slot remained null.
+    ///
+    /// This state owns no native handle and makes no claim about runtime-side
+    /// cleanup or resource reclamation.
+    NoHandle(Error),
+    /// HIP returned an error after writing a non-null, indeterminate output.
+    Quarantined(StreamCreationQuarantine),
+}
+
+impl StreamCreationError {
+    /// Underlying wrapper or HIP failure.
+    #[must_use]
+    pub fn error(&self) -> &Error {
+        match self {
+            Self::NoHandle(error) => error,
+            Self::Quarantined(quarantine) => quarantine.error(),
+        }
+    }
+}
+
+impl fmt::Display for StreamCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoHandle(error) => fmt::Display::fmt(error, formatter),
+            Self::Quarantined(quarantine) => write!(
+                formatter,
+                "HIP stream creation returned an indeterminate non-null output: {}",
+                quarantine.error()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StreamCreationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error())
+    }
+}
+
+/// Terminal custody for a non-null output from failed HIP stream creation.
+///
+/// The output is neither assumed valid nor passed to `hipStreamDestroy`. This
+/// value exposes accounting facts and the creation error, but no handle, retry,
+/// or release transition. Dropping it performs no HIP work.
+#[must_use = "the indeterminate stream output must remain conservatively accounted"]
+pub struct StreamCreationQuarantine {
+    error: Error,
+    resource: ResourceMetadata,
+    _handle: StreamTeardownHandle,
+}
+
+impl fmt::Debug for StreamCreationQuarantine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamCreationQuarantine")
+            .field("error", &self.error)
+            .field("resource", &self.resource)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamCreationQuarantine {
+    /// HIP failure returned with the indeterminate output.
+    #[must_use]
+    pub const fn error(&self) -> &Error {
+        &self.error
+    }
+
+    /// Stream creation facts retained for conservative accounting.
+    #[must_use]
+    pub const fn resource(&self) -> &ResourceMetadata {
+        &self.resource
     }
 }
 
@@ -280,10 +454,18 @@ impl PendingStreamDestroy {
 }
 
 /// Opaque terminal stream record after an indeterminate destroy outcome.
-#[derive(Debug)]
 pub struct StreamTeardownQuarantine {
     tombstone: TeardownTombstone,
     _owner: ReleaseOwner<StreamTeardownHandle>,
+}
+
+impl fmt::Debug for StreamTeardownQuarantine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamTeardownQuarantine")
+            .field("tombstone", &self.tombstone)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StreamTeardownQuarantine {

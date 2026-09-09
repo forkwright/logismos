@@ -4,8 +4,12 @@ use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 use std::ffi::c_void;
+use std::fmt;
 use std::io::{self, Write};
 
+use crate::creation::{
+    CreationAttempt, CreationPort, CreationResolution, attempt_creation, resolve_creation,
+};
 use crate::device::Device;
 use crate::error::{Error, InternalSnafu, OutOfMemorySnafu, Result, check, hipError_t_code};
 use crate::ffi;
@@ -47,56 +51,76 @@ unsafe impl<T: BytePod + Sync> Sync for DeviceBuffer<T> {}
 impl<T: BytePod> DeviceBuffer<T> {
     /// Allocate `len` elements of `T` on `device`.
     ///
+    /// This compatibility entry point returns the historical [`crate::Result`]
+    /// shape. It cannot return custody when a failed `hipMalloc` anomalously
+    /// writes a non-null output pointer. Construction transactions that require
+    /// truthful native ownership must use [`Self::alloc_tracked`] instead.
+    ///
     /// # Errors
     ///
     /// - [`Error::OutOfMemory`] when `hipMalloc` returns an
     ///   out-of-memory status.
     /// - [`Error::Runtime`] for any other HIP failure.
     pub fn alloc(device: &Device, len: usize) -> Result<Self> {
-        device.make_current()?;
-        let bytes = len.checked_mul(core::mem::size_of::<T>()).ok_or_else(|| {
-            InternalSnafu {
-                message: "allocation size overflow",
+        let (_, attempt) = allocation_attempt::<T>(device, len)?;
+        match resolve_creation(
+            attempt,
+            |ptr| Self::from_created_handle(device, len, ptr),
+            |_, error| error,
+        ) {
+            CreationResolution::Created(buffer) => Ok(buffer),
+            CreationResolution::NoHandle(error) | CreationResolution::Quarantined(error) => {
+                Err(error)
             }
-            .build()
-        })?;
-        let mut ptr: *mut c_void = core::ptr::null_mut();
-        // SAFETY: FFI call; `&mut ptr` valid. HIP returns either a
-        // non-null pointer with status success, or null with a failure
-        // code; we validate both.
-        let status = unsafe { ffi::hipMalloc(&mut ptr, bytes) };
-        if status != ffi::hipError_t::hipSuccess {
-            let free = device.memory_budget().map(|b| b.free).unwrap_or(0);
-            return Err(if status == ffi::hipError_t::hipErrorOutOfMemory {
-                OutOfMemorySnafu {
-                    requested: bytes,
-                    free,
-                }
-                .build()
-            } else {
-                Error::runtime(hipError_t_code(status), "hipMalloc")
-            });
         }
-        let nn = NonNull::new(ptr.cast::<T>()).ok_or_else(|| {
-            InternalSnafu {
-                message: "hipMalloc returned success with null ptr",
+    }
+
+    /// Allocate with explicit custody for every observed output-handle state.
+    ///
+    /// This is the authoritative constructor for native ownership
+    /// transactions. A preflight failure, size rejection, or HIP error whose
+    /// output slot remains null returns [`BufferAllocationError::NoHandle`]. A
+    /// HIP error accompanied by a non-null output returns an opaque terminal
+    /// [`BufferCreationQuarantine`]; that pointer is never exposed, freed, or
+    /// retried because HIP did not establish that it denotes a live allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferAllocationError`] for wrapper rejection or HIP failure.
+    pub fn alloc_tracked(
+        device: &Device,
+        len: usize,
+    ) -> core::result::Result<Self, BufferAllocationError> {
+        let (bytes, attempt) =
+            allocation_attempt::<T>(device, len).map_err(BufferAllocationError::NoHandle)?;
+        match resolve_creation(
+            attempt,
+            |ptr| Self::from_created_handle(device, len, ptr),
+            |handle, error| BufferCreationQuarantine {
+                error,
+                resource: ResourceMetadata::new(
+                    ResourceKind::Buffer,
+                    bytes,
+                    device.clone(),
+                    TeardownEntryId::Standalone,
+                ),
+                _handle: BufferTeardownHandle { ptr: handle },
+            },
+        ) {
+            CreationResolution::Created(buffer) => Ok(buffer),
+            CreationResolution::NoHandle(error) => Err(BufferAllocationError::NoHandle(error)),
+            CreationResolution::Quarantined(quarantine) => {
+                Err(BufferAllocationError::Quarantined(quarantine))
             }
-            .build()
-        })?;
-        Ok(Self {
-            ptr: nn,
-            len,
-            device: device.clone(),
-            _marker: PhantomData,
-        })
+        }
     }
 
     /// Allocate and copy `data` to device memory.
     ///
     /// This convenience constructor uses ordinary buffer destruction if the
     /// copy fails. Custody-sensitive construction transactions must instead
-    /// call [`Self::alloc`], then [`Self::copy_from_host`], and capture the
-    /// still-owned buffer before propagating a copy error.
+    /// call [`Self::alloc_tracked`], then [`Self::copy_from_host`], and capture
+    /// the still-owned buffer before propagating a copy error.
     ///
     /// # Errors
     ///
@@ -105,6 +129,21 @@ impl<T: BytePod> DeviceBuffer<T> {
         let mut buf = Self::alloc(device, data.len())?;
         buf.copy_from_host(data)?;
         Ok(buf)
+    }
+
+    fn from_created_handle(device: &Device, len: usize, ptr: *mut c_void) -> Result<Self> {
+        let ptr = NonNull::new(ptr.cast::<T>()).ok_or_else(|| {
+            InternalSnafu {
+                message: "hipMalloc returned success with null ptr",
+            }
+            .build()
+        })?;
+        Ok(Self {
+            ptr,
+            len,
+            device: device.clone(),
+            _marker: PhantomData,
+        })
     }
 
     /// Start explicit, one-way release of this allocation.
@@ -350,6 +389,151 @@ impl<T: BytePod> DeviceBuffer<T> {
     }
 }
 
+struct BufferAllocationPort<'a> {
+    device: &'a Device,
+    requested_bytes: usize,
+}
+
+impl CreationPort for BufferAllocationPort<'_> {
+    type Handle = *mut c_void;
+
+    fn null_handle(&self) -> Self::Handle {
+        core::ptr::null_mut()
+    }
+
+    fn is_null(&self, handle: Self::Handle) -> bool {
+        handle.is_null()
+    }
+
+    fn preflight(&mut self) -> Result<()> {
+        self.device.make_current()
+    }
+
+    fn create(&mut self, output: &mut Self::Handle) -> Result<()> {
+        // SAFETY: `output` is a valid writable pointer slot for this call.
+        let status = unsafe { ffi::hipMalloc(output, self.requested_bytes) };
+        if status == ffi::hipError_t::hipSuccess {
+            Ok(())
+        } else if status == ffi::hipError_t::hipErrorOutOfMemory {
+            let free = self
+                .device
+                .memory_budget()
+                .map(|budget| budget.free)
+                .unwrap_or(0);
+            Err(OutOfMemorySnafu {
+                requested: self.requested_bytes,
+                free,
+            }
+            .build())
+        } else {
+            Err(Error::runtime(hipError_t_code(status), "hipMalloc"))
+        }
+    }
+
+    fn success_with_null_error(&self) -> Error {
+        InternalSnafu {
+            message: "hipMalloc returned success with null ptr",
+        }
+        .build()
+    }
+}
+
+fn allocation_attempt<T: BytePod>(
+    device: &Device,
+    len: usize,
+) -> Result<(usize, CreationAttempt<*mut c_void>)> {
+    let requested_bytes = len.checked_mul(core::mem::size_of::<T>()).ok_or_else(|| {
+        InternalSnafu {
+            message: "allocation size overflow",
+        }
+        .build()
+    })?;
+    let mut port = BufferAllocationPort {
+        device,
+        requested_bytes,
+    };
+    Ok((requested_bytes, attempt_creation(&mut port)))
+}
+
+/// Failure from an explicitly tracked device allocation attempt.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BufferAllocationError {
+    /// The call was rejected before creation or its output slot remained null.
+    ///
+    /// This state owns no native handle and makes no claim about measured VRAM
+    /// reclamation.
+    NoHandle(Error),
+    /// HIP returned an error after writing a non-null, indeterminate output.
+    Quarantined(BufferCreationQuarantine),
+}
+
+impl BufferAllocationError {
+    /// Underlying wrapper or HIP failure.
+    #[must_use]
+    pub fn error(&self) -> &Error {
+        match self {
+            Self::NoHandle(error) => error,
+            Self::Quarantined(quarantine) => quarantine.error(),
+        }
+    }
+}
+
+impl fmt::Display for BufferAllocationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoHandle(error) => fmt::Display::fmt(error, formatter),
+            Self::Quarantined(quarantine) => write!(
+                formatter,
+                "HIP allocation returned an indeterminate non-null output: {}",
+                quarantine.error()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BufferAllocationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error())
+    }
+}
+
+/// Terminal custody for a non-null output from a failed `hipMalloc` call.
+///
+/// The output is neither assumed valid nor passed to `hipFree`. This value
+/// exposes accounting facts and the creation error, but no pointer, retry, or
+/// release transition. Dropping it performs no HIP work.
+#[must_use = "the indeterminate allocation must remain conservatively accounted"]
+pub struct BufferCreationQuarantine {
+    error: Error,
+    resource: ResourceMetadata,
+    _handle: BufferTeardownHandle,
+}
+
+impl fmt::Debug for BufferCreationQuarantine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BufferCreationQuarantine")
+            .field("error", &self.error)
+            .field("resource", &self.resource)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BufferCreationQuarantine {
+    /// HIP failure returned with the indeterminate output.
+    #[must_use]
+    pub const fn error(&self) -> &Error {
+        &self.error
+    }
+
+    /// Requested allocation facts retained for conservative accounting.
+    #[must_use]
+    pub const fn resource(&self) -> &ResourceMetadata {
+        &self.resource
+    }
+}
+
 /// Opaque, type-erased allocation owner prepared for explicit teardown.
 ///
 /// This value contains an inert raw handle and accounting metadata only. It
@@ -425,10 +609,18 @@ impl PendingBufferTeardown {
 }
 
 /// Opaque terminal allocation record after an indeterminate `hipFree` outcome.
-#[derive(Debug)]
 pub struct BufferTeardownQuarantine {
     tombstone: TeardownTombstone,
     _owner: ReleaseOwner<BufferTeardownHandle>,
+}
+
+impl fmt::Debug for BufferTeardownQuarantine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BufferTeardownQuarantine")
+            .field("tombstone", &self.tombstone)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BufferTeardownQuarantine {

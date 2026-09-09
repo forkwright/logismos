@@ -37,6 +37,8 @@
     clippy::too_many_lines
 )]
 
+mod creation;
+
 pub mod device;
 pub mod error;
 pub mod ffi;
@@ -51,13 +53,14 @@ pub use crate::device::{
 };
 pub use crate::error::{Error, ErrorKind, Result, check};
 pub use crate::memory::{
-    BufferRelease, BufferTeardownQuarantine, DeviceBuffer, PendingBufferTeardown, PendingCopy,
-    TeardownBuffer,
+    BufferAllocationError, BufferCreationQuarantine, BufferRelease, BufferTeardownQuarantine,
+    DeviceBuffer, PendingBufferTeardown, PendingCopy, TeardownBuffer,
 };
 pub use crate::pod::BytePod;
 pub use crate::stream::{
     Event, NonOwnedStream, PendingStreamDestroy, PendingStreamQuiesce, QuiescentStream, Stream,
-    StreamQuiesce, StreamRelease, StreamSynchronizationUnconfirmed, StreamTeardownQuarantine,
+    StreamCreationError, StreamCreationQuarantine, StreamQuiesce, StreamRelease,
+    StreamSynchronizationUnconfirmed, StreamTeardownQuarantine,
 };
 pub use crate::teardown::{
     InventoryAccountingError, InventoryEvidence, InventoryPushError, InventoryQuarantine,
