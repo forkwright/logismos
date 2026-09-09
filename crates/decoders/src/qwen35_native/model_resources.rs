@@ -218,15 +218,20 @@ impl ModelSessionTeardown {
 
     /// Recover the exact resident owner only after HIP acknowledged the whole
     /// mutable-session inventory and its ordered stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged boxed teardown custody unless the inventory has
+    /// an actual full HIP acknowledgement.
     pub(super) fn into_released_resident(
         self,
-    ) -> core::result::Result<Arc<NativeResidentModelResources>, Self> {
+    ) -> core::result::Result<Arc<NativeResidentModelResources>, Box<Self>> {
         match self {
             Self::Releasing {
                 release: InventoryRelease::Released(_),
                 resident,
             } => Ok(resident.recover()),
-            other => Err(other),
+            other => Err(Box::new(other)),
         }
     }
 }
