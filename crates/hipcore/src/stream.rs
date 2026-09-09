@@ -60,10 +60,10 @@ impl Stream {
     /// Create a non-blocking stream with explicit output-handle custody.
     ///
     /// A preflight failure or HIP error whose output slot remains null returns
-    /// [`StreamCreationError::NoHandle`]. A HIP error accompanied by a non-null
-    /// output returns an opaque terminal [`StreamCreationQuarantine`]; the
-    /// handle is never exposed, destroyed, or retried because HIP did not
-    /// establish that it denotes an owned stream.
+    /// [`StreamCreationError::NoHandle`]. A creation or owner-admission error
+    /// with a retained non-null output returns an opaque terminal
+    /// [`StreamCreationQuarantine`]; the handle is never exposed, destroyed, or
+    /// retried without an admitted resource owner.
     ///
     /// # Errors
     ///
@@ -255,7 +255,7 @@ pub enum StreamCreationError {
     /// This state owns no native handle and makes no claim about runtime-side
     /// cleanup or resource reclamation.
     NoHandle(Error),
-    /// HIP returned an error after writing a non-null, indeterminate output.
+    /// Creation or owner admission failed with a retained non-null output.
     Quarantined(StreamCreationQuarantine),
 }
 
@@ -289,7 +289,7 @@ impl std::error::Error for StreamCreationError {
     }
 }
 
-/// Terminal custody for a non-null output from failed HIP stream creation.
+/// Terminal custody for a non-null output that could not become an owned stream.
 ///
 /// The output is neither assumed valid nor passed to `hipStreamDestroy`. This
 /// value exposes accounting facts and the creation error, but no handle, retry,
@@ -312,7 +312,7 @@ impl fmt::Debug for StreamCreationQuarantine {
 }
 
 impl StreamCreationQuarantine {
-    /// HIP failure returned with the indeterminate output.
+    /// Creation or owner-admission failure retained with the output.
     #[must_use]
     pub const fn error(&self) -> &Error {
         &self.error

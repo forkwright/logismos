@@ -80,9 +80,9 @@ impl<T: BytePod> DeviceBuffer<T> {
     /// This is the authoritative constructor for native ownership
     /// transactions. A preflight failure, size rejection, or HIP error whose
     /// output slot remains null returns [`BufferAllocationError::NoHandle`]. A
-    /// HIP error accompanied by a non-null output returns an opaque terminal
-    /// [`BufferCreationQuarantine`]; that pointer is never exposed, freed, or
-    /// retried because HIP did not establish that it denotes a live allocation.
+    /// creation or owner-admission error with a retained non-null output returns
+    /// an opaque terminal [`BufferCreationQuarantine`]; that pointer is never
+    /// exposed, freed, or retried without an admitted resource owner.
     ///
     /// # Errors
     ///
@@ -463,7 +463,7 @@ pub enum BufferAllocationError {
     /// This state owns no native handle and makes no claim about measured VRAM
     /// reclamation.
     NoHandle(Error),
-    /// HIP returned an error after writing a non-null, indeterminate output.
+    /// Creation or owner admission failed with a retained non-null output.
     Quarantined(BufferCreationQuarantine),
 }
 
@@ -497,7 +497,7 @@ impl std::error::Error for BufferAllocationError {
     }
 }
 
-/// Terminal custody for a non-null output from a failed `hipMalloc` call.
+/// Terminal custody for a non-null output that could not become an owned buffer.
 ///
 /// The output is neither assumed valid nor passed to `hipFree`. This value
 /// exposes accounting facts and the creation error, but no pointer, retry, or
@@ -520,7 +520,7 @@ impl fmt::Debug for BufferCreationQuarantine {
 }
 
 impl BufferCreationQuarantine {
-    /// HIP failure returned with the indeterminate output.
+    /// Creation or owner-admission failure retained with the output.
     #[must_use]
     pub const fn error(&self) -> &Error {
         &self.error

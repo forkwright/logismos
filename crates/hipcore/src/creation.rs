@@ -56,7 +56,7 @@ pub(crate) fn resolve_creation<H: Copy, R, Q>(
     match attempt {
         CreationAttempt::Created(handle) => match wrap_created(handle) {
             Ok(resource) => CreationResolution::Created(resource),
-            Err(error) => CreationResolution::NoHandle(error),
+            Err(error) => CreationResolution::Quarantined(quarantine(handle, error)),
         },
         CreationAttempt::NoHandle(error) => CreationResolution::NoHandle(error),
         CreationAttempt::Indeterminate { handle, error } => {
@@ -235,6 +235,24 @@ mod tests {
             },
         );
         assert!(matches!(resolution, CreationResolution::Created(_)));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(resolution);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_owner_admission_retains_the_created_handle() {
+        let resolution = resolve_creation(
+            CreationAttempt::Created(7),
+            |_| Err::<DropTrackedOwner, _>(failure("owner admission")),
+            |handle, error| FakeQuarantine {
+                _handle: handle,
+                _error: error,
+            },
+        );
+        assert!(matches!(
+            resolution,
+            CreationResolution::Quarantined(FakeQuarantine { _handle: 7, .. })
+        ));
     }
 }
