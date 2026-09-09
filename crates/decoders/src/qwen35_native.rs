@@ -9,7 +9,15 @@ mod plan_tests;
 #[cfg(feature = "gpu")]
 mod resources;
 #[cfg(feature = "gpu")]
+mod session;
+#[cfg(feature = "gpu")]
 mod weights;
+
+#[cfg(feature = "gpu")]
+pub use session::{
+    Qwen35NativeLayerDeviceDemand, Qwen35NativeLayerPlan, Qwen35NativeLayerSession,
+    Qwen35NativeLayerSessionState,
+};
 
 /// One owned resource bundle whose submitted work can be synchronized.
 ///
