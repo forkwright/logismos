@@ -7,7 +7,7 @@ use super::ResourceOwner;
 use super::model_plan::{DeviceModelPlan, ModelDeviceByteDemand};
 use super::model_resources::{
     ModelSessionResources, ModelSessionTeardown, ModelSessionTeardownState,
-    NativeResidentModelResources,
+    NativeResidentModelResources, NativeResidentTeardown,
 };
 use super::session::{Qwen35NativeSessionState, begin_error, completion_error, session_state};
 use crate::{Qwen35Weights, Result};
@@ -287,6 +287,64 @@ impl Qwen35NativeExecutionModel {
         self.plan_session(self.resources.context_ceiling())?
             .into_session()
     }
+
+    /// Consume this model into explicit resident teardown when no use retains it.
+    ///
+    /// A live session or planned use keeps the immutable resident `Arc` alive,
+    /// so this returns that exact model unchanged rather than treating a shared
+    /// reference count as an eviction acknowledgement.
+    #[must_use]
+    pub fn close(self) -> Qwen35NativeExecutionModelClose {
+        match Arc::try_unwrap(self.resources) {
+            Ok(resources) => {
+                Qwen35NativeExecutionModelClose::Teardown(Qwen35NativeExecutionModelTeardown {
+                    inner: resources.into_teardown_parts().begin_release(),
+                })
+            }
+            Err(resources) => Qwen35NativeExecutionModelClose::InUse(Self { resources }),
+        }
+    }
+}
+
+/// Result of requesting explicit immutable-model teardown.
+#[must_use = "a shared model remains usable or teardown retains native ownership"]
+pub enum Qwen35NativeExecutionModelClose {
+    /// Another session or exact-context plan still retains the resident model.
+    InUse(Qwen35NativeExecutionModel),
+    /// The unique resident model has entered explicit HIP teardown.
+    Teardown(Qwen35NativeExecutionModelTeardown),
+}
+
+/// Explicit teardown custody for a unique immutable native model.
+///
+/// Dropping this owner makes no HIP call and never acknowledges release.
+#[must_use = "resident teardown outcomes retain explicit HIP custody"]
+pub struct Qwen35NativeExecutionModelTeardown {
+    inner: NativeResidentTeardown,
+}
+
+impl Qwen35NativeExecutionModelTeardown {
+    /// Return the exact resident-teardown custody class.
+    #[must_use]
+    pub fn state(&self) -> Qwen35NativeExecutionSessionTeardownState {
+        teardown_state(self.inner.state())
+    }
+
+    /// Retry HIP aggregate teardown only after its preflight-pending outcome.
+    #[must_use]
+    pub fn retry(self) -> Self {
+        Self {
+            inner: self.inner.retry_pending(),
+        }
+    }
+
+    /// Deliberately retry only stream synchronization after completion was unproved.
+    #[must_use]
+    pub fn reconcile(self) -> Self {
+        Self {
+            inner: self.inner.reconcile_synchronization(),
+        }
+    }
 }
 
 /// Exact per-use session plan bound to one immutable resident native model.
@@ -369,26 +427,7 @@ impl Qwen35NativeExecutionSessionTeardown {
     /// Return the exact custody class; this is never evidence of physical eviction.
     #[must_use]
     pub fn state(&self) -> Qwen35NativeExecutionSessionTeardownState {
-        match self.inner.state() {
-            ModelSessionTeardownState::Released => {
-                Qwen35NativeExecutionSessionTeardownState::Released
-            }
-            ModelSessionTeardownState::Unadmitted => {
-                Qwen35NativeExecutionSessionTeardownState::Unadmitted
-            }
-            ModelSessionTeardownState::PartiallyAdmitted => {
-                Qwen35NativeExecutionSessionTeardownState::PartiallyAdmitted
-            }
-            ModelSessionTeardownState::Pending => {
-                Qwen35NativeExecutionSessionTeardownState::Pending
-            }
-            ModelSessionTeardownState::SynchronizationUnconfirmed => {
-                Qwen35NativeExecutionSessionTeardownState::SynchronizationUnconfirmed
-            }
-            ModelSessionTeardownState::Quarantined => {
-                Qwen35NativeExecutionSessionTeardownState::Quarantined
-            }
-        }
+        teardown_state(self.inner.state())
     }
 
     /// Retry HIP aggregate teardown only after its preflight-pending outcome.
@@ -411,6 +450,25 @@ impl Qwen35NativeExecutionSessionTeardown {
     pub fn reconcile(self) -> Self {
         Self {
             inner: self.inner.reconcile_synchronization(),
+        }
+    }
+}
+
+fn teardown_state(state: ModelSessionTeardownState) -> Qwen35NativeExecutionSessionTeardownState {
+    match state {
+        ModelSessionTeardownState::Released => Qwen35NativeExecutionSessionTeardownState::Released,
+        ModelSessionTeardownState::Unadmitted => {
+            Qwen35NativeExecutionSessionTeardownState::Unadmitted
+        }
+        ModelSessionTeardownState::PartiallyAdmitted => {
+            Qwen35NativeExecutionSessionTeardownState::PartiallyAdmitted
+        }
+        ModelSessionTeardownState::Pending => Qwen35NativeExecutionSessionTeardownState::Pending,
+        ModelSessionTeardownState::SynchronizationUnconfirmed => {
+            Qwen35NativeExecutionSessionTeardownState::SynchronizationUnconfirmed
+        }
+        ModelSessionTeardownState::Quarantined => {
+            Qwen35NativeExecutionSessionTeardownState::Quarantined
         }
     }
 }

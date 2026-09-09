@@ -77,6 +77,30 @@ pub(super) struct ModelSessionResources {
     position: usize,
 }
 
+/// Fully disarmed immutable uploads awaiting a dedicated teardown stream.
+#[must_use = "resident uploads remain live until explicit HIP teardown"]
+pub(super) struct NativeResidentTeardownParts {
+    device: Device,
+    buffers: Vec<TeardownBuffer>,
+}
+
+/// Explicit ownership for resident uploads after their last model `Arc` ended.
+///
+/// Like session teardown, this owns the HIP primitive directly and adds no
+/// release semantics. Its buffer extent comes only from captured owners.
+#[must_use = "resident teardown retains live native ownership"]
+pub(super) enum NativeResidentTeardown {
+    /// Creating a fresh owned teardown stream failed before HIP admission.
+    Unadmitted(NativeResidentTeardownParts),
+    /// Checked accounting admitted a prefix and retained the remaining buffers.
+    PartiallyAdmitted {
+        inventory: TeardownInventory,
+        buffers: Vec<TeardownBuffer>,
+    },
+    /// HIP's actual aggregate outcome for every admitted resident owner.
+    Releasing(InventoryRelease),
+}
+
 /// Lossless session custody before or during explicit HIP aggregate teardown.
 ///
 /// Every mutable buffer is first converted to an inert `TeardownBuffer`. The
@@ -169,6 +193,43 @@ impl ModelSessionTeardown {
     }
 }
 
+impl NativeResidentTeardown {
+    /// Classify the exact ownership retained by this resident teardown result.
+    pub(super) const fn state(&self) -> ModelSessionTeardownState {
+        match self {
+            Self::Unadmitted(_) => ModelSessionTeardownState::Unadmitted,
+            Self::PartiallyAdmitted { .. } => ModelSessionTeardownState::PartiallyAdmitted,
+            Self::Releasing(release) => match release {
+                InventoryRelease::Released(_) => ModelSessionTeardownState::Released,
+                InventoryRelease::Pending(_) => ModelSessionTeardownState::Pending,
+                InventoryRelease::SynchronizationUnconfirmed(_) => {
+                    ModelSessionTeardownState::SynchronizationUnconfirmed
+                }
+                InventoryRelease::Quarantined(_) => ModelSessionTeardownState::Quarantined,
+                _ => ModelSessionTeardownState::Quarantined,
+            },
+        }
+    }
+
+    /// Forward HIP's only retryable aggregate transition without changing custody.
+    pub(super) fn retry_pending(self) -> Self {
+        match self {
+            Self::Releasing(InventoryRelease::Pending(pending)) => Self::Releasing(pending.retry()),
+            other => other,
+        }
+    }
+
+    /// Forward HIP's deliberate non-destructive synchronization reconciliation.
+    pub(super) fn reconcile_synchronization(self) -> Self {
+        match self {
+            Self::Releasing(InventoryRelease::SynchronizationUnconfirmed(unconfirmed)) => {
+                Self::Releasing(unconfirmed.reconcile())
+            }
+            other => other,
+        }
+    }
+}
+
 /// Fully disarmed mutable session buffers awaiting aggregate admission.
 #[must_use = "all typed buffers have been disarmed and must enter explicit teardown"]
 pub(super) struct ModelSessionTeardownParts {
@@ -214,6 +275,36 @@ impl ModelSessionTeardownParts {
     }
 }
 
+impl NativeResidentTeardownParts {
+    /// Create the owned empty stream needed to quiesce an otherwise unique model.
+    pub(super) fn begin_release(self) -> NativeResidentTeardown {
+        let Self {
+            device,
+            mut buffers,
+        } = self;
+        let stream = match Stream::new(&device) {
+            Ok(stream) => stream,
+            Err(_) => return NativeResidentTeardown::Unadmitted(Self { device, buffers }),
+        };
+        let mut inventory = match TeardownInventory::try_new(stream) {
+            Ok(inventory) => inventory,
+            Err(stream) => {
+                return NativeResidentTeardown::Unadmitted(Self {
+                    device: stream.device().clone(),
+                    buffers,
+                });
+            }
+        };
+        while let Some(buffer) = buffers.pop() {
+            if let Err(error) = inventory.push_teardown_buffer(buffer) {
+                buffers.push(error.into_buffer());
+                return NativeResidentTeardown::PartiallyAdmitted { inventory, buffers };
+            }
+        }
+        NativeResidentTeardown::Releasing(inventory.begin_release())
+    }
+}
+
 fn recover_non_owned_stream(stream: NonOwnedStream) -> Stream {
     stream.into_stream()
 }
@@ -254,6 +345,35 @@ impl NativeResidentModelResources {
         sink.push_f32(self.output_norm);
         for layer in self.layers {
             layer.into_buffer_sink(sink);
+        }
+    }
+
+    /// Disarm the final unique resident owner before it creates teardown work.
+    ///
+    /// The caller establishes uniqueness by consuming the last `Arc`; no
+    /// session can then retain a stream that references these uploads.
+    pub(super) fn into_teardown_parts(self) -> NativeResidentTeardownParts {
+        let Self {
+            verified_weights,
+            plan,
+            device,
+            embedding,
+            output,
+            output_norm,
+            layers,
+        } = self;
+        drop(verified_weights);
+        drop(plan);
+        let mut buffers = NativeBufferParts::new();
+        embedding.into_buffer_sink(&mut buffers);
+        output.into_buffer_sink(&mut buffers);
+        buffers.push_f32(output_norm);
+        for layer in layers {
+            layer.into_buffer_sink(&mut buffers);
+        }
+        NativeResidentTeardownParts {
+            device,
+            buffers: buffers.into_buffers(),
         }
     }
 }
