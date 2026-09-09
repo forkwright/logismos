@@ -7,9 +7,13 @@ license.workspace = true
 description = "KV cache layouts (flat only in Phase 2; paged + radix in Phases 6 + 12)."
 publish = false
 
+[features]
+default = ["flat"]
+flat = ["dep:half", "dep:taxis"]
+
 [dependencies]
-taxis = { workspace = true }
-half = { workspace = true }
+taxis = { workspace = true, optional = true }
+half = { workspace = true, optional = true }
 snafu = { workspace = true }
 
 [lints]

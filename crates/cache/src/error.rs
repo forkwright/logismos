@@ -11,6 +11,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[non_exhaustive]
 pub enum Error {
     /// Underlying tensor-layer failure.
+    #[cfg(feature = "flat")]
     #[snafu(transparent)]
     Taxis {
         /// Source tensor error.
@@ -103,6 +104,174 @@ pub enum Error {
     Msg {
         /// Free-form description.
         message: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Paged-KV metadata allocation failed before the pool was mutated.
+    #[snafu(display("cache: could not reserve paged-KV {target} metadata"))]
+    PagedAllocation {
+        /// Allocation purpose.
+        target: &'static str,
+        /// Allocation failure retained for callers.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Paged-KV geometry has a zero dimension.
+    #[snafu(display("cache: paged-KV {field} must be nonzero"))]
+    PagedZeroDimension {
+        /// Invalid geometry field.
+        field: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Checked paged-KV accounting overflowed.
+    #[snafu(display("cache: paged-KV {operation} overflowed"))]
+    PagedArithmetic {
+        /// Checked arithmetic operation.
+        operation: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// An append contains no rows.
+    #[snafu(display("cache: paged-KV append must contain at least one token"))]
+    PagedEmptyAppend {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// An append exceeds the pool's admitted context.
+    #[snafu(display(
+        "cache: paged-KV append of {append_tokens} tokens at {committed_tokens} exceeds context {max_context}"
+    ))]
+    PagedContextOverflow {
+        /// Committed token count.
+        committed_tokens: usize,
+        /// Requested append count.
+        append_tokens: usize,
+        /// Pool context bound.
+        max_context: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A fully preallocated pool cannot stage the requested page changes.
+    #[snafu(display(
+        "cache: paged-KV requires {required_bundles} free bundles, only {available_bundles} remain"
+    ))]
+    PagedCapacity {
+        /// Bundles needed by this transaction.
+        required_bundles: usize,
+        /// Currently free bundles.
+        available_bundles: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Paged-KV layer index is outside the all-layer pool.
+    #[snafu(display("cache: paged-KV layer {layer} is outside {layers} layers"))]
+    PagedLayerOutOfRange {
+        /// Requested layer.
+        layer: usize,
+        /// Pool layer count.
+        layers: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A key or value row has the wrong width.
+    #[snafu(display(
+        "cache: paged-KV {kind} row for layer {layer} has width {actual}, expected {expected}"
+    ))]
+    PagedRowWidth {
+        /// K/V row kind.
+        kind: &'static str,
+        /// Layer receiving the row.
+        layer: usize,
+        /// Observed element count.
+        actual: usize,
+        /// Required row width.
+        expected: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A transaction token index is outside its requested append.
+    #[snafu(display(
+        "cache: paged-KV transaction token {token} is outside append length {append_tokens}"
+    ))]
+    PagedAppendTokenOutOfRange {
+        /// Requested transaction-relative token.
+        token: usize,
+        /// Transaction append length.
+        append_tokens: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A layer row was not written in contiguous token order.
+    #[snafu(display(
+        "cache: paged-KV layer {layer} expected transaction token {expected}, got {actual}"
+    ))]
+    PagedWriteOrder {
+        /// Layer receiving the row.
+        layer: usize,
+        /// Required next transaction-relative token.
+        expected: usize,
+        /// Supplied transaction-relative token.
+        actual: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A view attempted to read a token that has not been committed or staged for that layer.
+    #[snafu(display("cache: paged-KV token {token} is outside visible length {visible_tokens}"))]
+    PagedReadBeyondVisible {
+        /// Requested absolute token.
+        token: usize,
+        /// Rows safely visible to the caller.
+        visible_tokens: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Commit found a layer that did not receive every requested row.
+    #[snafu(display(
+        "cache: paged-KV layer {layer} wrote {written_tokens} of {append_tokens} transaction rows"
+    ))]
+    PagedIncompleteAppend {
+        /// Incomplete layer.
+        layer: usize,
+        /// Rows received for that layer.
+        written_tokens: usize,
+        /// Rows required for every layer.
+        append_tokens: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Internal checked layout did not match its preallocated backing.
+    #[snafu(display("cache: paged-KV {operation} exceeded its validated layout"))]
+    PagedLayout {
+        /// Failed internal layout operation.
+        operation: &'static str,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
