@@ -14,7 +14,6 @@ use crate::{Qwen35Weights, Result};
 #[derive(Debug)]
 pub(crate) struct DeviceFullAttentionPlan {
     pub(crate) layout: Layout,
-    pub(crate) block: usize,
     pub(crate) matrices: ProjectionWeights,
     pub(crate) scalars: ScalarWeights,
     pub(crate) workspace: WorkspacePlan,
@@ -186,7 +185,6 @@ impl DeviceFullAttentionPlan {
         };
         Ok(Self {
             layout,
-            block,
             matrices,
             scalars,
             workspace,
