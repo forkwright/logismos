@@ -539,13 +539,11 @@ fn cpu_tensor_from_bytes(dtype: DType, bytes: &[u8], shape: Shape) -> Result<Ten
     Tensor::from_cpu(storage, shape).map_err(|source| crate::error::TaxisSnafu { source }.build())
 }
 
-/// Postcondition on every `chunks_exact`-based decoder: `chunks_exact`
-/// silently drops a trailing partial chunk, so a byte length that isn't
-/// a whole multiple of the dtype width would otherwise produce a `Vec`
-/// shorter than `expected` — and `Tensor::from_cpu` performs no length
-/// check of its own against the `Shape` it's handed, so that mismatch
-/// would surface later as an out-of-bounds read, not a construction
-/// error.
+/// Reject a decoded-length mismatch at the serialized-byte boundary.
+///
+/// `chunks_exact` omits partial trailing chunks. Refusing here preserves
+/// byte-decoding context before the tensor constructor checks shape/storage
+/// compatibility independently.
 fn check_decoded_len(produced: usize, expected: usize, byte_len: usize) -> Result<()> {
     if produced != expected {
         return ShapeMismatchSnafu {
