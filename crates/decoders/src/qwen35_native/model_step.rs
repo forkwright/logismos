@@ -14,9 +14,7 @@ use crate::error::{
 pub(super) struct ModelTokenPlan {
     /// Exact selected serialized embedding row.
     pub(super) embedding: kernels::row_gemv::RowDecodePlan,
-    /// Checked visible prefix length for this token.
-    pub(super) visible_tokens: usize,
-    /// Checked committed token count after successful model-wide publication.
+    /// Visible prefix length, committed only after successful model-wide publication.
     pub(super) next_position: usize,
     /// Full-attention decode geometry when this model owns native paged KV.
     pub(super) attention: Option<kernels::attention::NativePagedDecodePlan>,
@@ -66,7 +64,6 @@ impl ModelTokenPlan {
 
         Ok(Self {
             embedding,
-            visible_tokens: next_position,
             next_position,
             attention,
         })
@@ -109,7 +106,6 @@ mod tests {
         let token =
             ModelTokenPlan::from_model(&plan, CONTEXT - 1, 0).map_err(|error| error.to_string())?;
 
-        assert_eq!(token.visible_tokens, CONTEXT);
         assert_eq!(token.next_position, CONTEXT);
         assert!(ModelTokenPlan::from_model(&plan, CONTEXT, 0).is_err());
         Ok(())
