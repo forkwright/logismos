@@ -14,6 +14,8 @@ use std::ffi::c_void;
 use hipcore::Stream;
 use snafu::{ResultExt, Snafu};
 
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+use crate::device_span::{checked_f32_device_span, reject_overlapping_f32_spans};
 #[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 use crate::error::LaunchSnafu;
 #[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
@@ -901,14 +903,6 @@ struct GdnStepAbi {
 }
 
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
-#[derive(Clone, Copy)]
-struct DeviceSpan {
-    start: usize,
-    end: usize,
-    name: &'static str,
-}
-
-#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 #[expect(
     clippy::too_many_arguments,
     reason = "validation receives the fixed raw staged GDN step ABI without constructing a second shape owner"
@@ -962,21 +956,30 @@ fn validate_gdn_step_launch(
     validate_gdn_step_length("output", output_elements, plan.output_elements())?;
 
     let inputs = [
-        checked_device_span(q_f32, q_elements, "q")?,
-        checked_device_span(k_f32, k_elements, "k")?,
-        checked_device_span(v_f32, v_elements, "v")?,
-        checked_device_span(beta_f32, beta_elements, "beta")?,
-        checked_device_span(g_f32, g_elements, "g")?,
-        checked_device_span(state_in_f32, state_in_elements, "state_in")?,
+        checked_f32_device_span(GDN_GROUPED_STEP_KERNEL, q_f32, q_elements, "q")?,
+        checked_f32_device_span(GDN_GROUPED_STEP_KERNEL, k_f32, k_elements, "k")?,
+        checked_f32_device_span(GDN_GROUPED_STEP_KERNEL, v_f32, v_elements, "v")?,
+        checked_f32_device_span(GDN_GROUPED_STEP_KERNEL, beta_f32, beta_elements, "beta")?,
+        checked_f32_device_span(GDN_GROUPED_STEP_KERNEL, g_f32, g_elements, "g")?,
+        checked_f32_device_span(GDN_GROUPED_STEP_KERNEL, state_in_f32, state_in_elements, "state_in")?,
     ];
-    let state_out =
-        checked_device_span(state_out_f32.cast_const(), state_out_elements, "state_out")?;
-    let output = checked_device_span(output_f32.cast_const(), output_elements, "output")?;
+    let state_out = checked_f32_device_span(
+        GDN_GROUPED_STEP_KERNEL,
+        state_out_f32.cast_const(),
+        state_out_elements,
+        "state_out",
+    )?;
+    let output = checked_f32_device_span(
+        GDN_GROUPED_STEP_KERNEL,
+        output_f32.cast_const(),
+        output_elements,
+        "output",
+    )?;
     for input in inputs {
-        reject_overlapping_gdn_step_spans(state_out, input)?;
-        reject_overlapping_gdn_step_spans(output, input)?;
+        reject_overlapping_f32_spans(GDN_GROUPED_STEP_KERNEL, state_out, input)?;
+        reject_overlapping_f32_spans(GDN_GROUPED_STEP_KERNEL, output, input)?;
     }
-    reject_overlapping_gdn_step_spans(state_out, output)?;
+    reject_overlapping_f32_spans(GDN_GROUPED_STEP_KERNEL, state_out, output)?;
 
     Ok(GdnStepAbi {
         key_head_count: gdn_step_u32("key_head_count", plan.key_head_count())?,
@@ -994,48 +997,6 @@ fn validate_gdn_step_length(name: &'static str, actual: usize, expected: usize) 
         unsupported_gdn_step_shape(format!(
             "{name} length {actual} does not match allocation-plan extent {expected}"
         ))
-    }
-}
-
-#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
-fn checked_device_span(
-    pointer: *const f32,
-    elements: usize,
-    name: &'static str,
-) -> Result<DeviceSpan> {
-    if pointer.is_null() {
-        return unsupported_gdn_step_shape(format!("{name} must be non-null"));
-    }
-    if !pointer.addr().is_multiple_of(core::mem::align_of::<f32>()) {
-        return unsupported_gdn_step_shape(format!("{name} must be aligned for f32"));
-    }
-    let layout = std::alloc::Layout::array::<f32>(elements).map_err(|_| {
-        UnsupportedShapeSnafu {
-            kernel: GDN_GROUPED_STEP_KERNEL,
-            msg: format!("{name} length {elements} exceeds the Rust allocation layout domain"),
-        }
-        .build()
-    })?;
-    let start = pointer.addr();
-    let end = start.checked_add(layout.size()).ok_or_else(|| {
-        UnsupportedShapeSnafu {
-            kernel: GDN_GROUPED_STEP_KERNEL,
-            msg: format!("{name} device span overflows the address domain"),
-        }
-        .build()
-    })?;
-    Ok(DeviceSpan { start, end, name })
-}
-
-#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
-fn reject_overlapping_gdn_step_spans(left: DeviceSpan, right: DeviceSpan) -> Result<()> {
-    if left.start < right.end && right.start < left.end {
-        unsupported_gdn_step_shape(format!(
-            "writable {} span aliases {} span",
-            left.name, right.name
-        ))
-    } else {
-        Ok(())
     }
 }
 
@@ -1667,7 +1628,8 @@ mod tests {
             Err(crate::Error::UnsupportedShape { .. })
         ));
         assert!(matches!(
-            checked_device_span(
+            checked_f32_device_span(
+                GDN_GROUPED_STEP_KERNEL,
                 core::ptr::NonNull::<f32>::dangling().as_ptr(),
                 usize::MAX,
                 "overflow"

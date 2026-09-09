@@ -41,6 +41,8 @@
     clippy::missing_safety_doc
 )]
 
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+mod device_span;
 pub mod causal_conv;
 pub mod cpu_f32;
 pub mod error;
