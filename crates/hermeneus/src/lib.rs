@@ -7,10 +7,12 @@
 //! living in a separate crate because both protocols are the same
 //! role at different transports.
 //!
-//! Protocol scaffold. No functional service or published wire contract yet.
-//! The private service adapter belongs here: it will bind the existing text,
-//! decoder, placement and scheduler owners without moving HIP into the pure
-//! request/planning crates or creating a second resource ledger.
+//! No functional service or published wire contract yet. The optional `gpu`
+//! feature provides shared native text execution ownership with explicit
+//! qualified entrypoints and teardown custody. A private admitted service must
+//! still bind those actual owners to placement, scheduling and a current host
+//! grant without moving HIP into the pure request/planning crates or creating
+//! a second resource ledger.
 //!
 //! ## Responsibility
 //!
@@ -40,6 +42,17 @@
 //! provider transition have separate gates; implementing this crate does not
 //! automatically replace llama-server or retarget the fleet's `local` provider.
 #![deny(missing_docs)]
+
+#[cfg(feature = "gpu")]
+mod native_text;
+
+#[cfg(feature = "gpu")]
+pub use native_text::{
+    NativeTextDriverError, NativeTextGenerationFailure, NativeTextResident,
+    NativeTextResidentBuildFailure, NativeTextResidentClose, NativeTextResidentTeardown,
+    NativeTextUseClose, NativeTextUseConstructionCustody, NativeTextUsePlan,
+    NativeTextUsePlanFailure,
+};
 
 #[cfg(test)]
 const CRATE_NAME: &str = "hermeneus";

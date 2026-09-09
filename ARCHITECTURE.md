@@ -48,6 +48,9 @@ semantically respects that boundary.
   Opt-in `decoders/gpu` adds optional `hipcore`, `kernels/gpu` and `cache/gpu`
   for owned native one-block and main-model consumers; the GPU-capable facade selects it.
   Default CPU consumers and package-isolated CPU checks do not select it.
+- `hermeneus` defaults to a HIP-free graph. Its optional `gpu` feature joins
+  the existing text and native decoder owners; the GPU facade enables and
+  re-exports that execution boundary. It adds no transport or host-grant issuer.
 - `cache::paged` owns one logical KV ledger, CPU backing with borrowed row views
   and atomic append transactions, and optional separate native K/V/table backing.
   It does not own model semantics, shared-prefix identity,
@@ -276,10 +279,12 @@ Session teardown separately retains its shared model reference, including on
 abandonment. Only the actual fully released HIP outcome permits explicit
 recovery of that model owner; normal completion need not permanently pin the
 resident. Resident close first requires unique ownership, but that reference
-count alone is never a release receipt. Aggregate construction-failure custody
-and binding these outcomes to service accounting remain incomplete under
-[#173](https://github.com/forkwright/logismos/issues/173); ordinary constructor
-errors or resource `Drop` must not be interpreted as successful load rollback.
+count alone is never a release receipt. Aggregate construction failures retain
+their exact typed source and completed owners in `NativeBuildFailure`; explicit
+release distinguishes known-owner progress from terminal creation quarantine.
+Binding these outcomes to service accounting remains incomplete under
+[#173](https://github.com/forkwright/logismos/issues/173). A constructor error
+or resource `Drop` must not be interpreted as successful load rollback.
 
 `loader::gguf::VerifiedArtifact` owns one immutable serialized backing, admitted
 under an explicit byte limit and matched against a required SHA-256 expectation.
@@ -381,6 +386,21 @@ it does not reconstruct identity from equal shapes or totals and does not mint
 authority. Its borrowed execution profile exposes the same weights and configured
 context ceiling for a separate shared execution owner. Cancellation is cooperative,
 so preparation may finish inertly if cancellation arrives during tokenization.
+
+`hermeneus::NativeTextResident` binds that exact pipeline to reusable immutable
+native uploads. Its effective context ceiling derives from both configured
+limits and the artifact's execution capacity. Planning consumes one prepared
+request, checks the shared profile owner, and retains a fresh exact-context
+session plan. The caller can inspect its native demand and logits-storage plan
+before acquiring request storage; equal vocabulary width is not profile identity.
+Explicit qualified execution delegates generation semantics to `text` and
+token execution to `decoders`, with per-token output release and per-use session
+teardown. Unconfirmed cleanup withholds publication and retains typed custody.
+Resident abandonment is inert, not eviction; explicit close owns its teardown.
+This lower-level boundary does not bind scheduler leases to physical owners,
+verify a current host grant, or expose a serving endpoint. Those remain separate
+integration and qualification obligations, including allocator and runtime
+overhead beyond requested extents.
 The decoder report excludes rendered text, u32 prompt/generated IDs, tokenizer
 and decoded strings; it is not a whole-request estimate or admission grant.
 

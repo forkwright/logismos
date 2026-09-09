@@ -1273,6 +1273,13 @@ impl Layout {
     }
 }
 
+pub(crate) fn execution_context_ceiling(weights: &Qwen35Weights) -> Result<usize> {
+    Ok(u32_meta(
+        weights.payload().observation().metadata(),
+        CONTEXT_LENGTH_KEY,
+    )? as usize)
+}
+
 pub(crate) fn read_f32(
     weights: &Qwen35Weights,
     name: &str,

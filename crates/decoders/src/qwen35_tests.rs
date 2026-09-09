@@ -8,7 +8,7 @@ use tempfile::tempdir;
 use test_fixtures::{RawGguf, RawMetadata, RawMetadataValue, RawTensor, serialize_raw_gguf};
 
 use super::*;
-use crate::Qwen35Weights;
+use crate::{Qwen35LogitSelection, Qwen35Weights};
 
 const TEST_ALIGNMENT: u32 = 32;
 const TEST_HIDDEN: u64 = 3;
@@ -184,6 +184,109 @@ fn keeps_execution_epsilon_outside_structural_admission() -> std::result::Result
         ),
         "recurrent execution must refuse rather than default a missing RMS epsilon"
     );
+    Ok(())
+}
+
+#[test]
+fn execution_context_ceiling_returns_the_artifact_declared_value() -> std::result::Result<(), String>
+{
+    let mut fixture = fixture(1)?;
+    set_u32(&mut fixture, "qwen35.context_length", 13)?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let _plan = weights
+        .execution_plan(2, 1, Qwen35LogitSelection::LastToken)
+        .map_err(|error| error.to_string())?;
+
+    assert_eq!(
+        weights
+            .execution_context_ceiling()
+            .map_err(|error| error.to_string())?,
+        13,
+        "the artifact ceiling is independent of a smaller configured request"
+    );
+    Ok(())
+}
+
+#[test]
+fn execution_context_ceiling_refuses_missing_metadata_like_execution_plan()
+-> std::result::Result<(), String> {
+    let mut fixture = fixture(1)?;
+    fixture
+        .metadata
+        .retain(|entry| entry.key() != "qwen35.context_length");
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+
+    assert!(matches!(
+        weights.execution_context_ceiling(),
+        Err(crate::Error::MissingMetadata {
+            key: "qwen35.context_length",
+            ..
+        })
+    ));
+    assert!(matches!(
+        weights.execution_plan(1, 1, Qwen35LogitSelection::LastToken),
+        Err(crate::Error::MissingMetadata {
+            key: "qwen35.context_length",
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn execution_context_ceiling_refuses_invalid_metadata_like_execution_plan()
+-> std::result::Result<(), String> {
+    let mut fixture = fixture(1)?;
+    replace_metadata(
+        &mut fixture,
+        MetadataEntry::F32("qwen35.context_length", 8.0),
+    )?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+
+    assert!(matches!(
+        weights.execution_context_ceiling(),
+        Err(crate::Error::MetadataType {
+            key: "qwen35.context_length",
+            expected: "u32",
+            ..
+        })
+    ));
+    assert!(matches!(
+        weights.execution_plan(1, 1, Qwen35LogitSelection::LastToken),
+        Err(crate::Error::MetadataType {
+            key: "qwen35.context_length",
+            expected: "u32",
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn execution_context_ceiling_reports_zero_that_refuses_execution() -> std::result::Result<(), String>
+{
+    let mut fixture = fixture(1)?;
+    set_u32(&mut fixture, "qwen35.context_length", 0)?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+
+    assert_eq!(
+        weights
+            .execution_context_ceiling()
+            .map_err(|error| error.to_string())?,
+        0
+    );
+    assert!(matches!(
+        weights.execution_plan(1, 1, Qwen35LogitSelection::LastToken),
+        Err(crate::Error::ExecutionContext {
+            requested: 1,
+            rule: "caller context must not exceed artifact context_length",
+            ..
+        })
+    ));
     Ok(())
 }
 

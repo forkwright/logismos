@@ -151,4 +151,14 @@ impl Qwen35Weights {
     ) -> Result<Qwen35ExecutionPlan> {
         Qwen35ExecutionPlan::try_from_weights(self, max_context, max_step_tokens, selection)
     }
+
+    /// Return the artifact-declared ceiling for one execution context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] when the verified artifact does not provide a
+    /// valid `qwen35.context_length` execution metadata value.
+    pub fn execution_context_ceiling(&self) -> Result<usize> {
+        crate::qwen35_execution::execution_context_ceiling(self)
+    }
 }
