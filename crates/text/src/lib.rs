@@ -373,7 +373,7 @@ where
     }
 }
 
-// WHY: Snafu's generic source path requires `AsErrorSource` (`'static`),
+// WHY: Snafu 0.9.2's generic `AsErrorSource` blanket impl requires `'static`,
 // while the driver contract deliberately accepts only `std::error::Error`.
 impl<DriverError> std::error::Error for RecycledGenerationError<DriverError>
 where

@@ -246,6 +246,39 @@ impl RecycledGenerationDriver for CustodyFailureDriver {
     }
 }
 
+#[derive(Debug)]
+struct BorrowedDriverError<'message> {
+    message: &'message str,
+}
+
+impl Display for BorrowedDriverError<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for BorrowedDriverError<'_> {}
+
+struct BorrowedFailureDriver<'message> {
+    failure: Option<BorrowedDriverError<'message>>,
+}
+
+impl<'message> RecycledGenerationDriver for BorrowedFailureDriver<'message> {
+    type Error = BorrowedDriverError<'message>;
+
+    fn step_into(
+        &mut self,
+        _token_ids: &[u32],
+        _logits: &mut [f32],
+        _cancellation: &dyn Cancellation,
+    ) -> std::result::Result<(), Self::Error> {
+        match self.failure.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
 struct CancelOnCheck {
     check: Cell<usize>,
     cancel_at: usize,
@@ -439,6 +472,52 @@ fn recycled_driver_error_moves_non_send_custody_without_losing_identity() -> Tes
         RecycledGenerationError::Pipeline { source } => {
             return Err(std::io::Error::other(format!(
                 "driver custody was flattened into a pipeline error: {source}"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn recycled_driver_error_accepts_borrowed_non_static_custody() -> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let pipeline = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+    let messages = [TextMessage::new(TextRole::User, "hello")];
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+    let logits_storage = acquire_logits(&prepared)?;
+    let custody = String::from("borrowed native release custody");
+    let custody_identity = custody.as_ptr();
+    let mut driver = BorrowedFailureDriver {
+        failure: Some(BorrowedDriverError { message: &custody }),
+    };
+
+    let error = recycled_error(prepared.generate_with_recycled_driver(
+        &mut driver,
+        logits_storage,
+        &NeverCancelled,
+    ))?;
+
+    match error {
+        RecycledGenerationError::Driver { source } => {
+            assert_eq!(
+                source.message.as_ptr(),
+                custody_identity,
+                "the generic boundary must preserve the exact borrowed custody identity"
+            );
+            assert_eq!(
+                source.message,
+                custody.as_str(),
+                "the generic boundary must return the borrowed driver error unchanged"
+            );
+        }
+        RecycledGenerationError::Pipeline { source } => {
+            return Err(std::io::Error::other(format!(
+                "borrowed driver custody was flattened into a pipeline error: {source}"
             ))
             .into());
         }
