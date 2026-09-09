@@ -1,6 +1,8 @@
 //! Owned native full-attention resource lifecycle.
 
 #[cfg(feature = "gpu")]
+mod dispatch;
+#[cfg(feature = "gpu")]
 mod plan;
 #[cfg(all(test, feature = "gpu"))]
 mod plan_tests;
