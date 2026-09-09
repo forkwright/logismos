@@ -94,6 +94,12 @@ pub(crate) struct DeviceByteDemand {
     pub(crate) table: usize,
 }
 
+impl DeviceByteDemand {
+    pub(crate) fn total(self) -> Result<usize> {
+        sum(&[self.weights, self.scratch, self.input, self.output, self.controls, self.key_values, self.table], "native device byte total")
+    }
+}
+
 impl DeviceFullAttentionPlan {
     pub(crate) fn from_weights(
         weights: &Qwen35Weights<'_>,
@@ -391,4 +397,3 @@ fn sum(values: &[usize], context: &'static str) -> Result<usize> {
             .ok_or_else(|| ArithmeticOverflowSnafu { context }.build())
     })
 }
-

@@ -3,6 +3,8 @@
 #[cfg(feature = "gpu")]
 mod plan;
 #[cfg(feature = "gpu")]
+mod resources;
+#[cfg(feature = "gpu")]
 mod weights;
 
 /// One owned resource bundle whose submitted work can be synchronized.
