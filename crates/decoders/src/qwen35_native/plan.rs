@@ -109,6 +109,15 @@ impl DeviceFullAttentionPlan {
         page_tokens: kernels::attention::NativePageTokens,
     ) -> Result<Self> {
         let layout = Layout::from_metadata(weights, max_context)?;
+        Self::from_layout(weights, layout, block, page_tokens)
+    }
+
+    pub(super) fn from_layout(
+        weights: &Qwen35Weights<'_>,
+        layout: Layout,
+        block: usize,
+        page_tokens: kernels::attention::NativePageTokens,
+    ) -> Result<Self> {
         if !layout.is_admitted_full_block(block) {
             return NativeSessionStateSnafu {
                 rule: "native plan requires an admitted full-attention main block",
@@ -204,7 +213,7 @@ impl AttentionProjectionWeights {
         })
     }
 
-    fn bytes(&self) -> Result<usize> {
+    pub(super) fn bytes(&self) -> Result<usize> {
         sum(
             &[
                 self.q_gate.serialized_bytes,
@@ -241,7 +250,7 @@ impl AttentionNormalizationWeights {
         })
     }
 
-    fn bytes(&self) -> Result<usize> {
+    pub(super) fn bytes(&self) -> Result<usize> {
         let widths = [self.input.elements, self.query.elements, self.key.elements];
         elements_bytes(
             sum(&widths, "native scalar weight elements")?,
@@ -344,7 +353,7 @@ impl WorkspacePlan {
         })
     }
 
-    fn elements(self) -> Result<usize> {
+    pub(super) fn elements(self) -> Result<usize> {
         sum(
             &[
                 self.hidden,
@@ -363,7 +372,7 @@ impl WorkspacePlan {
         )
     }
 
-    fn coefficient_elements(self) -> Result<usize> {
+    pub(super) fn coefficient_elements(self) -> Result<usize> {
         self.query_rotary
             .coefficient_elements()
             .checked_mul(2)

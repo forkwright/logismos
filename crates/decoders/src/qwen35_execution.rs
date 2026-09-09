@@ -28,9 +28,9 @@ const ROPE_LEGACY_LINEAR_SCALE_KEY: &str = "qwen35.rope.scale_linear";
 const ROPE_DIMENSION_COUNT_KEY: &str = "qwen35.rope.dimension_count";
 const ATTENTION_SCALE_KEY: &str = "qwen35.attention.scale";
 const ATTENTION_CAUSAL_KEY: &str = "qwen35.attention.causal";
-const TOKEN_EMBEDDING: &str = "token_embd.weight";
-const OUTPUT_NORM: &str = "output_norm.weight";
-const OUTPUT: &str = "output.weight";
+pub(crate) const TOKEN_EMBEDDING: &str = "token_embd.weight";
+pub(crate) const OUTPUT_NORM: &str = "output_norm.weight";
+pub(crate) const OUTPUT: &str = "output.weight";
 
 /// Select which token-logit rows a bounded execution retains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -959,6 +959,18 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
+    pub(crate) const fn vocabulary(self) -> usize {
+        self.vocabulary
+    }
+
+    pub(crate) const fn main_block_count(self) -> usize {
+        self.main_blocks
+    }
+
+    pub(crate) const fn hidden_dimension(self) -> u64 {
+        self.hidden_u64
+    }
+
     pub(crate) const fn max_context(self) -> usize {
         self.max_context
     }

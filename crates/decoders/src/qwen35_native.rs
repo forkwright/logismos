@@ -5,6 +5,8 @@ mod dispatch;
 #[cfg(feature = "gpu")]
 mod finish;
 #[cfg(feature = "gpu")]
+mod model_plan;
+#[cfg(feature = "gpu")]
 mod model_resources;
 #[cfg(feature = "gpu")]
 mod model_session;
