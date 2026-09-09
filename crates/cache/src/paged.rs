@@ -16,6 +16,8 @@ use crate::error::{
     PagedReadBeyondVisibleSnafu, PagedRowWidthSnafu, PagedWriteOrderSnafu, PagedZeroDimensionSnafu,
     Result,
 };
+#[cfg(any(feature = "gpu", test))]
+use crate::error::{PagedNativeCommitNotPreparedSnafu, PagedNativeCommitPreparedSnafu};
 #[cfg(feature = "gpu")]
 use crate::error::{PagedNativeDeviceMismatchSnafu, PagedNativePoisonedSnafu};
 
@@ -297,6 +299,7 @@ impl PagedKvLedger {
         Ok(AppendReservation {
             append_tokens,
             original_tokens,
+            target_tokens: target,
             original_page_count,
             replaced_tail,
         })
@@ -346,6 +349,12 @@ impl PagedKvLedger {
     }
 
     fn commit(&mut self, reservation: &mut AppendReservation) -> Result<()> {
+        self.validate_commit(reservation)?;
+        self.publish_commit(reservation);
+        Ok(())
+    }
+
+    fn validate_commit(&self, reservation: &AppendReservation) -> Result<()> {
         for (layer, written_tokens) in self.staged_rows.iter().copied().enumerate() {
             if written_tokens != reservation.append_tokens {
                 return PagedIncompleteAppendSnafu {
@@ -356,20 +365,15 @@ impl PagedKvLedger {
                 .fail();
             }
         }
-        self.committed_tokens = reservation
-            .original_tokens
-            .checked_add(reservation.append_tokens)
-            .ok_or_else(|| {
-                PagedArithmeticSnafu {
-                    operation: "commit token count",
-                }
-                .build()
-            })?;
+        Ok(())
+    }
+
+    fn publish_commit(&mut self, reservation: &mut AppendReservation) {
+        self.committed_tokens = reservation.target_tokens;
         if let Some(replacement) = reservation.replaced_tail.take() {
             self.free.push(replacement.original_bundle);
         }
         self.staged_rows.fill(0);
-        Ok(())
     }
 
     fn rollback(&mut self, reservation: &AppendReservation) {
@@ -674,8 +678,39 @@ struct LedgerWriteLocation {
 struct AppendReservation {
     append_tokens: usize,
     original_tokens: usize,
+    target_tokens: usize,
     original_page_count: usize,
     replaced_tail: Option<TailReplacement>,
+}
+
+/// Cache-owned native publication state after all layers have been verified.
+///
+/// This contains no device handles or independent ledger: it parks the one
+/// reservation that already mutated the owning pool's host ledger.
+#[cfg(any(feature = "gpu", test))]
+#[derive(Debug, Default)]
+struct NativePreparedCommit {
+    reservation: Option<AppendReservation>,
+}
+
+#[cfg(any(feature = "gpu", test))]
+impl NativePreparedCommit {
+    fn ensure_empty(&self) -> Result<()> {
+        if self.reservation.is_some() {
+            return PagedNativeCommitPreparedSnafu.fail();
+        }
+        Ok(())
+    }
+
+    fn park_verified(&mut self, reservation: AppendReservation) {
+        self.reservation = Some(reservation);
+    }
+
+    fn take(&mut self) -> Result<AppendReservation> {
+        self.reservation
+            .take()
+            .ok_or_else(|| PagedNativeCommitNotPreparedSnafu.build())
+    }
 }
 
 impl PagedAppend<'_> {
@@ -931,6 +966,7 @@ impl From<NativePageTokens> for PageTokens {
 #[cfg(feature = "gpu")]
 pub struct NativePagedKvPool {
     ledger: PagedKvLedger,
+    prepared: NativePreparedCommit,
     plan: NativePagedKvPlan,
     keys: DeviceBuffer<f32>,
     values: DeviceBuffer<f32>,
@@ -948,6 +984,7 @@ impl NativePagedKvPool {
         let table = DeviceBuffer::alloc(device, plan.logical.allocation.page_count)?;
         Ok(Self {
             ledger,
+            prepared: NativePreparedCommit::default(),
             plan,
             keys,
             values,
@@ -971,6 +1008,7 @@ impl NativePagedKvPool {
         stream: &Stream,
     ) -> Result<NativePagedAppend<'_>> {
         self.ensure_not_poisoned()?;
+        self.prepared.ensure_empty()?;
         self.ensure_stream_device(stream)?;
         let reservation = self.ledger.begin_append(append_tokens)?;
         let prepared = unsafe { self.prepare_device_append(&reservation, stream) };
@@ -984,9 +1022,24 @@ impl NativePagedKvPool {
         }
         Ok(NativePagedAppend {
             pool: self,
-            reservation,
-            committed: false,
+            reservation: Some(reservation),
         })
+    }
+
+    /// Publish the one prepared native append after external completion proof.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have successfully synchronized the ordered stream used
+    /// for that append's prepare, row, and attention submissions. No read or
+    /// write of its K/V, table, query, or output buffers may remain pending.
+    /// On any submission or completion failure, retain and never reuse this
+    /// complete native session instead of calling this method.
+    pub unsafe fn commit_prepared_after_completion(&mut self) -> Result<()> {
+        self.ensure_not_poisoned()?;
+        let mut reservation = self.prepared.take()?;
+        self.ledger.publish_commit(&mut reservation);
+        Ok(())
     }
 
     fn ensure_not_poisoned(&self) -> Result<()> {
@@ -1057,8 +1110,7 @@ impl NativePagedKvPool {
 #[cfg(feature = "gpu")]
 pub struct NativePagedAppend<'a> {
     pool: &'a mut NativePagedKvPool,
-    reservation: AppendReservation,
-    committed: bool,
+    reservation: Option<AppendReservation>,
 }
 
 #[cfg(feature = "gpu")]
@@ -1084,10 +1136,8 @@ impl NativePagedAppend<'_> {
     ) -> Result<()> {
         self.pool.ensure_not_poisoned()?;
         self.pool.ensure_stream_device(stream)?;
-        let location = self
-            .pool
-            .ledger
-            .write_location(&self.reservation, layer, token)?;
+        let reservation = self.reservation()?;
+        let location = self.pool.ledger.write_location(reservation, layer, token)?;
         let submitted = unsafe {
             kernels::paged_kv::append_row_f32(
                 self.pool.plan.layout,
@@ -1123,7 +1173,10 @@ impl NativePagedAppend<'_> {
 
     /// Return one staged native layer view for Q=1 paged attention.
     pub fn layer_kv(&self, layer: usize) -> Result<NativePagedLayerKv<'_>> {
-        let tokens = self.pool.ledger.visible_tokens(&self.reservation, layer)?;
+        let tokens = self
+            .pool
+            .ledger
+            .visible_tokens(self.reservation()?, layer)?;
         Ok(NativePagedLayerKv {
             pool: self.pool,
             layer,
@@ -1131,30 +1184,42 @@ impl NativePagedAppend<'_> {
         })
     }
 
-    /// Publish host ledger state only after the caller has proved completion.
+    /// Verify every layer's staged rows and park this append in its pool.
     ///
-    /// # Safety
-    ///
-    /// The caller must have successfully synchronized the same ordered stream
-    /// used for this transaction's prepare, row, and attention submissions.
-    /// No read or write of the transaction's K/V, table, query, or output
-    /// buffers may remain pending. On any submission or completion failure,
-    /// the caller must drop this append, retain the complete native session,
-    /// and never reuse it.
-    pub unsafe fn commit_after_completion(mut self) -> Result<()> {
+    /// This ends the borrow so an external resource owner can synchronize the
+    /// complete device bundle before calling
+    /// [`NativePagedKvPool::commit_prepared_after_completion`]. It does not
+    /// publish host ledger state or issue a device operation.
+    pub fn prepare_commit(mut self) -> Result<()> {
         self.pool.ensure_not_poisoned()?;
-        self.pool.ledger.commit(&mut self.reservation)?;
-        self.committed = true;
+        self.pool.prepared.ensure_empty()?;
+        self.pool.ledger.validate_commit(self.reservation()?)?;
+        let reservation = self.reservation.take().ok_or_else(|| {
+            PagedLayoutSnafu {
+                operation: "native append reservation",
+            }
+            .build()
+        })?;
+        self.pool.prepared.park_verified(reservation);
         Ok(())
+    }
+
+    fn reservation(&self) -> Result<&AppendReservation> {
+        self.reservation.as_ref().ok_or_else(|| {
+            PagedLayoutSnafu {
+                operation: "native append reservation",
+            }
+            .build()
+        })
     }
 }
 
 #[cfg(feature = "gpu")]
 impl Drop for NativePagedAppend<'_> {
     fn drop(&mut self) {
-        if !self.committed {
+        if let Some(reservation) = self.reservation.as_ref() {
             // WHY: logical staging is unpublished; no device rollback is safe after any submission.
-            self.pool.ledger.rollback(&self.reservation);
+            self.pool.ledger.rollback(reservation);
             // A prepare/table or row kernel may already be in flight.  Keep
             // the host ledger unpublished, but refuse any reuse until the
             // caller has retained and resolved the whole native session.
@@ -1364,6 +1429,19 @@ mod tests {
     fn write_all(txn: &mut PagedAppend<'_>, start: usize, tokens: usize) -> Result<()> {
         write_layer(txn, 0, start, tokens)?;
         write_layer(txn, 1, start, tokens)
+    }
+
+    fn record_all_ledger_rows(
+        ledger: &mut PagedKvLedger,
+        reservation: &AppendReservation,
+    ) -> Result<()> {
+        for layer in 0..LAYERS {
+            for token in 0..reservation.append_tokens {
+                let location = ledger.write_location(reservation, layer, token)?;
+                ledger.record_write(layer, location.page, location.within)?;
+            }
+        }
+        Ok(())
     }
 
     fn assert_inventory(pool: &PagedKvPool, held_old_tail: Option<usize>) {
@@ -1754,6 +1832,46 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn prepared_native_commit_parks_one_verified_reservation_without_device_state() -> Result<()> {
+        let plan = PagedKvPlan::new(geometry(8), PageTokens::B8)?;
+        let mut ledger = PagedKvLedger::new(plan)?;
+        let mut prepared = NativePreparedCommit::default();
+
+        assert!(matches!(
+            prepared.take(),
+            Err(Error::PagedNativeCommitNotPrepared { .. })
+        ));
+
+        let incomplete = ledger.begin_append(1)?;
+        let first = ledger.write_location(&incomplete, 0, 0)?;
+        ledger.record_write(0, first.page, first.within)?;
+        assert!(matches!(
+            ledger.validate_commit(&incomplete),
+            Err(Error::PagedIncompleteAppend { layer: 1, .. })
+        ));
+        ledger.rollback(&incomplete);
+
+        let reservation = ledger.begin_append(1)?;
+        record_all_ledger_rows(&mut ledger, &reservation)?;
+        ledger.validate_commit(&reservation)?;
+        prepared.park_verified(reservation);
+        assert!(matches!(
+            prepared.ensure_empty(),
+            Err(Error::PagedNativeCommitPrepared { .. })
+        ));
+        assert_eq!(ledger.committed_tokens, 0);
+
+        let mut reservation = prepared.take()?;
+        ledger.publish_commit(&mut reservation);
+        assert_eq!(ledger.committed_tokens, 1);
+        assert!(matches!(
+            prepared.take(),
+            Err(Error::PagedNativeCommitNotPrepared { .. })
+        ));
+        Ok(())
     }
     #[test]
     fn boundary_capacity_and_shape_are_typed() -> Result<()> {
