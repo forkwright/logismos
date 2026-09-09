@@ -274,7 +274,7 @@ struct LeaseCapability {
     reserved_bytes: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum LeaseReleaseReason {
     Foreign,
     Unknown,
