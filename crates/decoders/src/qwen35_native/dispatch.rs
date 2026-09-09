@@ -34,6 +34,10 @@ impl DeviceResources {
     /// all owned resources must remain exclusively owned on this stream's
     /// device until the caller has established completion or retained them
     /// after uncertainty.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the pinned native full-attention operation order is one bounded transactional unit"
+    )]
     pub(crate) unsafe fn submit_step(&mut self) -> Result<()> {
         let step = self.step.as_ref().ok_or_else(|| {
             NativeSessionStateSnafu {
