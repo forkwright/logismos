@@ -40,7 +40,7 @@
 pub mod error;
 #[cfg(feature = "flat")]
 pub mod flat;
-pub mod paged;
+mod paged;
 
 #[cfg(feature = "flat")]
 use taxis::Tensor;
@@ -49,8 +49,7 @@ pub use crate::error::{Error, Result};
 #[cfg(feature = "flat")]
 pub use crate::flat::{CacheLayout, FlatKvCache};
 pub use crate::paged::{
-    PagedAppend, PagedKvGeometry, PagedKvPageTokens, PagedKvPlan, PagedKvPool, PagedKvView,
-    PagedLayerKv,
+    PagedAppend, PagedKvGeometry, PagedKvPlan, PagedKvPool, PagedLayerKv,
 };
 
 /// Legacy unshared tensor KV-cache contract.

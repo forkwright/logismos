@@ -325,13 +325,17 @@ fn report_component_sum(
 }
 
 fn assert_same_execution_state(
-    left: &Qwen35Execution<'_, '_>,
-    right: &Qwen35Execution<'_, '_>,
+    left_execution: &Qwen35Execution<'_, '_>,
+    right_execution: &Qwen35Execution<'_, '_>,
 ) -> std::result::Result<(), String> {
-    assert_eq!(left.position, right.position);
-    assert_eq!(left.layers.len(), right.layers.len());
-    for (left, right) in left.layers.iter().zip(&right.layers) {
-        match (left, right) {
+    assert_eq!(left_execution.position, right_execution.position);
+    assert_eq!(left_execution.layers.len(), right_execution.layers.len());
+    for (left_layer, right_layer) in left_execution
+        .layers
+        .iter()
+        .zip(&right_execution.layers)
+    {
+        match (left_layer, right_layer) {
             (LayerState::Recurrent(left), LayerState::Recurrent(right)) => {
                 assert_eq!(
                     left.transaction_state_for_test(),
@@ -339,11 +343,11 @@ fn assert_same_execution_state(
                 );
             }
             (LayerState::Full(left_layer), LayerState::Full(right_layer)) => {
-                let left_pool = left
+                let left_pool = left_execution
                     .paged_kv_pool
                     .as_ref()
                     .ok_or_else(|| "left execution is missing paged KV backing".to_string())?;
-                let right_pool = right
+                let right_pool = right_execution
                     .paged_kv_pool
                     .as_ref()
                     .ok_or_else(|| "right execution is missing paged KV backing".to_string())?;

@@ -23,22 +23,15 @@ pub struct PagedKvGeometry {
     pub max_context: usize,
 }
 
-/// Supported token counts in one all-layer page bundle.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[non_exhaustive]
-pub enum PagedKvPageTokens {
-    /// Eight token rows per all-layer page bundle.
+enum PageTokens {
     B8,
-    /// Sixteen token rows per all-layer page bundle.
     B16,
-    /// Thirty-two token rows per all-layer page bundle.
     B32,
 }
 
-impl PagedKvPageTokens {
-    /// Number of token rows held by one page.
-    #[must_use]
-    pub const fn count(self) -> usize {
+impl PageTokens {
+    const fn count(self) -> usize {
         match self {
             Self::B8 => 8,
             Self::B16 => 16,
@@ -51,13 +44,10 @@ impl PagedKvPageTokens {
 #[derive(Clone, Copy, Debug)]
 pub struct PagedKvPlan {
     geometry: PagedKvGeometry,
-    page_tokens: PagedKvPageTokens,
+    page_tokens: PageTokens,
     page_count: usize,
     bundle_count: usize,
     requested_f32: usize,
-    backing_bytes: usize,
-    metadata_bytes: usize,
-    tail_copy_f32: usize,
     tail_copy_bytes: usize,
     total_requested_bytes: usize,
 }
@@ -66,9 +56,9 @@ impl PagedKvPlan {
     /// Select the least checked CPU allocation request, then tail-copy cost.
     pub fn select(geometry: PagedKvGeometry) -> Result<Self> {
         let candidates = [
-            Self::b8(geometry)?,
-            Self::b16(geometry)?,
-            Self::b32(geometry)?,
+            Self::new(geometry, PageTokens::B8)?,
+            Self::new(geometry, PageTokens::B16)?,
+            Self::new(geometry, PageTokens::B32)?,
         ];
         let mut selected = candidates[0];
         for candidate in candidates.into_iter().skip(1) {
@@ -78,19 +68,7 @@ impl PagedKvPlan {
         }
         Ok(selected)
     }
-    /// Construct the eight-token candidate.
-    pub fn b8(geometry: PagedKvGeometry) -> Result<Self> {
-        Self::new(geometry, PagedKvPageTokens::B8)
-    }
-    /// Construct the sixteen-token candidate.
-    pub fn b16(geometry: PagedKvGeometry) -> Result<Self> {
-        Self::new(geometry, PagedKvPageTokens::B16)
-    }
-    /// Construct the thirty-two-token candidate.
-    pub fn b32(geometry: PagedKvGeometry) -> Result<Self> {
-        Self::new(geometry, PagedKvPageTokens::B32)
-    }
-    fn new(geometry: PagedKvGeometry, page_tokens: PagedKvPageTokens) -> Result<Self> {
+    fn new(geometry: PagedKvGeometry, page_tokens: PageTokens) -> Result<Self> {
         for (field, value) in [
             ("layers", geometry.layers),
             ("row_width", geometry.row_width),
@@ -177,62 +155,14 @@ impl PagedKvPlan {
             page_count,
             bundle_count,
             requested_f32,
-            backing_bytes,
-            metadata_bytes,
-            tail_copy_f32,
             tail_copy_bytes,
             total_requested_bytes,
         })
-    }
-    /// Geometry used to derive this plan.
-    #[must_use]
-    pub const fn geometry(self) -> PagedKvGeometry {
-        self.geometry
-    }
-    /// Selected page-token witness.
-    #[must_use]
-    pub const fn page_tokens(self) -> PagedKvPageTokens {
-        self.page_tokens
-    }
-    /// Context-covering page-table capacity.
-    #[must_use]
-    pub const fn page_count(self) -> usize {
-        self.page_count
-    }
-    /// All-layer bundles, including one COW spare.
-    #[must_use]
-    pub const fn bundle_count(self) -> usize {
-        self.bundle_count
     }
     /// Exact f32 backing, including padding and spare.
     #[must_use]
     pub const fn requested_f32_elements(self) -> usize {
         self.requested_f32
-    }
-    /// F32 backing expressed in checked bytes before allocation.
-    #[must_use]
-    pub const fn backing_bytes(self) -> usize {
-        self.backing_bytes
-    }
-    /// Persistent non-f32 metadata capacity.
-    #[must_use]
-    pub const fn metadata_bytes(self) -> usize {
-        self.metadata_bytes
-    }
-    /// Maximum copied f32 payload for a partial-tail COW.
-    #[must_use]
-    pub const fn max_tail_copy_f32_elements(self) -> usize {
-        self.tail_copy_f32
-    }
-    /// Maximum partial-tail COW payload expressed in checked bytes.
-    #[must_use]
-    pub const fn max_tail_copy_bytes(self) -> usize {
-        self.tail_copy_bytes
-    }
-    /// Exact CPU allocation request: fixed backing plus persistent metadata.
-    #[must_use]
-    pub const fn total_requested_bytes(self) -> usize {
-        self.total_requested_bytes
     }
     fn cost(self) -> (usize, usize, usize) {
         (
@@ -290,24 +220,6 @@ impl PagedKvPool {
             staged_rows,
             committed_tokens: 0,
         })
-    }
-    /// The exact plan used by this owner.
-    #[must_use]
-    pub const fn plan(&self) -> PagedKvPlan {
-        self.plan
-    }
-    /// Rows committed in every layer.
-    #[must_use]
-    pub const fn committed_tokens(&self) -> usize {
-        self.committed_tokens
-    }
-    /// Immutable committed view.
-    #[must_use]
-    pub fn committed(&self) -> PagedKvView<'_> {
-        PagedKvView {
-            pool: self,
-            tokens: self.committed_tokens,
-        }
     }
     /// One immutable committed layer.
     pub fn layer_kv(&self, layer: usize) -> Result<PagedLayerKv<'_>> {
@@ -718,35 +630,6 @@ impl Drop for PagedAppend<'_> {
     }
 }
 
-/// Immutable committed pool view.
-#[derive(Debug)]
-pub struct PagedKvView<'a> {
-    pool: &'a PagedKvPool,
-    tokens: usize,
-}
-impl PagedKvView<'_> {
-    /// Visible committed token count.
-    #[must_use]
-    pub const fn tokens(&self) -> usize {
-        self.tokens
-    }
-    /// Borrow one committed layer.
-    pub fn layer_kv(&self, layer: usize) -> Result<PagedLayerKv<'_>> {
-        if layer >= self.pool.plan.geometry.layers {
-            return PagedLayerOutOfRangeSnafu {
-                layer,
-                layers: self.pool.plan.geometry.layers,
-            }
-            .fail();
-        }
-        Ok(PagedLayerKv {
-            pool: self.pool,
-            layer,
-            tokens: self.tokens,
-        })
-    }
-}
-
 /// Borrowed K/V rows for one layer.
 #[derive(Debug)]
 pub struct PagedLayerKv<'a> {
@@ -955,9 +838,9 @@ mod tests {
     fn assert_committed_matches(pool: &PagedKvPool, model: &[Vec<ModelRow>; LAYERS]) -> Result<()> {
         let tokens = model[0].len();
         assert!(model.iter().all(|layer| layer.len() == tokens));
-        assert_eq!(pool.committed_tokens(), tokens);
+        assert_eq!(pool.committed_tokens, tokens);
         for (layer, expected_rows) in model.iter().enumerate() {
-            let rows = pool.committed().layer_kv(layer)?;
+            let rows = pool.layer_kv(layer)?;
             assert_eq!(rows.tokens(), tokens);
             for (token, expected) in expected_rows.iter().enumerate() {
                 assert_eq!(rows.key_row(token)?, expected.key);
@@ -1158,31 +1041,25 @@ mod tests {
 
     #[test]
     fn all_page_sizes_match_independent_transaction_row_models() -> Result<()> {
-        for (page_tokens, make_plan) in [
-            (
-                8,
-                PagedKvPlan::b8 as fn(PagedKvGeometry) -> Result<PagedKvPlan>,
-            ),
-            (
-                16,
-                PagedKvPlan::b16 as fn(PagedKvGeometry) -> Result<PagedKvPlan>,
-            ),
-            (
-                32,
-                PagedKvPlan::b32 as fn(PagedKvGeometry) -> Result<PagedKvPlan>,
-            ),
+        for (page_tokens, page) in [
+            (8, PageTokens::B8),
+            (16, PageTokens::B16),
+            (32, PageTokens::B32),
         ] {
             let max_context = page_tokens * 2 + 1;
-            exercise_partial_tail_rollback(page_tokens, make_plan(geometry(max_context))?)?;
+            exercise_partial_tail_rollback(
+                page_tokens,
+                PagedKvPlan::new(geometry(max_context), page)?,
+            )?;
             exercise_start_and_multi_page_append(
                 page_tokens,
-                make_plan(geometry(max_context))?,
+                PagedKvPlan::new(geometry(max_context), page)?,
                 page_tokens,
                 page_tokens + 1,
             )?;
             exercise_start_and_multi_page_append(
                 page_tokens,
-                make_plan(geometry(max_context))?,
+                PagedKvPlan::new(geometry(max_context), page)?,
                 page_tokens + 1,
                 page_tokens,
             )?;
@@ -1191,7 +1068,7 @@ mod tests {
     }
     #[test]
     fn boundary_capacity_and_shape_are_typed() -> Result<()> {
-        let mut pool = PagedKvPool::new(PagedKvPlan::b8(geometry(20))?)?;
+        let mut pool = PagedKvPool::new(PagedKvPlan::new(geometry(20), PageTokens::B8)?)?;
         assert!(matches!(
             pool.begin_append(21),
             Err(Error::PagedContextOverflow { .. })
@@ -1205,53 +1082,50 @@ mod tests {
     }
     #[test]
     fn selector_minimizes_checked_cpu_request_not_page_size() -> Result<()> {
-        let word = size_of::<usize>();
         let narrow = PagedKvGeometry {
             layers: 1,
             row_width: 1,
             max_context: 128,
         };
-        let narrow_b8 = PagedKvPlan::b8(narrow)?;
-        let narrow_b16 = PagedKvPlan::b16(narrow)?;
-        let narrow_b32 = PagedKvPlan::b32(narrow)?;
-        assert_eq!(narrow_b8.backing_bytes(), 1_088);
-        assert_eq!(narrow_b8.metadata_bytes(), 50 * word);
-        assert_eq!(narrow_b8.total_requested_bytes(), 1_088 + 50 * word);
-        assert_eq!(narrow_b16.backing_bytes(), 1_152);
-        assert_eq!(narrow_b16.metadata_bytes(), 26 * word);
-        assert_eq!(narrow_b16.total_requested_bytes(), 1_152 + 26 * word);
-        assert_eq!(narrow_b32.backing_bytes(), 1_280);
-        assert_eq!(narrow_b32.metadata_bytes(), 14 * word);
-        assert_eq!(narrow_b32.total_requested_bytes(), 1_280 + 14 * word);
-        assert_eq!(
-            PagedKvPlan::select(narrow)?.page_tokens(),
-            PagedKvPageTokens::B16
-        );
+        let narrow_b8 = PagedKvPlan::new(narrow, PageTokens::B8)?;
+        let narrow_b16 = PagedKvPlan::new(narrow, PageTokens::B16)?;
+        let narrow_b32 = PagedKvPlan::new(narrow, PageTokens::B32)?;
+        assert_plan_request(narrow_b8, narrow, 8);
+        assert_plan_request(narrow_b16, narrow, 16);
+        assert_plan_request(narrow_b32, narrow, 32);
+        assert_eq!(PagedKvPlan::select(narrow)?.page_tokens, PageTokens::B16);
         let wide = PagedKvGeometry {
             layers: 1,
             row_width: 64,
             max_context: 128,
         };
-        let wide_b8 = PagedKvPlan::b8(wide)?;
-        let wide_b16 = PagedKvPlan::b16(wide)?;
-        assert_eq!(wide_b8.backing_bytes(), 69_632);
-        assert_eq!(wide_b8.metadata_bytes(), 50 * word);
-        assert_eq!(wide_b8.total_requested_bytes(), 69_632 + 50 * word);
-        assert_eq!(wide_b16.backing_bytes(), 73_728);
-        assert_eq!(wide_b16.metadata_bytes(), 26 * word);
-        assert_eq!(wide_b16.total_requested_bytes(), 73_728 + 26 * word);
-        assert_eq!(
-            PagedKvPlan::select(wide)?.page_tokens(),
-            PagedKvPageTokens::B8
-        );
+        let wide_b8 = PagedKvPlan::new(wide, PageTokens::B8)?;
+        let wide_b16 = PagedKvPlan::new(wide, PageTokens::B16)?;
+        assert_plan_request(wide_b8, wide, 8);
+        assert_plan_request(wide_b16, wide, 16);
+        assert_eq!(PagedKvPlan::select(wide)?.page_tokens, PageTokens::B8);
         assert!(matches!(
-            PagedKvPlan::b8(PagedKvGeometry {
+            PagedKvPlan::new(PagedKvGeometry {
                 layers: usize::MAX,
                 row_width: 2,
                 max_context: 1
-            }),
+            }, PageTokens::B8),
             Err(Error::PagedArithmetic { .. })
         ));
         Ok(())
+    }
+
+    fn assert_plan_request(
+        plan: PagedKvPlan,
+        geometry: PagedKvGeometry,
+        page_tokens: usize,
+    ) {
+        let page_count = geometry.max_context.div_ceil(page_tokens);
+        let bundle_count = page_count + 1;
+        let requested_f32 = bundle_count * geometry.layers * 2 * page_tokens * geometry.row_width;
+        let metadata_bytes = (page_count * 2 + bundle_count + geometry.layers) * size_of::<usize>();
+        let total_requested_bytes = requested_f32 * size_of::<f32>() + metadata_bytes;
+        assert_eq!(plan.requested_f32_elements(), requested_f32);
+        assert_eq!(plan.total_requested_bytes, total_requested_bytes);
     }
 }

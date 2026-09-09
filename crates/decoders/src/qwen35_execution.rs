@@ -1,7 +1,6 @@
 //! Bounded CPU token-to-logits execution for a verified Qwen3.5 payload.
 
-use cache::paged::{PagedAppend, PagedLayerKv};
-use cache::{PagedKvGeometry, PagedKvPlan, PagedKvPool};
+use cache::{PagedAppend, PagedKvGeometry, PagedKvPlan, PagedKvPool, PagedLayerKv};
 use loader::gguf::{GgmlType, MetaValue, MetaValueType};
 use num_traits::ToPrimitive;
 use quant::f32_row::F32Row;
@@ -57,8 +56,8 @@ pub struct Qwen35ExecutionPlan<'weights, 'artifact> {
 ///
 /// Each successful [`Self::step`] executes every input token and returns rows
 /// according to the plan's [`Qwen35LogitSelection`]. The method stages recurrent
-/// and full-attention history in a clone, committing it only after the whole
-/// call, including selected final logits, succeeds.
+/// state while borrowing a private paged-KV append transaction; both publish only
+/// after the whole call, including selected final logits, succeeds.
 #[derive(Debug)]
 pub struct Qwen35Execution<'weights, 'artifact> {
     weights: &'weights Qwen35Weights<'artifact>,
@@ -296,8 +295,12 @@ impl<'weights, 'artifact> StagedExecution<'weights, 'artifact> {
                     LayerState::Full(full_layer) => full_attention(
                         weights,
                         layout,
-                        position,
-                        block,
+                        FullAttentionStep {
+                            position,
+                            block,
+                            full_layer: *full_layer,
+                            append_token: token_index,
+                        },
                         &hidden,
                         append.as_deref_mut().ok_or_else(|| {
                             ExecutionContextSnafu {
@@ -306,8 +309,6 @@ impl<'weights, 'artifact> StagedExecution<'weights, 'artifact> {
                             }
                             .build()
                         })?,
-                        *full_layer,
-                        token_index,
                     )?,
                 };
                 self.finish_layer(block, &mut hidden, &attention)?;
@@ -463,6 +464,14 @@ fn paged_kv_plan(layout: Layout) -> Result<Option<PagedKvPlan>> {
     .context(ExecutionPagedKvSnafu)
 }
 
+#[derive(Clone, Copy)]
+struct FullAttentionStep {
+    position: usize,
+    block: usize,
+    full_layer: usize,
+    append_token: usize,
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the pinned full-attention operation order is one bounded transactional unit"
@@ -470,13 +479,16 @@ fn paged_kv_plan(layout: Layout) -> Result<Option<PagedKvPlan>> {
 fn full_attention(
     weights: &Qwen35Weights<'_>,
     layout: Layout,
-    position: usize,
-    block: usize,
+    step: FullAttentionStep,
     input: &[f32],
     append: &mut PagedAppend<'_>,
-    full_layer: usize,
-    append_token: usize,
 ) -> Result<Vec<f32>> {
+    let FullAttentionStep {
+        position,
+        block,
+        full_layer,
+        append_token,
+    } = step;
     let attention_tokens = position.checked_add(1).ok_or_else(|| {
         ArithmeticOverflowSnafu {
             context: "full-attention token count",
