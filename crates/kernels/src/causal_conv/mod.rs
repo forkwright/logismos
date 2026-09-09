@@ -540,7 +540,12 @@ fn validate_causal_conv_step_launch(
 
     let inputs = [
         checked_f32_device_span(CAUSAL_CONV_STEP_KERNEL, input_f32, input_elements, "input")?,
-        checked_f32_device_span(CAUSAL_CONV_STEP_KERNEL, weights_f32, weight_elements, "weights")?,
+        checked_f32_device_span(
+            CAUSAL_CONV_STEP_KERNEL,
+            weights_f32,
+            weight_elements,
+            "weights",
+        )?,
         checked_f32_device_span(
             CAUSAL_CONV_STEP_KERNEL,
             history_in_f32,
@@ -1014,7 +1019,11 @@ mod tests {
         assert!(matches!(
             validate_causal_conv_step_launch(
                 plan,
-                aligned_f32.as_ptr().cast::<u8>().wrapping_add(1).cast::<f32>(),
+                aligned_f32
+                    .as_ptr()
+                    .cast::<u8>()
+                    .wrapping_add(1)
+                    .cast::<f32>(),
                 aligned.input.len(),
                 aligned.weights.as_ptr(),
                 aligned.weights.len(),
@@ -1086,7 +1095,12 @@ mod tests {
         ));
         let address_overflow = (usize::MAX - 3) as *const f32;
         assert!(matches!(
-            checked_f32_device_span(CAUSAL_CONV_STEP_KERNEL, address_overflow, 1, "address overflow"),
+            checked_f32_device_span(
+                CAUSAL_CONV_STEP_KERNEL,
+                address_overflow,
+                1,
+                "address overflow"
+            ),
             Err(crate::Error::UnsupportedShape { .. })
         ));
         if let Ok(abi_overflow) = usize::try_from(u64::from(u32::MAX) + 1) {
@@ -1144,15 +1158,9 @@ mod tests {
         let second_input = [0.75, -0.5, 2.0];
         let plan = CausalConvAllocationPlan::try_from_dimensions(1, 3, 3)
             .map_err(|error| format!("build one-token plan: {error}"))?;
-        let (first_output_oracle, first_history_oracle) = oracle_causal_conv(
-            &first_input,
-            &weights_host,
-            &initial_history,
-            1,
-            3,
-            3,
-        )
-        .map_err(|error| format!("first oracle: {error}"))?;
+        let (first_output_oracle, first_history_oracle) =
+            oracle_causal_conv(&first_input, &weights_host, &initial_history, 1, 3, 3)
+                .map_err(|error| format!("first oracle: {error}"))?;
         let first_history_expected: Vec<f32> = first_history_oracle
             .iter()
             .map(|value| *value as f32)
@@ -1220,13 +1228,23 @@ mod tests {
             .copy_to_host(&mut preserved_weights)
             .map_err(|error| format!("read immutable weights: {error}"))?;
         assert_close_f64(&first_output, &first_output_oracle, "device first output");
-        assert_close_f64(&first_history, &first_history_oracle, "device first history");
-        assert_eq!(preserved_first_input, first_input, "device input must remain immutable");
+        assert_close_f64(
+            &first_history,
+            &first_history_oracle,
+            "device first history",
+        );
+        assert_eq!(
+            preserved_first_input, first_input,
+            "device input must remain immutable"
+        );
         assert_eq!(
             preserved_initial_history, initial_history,
             "device initial history must remain immutable"
         );
-        assert_eq!(preserved_weights, weights_host, "device weights must remain immutable");
+        assert_eq!(
+            preserved_weights, weights_host,
+            "device weights must remain immutable"
+        );
 
         let second_input = DeviceBuffer::<f32>::from_host(&device, &second_input)
             .map_err(|error| format!("upload continuation input: {error}"))?;
@@ -1288,21 +1306,16 @@ mod tests {
         let width_one_weights = [4.0_f32, -0.5];
         let width_one_plan = CausalConvAllocationPlan::try_from_dimensions(1, 2, 1)
             .map_err(|error| format!("build width-one plan: {error}"))?;
-        let (width_one_output_oracle, width_one_history_oracle) = oracle_causal_conv(
-            &width_one_input,
-            &width_one_weights,
-            &[],
-            1,
-            2,
-            1,
-        )
-        .map_err(|error| format!("width-one oracle: {error}"))?;
+        let (width_one_output_oracle, width_one_history_oracle) =
+            oracle_causal_conv(&width_one_input, &width_one_weights, &[], 1, 2, 1)
+                .map_err(|error| format!("width-one oracle: {error}"))?;
         let width_one_input = DeviceBuffer::<f32>::from_host(&device, &width_one_input)
             .map_err(|error| format!("upload width-one input: {error}"))?;
         let width_one_weights = DeviceBuffer::<f32>::from_host(&device, &width_one_weights)
             .map_err(|error| format!("upload width-one weights: {error}"))?;
-        let width_one_output = DeviceBuffer::<f32>::alloc(&device, width_one_plan.output_elements())
-            .map_err(|error| format!("allocate width-one output: {error}"))?;
+        let width_one_output =
+            DeviceBuffer::<f32>::alloc(&device, width_one_plan.output_elements())
+                .map_err(|error| format!("allocate width-one output: {error}"))?;
         // SAFETY: width one has no history footprint, so null history pointers
         // carry zero lengths while the remaining distinct buffers match `plan`.
         unsafe {

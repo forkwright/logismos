@@ -961,7 +961,12 @@ fn validate_gdn_step_launch(
         checked_f32_device_span(GDN_GROUPED_STEP_KERNEL, v_f32, v_elements, "v")?,
         checked_f32_device_span(GDN_GROUPED_STEP_KERNEL, beta_f32, beta_elements, "beta")?,
         checked_f32_device_span(GDN_GROUPED_STEP_KERNEL, g_f32, g_elements, "g")?,
-        checked_f32_device_span(GDN_GROUPED_STEP_KERNEL, state_in_f32, state_in_elements, "state_in")?,
+        checked_f32_device_span(
+            GDN_GROUPED_STEP_KERNEL,
+            state_in_f32,
+            state_in_elements,
+            "state_in",
+        )?,
     ];
     let state_out = checked_f32_device_span(
         GDN_GROUPED_STEP_KERNEL,
