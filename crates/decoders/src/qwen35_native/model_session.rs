@@ -293,14 +293,13 @@ impl Qwen35NativeExecutionModel {
     /// A live session or planned use keeps the immutable resident `Arc` alive,
     /// so this returns that exact model unchanged rather than treating a shared
     /// reference count as an eviction acknowledgement.
-    #[must_use]
     pub fn close(self) -> Qwen35NativeExecutionModelClose {
         match Arc::try_unwrap(self.resources) {
-            Ok(resources) => {
-                Qwen35NativeExecutionModelClose::Teardown(Qwen35NativeExecutionModelTeardown {
+            Ok(resources) => Qwen35NativeExecutionModelClose::Teardown(Box::new(
+                Qwen35NativeExecutionModelTeardown {
                     inner: resources.into_teardown_parts().begin_release(),
-                })
-            }
+                },
+            )),
             Err(resources) => Qwen35NativeExecutionModelClose::InUse(Self { resources }),
         }
     }
@@ -312,7 +311,7 @@ pub enum Qwen35NativeExecutionModelClose {
     /// Another session or exact-context plan still retains the resident model.
     InUse(Qwen35NativeExecutionModel),
     /// The unique resident model has entered explicit HIP teardown.
-    Teardown(Qwen35NativeExecutionModelTeardown),
+    Teardown(Box<Qwen35NativeExecutionModelTeardown>),
 }
 
 /// Explicit teardown custody for a unique immutable native model.
@@ -331,7 +330,6 @@ impl Qwen35NativeExecutionModelTeardown {
     }
 
     /// Retry HIP aggregate teardown only after its preflight-pending outcome.
-    #[must_use]
     pub fn retry(self) -> Self {
         Self {
             inner: self.inner.retry_pending(),
@@ -339,7 +337,6 @@ impl Qwen35NativeExecutionModelTeardown {
     }
 
     /// Deliberately retry only stream synchronization after completion was unproved.
-    #[must_use]
     pub fn reconcile(self) -> Self {
         Self {
             inner: self.inner.reconcile_synchronization(),
@@ -435,7 +432,6 @@ impl Qwen35NativeExecutionSessionTeardown {
     /// Other outcomes retain their exact custody unchanged. In particular, a
     /// synchronization-unconfirmed result requires [`Self::reconcile`], never
     /// an ordinary destructor retry.
-    #[must_use]
     pub fn retry(self) -> Self {
         Self {
             inner: self.inner.retry_pending(),
@@ -446,7 +442,6 @@ impl Qwen35NativeExecutionSessionTeardown {
     ///
     /// This leaves every other teardown outcome unchanged and never retries a
     /// destructor after a quarantined result.
-    #[must_use]
     pub fn reconcile(self) -> Self {
         Self {
             inner: self.inner.reconcile_synchronization(),

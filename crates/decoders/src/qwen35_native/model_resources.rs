@@ -191,7 +191,6 @@ impl ModelSessionTeardown {
                 InventoryRelease::SynchronizationUnconfirmed(_) => {
                     ModelSessionTeardownState::SynchronizationUnconfirmed
                 }
-                InventoryRelease::Quarantined(_) => ModelSessionTeardownState::Quarantined,
                 _ => ModelSessionTeardownState::Quarantined,
             },
         }
@@ -258,7 +257,6 @@ impl NativeResidentTeardown {
                 InventoryRelease::SynchronizationUnconfirmed(_) => {
                     ModelSessionTeardownState::SynchronizationUnconfirmed
                 }
-                InventoryRelease::Quarantined(_) => ModelSessionTeardownState::Quarantined,
                 _ => ModelSessionTeardownState::Quarantined,
             },
         }
@@ -1060,10 +1058,11 @@ mod tests {
     #[test]
     fn abandoned_retention_never_drops_the_last_resident() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let resident = Arc::new(DropProbe(Arc::clone(&drops)));
-        let retention = super::ResidentRetention::new(Arc::clone(&resident));
-        drop(resident);
-        drop(retention);
+        {
+            let resident = Arc::new(DropProbe(Arc::clone(&drops)));
+            let _retention = super::ResidentRetention::new(Arc::clone(&resident));
+            drop(resident);
+        }
         assert_eq!(drops.load(Ordering::SeqCst), 0);
     }
 
