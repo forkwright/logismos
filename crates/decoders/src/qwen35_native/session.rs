@@ -104,6 +104,11 @@ impl<'weights, 'artifact> Qwen35NativeLayerPlan<'weights, 'artifact> {
     ///
     /// This performs no device initialization, allocation, upload, or kernel
     /// submission.
+    ///
+    /// # Errors
+    ///
+    /// Refuses unsupported block roles, metadata, matrix formats or geometry,
+    /// out-of-range context, and unrepresentable allocation extents.
     pub fn try_from_weights(
         weights: &'weights Qwen35Weights<'artifact>,
         block: usize,
@@ -126,6 +131,11 @@ impl<'weights, 'artifact> Qwen35NativeLayerPlan<'weights, 'artifact> {
     }
 
     /// Upload this exact plan's verified weights and create its owned session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed allocation, upload, stream, or weight-binding failure.
+    /// No inference kernel is submitted during construction.
     ///
     /// # Safety
     ///
@@ -177,6 +187,14 @@ impl Qwen35NativeLayerSession {
     }
 
     /// Execute one token through exactly one admitted native full-attention block.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a poisoned session, wrong-device or wrong-sized input, exhausted
+    /// context, or failed allocation. Preflight refusal leaves the session
+    /// ready. Any error after submission permanently poisons it; use
+    /// [`Self::state`] to distinguish known-idle from uncertain completion.
+    /// No failed step publishes KV, advances position, or returns partial output.
     ///
     /// # Safety
     ///
