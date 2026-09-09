@@ -38,11 +38,15 @@ device allocation extents. Auxiliary NextN tensors may be present but are not
 uploaded or executed by this main autoregressive baseline. The narrower
 `Qwen35NativeLayerPlan` remains available for single-block qualification.
 
-One model owner retains device weights, scratch, recurrent committed/staged
-state, paged KV, controls, stream, numerical status and pending logits. It
-publishes state only after whole-token synchronization and a clear status read.
+One immutable native model owner shares uploaded weights across sessions.
+Each session independently owns scratch, recurrent committed/staged state,
+paged KV, controls, stream, numerical status and pending logits. It publishes
+state only after whole-token synchronization and a clear status read.
 Arithmetic failures poison the session without returning logits or publishing
-KV, recurrent state or position; uncertain completion retains the entire bundle.
+KV, recurrent state or position; uncertain completion retains the entire
+session bundle and its shared model reference. Requested demand separates
+resident uploads, per-session state, token controls and returned logits;
+arbitrarily retained outputs and qualified runtime overhead remain separate.
 The status checks explicit operations, not hidden math-library temporaries, and
 still requires a qualified denorm-preserving compiler/math/device profile.
 The `logismos` facade selects this surface; direct CPU consumers keep it off.
@@ -80,6 +84,8 @@ The [`placement`](crates/placement/src/lib.rs) ledger owns per-device reservatio
 These are deterministic process-local contracts, not physical reservations or a running executor.
 A service owner must use one controller per resource grant and drain or reconcile on restart.
 Supplied memory estimates are not yet artifact-derived requirements or measured residency.
+In-process requested-byte leases compete with v1 workload reservations in the
+same per-device ledger. Dropping a lease does not release its accounting.
 
 `logismos inspect --input PATH` retains its v1 digest/census receipt. Explicit `--metadata`
 adds typed metadata (including empty-array element types and float bits) and source-order
@@ -93,7 +99,8 @@ from an opaque observation: exact typed metadata determines tensor roles and sha
 main decoder blocks remain distinct from an optional auxiliary NextN block. This does not
 validate payloads or authorize execution. For payload access, `loader::gguf::VerifiedArtifact`
 owns one immutable byte backing under an explicit size limit and requires a matching SHA-256
-expectation. `decoders::Qwen35Weights` binds that backing to the structural profile and executes
+expectation. Clones share that backing and its observation without rereading the
+source. `decoders::Qwen35Weights` retains that owner, binds it to the structural profile and executes
 named F32/Q8_0/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS matrix projections using
 [`quant`](crates/quant/src/lib.rs). The same checked block decoders support linear
 row decoding.
@@ -129,7 +136,9 @@ untrusted requests, and are content binding rather than publisher authentication
 
 `TextPipeline::prepare` exposes the exact rendered prompt, final token IDs and
 artifact-bound decoder requirements without creating a decoder session or running
-the model. Its opaque result is consumed for execution; ordinary `generate` uses
+the model. Its opaque result owns the immutable pipeline profile and bound
+decoder plan, so it outlives the caller's setup handles without copying model
+or tokenizer payloads. It is consumed for execution; ordinary `generate` uses
 the same path. Context and prefill bounds derive from that request, not configured
 ceilings. These reports cover decoder f32 backing only, not prompt/tokenizer/text
 allocations, whole-request memory or admission.

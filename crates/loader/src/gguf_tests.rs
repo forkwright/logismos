@@ -303,11 +303,17 @@ fn verified_artifact_clone_retains_the_verified_backing_after_original_drop() ->
         digest_for_bytes(&bytes),
         fixture_backing_limit(&bytes)?,
     )?;
+    let original_tensor_pointer = artifact.tensor("one")?.bytes().as_ptr();
     let retained = artifact.clone();
     drop(artifact);
     std::fs::write(&path, b"replaced after verified load")?;
 
     let tensor = retained.tensor("one")?;
+    assert_eq!(
+        tensor.bytes().as_ptr(),
+        original_tensor_pointer,
+        "clones must share the verified backing, not duplicate its payload"
+    );
     assert_eq!(
         tensor.bytes(),
         [0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64],

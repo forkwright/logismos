@@ -128,6 +128,10 @@ an optimal placement claim, or permission to stop another workload. The CPU-only
 `placement::ReservationLedger` and `sched::Scheduler` add process-local,
 opaque-capability admission accounting after planning; they do not establish
 unique host ownership, allocate a device, or establish physical residency.
+Non-serializable requested-device-byte leases use that same ledger for
+independent reservations without fabricating v1 workload estimates. Both lease
+forms share revisions, capacity and release authority; dropping a capability
+does not free its accounted bytes.
 Their detailed state protocol and proof limits belong to the `sched` rustdoc
 and the operator-managed private planning corpus, not this overview.
 
@@ -221,8 +225,9 @@ terminal NextN extension from execution and device weight/state allocation;
 presence of that extension is not a blanket refusal. Serialized row lookup and
 GEMV share format-local reconstruction, retaining the established f32 dot order.
 
-The native model owns one stream and one layer-indexed KV pool when full
-attention is present. Each recurrent layer has distinct committed and staged
+The native model owns immutable uploads shared through an `Arc`; it retains
+the exact verified weight owner. Each session owns one stream and one
+layer-indexed KV pool when full attention is present. Each recurrent layer has distinct committed and staged
 raw convolution history and GDN state. A single full-attention workspace, a
 single recurrent workspace and a common residual/FFN workspace are reused in
 stream order; two hidden rows alternate between main blocks. Recurrent Q/K
@@ -237,17 +242,22 @@ precede KV publication; recurrent state swaps and position advancement then
 form an infallible tail. The public demand distinguishes actual immutable
 uploads, shared workspaces, hidden/final/logit/control buffers, KV/table,
 active/staged recurrent allocations and numerical status. It excludes
-host/runtime overhead and arbitrarily retained returned logits. It is neither a resource grant nor
+host/runtime overhead and arbitrarily retained returned logits. Its resident,
+session, token-control and returned-logit categories derive from the same
+checked demand. Uncertain completion retains the shared model reference with
+the complete per-session bundle. Sharing does not make `Drop` an eviction
+receipt. Demand is neither a resource grant nor
 measured physical residency. Native numeric obligations remain explicitly
 unsafe; compiler-checked, ignored device witnesses are not execution evidence.
 
 `loader::gguf::VerifiedArtifact` owns one immutable serialized backing, admitted
 under an explicit byte limit and matched against a required SHA-256 expectation.
-Its metadata and tensor borrows come from those same bytes. This content binding
+Its metadata and tensor borrows come from those same bytes; clones retain one
+shared backing and observation rather than copying payloads or reopening a path. This content binding
 does not establish publisher authenticity, a filesystem snapshot, or a total
 host-memory reservation. Existing observation receipts remain reporting data.
 
-`decoders::Qwen35Weights` binds the existing structural contract to that owner
+`decoders::Qwen35Weights` retains a shared clone of that owner and binds the existing structural contract
 and executes named F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS matrix
 projections through `quant`. Linear row decoding shares those checked block
 decoders and geometry; other unsupported formats are explicit refusals.
@@ -301,8 +311,10 @@ comparison tolerance; batch-versus-sequential agreement alone is insufficient.
 `text::TextPipeline` binds an explicitly selected tokenizer identity to the
 verified model's vocabulary and special-token policy. The same model digest
 commits the embedded template; no second template identity authority exists.
-Its private template environment registers no named templates or loader and
-renders only the admitted source. It accepts typed text messages and uses
+Its immutable shared profile retains weights, tokenizer, owned template source
+and policy. Each render creates a stack-local private template environment,
+registers no named templates or loader, and renders only that admitted source.
+It accepts typed text messages and uses
 checked greedy selection followed by collective sequence decoding. Requests
 have independent execution state, bounded context/output and cooperative
 cancellation checks; failures publish neither partial text nor resumable state.
@@ -311,7 +323,7 @@ undone in a shared session. These limits do not bound total template/tokenizer
 heap use or authenticate the selected model/tokenizer's publisher.
 
 `TextPipeline::prepare` returns an opaque `PreparedGeneration` that owns the
-rendered prompt and final token IDs, borrows the immutable pipeline, and retains
+rendered prompt and final token IDs, shares ownership of the immutable pipeline, and retains
 one `Qwen35ExecutionPlan`. Its context is checked prompt plus output tokens;
 its maximum step is the nonempty prompt length. Configured limits are ceilings,
 while the actual request must fit the artifact. Read-only getters expose these
