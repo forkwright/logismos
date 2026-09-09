@@ -10,7 +10,8 @@ pub(crate) const SCALE_BYTES: usize = 2;
 // WHY: The operator-approved exception is exactly these finite interoperability
 // values. Provenance: ggml-org/llama.cpp@6a1a922d269908a29cbd4b49c27e6a8e7fd10fae,
 // ggml/src/ggml-common.h:1120-1122. No upstream expression or decoder is used.
-pub(crate) const RECONSTRUCTION_VALUES: [i8; 16] = [
+/// Approved IQ4 reconstruction values shared by CPU decoding and generated HIP layout facts.
+pub const RECONSTRUCTION_VALUES: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 

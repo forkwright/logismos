@@ -49,7 +49,7 @@ pub mod error;
 pub mod gdn;
 #[cfg(feature = "gpu")]
 pub mod matmul;
-pub mod q8_0_gemv;
+pub mod row_gemv;
 #[cfg(feature = "gpu")]
 pub mod rms_norm;
 #[cfg(feature = "gpu")]

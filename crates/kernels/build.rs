@@ -92,7 +92,7 @@ fn main() -> Result<(), String> {
         ));
     }
 
-    write_q8_0_format_header(&out_dir)?;
+    write_row_format_header(&out_dir)?;
     compile_sources(&hipcc, &out_dir, &hip_sources, &cpp_sources)?;
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
@@ -105,7 +105,7 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-fn write_q8_0_format_header(out_dir: &Path) -> Result<(), String> {
+fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
     let values_per_block = quant::q8_0::Q8_0_VALUES_PER_BLOCK;
     let scale_bytes = quant::q8_0::Q8_0_SCALE_BYTES;
     let value_bytes = quant::q8_0::Q8_0_VALUE_BYTES;
@@ -119,11 +119,68 @@ fn write_q8_0_format_header(out_dir: &Path) -> Result<(), String> {
     {
         return Err("quant Q8_0 constants violate their declared layout relation".to_string());
     }
+    let q4_values = quant::Q4_K_VALUES_PER_BLOCK;
+    let q4_prefix = quant::q4_k::Q4_K_PREFIX_BYTES;
+    let q4_scales = quant::q4_k::Q4_K_SCALE_BYTES;
+    let q4_quant = quant::q4_k::Q4_K_QUANT_BYTES;
+    let q4_bytes = quant::Q4_K_BLOCK_BYTES;
+    let q5_values = quant::Q5_K_VALUES_PER_BLOCK;
+    let q5_prefix = quant::q5_k::Q5_K_PREFIX_BYTES;
+    let q5_scales = quant::q5_k::Q5_K_SCALE_BYTES;
+    let q5_high = quant::q5_k::Q5_K_HIGH_BITS_BYTES;
+    let q5_quant = quant::q5_k::Q5_K_QUANT_BYTES;
+    let q5_bytes = quant::Q5_K_BLOCK_BYTES;
+    let q6_values = quant::Q6_K_VALUES_PER_BLOCK;
+    let q6_low = quant::q6_k::Q6_K_LOW_BITS_BYTES;
+    let q6_high = quant::q6_k::Q6_K_HIGH_BITS_BYTES;
+    let q6_scales = quant::q6_k::Q6_K_SCALE_BYTES;
+    let q6_super_scale = quant::q6_k::Q6_K_SUPER_SCALE_BYTES;
+    let q6_bytes = quant::Q6_K_BLOCK_BYTES;
+    let iq4_nl_values = quant::IQ4_NL_VALUES_PER_BLOCK;
+    let iq4_nl_scale = quant::iq4_nl::IQ4_NL_SCALE_BYTES;
+    let iq4_nl_quant = quant::iq4_nl::IQ4_NL_QUANT_BYTES;
+    let iq4_nl_bytes = quant::IQ4_NL_BLOCK_BYTES;
+    let iq4_xs_values = quant::IQ4_XS_VALUES_PER_BLOCK;
+    let iq4_xs_scale = quant::iq4_xs::IQ4_XS_SCALE_BYTES;
+    let iq4_xs_scale_low = quant::iq4_xs::IQ4_XS_SCALE_LOW_BYTES;
+    let iq4_xs_scale_high = quant::iq4_xs::IQ4_XS_SCALE_HIGH_BYTES;
+    let iq4_xs_quant = quant::iq4_xs::IQ4_XS_QUANT_BYTES;
+    let iq4_xs_bytes = quant::IQ4_XS_BLOCK_BYTES;
+    let iq4_values = quant::IQ4_RECONSTRUCTION_VALUES
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let q4_derived = checked_sum(&[q4_prefix, q4_scales, q4_quant], "Q4_K")?;
+    let q5_derived = checked_sum(&[q5_prefix, q5_scales, q5_high, q5_quant], "Q5_K")?;
+    let q6_derived = checked_sum(&[q6_low, q6_high, q6_scales, q6_super_scale], "Q6_K")?;
+    let iq4_nl_derived = checked_sum(&[iq4_nl_scale, iq4_nl_quant], "IQ4_NL")?;
+    let iq4_xs_derived = checked_sum(
+        &[iq4_xs_scale, iq4_xs_scale_low, iq4_xs_scale_high, iq4_xs_quant],
+        "IQ4_XS",
+    )?;
+    if q4_bytes != q4_derived
+        || q5_bytes != q5_derived
+        || q6_bytes != q6_derived
+        || iq4_nl_bytes != iq4_nl_derived
+        || iq4_xs_bytes != iq4_xs_derived
+    {
+        return Err("quant constants violate an executable serialized-row layout relation".to_string());
+    }
     let header = format!(
-        "#pragma once\n\n#include <cstddef>\n\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUES_PER_BLOCK = {values_per_block};\ninline constexpr std::size_t LOGISMOS_Q8_0_SCALE_BYTES = {scale_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUE_BYTES = {value_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_BLOCK_BYTES = {block_bytes};\n"
+        "#pragma once\n\n#include <cstddef>\n#include <cstdint>\n\ninline constexpr std::size_t LOGISMOS_F32_VALUE_BYTES = {f32_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUES_PER_BLOCK = {values_per_block};\ninline constexpr std::size_t LOGISMOS_Q8_0_SCALE_BYTES = {scale_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUE_BYTES = {value_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_BLOCK_BYTES = {block_bytes};\ninline constexpr std::size_t LOGISMOS_K_GROUP_VALUES = {k_group};\ninline constexpr std::size_t LOGISMOS_Q4_K_VALUES_PER_BLOCK = {q4_values};\ninline constexpr std::size_t LOGISMOS_Q4_K_PREFIX_BYTES = {q4_prefix};\ninline constexpr std::size_t LOGISMOS_Q4_K_SCALE_BYTES = {q4_scales};\ninline constexpr std::size_t LOGISMOS_Q4_K_BLOCK_BYTES = {q4_bytes};\ninline constexpr std::size_t LOGISMOS_Q5_K_VALUES_PER_BLOCK = {q5_values};\ninline constexpr std::size_t LOGISMOS_Q5_K_PREFIX_BYTES = {q5_prefix};\ninline constexpr std::size_t LOGISMOS_Q5_K_SCALE_BYTES = {q5_scales};\ninline constexpr std::size_t LOGISMOS_Q5_K_HIGH_BITS_BYTES = {q5_high};\ninline constexpr std::size_t LOGISMOS_Q5_K_BLOCK_BYTES = {q5_bytes};\ninline constexpr std::size_t LOGISMOS_Q6_K_VALUES_PER_BLOCK = {q6_values};\ninline constexpr std::size_t LOGISMOS_Q6_K_LOW_BITS_BYTES = {q6_low};\ninline constexpr std::size_t LOGISMOS_Q6_K_HIGH_BITS_BYTES = {q6_high};\ninline constexpr std::size_t LOGISMOS_Q6_K_SCALE_BYTES = {q6_scales};\ninline constexpr std::size_t LOGISMOS_Q6_K_BLOCK_BYTES = {q6_bytes};\ninline constexpr std::size_t LOGISMOS_IQ4_NL_VALUES_PER_BLOCK = {iq4_nl_values};\ninline constexpr std::size_t LOGISMOS_IQ4_NL_BLOCK_BYTES = {iq4_nl_bytes};\ninline constexpr std::size_t LOGISMOS_IQ4_XS_VALUES_PER_BLOCK = {iq4_xs_values};\ninline constexpr std::size_t LOGISMOS_IQ4_XS_BLOCK_BYTES = {iq4_xs_bytes};\ninline constexpr std::int8_t LOGISMOS_IQ4_RECONSTRUCTION_VALUES[16] = {{{iq4_values}}};\n"
+        , f32_bytes = quant::f32_row::F32_ROW_VALUE_BYTES, k_group = quant::K_GROUP_VALUES
     );
-    std::fs::write(out_dir.join("q8_0_format.h"), header)
-        .map_err(|error| format!("write generated Q8_0 format header: {error}"))
+    std::fs::write(out_dir.join("row_format.h"), header)
+        .map_err(|error| format!("write generated serialized-row format header: {error}"))
+}
+
+fn checked_sum(fields: &[usize], format: &str) -> Result<usize, String> {
+    fields.iter().try_fold(0usize, |total, field| {
+        total
+            .checked_add(*field)
+            .ok_or_else(|| format!("quant {format} header fields overflow while deriving block bytes"))
+    })
 }
 
 fn compile_sources(
@@ -155,7 +212,7 @@ fn compile_sources(
             ])
             .arg(out_dir);
         if src.file_name().is_some_and(|name| {
-            name == "q8_0_gemv.hip" || name == "gdn_step.hip" || name == "causal_conv_step.hip"
+            name == "row_gemv.hip" || name == "gdn_step.hip" || name == "causal_conv_step.hip"
         }) {
             // WHY: these correctness baselines retain separately rounded f32
             // operations. Scope no-fast-math and no contraction to their

@@ -10,14 +10,14 @@ pub(crate) struct DeviceSpan {
     name: &'static str,
 }
 
-/// Check one raw dense-f32 device extent.
+/// Check one raw device extent with a typed alignment and layout contract.
 ///
 /// A zero-element extent has no footprint and therefore needs no pointer
 /// representation. Nonempty extents must be non-null, aligned, and fit both
 /// Rust's allocation-layout and address domains.
-pub(crate) fn checked_f32_device_span(
+pub(crate) fn checked_device_span<T>(
     kernel: &'static str,
-    pointer: *const f32,
+    pointer: *const T,
     elements: usize,
     name: &'static str,
 ) -> Result<Option<DeviceSpan>> {
@@ -27,10 +27,13 @@ pub(crate) fn checked_f32_device_span(
     if pointer.is_null() {
         return unsupported_shape(kernel, format!("{name} must be non-null"));
     }
-    if !pointer.addr().is_multiple_of(core::mem::align_of::<f32>()) {
-        return unsupported_shape(kernel, format!("{name} must be aligned for f32"));
+    if !pointer.addr().is_multiple_of(core::mem::align_of::<T>()) {
+        return unsupported_shape(
+            kernel,
+            format!("{name} must be aligned for its declared element type"),
+        );
     }
-    let layout = std::alloc::Layout::array::<f32>(elements).map_err(|_| {
+    let layout = std::alloc::Layout::array::<T>(elements).map_err(|_| {
         UnsupportedShapeSnafu {
             kernel,
             msg: format!("{name} length {elements} exceeds the Rust allocation layout domain"),
@@ -48,8 +51,28 @@ pub(crate) fn checked_f32_device_span(
     Ok(Some(DeviceSpan { start, end, name }))
 }
 
+/// Check one raw dense-f32 device extent.
+pub(crate) fn checked_f32_device_span(
+    kernel: &'static str,
+    pointer: *const f32,
+    elements: usize,
+    name: &'static str,
+) -> Result<Option<DeviceSpan>> {
+    checked_device_span(kernel, pointer, elements, name)
+}
+
+/// Check one raw serialized-byte device extent.
+pub(crate) fn checked_u8_device_span(
+    kernel: &'static str,
+    pointer: *const u8,
+    bytes: usize,
+    name: &'static str,
+) -> Result<Option<DeviceSpan>> {
+    checked_device_span(kernel, pointer, bytes, name)
+}
+
 /// Refuse overlap involving a writable device span.
-pub(crate) fn reject_overlapping_f32_spans(
+pub(crate) fn reject_overlapping_device_spans(
     kernel: &'static str,
     left: Option<DeviceSpan>,
     right: Option<DeviceSpan>,
@@ -65,6 +88,15 @@ pub(crate) fn reject_overlapping_f32_spans(
     } else {
         Ok(())
     }
+}
+
+/// Refuse overlap involving a writable dense-f32 device span.
+pub(crate) fn reject_overlapping_f32_spans(
+    kernel: &'static str,
+    left: Option<DeviceSpan>,
+    right: Option<DeviceSpan>,
+) -> Result<()> {
+    reject_overlapping_device_spans(kernel, left, right)
 }
 
 fn unsupported_shape<T>(kernel: &'static str, msg: String) -> Result<T> {
@@ -95,6 +127,28 @@ mod tests {
         );
         reject_overlapping_f32_spans(KERNEL, absent, present)?;
         reject_overlapping_f32_spans(KERNEL, present, absent)?;
+        Ok(())
+    }
+
+    #[test]
+    fn empty_byte_span_inside_present_span_has_no_overlap_footprint()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let values = [0.0_f32; 2];
+        let present = checked_u8_device_span(
+            KERNEL,
+            values.as_ptr().cast::<u8>(),
+            core::mem::size_of_val(&values),
+            "present bytes",
+        )?;
+        let absent = checked_u8_device_span(
+            KERNEL,
+            values.as_ptr().cast::<u8>().wrapping_byte_add(1),
+            0,
+            "absent inside present bytes",
+        )?;
+
+        reject_overlapping_device_spans(KERNEL, absent, present)?;
+        reject_overlapping_device_spans(KERNEL, present, absent)?;
         Ok(())
     }
 }
