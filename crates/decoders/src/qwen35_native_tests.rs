@@ -4,7 +4,9 @@ use hipcore::{Device, DeviceBuffer};
 
 use crate::qwen35::tests::{
     CanonicalHybridOracle, Fixture, assert_f32_matches_f64,
-    canonical_hybrid_fixture_with_context_and_rotary, canonical_hybrid_fixture_with_nextn,
+    canonical_hybrid_fixture_with_context_and_rotary,
+    canonical_hybrid_fixture_with_invalid_embedding_operand,
+    canonical_hybrid_fixture_with_invalid_output_head_operand, canonical_hybrid_fixture_with_nextn,
     verify_fixture,
 };
 use crate::{
@@ -84,6 +86,38 @@ fn reserved_device_native_full_block_matches_independent_oracle() -> core::resul
 
 #[test]
 #[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
+fn reserved_device_native_full_block_status_refuses_invalid_input()
+-> core::result::Result<(), String> {
+    let fixture = canonical_hybrid_fixture_with_context_and_rotary(FIXTURE_CONTEXT, Some(64))?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let plan = Qwen35NativeLayerPlan::try_from_weights(
+        &weights,
+        FULL_ATTENTION_BLOCK,
+        FIXTURE_CONTEXT,
+        kernels::attention::NativePageTokens::B8,
+    )
+    .map_err(|error| error.to_string())?;
+    let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
+    // SAFETY: this ignored witness owns the verified uploads and operates only
+    // on the operator-reserved gfx1100 device. The checked status allocation is
+    // initialized by session construction and the invalid input is deliberate.
+    let mut session = unsafe { plan.into_session(&device) }.map_err(|error| error.to_string())?;
+    let input = DeviceBuffer::from_host(&device, &[f32::NAN, 0.25, -0.5])
+        .map_err(|error| format!("upload invalid native full-block input: {error}"))?;
+    // SAFETY: the input is a live exact row allocation. Checked arithmetic must
+    // record the deliberate invalid value before logical publication.
+    if unsafe { session.step(input) }.is_ok() {
+        return Err("native full-block invalid input unexpectedly returned output".to_string());
+    }
+    if session.state() != Qwen35NativeLayerSessionState::PoisonedKnownIdle {
+        return Err("native full-block status fault must leave known-idle poison".to_string());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
 fn reserved_device_native_main_model_matches_oracle_and_excludes_nextn()
 -> core::result::Result<(), String> {
     let baseline = canonical_hybrid_fixture_with_context_and_rotary(FIXTURE_CONTEXT, Some(64))?;
@@ -92,6 +126,58 @@ fn reserved_device_native_main_model_matches_oracle_and_excludes_nextn()
         let auxiliary =
             canonical_hybrid_fixture_with_nextn(FIXTURE_CONTEXT, Some(64), auxiliary_value)?;
         native_main_model_witness(&auxiliary, &baseline)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
+fn reserved_device_native_main_model_status_refuses_invalid_embedding_operand()
+-> core::result::Result<(), String> {
+    native_main_model_status_fault_witness(
+        &canonical_hybrid_fixture_with_invalid_embedding_operand()?,
+        "early embedding operand",
+    )
+}
+
+#[test]
+#[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
+fn reserved_device_native_main_model_status_refuses_invalid_output_head_operand()
+-> core::result::Result<(), String> {
+    native_main_model_status_fault_witness(
+        &canonical_hybrid_fixture_with_invalid_output_head_operand()?,
+        "late output-head operand",
+    )
+}
+
+fn native_main_model_status_fault_witness(
+    fixture: &Fixture,
+    fault_stage: &str,
+) -> core::result::Result<(), String> {
+    let payload = verify_fixture(fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let plan = Qwen35NativeExecutionPlan::try_from_weights(
+        &weights,
+        1,
+        kernels::attention::NativePageTokens::B8,
+    )
+    .map_err(|error| error.to_string())?;
+    let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
+    // SAFETY: this ignored witness retains the complete model bundle on the
+    // operator-reserved device. The fixture deliberately violates the checked
+    // numerical domain while preserving structural artifact admission.
+    let mut session = unsafe { plan.into_session(&device) }.map_err(|error| error.to_string())?;
+    // SAFETY: the model owns its token input and all device resources. The
+    // checked status must reject the deliberate fault before publication.
+    if unsafe { session.step(0) }.is_ok() {
+        return Err(format!(
+            "native model {fault_stage} unexpectedly returned logits"
+        ));
+    }
+    if session.state() != Qwen35NativeSessionState::PoisonedKnownIdle {
+        return Err(format!(
+            "native model {fault_stage} must leave known-idle poison"
+        ));
     }
     Ok(())
 }

@@ -45,6 +45,7 @@ pub(super) struct ModelDeviceByteDemand {
     pub(super) recurrent_history_staged: usize,
     pub(super) recurrent_state_active: usize,
     pub(super) recurrent_state_staged: usize,
+    pub(super) numerical_status: usize,
 }
 
 impl ModelDeviceByteDemand {
@@ -65,6 +66,7 @@ impl ModelDeviceByteDemand {
                 self.recurrent_history_staged,
                 self.recurrent_state_active,
                 self.recurrent_state_staged,
+                self.numerical_status,
             ],
             "native main-model device bytes",
         )
@@ -320,6 +322,7 @@ impl ModelDeviceByteDemand {
                 blocks.recurrent_state_elements,
                 "native staged recurrent state bytes",
             )?,
+            numerical_status: kernels::numerical_status::NativeNumericalStatus::byte_demand(),
         })
     }
 }
@@ -526,6 +529,7 @@ mod tests {
             recurrent_history_staged: 192,
             recurrent_state_active: 192,
             recurrent_state_staged: 192,
+            numerical_status: kernels::numerical_status::NativeNumericalStatus::byte_demand(),
         };
         assert_eq!(
             plan.bytes, expected,
@@ -533,7 +537,9 @@ mod tests {
         );
         assert_eq!(
             plan.bytes.total().map_err(|error| error.to_string())?,
-            80_600,
+            80_600_usize
+                .checked_add(kernels::numerical_status::NativeNumericalStatus::byte_demand())
+                .ok_or("hand-derived numerical status total overflow")?,
             "hand-derived canonical model-device allocation"
         );
         assert_eq!(

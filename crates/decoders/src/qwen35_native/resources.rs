@@ -19,6 +19,7 @@ pub(super) struct DeviceResources {
     pub(super) weights: NativeWeights,
     pub(super) kv: NativePagedKvPool,
     pub(super) stream: Stream,
+    pub(super) numerical_status: kernels::numerical_status::NativeNumericalStatus,
     pub(super) workspace: NativeWorkspace,
     pub(super) finish_workspace: LayerFinishWorkspace,
     pub(super) step: Option<StepBuffers>,
@@ -63,6 +64,8 @@ impl DeviceResources {
     ) -> Result<Self> {
         let _ = plan.bytes.total()?;
         let stream = Stream::new(device).context(NativeDeviceSnafu)?;
+        let numerical_status = kernels::numerical_status::NativeNumericalStatus::new(device)
+            .context(crate::error::NativeKernelSnafu)?;
         let owned_weights = NativeWeights::upload(weights, &plan, device)?;
         let kv = NativePagedKvPool::new(plan.kv, device).context(NativePagedKvSnafu)?;
         let workspace = NativeWorkspace::new(&plan.workspace, device)?;
@@ -72,6 +75,7 @@ impl DeviceResources {
             weights: owned_weights,
             kv,
             stream,
+            numerical_status,
             workspace,
             finish_workspace,
             step: None,

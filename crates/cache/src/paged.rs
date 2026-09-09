@@ -8,6 +8,8 @@ use snafu::ResultExt;
 use hipcore::{Device, DeviceBuffer, Stream};
 #[cfg(feature = "gpu")]
 use kernels::attention::{NativePageTokens, NativePagedDecodePlan};
+#[cfg(feature = "gpu")]
+use kernels::numerical_status::NativeNumericalStatus;
 
 use crate::error::{
     PagedAllocationSnafu, PagedAppendTokenOutOfRangeSnafu, PagedArithmeticSnafu,
@@ -1281,6 +1283,15 @@ pub struct NativePagedLayerKv<'a> {
 }
 
 #[cfg(feature = "gpu")]
+struct NativePagedDecodeBacking {
+    keys: *const f32,
+    values: *const f32,
+    elements: usize,
+    table: *const u32,
+    table_entries: usize,
+}
+
+#[cfg(feature = "gpu")]
 impl NativePagedLayerKv<'_> {
     /// Rows visible to this layer during its current append.
     #[must_use]
@@ -1312,6 +1323,81 @@ impl NativePagedLayerKv<'_> {
         output: &DeviceBuffer<f32>,
         stream: &Stream,
     ) -> Result<()> {
+        let backing = self.checked_attention_backing(plan, query, output, stream)?;
+        // SAFETY: layer-major layout gives exactly one dense physical-page K/V span; all raw launch obligations remain caller-owned.
+        unsafe {
+            kernels::attention::launch_paged_decode_q1_f32(
+                plan,
+                query.as_device_ptr(),
+                query.len(),
+                backing.keys,
+                backing.elements,
+                backing.values,
+                backing.elements,
+                backing.table,
+                backing.table_entries,
+                output.as_device_ptr(),
+                output.len(),
+                stream,
+            )
+        }?;
+        Ok(())
+    }
+
+    /// Launch checked Q=1 paged attention without exposing cache pointers.
+    ///
+    /// # Safety
+    ///
+    /// `query` must remain live and immutable through completion. `output`
+    /// must remain live and exclusively owned through completion. Both buffers
+    /// and `status` must belong to this pool's device. `stream` must be this
+    /// pool's ordered transaction stream. The status records explicit operand
+    /// and arithmetic faults, but does not establish table-value validity,
+    /// device math-mode qualification, or hardware numerical parity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed device-mismatch, descriptor-binding, checked-offset, or
+    /// checked native attention-launch failure. The caller must synchronize and
+    /// read `status` before publishing the append's host ledger.
+    pub unsafe fn launch_paged_decode_checked(
+        &self,
+        plan: NativePagedDecodePlan,
+        query: &DeviceBuffer<f32>,
+        output: &DeviceBuffer<f32>,
+        stream: &Stream,
+        status: &NativeNumericalStatus,
+    ) -> Result<()> {
+        let backing = self.checked_attention_backing(plan, query, output, stream)?;
+        // SAFETY: the opaque backing helper established exact spans; the caller
+        // retains every buffer and status allocation through completion.
+        unsafe {
+            kernels::attention::launch_paged_decode_q1_f32_checked(
+                plan,
+                query.as_device_ptr(),
+                query.len(),
+                backing.keys,
+                backing.elements,
+                backing.values,
+                backing.elements,
+                backing.table,
+                backing.table_entries,
+                output.as_device_ptr(),
+                output.len(),
+                stream,
+                status,
+            )
+        }?;
+        Ok(())
+    }
+
+    fn checked_attention_backing(
+        &self,
+        plan: NativePagedDecodePlan,
+        query: &DeviceBuffer<f32>,
+        output: &DeviceBuffer<f32>,
+        stream: &Stream,
+    ) -> Result<NativePagedDecodeBacking> {
         self.pool.ensure_stream_device(stream)?;
         self.pool.ensure_buffer_device(query)?;
         self.pool.ensure_buffer_device(output)?;
@@ -1325,26 +1411,18 @@ impl NativePagedLayerKv<'_> {
                 }
                 .build()
             })?;
-        let key_base = unsafe { self.pool.keys.as_device_ptr().add(layer_offset) };
-        let value_base = unsafe { self.pool.values.as_device_ptr().add(layer_offset) };
-        // SAFETY: layer-major layout gives exactly one dense physical-page K/V span; all raw launch obligations remain caller-owned.
-        unsafe {
-            kernels::attention::launch_paged_decode_q1_f32(
-                plan,
-                query.as_device_ptr(),
-                query.len(),
-                key_base,
-                self.pool.plan.layout.layer_elements(),
-                value_base,
-                self.pool.plan.layout.layer_elements(),
-                self.pool.table.as_device_ptr(),
-                plan.page_table_entries(),
-                output.as_device_ptr(),
-                output.len(),
-                stream,
-            )
-        }?;
-        Ok(())
+        // SAFETY: `layer_kv` admits a ledger-valid layer, and the checked
+        // offset identifies one whole layer extent in each owned backing.
+        let keys = unsafe { self.pool.keys.as_device_ptr().add(layer_offset) }.cast_const();
+        // SAFETY: keys and values have the same checked layer-major extent.
+        let values = unsafe { self.pool.values.as_device_ptr().add(layer_offset) }.cast_const();
+        Ok(NativePagedDecodeBacking {
+            keys,
+            values,
+            elements: self.pool.plan.layout.layer_elements(),
+            table: self.pool.table.as_device_ptr().cast_const(),
+            table_entries: plan.page_table_entries(),
+        })
     }
 }
 

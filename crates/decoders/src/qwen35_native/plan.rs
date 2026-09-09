@@ -83,6 +83,7 @@ pub(super) struct DeviceByteDemand {
     pub(super) controls: usize,
     pub(super) key_values: usize,
     pub(super) table: usize,
+    pub(super) numerical_status: usize,
 }
 
 impl DeviceByteDemand {
@@ -96,6 +97,7 @@ impl DeviceByteDemand {
                 self.controls,
                 self.key_values,
                 self.table,
+                self.numerical_status,
             ],
             "native device byte total",
         )
@@ -199,6 +201,7 @@ impl DeviceFullAttentionPlan {
                 size_of::<u32>(),
                 "native table bytes",
             )?,
+            numerical_status: kernels::numerical_status::NativeNumericalStatus::byte_demand(),
         };
         Ok(Self {
             layout,

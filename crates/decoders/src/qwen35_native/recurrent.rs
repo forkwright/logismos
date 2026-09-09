@@ -70,6 +70,7 @@ pub(super) struct DeferredRecurrent<'resources> {
     pub(super) finish_weights: &'resources LayerFinishWeights,
     pub(super) finish_workspace: &'resources LayerFinishWorkspace,
     pub(super) stream: &'resources Stream,
+    pub(super) numerical_status: &'resources kernels::numerical_status::NativeNumericalStatus,
 }
 
 impl NativeRecurrentWeights {
@@ -167,11 +168,10 @@ impl DeferredRecurrent<'_> {
     /// # Safety
     ///
     /// All borrowed buffers must be exact non-overlapping spans on the stream
-    /// device and remain live through stream completion. Inputs, verified
-    /// weights, controls, and every operation intermediate must be finite and
-    /// normal-or-zero. The caller retains the complete model resource bundle
-    /// on submission failure and publishes staged recurrent state only after
-    /// model-wide completion is established.
+    /// device and remain live through stream completion. The sticky status
+    /// classifies explicit operands and results. The caller retains the
+    /// complete model resource bundle on submission failure and publishes
+    /// staged recurrent state only after model-wide completion is established.
     pub(super) unsafe fn submit(&self) -> Result<()> {
         // SAFETY: submit's contract retains every checked projection span.
         unsafe { self.submit_projections() }?;
@@ -193,6 +193,7 @@ impl DeferredRecurrent<'_> {
                 &self.weights.attention_norm,
                 &self.workspace.normalized_hidden,
                 self.stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: each verified matrix binds its exact distinct input/output
@@ -202,6 +203,7 @@ impl DeferredRecurrent<'_> {
                 &self.workspace.normalized_hidden,
                 &self.workspace.qkv,
                 self.stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: each remaining projection has its own exact output span.
@@ -210,6 +212,7 @@ impl DeferredRecurrent<'_> {
                 &self.workspace.normalized_hidden,
                 &self.workspace.z,
                 self.stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: alpha and beta outputs are distinct exact workspace spans.
@@ -218,6 +221,7 @@ impl DeferredRecurrent<'_> {
                 &self.workspace.normalized_hidden,
                 &self.workspace.alpha,
                 self.stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: beta projection output remains distinct through completion.
@@ -226,6 +230,7 @@ impl DeferredRecurrent<'_> {
                 &self.workspace.normalized_hidden,
                 &self.workspace.beta_projection,
                 self.stream,
+                self.numerical_status,
             )
         }
     }
@@ -236,19 +241,20 @@ impl DeferredRecurrent<'_> {
         unsafe { self.submit_convolution() }?;
         // SAFETY: raw and activated convolution spans are distinct exact buffers.
         unsafe {
-            kernels::decoder_ops::silu(
+            kernels::decoder_ops::silu_checked(
                 self.plan.workspace.convolution_silu,
                 self.workspace.raw_convolution.as_device_ptr().cast_const(),
                 self.workspace.raw_convolution.len(),
                 self.workspace.activated_convolution.as_device_ptr(),
                 self.workspace.activated_convolution.len(),
                 self.stream,
+                self.numerical_status,
             )
         }
         .context(NativeKernelSnafu)?;
         // SAFETY: the plan owns the grouped source and distinct tiled Q/K outputs.
         unsafe {
-            kernels::decoder_ops::launch_recurrent_qk_l2_f32(
+            kernels::decoder_ops::launch_recurrent_qk_l2_f32_checked(
                 self.plan.workspace.qk_l2,
                 self.workspace
                     .activated_convolution
@@ -260,6 +266,7 @@ impl DeferredRecurrent<'_> {
                 self.workspace.tiled_key.as_device_ptr(),
                 self.workspace.tiled_key.len(),
                 self.stream,
+                self.numerical_status,
             )
         }
         .context(NativeKernelSnafu)
@@ -269,7 +276,7 @@ impl DeferredRecurrent<'_> {
         // SAFETY: all scalar inputs are immutable exact spans and both outputs
         // are distinct writable buffers owned by this workspace.
         unsafe {
-            kernels::decoder_ops::launch_recurrent_scalars_f32(
+            kernels::decoder_ops::launch_recurrent_scalars_f32_checked(
                 self.plan.workspace.scalars,
                 self.workspace.alpha.as_device_ptr().cast_const(),
                 self.workspace.alpha.len(),
@@ -284,6 +291,7 @@ impl DeferredRecurrent<'_> {
                 self.workspace.log_decay.as_device_ptr(),
                 self.workspace.log_decay.len(),
                 self.stream,
+                self.numerical_status,
             )
         }
         .context(NativeKernelSnafu)?;
@@ -301,6 +309,7 @@ impl DeferredRecurrent<'_> {
                 &self.weights.output_norm,
                 &self.workspace.normalized_output,
                 self.stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: normalized recurrence output and Z are immutable distinct
@@ -312,6 +321,7 @@ impl DeferredRecurrent<'_> {
                 &self.workspace.normalized_output,
                 &self.workspace.gated_output,
                 self.stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: the checked output projection and its spans remain live.
@@ -320,6 +330,7 @@ impl DeferredRecurrent<'_> {
                 &self.workspace.gated_output,
                 &self.workspace.projected_attention,
                 self.stream,
+                self.numerical_status,
             )
         }?;
         let finish = DeferredLayerFinish {
@@ -330,9 +341,10 @@ impl DeferredRecurrent<'_> {
             weights: self.finish_weights,
             workspace: self.finish_workspace,
             stream: self.stream,
+            numerical_status: self.numerical_status,
         };
         // SAFETY: submit's contract retains all common-finish spans and their
-        // finite normal-or-zero inputs through stream completion.
+        // shared status allocation through stream completion.
         unsafe { finish.submit() }
     }
 
@@ -350,7 +362,7 @@ impl DeferredRecurrent<'_> {
         // SAFETY: the checked plan gives zero-length absent history for W=1,
         // otherwise the two state buffers are exact distinct device spans.
         unsafe {
-            kernels::causal_conv::launch_causal_conv_step_f32(
+            kernels::causal_conv::launch_causal_conv_step_f32_checked(
                 self.plan.convolution,
                 self.workspace.qkv.as_device_ptr().cast_const(),
                 self.workspace.qkv.len(),
@@ -363,6 +375,7 @@ impl DeferredRecurrent<'_> {
                 self.workspace.raw_convolution.as_device_ptr(),
                 self.workspace.raw_convolution.len(),
                 self.stream,
+                self.numerical_status,
             )
         }
         .context(NativeKernelSnafu)
@@ -378,7 +391,7 @@ impl DeferredRecurrent<'_> {
         // SAFETY: the plan derives the V tail from the activated-convolution
         // extent, and committed/staged GDN state plus output are distinct.
         unsafe {
-            kernels::gdn::launch_multi_head_recurrent_step_f32(
+            kernels::gdn::launch_multi_head_recurrent_step_f32_checked(
                 self.plan.recurrence,
                 self.workspace.tiled_query.as_device_ptr().cast_const(),
                 self.workspace.tiled_query.len(),
@@ -401,6 +414,7 @@ impl DeferredRecurrent<'_> {
                 self.workspace.recurrence_output.as_device_ptr(),
                 self.workspace.recurrence_output.len(),
                 self.stream,
+                self.numerical_status,
             )
         }
         .context(NativeKernelSnafu)
