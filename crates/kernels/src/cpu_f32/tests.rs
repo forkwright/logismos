@@ -1,7 +1,27 @@
 //! Unit tests for the Phase-3 fp32 CPU reference kernels.
 
 use super::*;
-use crate::error::{Error, RmsNormStage};
+use crate::error::{Error, RmsNormStage, UnitNormalizationStage};
+
+fn independent_l2_norm(values: &[f32]) -> f64 {
+    values
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn assert_unit_normalized(values: &[f32]) {
+    assert!(
+        values.iter().all(|value| value.is_finite()),
+        "normalized values must be finite: {values:?}"
+    );
+    let norm = independent_l2_norm(values);
+    assert!(
+        (norm - 1.0).abs() <= UNIT_NORM_TOLERANCE,
+        "normalized L2 norm {norm} exceeded tolerance {UNIT_NORM_TOLERANCE}"
+    );
+}
 
 #[test]
 fn embed_lookup_in_range_copies_rows() {
@@ -514,11 +534,80 @@ fn mean_pool_masked_all_zero_mask_stays_finite() {
 }
 
 #[test]
-fn l2_normalize_projects_to_unit() {
-    let mut v = vec![3.0_f32, 4.0];
-    l2_normalize_in_place(&mut v);
-    assert!((v[0] - 0.6).abs() < 1e-6);
-    assert!((v[1] - 0.8).abs() < 1e-6);
+fn l2_normalize_projects_ordinary_values_to_unit() -> Result<()> {
+    let mut values = [3.0_f32, 4.0];
+    l2_normalize_in_place(&mut values)?;
+    assert!((values[0] - 0.6).abs() < 1e-6);
+    assert!((values[1] - 0.8).abs() < 1e-6);
+    assert_unit_normalized(&values);
+    Ok(())
+}
+
+#[test]
+fn l2_normalize_handles_large_finite_values() -> Result<()> {
+    let mut values = [1.0e20_f32, -1.0e20_f32];
+    l2_normalize_in_place(&mut values)?;
+    assert!((values[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+    assert!((values[1] + std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+    assert_unit_normalized(&values);
+    Ok(())
+}
+
+#[test]
+fn l2_normalize_handles_small_finite_values() -> Result<()> {
+    let smallest = f32::from_bits(1);
+    let mut values = [smallest, -smallest];
+    l2_normalize_in_place(&mut values)?;
+    assert!((values[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+    assert!((values[1] + std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+    assert_unit_normalized(&values);
+    Ok(())
+}
+
+#[test]
+fn l2_normalize_handles_mixed_finite_magnitudes() -> Result<()> {
+    let mut values = [f32::MAX, 1.0, f32::MIN_POSITIVE, -f32::MAX];
+    l2_normalize_in_place(&mut values)?;
+    assert!(values[0].is_sign_positive());
+    assert!(values[1].is_sign_positive());
+    assert!(values[2].is_sign_positive());
+    assert!(values[3].is_sign_negative());
+    assert_unit_normalized(&values);
+    Ok(())
+}
+
+#[test]
+fn l2_normalize_refuses_empty_and_zero_vectors_without_writes() {
+    let mut empty = [];
+    assert!(matches!(
+        l2_normalize_in_place(&mut empty),
+        Err(Error::UnitNormalizationZeroNorm { elements: 0, .. })
+    ));
+
+    let mut zero = [0.0_f32, -0.0, 0.0];
+    let before = zero.map(f32::to_bits);
+    assert!(matches!(
+        l2_normalize_in_place(&mut zero),
+        Err(Error::UnitNormalizationZeroNorm { elements: 3, .. })
+    ));
+    assert_eq!(zero.map(f32::to_bits), before);
+}
+
+#[test]
+fn l2_normalize_refuses_non_finite_input_without_partial_writes() {
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut values = [3.0_f32, invalid, 4.0];
+        let before = values.map(f32::to_bits);
+        assert!(matches!(
+            l2_normalize_in_place(&mut values),
+            Err(Error::UnitNormalizationNonFinite {
+                stage: UnitNormalizationStage::Input,
+                index: 1,
+                ..
+            })
+        ));
+        assert_eq!(values.map(f32::to_bits), before);
+    }
 }
 
 #[test]

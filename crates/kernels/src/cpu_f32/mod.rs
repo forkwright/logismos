@@ -24,8 +24,12 @@ use snafu::ResultExt;
 use crate::error::{
     CpuF32AllocationSnafu, CpuF32ShapeSnafu, Result, RmsNormAllocationSnafu,
     RmsNormInvalidDimensionSnafu, RmsNormInvalidParameterSnafu, RmsNormNonFiniteSnafu,
-    RmsNormShapeSnafu, RmsNormSizeOverflowSnafu, RmsNormStage,
+    RmsNormShapeSnafu, RmsNormSizeOverflowSnafu, RmsNormStage, UnitNormalizationNonFiniteSnafu,
+    UnitNormalizationNonUnitSnafu, UnitNormalizationStage, UnitNormalizationZeroNormSnafu,
 };
+
+/// Maximum accepted absolute distance between a normalized vector's L2 norm and one.
+pub const UNIT_NORM_TOLERANCE: f64 = 1e-6;
 
 fn usize_to_f32(value: usize) -> f32 {
     value.to_f32().unwrap_or(f32::INFINITY)
@@ -810,18 +814,75 @@ pub fn mean_pool_masked(h: &[f32], mask: &[u8], seq: usize, hidden: usize) -> Ve
     out
 }
 
-/// L2-normalise a `[hidden]` vector in place. Denominator is clamped to
-/// `1e-12` to avoid NaN on zero input (safety net; real Stella outputs are
-/// never zero).
-pub fn l2_normalize_in_place(v: &mut [f32]) {
-    let mut sq = 0.0f32;
-    for &x in v.iter() {
-        sq += x * x;
+/// L2-normalize a finite, nonzero vector in place.
+///
+/// Norm accumulation and division use `f64`, covering the squared range of
+/// every finite `f32` value without the overflow or underflow of an `f32`
+/// accumulator. The rounded `f32` result is validated against
+/// [`UNIT_NORM_TOLERANCE`] before the first write, so every error leaves the
+/// caller's vector unchanged.
+///
+/// # Errors
+///
+/// Returns a typed [`crate::Error`] for empty, all-zero, non-finite, or
+/// non-unit-normalizable input.
+pub fn l2_normalize_in_place(values: &mut [f32]) -> Result<()> {
+    let mut squared_norm = 0.0_f64;
+    for (index, &value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return UnitNormalizationNonFiniteSnafu {
+                stage: UnitNormalizationStage::Input,
+                index,
+                value: f64::from(value),
+            }
+            .fail();
+        }
+        let value = f64::from(value);
+        squared_norm += value * value;
+        if !squared_norm.is_finite() {
+            return UnitNormalizationNonFiniteSnafu {
+                stage: UnitNormalizationStage::Accumulation,
+                index,
+                value: squared_norm,
+            }
+            .fail();
+        }
     }
-    let inv = sq.sqrt().max(1e-12).recip();
-    for x in v.iter_mut() {
-        *x *= inv;
+    let norm = squared_norm.sqrt();
+    if norm == 0.0 {
+        return UnitNormalizationZeroNormSnafu {
+            elements: values.len(),
+        }
+        .fail();
     }
+
+    let mut rounded_squared_norm = 0.0_f64;
+    for (index, &value) in values.iter().enumerate() {
+        let normalized = (f64::from(value) / norm) as f32;
+        if !normalized.is_finite() {
+            return UnitNormalizationNonFiniteSnafu {
+                stage: UnitNormalizationStage::Scale,
+                index,
+                value: f64::from(normalized),
+            }
+            .fail();
+        }
+        let normalized = f64::from(normalized);
+        rounded_squared_norm += normalized * normalized;
+    }
+    let rounded_norm = rounded_squared_norm.sqrt();
+    if !rounded_norm.is_finite() || (rounded_norm - 1.0).abs() > UNIT_NORM_TOLERANCE {
+        return UnitNormalizationNonUnitSnafu {
+            norm: rounded_norm,
+            tolerance: UNIT_NORM_TOLERANCE,
+        }
+        .fail();
+    }
+
+    for value in values {
+        *value = (f64::from(*value) / norm) as f32;
+    }
+    Ok(())
 }
 
 /// Build a Qwen2-style `(seq, head_dim/2)` cos+sin table. Returns

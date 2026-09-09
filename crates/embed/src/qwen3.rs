@@ -1,6 +1,7 @@
 //! Bounded CPU Qwen3 retrieval embeddings.
 
 use decoders::{Qwen3CpuRequirements, Qwen3Weights};
+use kernels::cpu_f32;
 use loader::gguf::{MetaValue, VerifiedArtifact};
 use logismos_core::{
     ComputeSnafu as CoreComputeSnafu, EmbeddingError, EmbeddingModel, EncodeOpts,
@@ -14,7 +15,7 @@ use tokenize::VerifiedTokenizer;
 use crate::error::{
     AllocationSnafu, BatchTooLargeSnafu, DecodersSnafu, EmptyInputSnafu,
     InputByteLengthOverflowSnafu, InputBytesTooLongSnafu, InputTooLongSnafu, InvalidLimitsSnafu,
-    MetadataSnafu, NonNormalizableSnafu, Qwen3TokenizerSnafu, RequirementsOverflowSnafu, Result,
+    MetadataSnafu, Qwen3TokenizerSnafu, RequirementsOverflowSnafu, Result, UnitNormalizationSnafu,
     UnresolvedPromptRoleSnafu, UnsupportedDimSnafu,
 };
 
@@ -23,7 +24,6 @@ const BOS: &str = "tokenizer.ggml.bos_token_id";
 const EOS: &str = "tokenizer.ggml.eos_token_id";
 const ADD_BOS: &str = "tokenizer.ggml.add_bos_token";
 const ADD_EOS: &str = "tokenizer.ggml.add_eos_token";
-const UNIT_NORM_TOLERANCE: f64 = 1e-6;
 
 /// Trusted instructions for semantic retrieval roles.
 #[derive(Clone, Debug, Default)]
@@ -274,13 +274,14 @@ impl<'artifact> Qwen3EmbeddingModel<'artifact> {
             }
             .fail();
         }
-        let hidden = self
+        let mut hidden = self
             .weights
             .execution(policy.max_tokens)
             .context(DecodersSnafu)?
             .last_hidden(&ids)
             .context(DecodersSnafu)?;
-        normalize(hidden)
+        cpu_f32::l2_normalize_in_place(&mut hidden).context(UnitNormalizationSnafu)?;
+        Ok(hidden)
     }
 
     fn request_policy(&self, opts: &EncodeOpts) -> Result<RequestPolicy> {
@@ -429,38 +430,6 @@ fn prefix(
     combined.push_str(text);
     Ok(combined)
 }
-fn normalize(mut values: Vec<f32>) -> Result<Vec<f32>> {
-    let sum = values.iter().try_fold(0_f64, |sum, value| {
-        if value.is_finite() {
-            Ok(sum + f64::from(*value) * f64::from(*value))
-        } else {
-            Err(())
-        }
-    });
-    let Ok(sum) = sum else {
-        return NonNormalizableSnafu.fail();
-    };
-    let norm = sum.sqrt();
-    if !norm.is_finite() || norm == 0.0 {
-        return NonNormalizableSnafu.fail();
-    }
-    for value in &mut values {
-        *value = (f64::from(*value) / norm) as f32;
-    }
-    if values.iter().any(|value| !value.is_finite()) {
-        return NonNormalizableSnafu.fail();
-    }
-    let output_norm = values
-        .iter()
-        .map(|value| f64::from(*value) * f64::from(*value))
-        .sum::<f64>()
-        .sqrt();
-    if !output_norm.is_finite() || (output_norm - 1.0).abs() > UNIT_NORM_TOLERANCE {
-        return NonNormalizableSnafu.fail();
-    }
-    Ok(values)
-}
-
 fn multiply_bytes(bytes: u64, count: usize, target: &'static str) -> Result<u64> {
     let count = u64::try_from(count).map_err(|_| RequirementsOverflowSnafu { target }.build())?;
     bytes
@@ -487,6 +456,28 @@ mod tests {
     const FEED_FORWARD: u64 = 4;
     const VOCABULARY: u64 = 4;
     const CONTEXT: u32 = 4;
+
+    fn independently_normalize(mut values: Vec<f32>) -> Vec<f32> {
+        let norm = values
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>()
+            .sqrt();
+        for value in &mut values {
+            *value = (f64::from(*value) / norm) as f32;
+        }
+        values
+    }
+
+    fn assert_unit_embedding(values: &[f32]) {
+        assert!(values.iter().all(|value| value.is_finite()));
+        let norm = values
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>()
+            .sqrt();
+        assert!((norm - 1.0).abs() <= cpu_f32::UNIT_NORM_TOLERANCE);
+    }
 
     #[test]
     fn prefix_obeys_explicit_roles_and_combined_byte_cap() -> Result<()> {
@@ -519,20 +510,36 @@ mod tests {
     }
 
     #[test]
-    fn normalization_returns_finite_unit_vectors_and_refuses_invalid_input() -> Result<()> {
-        let values = normalize(vec![3.0, 4.0])?;
-        let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 1e-6,
-            "normalization must produce a unit vector"
-        );
+    fn zero_hidden_is_refused_and_maps_to_stable_compute_error()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let mut raw = fixture()?;
+        for tensor in &mut raw.tensors {
+            tensor.payload.fill(0);
+        }
+        let artifact = artifact(&raw)?;
+        let model = Qwen3EmbeddingModel::from_verified_cpu(
+            &artifact,
+            verified_tokenizer(TokenizerModel::WordLevel)?,
+            Qwen3EmbeddingLimits {
+                max_text_bytes: 32,
+                max_tokens: 4,
+                max_batch_items: 1,
+            },
+            Qwen3RolePrefixes::default(),
+        )?;
+        let opts = EncodeOpts::default();
         assert!(matches!(
-            normalize(vec![0.0, 0.0]),
-            Err(crate::error::Error::NonNormalizable { .. })
+            model.encode_cpu("alice", &opts),
+            Err(crate::error::Error::UnitNormalization {
+                source: kernels::Error::UnitNormalizationZeroNorm { elements: 3, .. },
+                ..
+            })
         ));
+        let result = EmbeddingModel::encode(&model, "alice", &opts);
         assert!(matches!(
-            normalize(vec![f32::NAN]),
-            Err(crate::error::Error::NonNormalizable { .. })
+            result,
+            Err(EmbeddingError::Compute { ref message, .. })
+                if message.contains("zero L2 norm")
         ));
         Ok(())
     }
@@ -561,23 +568,27 @@ mod tests {
         let piece =
             Qwen3EmbeddingModel::from_verified_cpu(&artifact, word_piece, limits, prefixes)?;
         let default = EncodeOpts::default();
-        let expected = normalize(
+        let expected = independently_normalize(
             Qwen3Weights::try_from_verified(&artifact)?
                 .execution(4)?
                 .last_hidden(&[0, 2, 1])?,
-        )?;
-        assert_eq!(level.encode_cpu("alice", &default)?, expected);
+        );
+        let level_output = level.encode_cpu("alice", &default)?;
+        assert_eq!(level_output, expected);
+        assert_unit_embedding(&level_output);
         assert_eq!(piece.encode_cpu("alice", &default)?, expected);
         let query = EncodeOpts {
             prompt: Some(Prompt::S2sQuery),
             ..EncodeOpts::default()
         };
-        let expected_query = normalize(
+        let expected_query = independently_normalize(
             Qwen3Weights::try_from_verified(&artifact)?
                 .execution(4)?
                 .last_hidden(&[0, 2, 2, 1])?,
-        )?;
-        assert_eq!(level.encode_cpu("alice", &query)?, expected_query);
+        );
+        let query_output = level.encode_cpu("alice", &query)?;
+        assert_eq!(query_output, expected_query);
+        assert_unit_embedding(&query_output);
         assert_eq!(
             level.encode_cpu(
                 "alice",

@@ -32,6 +32,18 @@ pub enum RmsNormStage {
     Output,
 }
 
+/// The checked unit-normalization step that observed a non-finite value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnitNormalizationStage {
+    /// A value supplied by the caller.
+    Input,
+    /// The accumulated squared L2 norm.
+    Accumulation,
+    /// A value rounded back to the output `f32` representation.
+    Scale,
+}
+
 /// Errors surfaced by the kernel launchers and CPU references.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -182,6 +194,46 @@ pub enum Error {
         requested_len: usize,
         /// Allocation failure.
         source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU unit normalization observed a non-finite input or intermediate.
+    #[snafu(display(
+        "unit normalization {stage:?} rejected non-finite value {value} at index {index}"
+    ))]
+    UnitNormalizationNonFinite {
+        /// Checked unit-normalization step.
+        stage: UnitNormalizationStage,
+        /// Input position associated with the rejected value.
+        index: usize,
+        /// Rejected non-finite value represented at accumulator precision.
+        value: f64,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// CPU unit normalization received an empty or all-zero vector.
+    #[snafu(display("unit normalization rejects zero L2 norm for {elements} elements"))]
+    UnitNormalizationZeroNorm {
+        /// Number of input elements whose squared norm was zero.
+        elements: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Rounded CPU unit-normalization output did not meet its unit-norm contract.
+    #[snafu(display(
+        "unit normalization output norm {norm} exceeds tolerance {tolerance} from one"
+    ))]
+    UnitNormalizationNonUnit {
+        /// L2 norm recomputed from the rounded `f32` output values.
+        norm: f64,
+        /// Maximum accepted absolute distance from one.
+        tolerance: f64,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
