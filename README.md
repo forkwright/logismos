@@ -21,7 +21,7 @@ F32 weights remain f32 rather than being converted to fp16.
 The GPU numerical domain excludes subnormal
 scales, operands and intermediates pending denormal-mode qualification.
 GPU compilation is not numerical or performance
-qualification; native text/retrieval execution is still CPU-only.
+qualification; the safe text/retrieval pipelines remain CPU-only.
 
 The [single-query paged-attention](crates/kernels/src/attention/mod.rs) operation
 is consumed by the CPU hybrid decoder through borrowed KV rows. Its checked plan
@@ -29,15 +29,20 @@ also owns the decoder's attention-workspace accounting. A separate native
 descriptor and wave32 HIP kernel support explicit 8/16/32-token physical pages;
 they are not a whole-model GPU executor or a qualified device-cache policy.
 
-The opt-in `decoders/gpu` surface composes one complete Qwen3.5-family
-full-attention block for one token, including normalization, mixed-row
-projections, text mRoPE, paged KV, gating, FFN and residuals. Its artifact-bound
-`Qwen35NativeLayerPlan` derives named allocation extents; its explicitly unsafe,
-blocking session owns device weights, input, workspace, cache, stream and output.
-It publishes KV only after successful completion and permanently poisons on a
-submitted failure, retaining the entire bundle if completion remains uncertain.
+The opt-in `decoders/gpu` surface exposes an explicitly unsafe, blocking native
+Qwen3.5-family main-model executor: serialized embedding lookup, every recurrent
+and full-attention main block, final normalization and a distinct output head.
+`Qwen35NativeExecutionPlan` binds exact verified weights and derives requested
+device allocation extents. Auxiliary NextN tensors may be present but are not
+uploaded or executed by this main autoregressive baseline. The narrower
+`Qwen35NativeLayerPlan` remains available for single-block qualification.
+
+One model owner retains device weights, scratch, recurrent committed/staged
+state, paged KV, controls, stream and pending logits. It publishes all state
+only after whole-token completion and permanently poisons on a submitted
+failure, retaining the entire bundle if completion remains uncertain.
 The `logismos` facade selects this surface; direct CPU consumers keep it off.
-This is a qualification boundary, not native hybrid text generation, serving,
+This is a qualification boundary, not a safe GPU text pipeline, serving,
 a resource grant, or evidence of W7900/XTX numerical or performance parity.
 
 ## Why

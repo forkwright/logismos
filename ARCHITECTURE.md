@@ -46,7 +46,7 @@ semantically respects that boundary.
   distinct from payload-bound execution. The lower-level `quant` crate owns
   executable block and row geometry; inspection and projection reuse that owner.
   Opt-in `decoders/gpu` adds optional `hipcore`, `kernels/gpu` and `cache/gpu`
-  for the owned native one-block consumer; the GPU-capable facade selects it.
+  for owned native one-block and main-model consumers; the GPU-capable facade selects it.
   Default CPU consumers and package-isolated CPU checks do not select it.
 - `cache::paged` owns one logical KV ledger, CPU backing with borrowed row views
   and atomic append transactions, and optional separate native K/V/table backing.
@@ -171,8 +171,8 @@ score/softmax/value order. The unsafe asynchronous launcher requires valid
 device table entries, finite normal-or-zero arithmetic, buffer lifetimes and a
 nonaliasing staged output; it does not inspect device data or validate results.
 CPU arithmetic witnesses and compiled code objects do not qualify GPU numerical
-behavior. The native one-block decoder consumes this kernel and owns completion;
-whole-model composition, admission and hardware qualification remain separate work.
+behavior. Both native decoder consumers use this kernel under their owned
+completion boundary; admission and hardware qualification remain separate work.
 
 `Qwen35NativeLayerPlan` borrows the exact verified weights it inspects and is
 consumed when uploading a native full-attention-block session. Its demand comes
@@ -198,7 +198,34 @@ retryable; any submitted failure poisons the session without publishing its
 logical state. Uncertain completion retains all resources, including immutable
 weights and input. Drop retries synchronization and forgets the entire bundle
 if completion remains uncertain. This is not device rollback, reset authority,
-multi-token atomicity, recurrence composition, or a safe serving API.
+multi-token atomicity, or a safe serving API.
+
+`Qwen35NativeExecutionPlan` binds the same verified artifact through native
+embedding-row lookup, every main block in metadata order, final RMSNorm and the
+distinct `output.weight` projection. It deliberately excludes an optional
+terminal NextN extension from execution and device weight/state allocation;
+presence of that extension is not a blanket refusal. Serialized row lookup and
+GEMV share format-local reconstruction, retaining the established f32 dot order.
+
+The native model owns one stream and one layer-indexed KV pool when full
+attention is present. Each recurrent layer has distinct committed and staged
+raw convolution history and GDN state. A single full-attention workspace, a
+single recurrent workspace and a common residual/FFN workspace are reused in
+stream order; two hidden rows alternate between main blocks. Recurrent Q/K
+normalization tiles by source-head modulo into equal-head GDN; its activated
+convolution V tail is borrowed rather than transposed or copied. Both block
+kinds enter the shared finish only after their own output projection.
+
+The existing resource guard covers the first embedding submission through
+final logits. One append spans every full layer, interleaved with recurrent
+work, and is prepared once. After synchronization, all fallible local checks
+precede KV publication; recurrent state swaps and position advancement then
+form an infallible tail. The public demand distinguishes actual immutable
+uploads, shared workspaces, hidden/final/logit/control buffers, KV/table and
+active/staged recurrent allocations. It excludes host/runtime overhead and
+arbitrarily retained returned logits. It is neither a resource grant nor
+measured physical residency. Native numeric obligations remain explicitly
+unsafe; compiler-checked, ignored device witnesses are not execution evidence.
 
 `loader::gguf::VerifiedArtifact` owns one immutable serialized backing, admitted
 under an explicit byte limit and matched against a required SHA-256 expectation.
