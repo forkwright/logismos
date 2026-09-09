@@ -442,7 +442,7 @@ fn native_denominators(query: &[f32], key: &[f32], epsilon: f32) -> (f32, f32) {
 fn serial_sum_squares(values: &[f32]) -> f32 {
     let mut sum = 0.0_f32;
     for value in values {
-        sum = sum + value * value;
+        sum += value * value;
     }
     sum
 }
