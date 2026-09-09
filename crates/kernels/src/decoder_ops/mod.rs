@@ -21,6 +21,7 @@ const RMS_NORM_KERNEL: &str = "decoder_rms_norm_f32";
 const ROTARY_KERNEL: &str = "decoder_rotary_half_split_f32";
 const SPLIT_Q_GATE_KERNEL: &str = "decoder_split_q_gate_f32";
 const SIGMOID_MUL_KERNEL: &str = "decoder_sigmoid_mul_f32";
+const SILU_KERNEL: &str = "decoder_silu_f32";
 const SILU_MUL_KERNEL: &str = "decoder_silu_mul_f32";
 const RESIDUAL_ADD_KERNEL: &str = "decoder_residual_add_f32";
 #[cfg(test)]
@@ -61,6 +62,13 @@ unsafe extern "C" {
     fn logismos_launch_decoder_sigmoid_mul_f32(
         value_f32: *const c_void,
         gate_f32: *const c_void,
+        output_f32: *mut c_void,
+        elements: u32,
+        stream: *mut c_void,
+    ) -> u32;
+
+    fn logismos_launch_decoder_silu_f32(
+        input_f32: *const c_void,
         output_f32: *mut c_void,
         elements: u32,
         stream: *mut c_void,
@@ -575,6 +583,65 @@ pub unsafe fn sigmoid_mul(
     }
 }
 
+/// Launch `SiLU(input)` over one checked exact extent.
+///
+/// # Errors
+///
+/// Returns typed exact-span, CPU-only, stream, or HIP-launch failures.
+///
+/// # Safety
+///
+/// Every pointer must identify a correctly aligned allocation on `stream`'s
+/// device for its exact declared extent and remain live through stream
+/// completion. `input_f32` must remain immutable, and `output_f32` must
+/// remain exclusively writable, through completion. Output must not alias
+/// input. Inputs and every exponential, denominator, and activation
+/// intermediate must be finite and normal-or-zero.
+pub unsafe fn silu(
+    plan: ElementwiseF32Plan,
+    input_f32: *const f32,
+    input_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = (
+            plan,
+            input_f32,
+            input_elements,
+            output_f32,
+            output_elements,
+            stream,
+        );
+        no_gpu_refusal(SILU_KERNEL)
+    }
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        validate_unary_launch(
+            plan,
+            input_f32,
+            input_elements,
+            output_f32,
+            output_elements,
+            SILU_KERNEL,
+        )?;
+        stream.make_current()?;
+        // SAFETY: checked spans plus the caller's ownership and numerical-domain
+        // contract establish the private unary SiLU ABI preconditions.
+        let code = unsafe {
+            logismos_launch_decoder_silu_f32(
+                input_f32.cast::<c_void>(),
+                output_f32.cast::<c_void>(),
+                plan.elements_u32,
+                stream.raw().cast::<c_void>(),
+            )
+        };
+        launch_result(SILU_KERNEL, code)
+    }
+}
+
 /// Launch `SiLU(gate) * up` over one checked exact extent.
 ///
 /// # Errors
@@ -877,6 +944,23 @@ fn validate_elementwise_launch(
         checked_f32_device_span(kernel, output_f32.cast_const(), output_elements, "output")?;
     reject_overlapping_f32_spans(kernel, output, left)?;
     reject_overlapping_f32_spans(kernel, output, right)
+}
+
+#[cfg(any(test, not(logismos_no_gpu_kernels)))]
+fn validate_unary_launch(
+    plan: ElementwiseF32Plan,
+    input_f32: *const f32,
+    input_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    kernel: &'static str,
+) -> Result<()> {
+    validate_length(kernel, "input", input_elements, plan.elements)?;
+    validate_length(kernel, "output", output_elements, plan.elements)?;
+    let input = checked_f32_device_span(kernel, input_f32, input_elements, "input")?;
+    let output =
+        checked_f32_device_span(kernel, output_f32.cast_const(), output_elements, "output")?;
+    reject_overlapping_f32_spans(kernel, output, input)
 }
 
 fn validate_nonzero(kernel: &'static str, name: &'static str, value: usize) -> Result<()> {
@@ -1195,6 +1279,18 @@ fn sigmoid_mul_native_order_reference(
 }
 
 #[cfg(test)]
+fn silu_native_order_reference(plan: ElementwiseF32Plan, input: &[f32]) -> Result<Vec<f32>> {
+    validate_reference_length(SILU_KERNEL, "input", input.len(), plan.elements)?;
+    let mut output = reserve_native_reference("decoder SiLU reference", plan.elements)?;
+    output.extend(
+        input
+            .iter()
+            .map(|value| *value / (1.0_f32 + (-*value).exp())),
+    );
+    Ok(output)
+}
+
+#[cfg(test)]
 fn silu_mul_native_order_reference(
     plan: ElementwiseF32Plan,
     gate: &[f32],
@@ -1343,6 +1439,33 @@ mod tests {
     }
 
     #[test]
+    fn unary_silu_preserves_f32_order_on_a_signed_tail()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let plan = ElementwiseF32Plan::try_from_elements(ELEMENTWISE_THREADS + 1)?;
+        let pattern = [-3.0_f32, -0.75, 0.0, 0.25, 1.5, 4.0];
+        let mut input = Vec::new();
+        input.try_reserve_exact(plan.elements())?;
+        for index in 0..plan.elements() {
+            input.push(pattern[index % pattern.len()]);
+        }
+        let actual = silu_native_order_reference(plan, &input)?;
+        let expected = silu_f64_oracle(&input)?;
+        assert_close_f64(&actual, &expected, "unary SiLU f32 order");
+        let sigmoid_only = input
+            .iter()
+            .map(|value| 1.0_f32 / (1.0_f32 + (-*value).exp()))
+            .collect::<Vec<_>>();
+        assert!(
+            actual
+                .iter()
+                .zip(sigmoid_only)
+                .any(|(actual, sigmoid)| (actual - sigmoid).abs() > f32::EPSILON),
+            "signed SiLU inputs must not silently become sigmoid outputs"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rms_validator_accepts_exact_spans_and_refuses_short_input()
     -> core::result::Result<(), Box<dyn std::error::Error>> {
         let rms_plan = RmsNormF32Plan::try_from_dimensions(1, 3, 1e-5)?;
@@ -1434,6 +1557,83 @@ mod tests {
             )
             .is_err(),
             "short gate output must be refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn silu_validator_isolates_exact_span_and_alias_refusals()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let plan = ElementwiseF32Plan::try_from_elements(3)?;
+        let input = [-1.0_f32, 0.0, 1.0];
+        let mut output = [0.0_f32; 3];
+        validate_unary_launch(
+            plan,
+            input.as_ptr(),
+            input.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            SILU_KERNEL,
+        )?;
+        assert!(
+            validate_unary_launch(
+                plan,
+                input.as_ptr(),
+                input.len() - 1,
+                output.as_mut_ptr(),
+                output.len(),
+                SILU_KERNEL,
+            )
+            .is_err(),
+            "short SiLU input must be refused"
+        );
+        assert!(
+            validate_unary_launch(
+                plan,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len() - 1,
+                SILU_KERNEL,
+            )
+            .is_err(),
+            "short SiLU output must be refused"
+        );
+        assert!(
+            validate_unary_launch(
+                plan,
+                core::ptr::null(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                SILU_KERNEL,
+            )
+            .is_err(),
+            "null nonempty SiLU input must be refused"
+        );
+        assert!(
+            validate_unary_launch(
+                plan,
+                input.as_ptr(),
+                input.len(),
+                input.as_ptr().cast_mut(),
+                input.len(),
+                SILU_KERNEL,
+            )
+            .is_err(),
+            "SiLU output alias must be refused"
+        );
+        assert!(
+            validate_unary_launch(
+                plan,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr().wrapping_byte_add(1),
+                output.len(),
+                SILU_KERNEL,
+            )
+            .is_err(),
+            "misaligned SiLU output must be refused"
         );
         Ok(())
     }
@@ -1541,6 +1741,7 @@ mod tests {
             ROTARY_KERNEL,
             SPLIT_Q_GATE_KERNEL,
             SIGMOID_MUL_KERNEL,
+            SILU_KERNEL,
             SILU_MUL_KERNEL,
             RESIDUAL_ADD_KERNEL,
         ] {
@@ -1709,6 +1910,31 @@ mod tests {
             &sigmoid_expected,
             "device sigmoid multiplication",
         );
+        let unary_silu_output = DeviceBuffer::from_host(&device, &elementwise_output_host)
+            .map_err(|error| format!("initialize unary SiLU output: {error}"))?;
+        // SAFETY: input is immutable and output is an exclusive exact plan span.
+        unsafe {
+            silu(
+                elementwise,
+                split_gate.as_device_ptr(),
+                split_gate.len(),
+                unary_silu_output.as_device_ptr(),
+                unary_silu_output.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch unary SiLU: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize unary SiLU: {error}"))?;
+        let unary_silu_actual = read_device(&unary_silu_output)?;
+        let unary_silu_expected = silu_native_order_reference(elementwise, &gate_expected)
+            .map_err(|error| format!("unary SiLU reference: {error}"))?;
+        assert_close_f32(
+            &unary_silu_actual,
+            &unary_silu_expected,
+            "device unary SiLU",
+        );
         let silu_output = DeviceBuffer::from_host(&device, &elementwise_output_host)
             .map_err(|error| format!("initialize SiLU output: {error}"))?;
         // SAFETY: inputs remain immutable and output remains an exclusive exact plan span.
@@ -1791,6 +2017,21 @@ mod tests {
                     .map(|(value, scale)| f64::from(*value) * inverse * f64::from(*scale)),
             );
         }
+        Ok(output)
+    }
+
+    fn silu_f64_oracle(input: &[f32]) -> Result<Vec<f64>> {
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(input.len())
+            .context(crate::error::CpuF32AllocationSnafu {
+                operation: "decoder SiLU f64 oracle",
+                requested_len: input.len(),
+            })?;
+        output.extend(input.iter().map(|value| {
+            let value = f64::from(*value);
+            value / (1.0 + (-value).exp())
+        }));
         Ok(output)
     }
 
