@@ -1,6 +1,8 @@
 //! Source-only native full-attention plan accounting tests.
 
-use super::plan::DeviceByteDemand;
+use super::plan::{DeviceByteDemand, DeviceFullAttentionPlan};
+use crate::Qwen35Weights;
+use crate::qwen35::tests::{canonical_hybrid_fixture, verify_fixture};
 
 #[test]
 fn byte_demand_sums_every_native_category() -> core::result::Result<(), String> {
@@ -20,7 +22,6 @@ fn byte_demand_sums_every_native_category() -> core::result::Result<(), String> 
     );
     Ok(())
 }
-
 #[test]
 fn byte_demand_refuses_aggregate_overflow() {
     let demand = DeviceByteDemand {
@@ -36,4 +37,41 @@ fn byte_demand_refuses_aggregate_overflow() {
         demand.total().is_err(),
         "native aggregate accounting must fail before allocation on overflow"
     );
+}
+
+#[test]
+fn verified_full_block_plan_accepts_each_explicit_native_page_size()
+-> std::result::Result<(), String> {
+    let artifact = verify_fixture(&canonical_hybrid_fixture()?)?;
+    let weights = Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+    for page_tokens in [
+        kernels::attention::NativePageTokens::B8,
+        kernels::attention::NativePageTokens::B16,
+        kernels::attention::NativePageTokens::B32,
+    ] {
+        let plan = DeviceFullAttentionPlan::from_weights(&weights, 3, 4, page_tokens)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            plan.bytes.total().map_err(|error| error.to_string())? > 0,
+            "verified full block must derive a nonzero owned device demand"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn verified_plan_refuses_a_recurrent_main_block() -> std::result::Result<(), String> {
+    let artifact = verify_fixture(&canonical_hybrid_fixture()?)?;
+    let weights = Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+    assert!(
+        DeviceFullAttentionPlan::from_weights(
+            &weights,
+            0,
+            4,
+            kernels::attention::NativePageTokens::B8
+        )
+        .is_err(),
+        "a recurrent main block cannot be presented as native full attention"
+    );
+    Ok(())
 }
