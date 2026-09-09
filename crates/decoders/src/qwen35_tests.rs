@@ -1765,6 +1765,10 @@ impl CanonicalHybridOracle {
         })
     }
 
+    pub(crate) const fn hidden_width(&self) -> usize {
+        self.layout.hidden
+    }
+
     fn without_attention(mut self) -> Self {
         self.include_recurrent_attention = false;
         self.include_full_attention = false;
@@ -3131,7 +3135,7 @@ fn test_dimension(value: u64) -> std::result::Result<usize, String> {
     usize::try_from(value).map_err(|error| error.to_string())
 }
 
-fn assert_f32_matches_f64(
+pub(crate) fn assert_f32_matches_f64(
     actual: &[f32],
     expected: &[f64],
     subject: &str,

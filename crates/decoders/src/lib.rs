@@ -54,6 +54,9 @@ pub use crate::qwen35_weights::Qwen35Weights;
 #[cfg(test)]
 const CRATE_NAME: &str = "decoders";
 
+#[cfg(all(test, feature = "gpu"))]
+mod qwen35_native_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
