@@ -279,10 +279,12 @@ Session teardown separately retains its shared model reference, including on
 abandonment. Only the actual fully released HIP outcome permits explicit
 recovery of that model owner; normal completion need not permanently pin the
 resident. Resident close first requires unique ownership, but that reference
-count alone is never a release receipt. Aggregate construction-failure custody
-and binding these outcomes to service accounting remain incomplete under
-[#173](https://github.com/forkwright/logismos/issues/173); ordinary constructor
-errors or resource `Drop` must not be interpreted as successful load rollback.
+count alone is never a release receipt. Aggregate construction failures retain
+their exact typed source and completed owners in `NativeBuildFailure`; explicit
+release distinguishes known-owner progress from terminal creation quarantine.
+Binding these outcomes to service accounting remains incomplete under
+[#173](https://github.com/forkwright/logismos/issues/173). A constructor error
+or resource `Drop` must not be interpreted as successful load rollback.
 
 `loader::gguf::VerifiedArtifact` owns one immutable serialized backing, admitted
 under an explicit byte limit and matched against a required SHA-256 expectation.
