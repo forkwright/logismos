@@ -92,8 +92,11 @@ impl DeviceRecurrentPlan {
     /// No device allocation, upload, submission, state mutation, or cache
     /// publication occurs here.
     pub(super) fn from_weights(weights: &Qwen35Weights<'_>, block: usize) -> Result<Self> {
-        let block_index = u64::try_from(block).map_err(|_| ArithmeticOverflowSnafu {
-            context: "native recurrent block index",
+        let block_index = u64::try_from(block).map_err(|_| {
+            ArithmeticOverflowSnafu {
+                context: "native recurrent block index",
+            }
+            .build()
         })?;
         let epsilon = recurrent_layernorm_rms_epsilon(weights.payload().observation().metadata())?;
         let layout = ExecutionLayout::try_from_profile(weights.recurrent_layout(), epsilon)?;

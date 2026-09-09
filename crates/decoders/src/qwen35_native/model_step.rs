@@ -38,8 +38,11 @@ impl ModelTokenPlan {
             }
             .fail();
         }
-        let row = usize::try_from(token).map_err(|_| ArithmeticOverflowSnafu {
-            context: "native embedding token row",
+        let row = usize::try_from(token).map_err(|_| {
+            ArithmeticOverflowSnafu {
+                context: "native embedding token row",
+            }
+            .build()
         })?;
         let embedding = kernels::row_gemv::RowDecodePlan::try_from_shape(plan.embedding.shape, row)
             .context(NativeKernelSnafu)?;
