@@ -53,6 +53,8 @@ pub mod gdn;
 #[cfg(feature = "gpu")]
 pub mod matmul;
 #[cfg(feature = "gpu")]
+pub mod paged_kv;
+#[cfg(feature = "gpu")]
 pub mod rms_norm;
 #[cfg(feature = "gpu")]
 pub mod rope;

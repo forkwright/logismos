@@ -4,6 +4,13 @@ use core::ops::Range;
 
 use snafu::ResultExt;
 
+#[cfg(feature = "gpu")]
+use hipcore::{Device, DeviceBuffer, Stream};
+#[cfg(feature = "gpu")]
+use kernels::attention::{NativePageTokens, NativePagedDecodePlan};
+
+#[cfg(feature = "gpu")]
+use crate::error::PagedNativePoisonedSnafu;
 use crate::error::{
     PagedAllocationSnafu, PagedAppendTokenOutOfRangeSnafu, PagedArithmeticSnafu,
     PagedCapacitySnafu, PagedContextOverflowSnafu, PagedEmptyAppendSnafu,
@@ -201,11 +208,13 @@ impl PagedKvPlan {
     }
 }
 
-/// One private committed sequence with fixed all-layer page bundles.
+/// The HIP-free logical state shared by CPU and optional native paged backings.
+///
+/// WHY: page ownership, fills, append ordering, and publication are sequence
+/// semantics, while a host `Vec` and device buffers are only physical storage.
 #[derive(Debug)]
-pub struct PagedKvPool {
+struct PagedKvLedger {
     plan: PagedKvPlan,
-    storage: Vec<f32>,
     table: Vec<usize>,
     fills: Vec<usize>,
     free: Vec<usize>,
@@ -213,11 +222,8 @@ pub struct PagedKvPool {
     committed_tokens: usize,
 }
 
-impl PagedKvPool {
-    /// Allocate every f32 and persistent metadata capacity up front.
-    pub fn new(plan: PagedKvPlan) -> Result<Self> {
-        let mut storage = reserve(plan.allocation.requested_f32, "paged-KV f32 backing")?;
-        storage.resize(plan.allocation.requested_f32, 0.0);
+impl PagedKvLedger {
+    fn new(plan: PagedKvPlan) -> Result<Self> {
         let table = reserve(plan.allocation.page_count, "paged-KV page table")?;
         let fills = reserve(plan.allocation.page_count, "paged-KV page fills")?;
         let mut free = reserve(plan.allocation.bundle_count, "paged-KV free bundles")?;
@@ -228,7 +234,6 @@ impl PagedKvPool {
         }
         Ok(Self {
             plan,
-            storage,
             table,
             fills,
             free,
@@ -236,30 +241,15 @@ impl PagedKvPool {
             committed_tokens: 0,
         })
     }
-    /// One immutable committed layer.
-    pub fn layer_kv(&self, layer: usize) -> Result<PagedLayerKv<'_>> {
-        if layer >= self.plan.geometry.layers {
-            return PagedLayerOutOfRangeSnafu {
-                layer,
-                layers: self.plan.geometry.layers,
-            }
-            .fail();
-        }
-        Ok(PagedLayerKv {
-            pool: self,
-            layer,
-            tokens: self.committed_tokens,
-        })
-    }
-    /// Preflight whole-call capacity, then stage unpublished page changes.
-    pub fn begin_append(&mut self, append_tokens: usize) -> Result<PagedAppend<'_>> {
+
+    fn begin_append(&mut self, append_tokens: usize) -> Result<AppendReservation> {
         if append_tokens == 0 {
             return PagedEmptyAppendSnafu.fail();
         }
         let original_tokens = self.committed_tokens;
         let target = original_tokens
             .checked_add(append_tokens)
-            .filter(|x| *x <= self.plan.geometry.max_context)
+            .filter(|value| *value <= self.plan.geometry.max_context)
             .ok_or_else(|| {
                 PagedContextOverflowSnafu {
                     committed_tokens: original_tokens,
@@ -268,15 +258,18 @@ impl PagedKvPool {
                 }
                 .build()
             })?;
-        let old_pages = self.table.len();
-        let target_pages = ceil(target, self.plan.page_tokens.count(), "append target pages")?;
-        let partial = !original_tokens.is_multiple_of(self.plan.page_tokens.count());
-        let new_pages = target_pages.checked_sub(old_pages).ok_or_else(|| {
-            PagedLayoutSnafu {
-                operation: "page table monotonicity",
-            }
-            .build()
-        })?;
+        let original_page_count = self.table.len();
+        let page_tokens = self.plan.page_tokens.count();
+        let target_pages = ceil(target, page_tokens, "append target pages")?;
+        let partial = !original_tokens.is_multiple_of(page_tokens);
+        let new_pages = target_pages
+            .checked_sub(original_page_count)
+            .ok_or_else(|| {
+                PagedLayoutSnafu {
+                    operation: "page table monotonicity",
+                }
+                .build()
+            })?;
         let needed = new_pages.checked_add(usize::from(partial)).ok_or_else(|| {
             PagedArithmeticSnafu {
                 operation: "append spare count",
@@ -292,7 +285,7 @@ impl PagedKvPool {
         }
         self.staged_rows.fill(0);
         let replaced_tail = if partial {
-            Some(self.copy_tail()?)
+            Some(self.replace_tail_without_copy()?)
         } else {
             None
         };
@@ -301,24 +294,15 @@ impl PagedKvPool {
             self.table.push(bundle);
             self.fills.push(0);
         }
-        Ok(PagedAppend {
-            pool: self,
+        Ok(AppendReservation {
             append_tokens,
             original_tokens,
-            original_page_count: old_pages,
+            original_page_count,
             replaced_tail,
-            committed: false,
         })
     }
-    fn take_free(&mut self) -> Result<usize> {
-        self.free.pop().ok_or_else(|| {
-            PagedLayoutSnafu {
-                operation: "preflighted free bundle",
-            }
-            .build()
-        })
-    }
-    fn copy_tail(&mut self) -> Result<TailReplacement> {
+
+    fn replace_tail_without_copy(&mut self) -> Result<TailReplacement> {
         let page = self.table.len().checked_sub(1).ok_or_else(|| {
             PagedLayoutSnafu {
                 operation: "partial tail page",
@@ -338,34 +322,252 @@ impl PagedKvPool {
             .build()
         })?;
         let replacement_bundle = self.take_free()?;
-        let copied = (|| -> Result<()> {
-            for layer in 0..self.plan.geometry.layers {
-                for value in [false, true] {
-                    let source = self.span(original_bundle, layer, 0, value, fill)?;
-                    let destination = self.span(replacement_bundle, layer, 0, value, fill)?;
-                    self.storage.copy_within(source, destination.start);
-                }
-            }
-            Ok(())
-        })();
-        if let Err(error) = copied {
-            self.free.push(replacement_bundle);
-            return Err(error);
-        }
-        if let Some(bundle) = self.table.get_mut(page) {
-            *bundle = replacement_bundle;
-        } else {
-            return PagedLayoutSnafu {
+        *self.table.get_mut(page).ok_or_else(|| {
+            PagedLayoutSnafu {
                 operation: "partial tail replacement",
             }
-            .fail();
-        }
+            .build()
+        })? = replacement_bundle;
         Ok(TailReplacement {
             page,
             original_bundle,
             fill,
             replacement_bundle,
         })
+    }
+
+    fn take_free(&mut self) -> Result<usize> {
+        self.free.pop().ok_or_else(|| {
+            PagedLayoutSnafu {
+                operation: "preflighted free bundle",
+            }
+            .build()
+        })
+    }
+
+    fn commit(&mut self, reservation: &mut AppendReservation) -> Result<()> {
+        for (layer, written_tokens) in self.staged_rows.iter().copied().enumerate() {
+            if written_tokens != reservation.append_tokens {
+                return PagedIncompleteAppendSnafu {
+                    layer,
+                    written_tokens,
+                    append_tokens: reservation.append_tokens,
+                }
+                .fail();
+            }
+        }
+        self.committed_tokens = reservation
+            .original_tokens
+            .checked_add(reservation.append_tokens)
+            .ok_or_else(|| {
+                PagedArithmeticSnafu {
+                    operation: "commit token count",
+                }
+                .build()
+            })?;
+        if let Some(replacement) = reservation.replaced_tail.take() {
+            self.free.push(replacement.original_bundle);
+        }
+        self.staged_rows.fill(0);
+        Ok(())
+    }
+
+    fn rollback(&mut self, reservation: &AppendReservation) {
+        while self.table.len() > reservation.original_page_count {
+            if let Some(bundle) = self.table.pop() {
+                self.free.push(bundle);
+            }
+            let _ = self.fills.pop();
+        }
+        if let Some(replacement) = reservation.replaced_tail {
+            if let Some(bundle) = self.table.get_mut(replacement.page) {
+                *bundle = replacement.original_bundle;
+            }
+            if let Some(fill) = self.fills.get_mut(replacement.page) {
+                *fill = replacement.fill;
+            }
+            self.free.push(replacement.replacement_bundle);
+        }
+        self.staged_rows.fill(0);
+    }
+
+    fn write_location(
+        &self,
+        reservation: &AppendReservation,
+        layer: usize,
+        token: usize,
+    ) -> Result<LedgerWriteLocation> {
+        self.check_layer(layer)?;
+        if token >= reservation.append_tokens {
+            return PagedAppendTokenOutOfRangeSnafu {
+                token,
+                append_tokens: reservation.append_tokens,
+            }
+            .fail();
+        }
+        let expected = *self.staged_rows.get(layer).ok_or_else(|| {
+            PagedLayoutSnafu {
+                operation: "layer write counter",
+            }
+            .build()
+        })?;
+        if token != expected {
+            return PagedWriteOrderSnafu {
+                layer,
+                expected,
+                actual: token,
+            }
+            .fail();
+        }
+        let absolute = reservation
+            .original_tokens
+            .checked_add(token)
+            .ok_or_else(|| {
+                PagedArithmeticSnafu {
+                    operation: "absolute append token",
+                }
+                .build()
+            })?;
+        let page_tokens = self.plan.page_tokens.count();
+        let page = absolute / page_tokens;
+        let within = absolute % page_tokens;
+        let bundle = *self.table.get(page).ok_or_else(|| {
+            PagedLayoutSnafu {
+                operation: "append page lookup",
+            }
+            .build()
+        })?;
+        Ok(LedgerWriteLocation {
+            page,
+            bundle,
+            within,
+        })
+    }
+
+    fn record_write(&mut self, layer: usize, page: usize, within: usize) -> Result<()> {
+        if let Some(fill) = self.fills.get_mut(page) {
+            *fill = (*fill).max(within + 1);
+        } else {
+            return PagedLayoutSnafu {
+                operation: "append fill",
+            }
+            .fail();
+        }
+        if let Some(written) = self.staged_rows.get_mut(layer) {
+            *written = written.checked_add(1).ok_or_else(|| {
+                PagedArithmeticSnafu {
+                    operation: "layer write count",
+                }
+                .build()
+            })?;
+        } else {
+            return PagedLayoutSnafu {
+                operation: "layer write counter update",
+            }
+            .fail();
+        }
+        Ok(())
+    }
+
+    fn visible_tokens(&self, reservation: &AppendReservation, layer: usize) -> Result<usize> {
+        self.check_layer(layer)?;
+        let staged = *self.staged_rows.get(layer).ok_or_else(|| {
+            PagedLayoutSnafu {
+                operation: "staged view counter",
+            }
+            .build()
+        })?;
+        reservation
+            .original_tokens
+            .checked_add(staged)
+            .ok_or_else(|| {
+                PagedArithmeticSnafu {
+                    operation: "staged visible tokens",
+                }
+                .build()
+            })
+    }
+
+    fn check_layer(&self, layer: usize) -> Result<()> {
+        if layer >= self.plan.geometry.layers {
+            return PagedLayerOutOfRangeSnafu {
+                layer,
+                layers: self.plan.geometry.layers,
+            }
+            .fail();
+        }
+        Ok(())
+    }
+}
+
+/// One private committed sequence with fixed all-layer page bundles.
+#[derive(Debug)]
+pub struct PagedKvPool {
+    ledger: PagedKvLedger,
+    storage: Vec<f32>,
+}
+
+impl PagedKvPool {
+    /// Allocate every f32 and persistent metadata capacity up front.
+    pub fn new(plan: PagedKvPlan) -> Result<Self> {
+        let mut storage = reserve(plan.allocation.requested_f32, "paged-KV f32 backing")?;
+        storage.resize(plan.allocation.requested_f32, 0.0);
+        Ok(Self {
+            ledger: PagedKvLedger::new(plan)?,
+            storage,
+        })
+    }
+    /// One immutable committed layer.
+    pub fn layer_kv(&self, layer: usize) -> Result<PagedLayerKv<'_>> {
+        if layer >= self.ledger.plan.geometry.layers {
+            return PagedLayerOutOfRangeSnafu {
+                layer,
+                layers: self.ledger.plan.geometry.layers,
+            }
+            .fail();
+        }
+        Ok(PagedLayerKv {
+            pool: self,
+            layer,
+            tokens: self.ledger.committed_tokens,
+        })
+    }
+    /// Preflight whole-call capacity, then stage unpublished page changes.
+    pub fn begin_append(&mut self, append_tokens: usize) -> Result<PagedAppend<'_>> {
+        let reservation = self.ledger.begin_append(append_tokens)?;
+        if let Some(replacement) = reservation.replaced_tail {
+            if let Err(error) = self.copy_tail(replacement) {
+                self.ledger.rollback(&reservation);
+                return Err(error);
+            }
+        }
+        Ok(PagedAppend {
+            pool: self,
+            reservation,
+            committed: false,
+        })
+    }
+    fn copy_tail(&mut self, replacement: TailReplacement) -> Result<()> {
+        for layer in 0..self.ledger.plan.geometry.layers {
+            for value in [false, true] {
+                let source = self.span(
+                    replacement.original_bundle,
+                    layer,
+                    0,
+                    value,
+                    replacement.fill,
+                )?;
+                let destination = self.span(
+                    replacement.replacement_bundle,
+                    layer,
+                    0,
+                    value,
+                    replacement.fill,
+                )?;
+                self.storage.copy_within(source, destination.start);
+            }
+        }
+        Ok(())
     }
     fn span(
         &self,
@@ -375,9 +577,9 @@ impl PagedKvPool {
         value: bool,
         rows: usize,
     ) -> Result<Range<usize>> {
-        let page_tokens = self.plan.page_tokens.count();
-        if bundle >= self.plan.allocation.bundle_count
-            || layer >= self.plan.geometry.layers
+        let page_tokens = self.ledger.plan.page_tokens.count();
+        if bundle >= self.ledger.plan.allocation.bundle_count
+            || layer >= self.ledger.plan.geometry.layers
             || token >= page_tokens
             || rows > page_tokens - token
         {
@@ -387,7 +589,7 @@ impl PagedKvPool {
             .fail();
         }
         let bundle_start = bundle
-            .checked_mul(self.plan.bundle_elements()?)
+            .checked_mul(self.ledger.plan.bundle_elements()?)
             .ok_or_else(|| {
                 PagedArithmeticSnafu {
                     operation: "bundle offset",
@@ -395,7 +597,7 @@ impl PagedKvPool {
                 .build()
             })?;
         let layer_stride = page_tokens
-            .checked_mul(self.plan.geometry.row_width)
+            .checked_mul(self.ledger.plan.geometry.row_width)
             .and_then(|x| x.checked_mul(2))
             .ok_or_else(|| {
                 PagedArithmeticSnafu {
@@ -405,7 +607,7 @@ impl PagedKvPool {
             })?;
         let value_offset = if value {
             page_tokens
-                .checked_mul(self.plan.geometry.row_width)
+                .checked_mul(self.ledger.plan.geometry.row_width)
                 .ok_or_else(|| {
                     PagedArithmeticSnafu {
                         operation: "value offset",
@@ -421,7 +623,7 @@ impl PagedKvPool {
             .and_then(|x| x.checked_add(value_offset))
             .and_then(|x| {
                 token
-                    .checked_mul(self.plan.geometry.row_width)
+                    .checked_mul(self.ledger.plan.geometry.row_width)
                     .and_then(|y| x.checked_add(y))
             })
             .ok_or_else(|| {
@@ -431,7 +633,7 @@ impl PagedKvPool {
                 .build()
             })?;
         let end = rows
-            .checked_mul(self.plan.geometry.row_width)
+            .checked_mul(self.ledger.plan.geometry.row_width)
             .and_then(|x| start.checked_add(x))
             .filter(|x| *x <= self.storage.len())
             .ok_or_else(|| {
@@ -448,10 +650,7 @@ impl PagedKvPool {
 #[derive(Debug)]
 pub struct PagedAppend<'a> {
     pool: &'a mut PagedKvPool,
-    append_tokens: usize,
-    original_tokens: usize,
-    original_page_count: usize,
-    replaced_tail: Option<TailReplacement>,
+    reservation: AppendReservation,
     committed: bool,
 }
 
@@ -461,6 +660,22 @@ struct PagedWriteLocation {
     within: usize,
     key: Range<usize>,
     value: Range<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LedgerWriteLocation {
+    page: usize,
+    bundle: usize,
+    within: usize,
+}
+
+/// Unpublished logical mutations for one append transaction.
+#[derive(Debug)]
+struct AppendReservation {
+    append_tokens: usize,
+    original_tokens: usize,
+    original_page_count: usize,
+    replaced_tail: Option<TailReplacement>,
 }
 
 impl PagedAppend<'_> {
@@ -484,52 +699,23 @@ impl PagedAppend<'_> {
         keys: &[f32],
         values: &[f32],
     ) -> Result<PagedWriteLocation> {
-        self.check_layer(layer)?;
-        if token >= self.append_tokens {
-            return PagedAppendTokenOutOfRangeSnafu {
-                token,
-                append_tokens: self.append_tokens,
-            }
-            .fail();
-        }
-        let expected = *self.pool.staged_rows.get(layer).ok_or_else(|| {
-            PagedLayoutSnafu {
-                operation: "layer write counter",
-            }
-            .build()
-        })?;
-        if token != expected {
-            return PagedWriteOrderSnafu {
-                layer,
-                expected,
-                actual: token,
-            }
-            .fail();
-        }
         self.check_row(layer, "key", keys)?;
         self.check_row(layer, "value", values)?;
-        let absolute = self.original_tokens.checked_add(token).ok_or_else(|| {
-            PagedArithmeticSnafu {
-                operation: "absolute append token",
-            }
-            .build()
-        })?;
-        let page_tokens = self.pool.plan.page_tokens.count();
-        let page = absolute / page_tokens;
-        let within = absolute % page_tokens;
-        let bundle = *self.pool.table.get(page).ok_or_else(|| {
-            PagedLayoutSnafu {
-                operation: "append page lookup",
-            }
-            .build()
-        })?;
-        let key = self.pool.span(bundle, layer, within, false, 1)?;
-        let value = self.pool.span(bundle, layer, within, true, 1)?;
+        let location = self
+            .pool
+            .ledger
+            .write_location(&self.reservation, layer, token)?;
+        let key = self
+            .pool
+            .span(location.bundle, layer, location.within, false, 1)?;
+        let value = self
+            .pool
+            .span(location.bundle, layer, location.within, true, 1)?;
         self.check_storage_row(&key, "key row write")?;
         self.check_storage_row(&value, "value row write")?;
         Ok(PagedWriteLocation {
-            page,
-            within,
+            page: location.page,
+            within: location.within,
             key,
             value,
         })
@@ -555,44 +741,11 @@ impl PagedAppend<'_> {
         Ok(())
     }
     fn record_write(&mut self, layer: usize, page: usize, within: usize) -> Result<()> {
-        if let Some(fill) = self.pool.fills.get_mut(page) {
-            *fill = (*fill).max(within + 1);
-        } else {
-            return PagedLayoutSnafu {
-                operation: "append fill",
-            }
-            .fail();
-        }
-        if let Some(written) = self.pool.staged_rows.get_mut(layer) {
-            *written = written.checked_add(1).ok_or_else(|| {
-                PagedArithmeticSnafu {
-                    operation: "layer write count",
-                }
-                .build()
-            })?;
-        } else {
-            return PagedLayoutSnafu {
-                operation: "layer write counter update",
-            }
-            .fail();
-        }
-        Ok(())
+        self.pool.ledger.record_write(layer, page, within)
     }
     /// View only committed rows plus this layer's contiguous written prefix.
     pub fn layer_kv(&self, layer: usize) -> Result<PagedLayerKv<'_>> {
-        self.check_layer(layer)?;
-        let staged = *self.pool.staged_rows.get(layer).ok_or_else(|| {
-            PagedLayoutSnafu {
-                operation: "staged view counter",
-            }
-            .build()
-        })?;
-        let tokens = self.original_tokens.checked_add(staged).ok_or_else(|| {
-            PagedArithmeticSnafu {
-                operation: "staged visible tokens",
-            }
-            .build()
-        })?;
+        let tokens = self.pool.ledger.visible_tokens(&self.reservation, layer)?;
         Ok(PagedLayerKv {
             pool: self.pool,
             layer,
@@ -601,49 +754,17 @@ impl PagedAppend<'_> {
     }
     /// Publish only after every layer owns every requested row.
     pub fn commit(mut self) -> Result<()> {
-        for (layer, written_tokens) in self.pool.staged_rows.iter().copied().enumerate() {
-            if written_tokens != self.append_tokens {
-                return PagedIncompleteAppendSnafu {
-                    layer,
-                    written_tokens,
-                    append_tokens: self.append_tokens,
-                }
-                .fail();
-            }
-        }
-        self.pool.committed_tokens = self
-            .original_tokens
-            .checked_add(self.append_tokens)
-            .ok_or_else(|| {
-                PagedArithmeticSnafu {
-                    operation: "commit token count",
-                }
-                .build()
-            })?;
-        if let Some(replacement) = self.replaced_tail.take() {
-            self.pool.free.push(replacement.original_bundle);
-        }
-        self.pool.staged_rows.fill(0);
+        self.pool.ledger.commit(&mut self.reservation)?;
         self.committed = true;
         Ok(())
     }
-    fn check_layer(&self, layer: usize) -> Result<()> {
-        if layer >= self.pool.plan.geometry.layers {
-            return PagedLayerOutOfRangeSnafu {
-                layer,
-                layers: self.pool.plan.geometry.layers,
-            }
-            .fail();
-        }
-        Ok(())
-    }
     fn check_row(&self, layer: usize, kind: &'static str, row: &[f32]) -> Result<()> {
-        if row.len() != self.pool.plan.geometry.row_width {
+        if row.len() != self.pool.ledger.plan.geometry.row_width {
             return PagedRowWidthSnafu {
                 kind,
                 layer,
                 actual: row.len(),
-                expected: self.pool.plan.geometry.row_width,
+                expected: self.pool.ledger.plan.geometry.row_width,
             }
             .fail();
         }
@@ -656,22 +777,7 @@ impl Drop for PagedAppend<'_> {
         if self.committed {
             return;
         }
-        while self.pool.table.len() > self.original_page_count {
-            if let Some(bundle) = self.pool.table.pop() {
-                self.pool.free.push(bundle);
-            }
-            let _ = self.pool.fills.pop();
-        }
-        if let Some(replacement) = self.replaced_tail {
-            if let Some(bundle) = self.pool.table.get_mut(replacement.page) {
-                *bundle = replacement.original_bundle;
-            }
-            if let Some(fill) = self.pool.fills.get_mut(replacement.page) {
-                *fill = replacement.fill;
-            }
-            self.pool.free.push(replacement.replacement_bundle);
-        }
-        self.pool.staged_rows.fill(0);
+        self.pool.ledger.rollback(&self.reservation);
     }
 }
 
@@ -704,10 +810,10 @@ impl PagedLayerKv<'_> {
             }
             .fail();
         }
-        let page_tokens = self.pool.plan.page_tokens.count();
+        let page_tokens = self.pool.ledger.plan.page_tokens.count();
         let page = token / page_tokens;
         let within = token % page_tokens;
-        let fill = *self.pool.fills.get(page).ok_or_else(|| {
+        let fill = *self.pool.ledger.fills.get(page).ok_or_else(|| {
             PagedLayoutSnafu {
                 operation: "visible fill lookup",
             }
@@ -719,7 +825,7 @@ impl PagedLayerKv<'_> {
             }
             .fail();
         }
-        let bundle = *self.pool.table.get(page).ok_or_else(|| {
+        let bundle = *self.pool.ledger.table.get(page).ok_or_else(|| {
             PagedLayoutSnafu {
                 operation: "visible page lookup",
             }
@@ -732,6 +838,392 @@ impl PagedLayerKv<'_> {
             }
             .build()
         })
+    }
+}
+
+/// Explicit native physical backing derived from one logical paged geometry.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy)]
+pub struct NativePagedKvPlan {
+    logical: PagedKvPlan,
+    kv_heads: usize,
+    head_width: usize,
+    layout: kernels::paged_kv::PagedKvNativeLayout,
+}
+
+#[cfg(feature = "gpu")]
+impl NativePagedKvPlan {
+    /// Bind native K/V rows to the shared logical geometry with an explicit page size.
+    pub fn try_from_geometry(
+        geometry: PagedKvGeometry,
+        kv_heads: usize,
+        head_width: usize,
+        page_tokens: NativePageTokens,
+    ) -> Result<Self> {
+        let row_width = kv_heads.checked_mul(head_width).ok_or_else(|| {
+            PagedArithmeticSnafu {
+                operation: "native key-value row width",
+            }
+            .build()
+        })?;
+        if row_width != geometry.row_width {
+            return PagedLayoutSnafu {
+                operation: "native key-value heads and width",
+            }
+            .fail();
+        }
+        let logical = PagedKvPlan::new(geometry, page_tokens.into())?;
+        let layout = kernels::paged_kv::PagedKvNativeLayout::try_from_dimensions(
+            geometry.layers,
+            geometry.row_width,
+            page_tokens.get(),
+            logical.allocation.bundle_count,
+        )?;
+        Ok(Self {
+            logical,
+            kv_heads,
+            head_width,
+            layout,
+        })
+    }
+
+    /// Shared logical plan used by CPU-style page ownership and transactions.
+    #[must_use]
+    pub const fn logical(self) -> PagedKvPlan {
+        self.logical
+    }
+
+    /// Explicit native K/V backing geometry.
+    #[must_use]
+    pub const fn layout(self) -> kernels::paged_kv::PagedKvNativeLayout {
+        self.layout
+    }
+
+    /// Key/value heads represented by one native row.
+    #[must_use]
+    pub const fn kv_heads(self) -> usize {
+        self.kv_heads
+    }
+
+    /// Scalars in each key/value head.
+    #[must_use]
+    pub const fn head_width(self) -> usize {
+        self.head_width
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl From<NativePageTokens> for PageTokens {
+    fn from(value: NativePageTokens) -> Self {
+        match value {
+            NativePageTokens::B8 => Self::B8,
+            NativePageTokens::B16 => Self::B16,
+            NativePageTokens::B32 => Self::B32,
+        }
+    }
+}
+
+/// Optional native K/V backing for one non-cloneable session.
+///
+/// The host ledger remains authoritative. Device K/V and table allocations are
+/// physical mirrors only; a caller that observes a failure after submission
+/// must poison and retain the entire owning session until completion is known.
+#[cfg(feature = "gpu")]
+pub struct NativePagedKvPool {
+    ledger: PagedKvLedger,
+    plan: NativePagedKvPlan,
+    keys: DeviceBuffer<f32>,
+    values: DeviceBuffer<f32>,
+    table: DeviceBuffer<u32>,
+    poisoned: bool,
+}
+
+#[cfg(feature = "gpu")]
+impl NativePagedKvPool {
+    /// Allocate native K/V and table mirrors before any append is admitted.
+    pub fn new(plan: NativePagedKvPlan, device: &Device) -> Result<Self> {
+        let ledger = PagedKvLedger::new(plan.logical)?;
+        let keys = DeviceBuffer::alloc(device, plan.layout.backing_elements())?;
+        let values = DeviceBuffer::alloc(device, plan.layout.backing_elements())?;
+        let table = DeviceBuffer::alloc(device, plan.logical.allocation.page_count)?;
+        Ok(Self {
+            ledger,
+            plan,
+            keys,
+            values,
+            table,
+            poisoned: false,
+        })
+    }
+
+    /// Stage a native append and mirror its required COW/table mutations.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns the stream and every device allocation participating in
+    /// the complete layer. On any submission or completion uncertainty it must
+    /// retain that complete bundle and never reuse this pool.
+    pub unsafe fn begin_append(
+        &mut self,
+        append_tokens: usize,
+        stream: &Stream,
+    ) -> Result<NativePagedAppend<'_>> {
+        self.ensure_not_poisoned()?;
+        let reservation = self.ledger.begin_append(append_tokens)?;
+        let prepared = unsafe { self.prepare_device_append(&reservation, stream) };
+        if let Err(error) = prepared {
+            // Host state is still authoritative and unpublished.  Device
+            // writes may be uncertain, so restore only the host ledger and
+            // permanently refuse reuse of this native backing.
+            self.ledger.rollback(&reservation);
+            self.poisoned = true;
+            return Err(error);
+        }
+        Ok(NativePagedAppend {
+            pool: self,
+            reservation,
+            committed: false,
+        })
+    }
+
+    fn ensure_not_poisoned(&self) -> Result<()> {
+        if self.poisoned {
+            return PagedNativePoisonedSnafu.fail();
+        }
+        Ok(())
+    }
+
+    unsafe fn prepare_device_append(
+        &mut self,
+        reservation: &AppendReservation,
+        stream: &Stream,
+    ) -> Result<()> {
+        if let Some(replacement) = reservation.replaced_tail {
+            // SAFETY: pool-owned non-overlapping K/V spans and reservation-derived pages remain live through caller-owned completion.
+            unsafe {
+                kernels::paged_kv::copy_tail_f32(
+                    self.plan.layout,
+                    self.keys.as_device_ptr(),
+                    self.keys.len(),
+                    self.values.as_device_ptr(),
+                    self.values.len(),
+                    replacement.original_bundle,
+                    replacement.replacement_bundle,
+                    replacement.fill,
+                    stream,
+                )?
+            };
+            // SAFETY: the ledger selected this in-range logical/physical page mapping.
+            unsafe {
+                kernels::paged_kv::write_table_u32(
+                    self.table.as_device_ptr(),
+                    self.table.len(),
+                    replacement.page,
+                    replacement.replacement_bundle,
+                    stream,
+                )?
+            };
+        }
+        for logical_page in reservation.original_page_count..self.ledger.table.len() {
+            let physical_page = *self.ledger.table.get(logical_page).ok_or_else(|| {
+                PagedLayoutSnafu {
+                    operation: "native staged page table",
+                }
+                .build()
+            })?;
+            // SAFETY: the ledger's checked table range supplies both ABI-sized indices.
+            unsafe {
+                kernels::paged_kv::write_table_u32(
+                    self.table.as_device_ptr(),
+                    self.table.len(),
+                    logical_page,
+                    physical_page,
+                    stream,
+                )?
+            };
+        }
+        Ok(())
+    }
+}
+
+/// Borrowed native append transaction with unpublished host-ledger mutations.
+#[cfg(feature = "gpu")]
+pub struct NativePagedAppend<'a> {
+    pool: &'a mut NativePagedKvPool,
+    reservation: AppendReservation,
+    committed: bool,
+}
+
+#[cfg(feature = "gpu")]
+impl NativePagedAppend<'_> {
+    /// Stage one device-resident K/V row for one full-attention layer.
+    ///
+    /// # Safety
+    ///
+    /// Source rows must be live device allocations of the declared width on
+    /// `stream`'s device. The caller owns completion and must poison its whole
+    /// session if submission completion becomes uncertain.
+    pub unsafe fn write_layer_row(
+        &mut self,
+        layer: usize,
+        token: usize,
+        key_f32: *const f32,
+        key_elements: usize,
+        value_f32: *const f32,
+        value_elements: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.pool.ensure_not_poisoned()?;
+        let location = self
+            .pool
+            .ledger
+            .write_location(&self.reservation, layer, token)?;
+        let submitted = unsafe {
+            kernels::paged_kv::append_row_f32(
+                self.pool.plan.layout,
+                self.pool.keys.as_device_ptr(),
+                self.pool.keys.len(),
+                self.pool.values.as_device_ptr(),
+                self.pool.values.len(),
+                key_f32,
+                key_elements,
+                value_f32,
+                value_elements,
+                layer,
+                location.bundle,
+                location.within,
+                stream,
+            )
+        };
+        if let Err(error) = submitted {
+            self.pool.poisoned = true;
+            return Err(error.into());
+        }
+        let recorded = self
+            .pool
+            .ledger
+            .record_write(layer, location.page, location.within);
+        if recorded.is_err() {
+            // WHY: a row append was already submitted, so a logical error
+            // cannot make the native backing safely reusable.
+            self.pool.poisoned = true;
+        }
+        recorded
+    }
+
+    /// Return one staged native layer view for Q=1 paged attention.
+    pub fn layer_kv(&self, layer: usize) -> Result<NativePagedLayerKv<'_>> {
+        let tokens = self.pool.ledger.visible_tokens(&self.reservation, layer)?;
+        Ok(NativePagedLayerKv {
+            pool: self.pool,
+            layer,
+            tokens,
+        })
+    }
+
+    /// Publish host ledger state only after the caller has proved completion.
+    pub fn commit_after_completion(mut self) -> Result<()> {
+        self.pool.ensure_not_poisoned()?;
+        self.pool.ledger.commit(&mut self.reservation)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Drop for NativePagedAppend<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // WHY: logical staging is unpublished; no device rollback is safe after any submission.
+            self.pool.ledger.rollback(&self.reservation);
+            // A prepare/table or row kernel may already be in flight.  Keep
+            // the host ledger unpublished, but refuse any reuse until the
+            // caller has retained and resolved the whole native session.
+            self.pool.poisoned = true;
+        }
+    }
+}
+
+/// Opaque per-layer native K/V source for the Q=1 attention launcher.
+#[cfg(feature = "gpu")]
+pub struct NativePagedLayerKv<'a> {
+    pool: &'a NativePagedKvPool,
+    layer: usize,
+    tokens: usize,
+}
+
+#[cfg(feature = "gpu")]
+impl NativePagedLayerKv<'_> {
+    /// Rows visible to this layer during its current append.
+    #[must_use]
+    pub const fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// Launch Q=1 paged attention without exposing cache table or backing pointers.
+    ///
+    /// # Safety
+    ///
+    /// The query/output buffers and stream must uphold the attention launcher's
+    /// device lifetime, non-aliasing, and finite normal-or-zero obligations.
+    pub unsafe fn launch_paged_decode(
+        &self,
+        plan: NativePagedDecodePlan,
+        query_f32: *const f32,
+        query_elements: usize,
+        output_f32: *mut f32,
+        output_elements: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let attention_row_width = plan
+            .logical()
+            .kv_heads()
+            .checked_mul(plan.logical().head_width())
+            .ok_or_else(|| {
+                PagedArithmeticSnafu {
+                    operation: "native paged-attention row width",
+                }
+                .build()
+            })?;
+        if self.tokens != plan.logical().visible_tokens()
+            || self.pool.plan.layout.physical_pages() != plan.physical_pages()
+            || self.pool.plan.layout.page_tokens() != plan.page_tokens().get()
+            || self.pool.plan.layout.row_width() != attention_row_width
+        {
+            return PagedLayoutSnafu {
+                operation: "native paged-attention descriptor binding",
+            }
+            .fail();
+        }
+        let layer_offset = self
+            .layer
+            .checked_mul(self.pool.plan.layout.layer_elements())
+            .ok_or_else(|| {
+                PagedArithmeticSnafu {
+                    operation: "native layer backing offset",
+                }
+                .build()
+            })?;
+        let key_base = unsafe { self.pool.keys.as_device_ptr().add(layer_offset) };
+        let value_base = unsafe { self.pool.values.as_device_ptr().add(layer_offset) };
+        // SAFETY: layer-major layout gives exactly one dense physical-page K/V span; all raw launch obligations remain caller-owned.
+        unsafe {
+            kernels::attention::launch_paged_decode_q1_f32(
+                plan,
+                query_f32,
+                query_elements,
+                key_base,
+                self.pool.plan.layout.layer_elements(),
+                value_base,
+                self.pool.plan.layout.layer_elements(),
+                self.pool.table.as_device_ptr(),
+                plan.page_table_entries(),
+                output_f32,
+                output_elements,
+                stream,
+            )?
+        };
+        Ok(())
     }
 }
 
@@ -843,24 +1335,24 @@ mod tests {
     }
 
     fn assert_inventory(pool: &PagedKvPool, held_old_tail: Option<usize>) {
-        assert_eq!(pool.table.len(), pool.fills.len());
+        assert_eq!(pool.ledger.table.len(), pool.ledger.fills.len());
         let mut seen = BTreeSet::new();
-        for bundle in &pool.table {
-            assert!(*bundle < pool.plan.allocation.bundle_count);
+        for bundle in &pool.ledger.table {
+            assert!(*bundle < pool.ledger.plan.allocation.bundle_count);
             assert!(seen.insert(*bundle));
         }
-        for bundle in &pool.free {
-            assert!(*bundle < pool.plan.allocation.bundle_count);
+        for bundle in &pool.ledger.free {
+            assert!(*bundle < pool.ledger.plan.allocation.bundle_count);
             assert!(seen.insert(*bundle));
         }
         if let Some(bundle) = held_old_tail {
-            assert!(bundle < pool.plan.allocation.bundle_count);
+            assert!(bundle < pool.ledger.plan.allocation.bundle_count);
             assert!(seen.insert(bundle));
         }
-        assert_eq!(seen.len(), pool.plan.allocation.bundle_count);
+        assert_eq!(seen.len(), pool.ledger.plan.allocation.bundle_count);
         assert_eq!(
-            pool.table.len() + pool.free.len() + usize::from(held_old_tail.is_some()),
-            pool.plan.allocation.bundle_count
+            pool.ledger.table.len() + pool.ledger.free.len() + usize::from(held_old_tail.is_some()),
+            pool.ledger.plan.allocation.bundle_count
         );
     }
 
@@ -883,7 +1375,7 @@ mod tests {
     fn assert_committed_matches(pool: &PagedKvPool, model: &[Vec<ModelRow>; LAYERS]) -> Result<()> {
         let tokens = model[0].len();
         assert!(model.iter().all(|layer| layer.len() == tokens));
-        assert_eq!(pool.committed_tokens, tokens);
+        assert_eq!(pool.ledger.committed_tokens, tokens);
         for (layer, expected_rows) in model.iter().enumerate() {
             let rows = pool.layer_kv(layer)?;
             assert_eq!(rows.tokens(), tokens);
@@ -932,7 +1424,8 @@ mod tests {
     fn assert_staged_inventory(txn: &PagedAppend<'_>) {
         assert_inventory(
             txn.pool,
-            txn.replaced_tail
+            txn.reservation
+                .replaced_tail
                 .map(|replacement| replacement.original_bundle),
         );
     }
@@ -968,8 +1461,8 @@ mod tests {
     }
 
     fn tail_witness(pool: &PagedKvPool) -> Result<TailWitness> {
-        let bundle = pool.table[0];
-        let fill = pool.fills[0];
+        let bundle = pool.ledger.table[0];
+        let fill = pool.ledger.fills[0];
         Ok(TailWitness {
             bundle,
             fill,
@@ -984,8 +1477,8 @@ mod tests {
     ) -> Result<()> {
         {
             let mut incomplete = pool.begin_append(2)?;
-            assert!(incomplete.replaced_tail.is_some());
-            assert_ne!(incomplete.pool.table[0], witness.bundle);
+            assert!(incomplete.reservation.replaced_tail.is_some());
+            assert_ne!(incomplete.pool.ledger.table[0], witness.bundle);
             assert_staged_inventory(&incomplete);
             assert_tail_payload(
                 incomplete.pool,
@@ -1039,7 +1532,7 @@ mod tests {
         model: &[Vec<ModelRow>; LAYERS],
         witness: &TailWitness,
     ) -> Result<()> {
-        assert_eq!(pool.table[0], witness.bundle);
+        assert_eq!(pool.ledger.table[0], witness.bundle);
         assert_tail_payload(pool, witness.bundle, witness.fill, &witness.payload)?;
         assert_inventory(pool, None);
         assert_committed_matches(pool, model)
@@ -1094,22 +1587,25 @@ mod tests {
         let old_tail = if start.is_multiple_of(page_tokens) {
             None
         } else {
-            let page = pool.table.len() - 1;
-            let bundle = pool.table[page];
+            let page = pool.ledger.table.len() - 1;
+            let bundle = pool.ledger.table[page];
             Some((
                 bundle,
-                pool.fills[page],
-                tail_payload(&pool, bundle, pool.fills[page])?,
+                pool.ledger.fills[page],
+                tail_payload(&pool, bundle, pool.ledger.fills[page])?,
             ))
         };
         {
             let mut txn = pool.begin_append(append_tokens)?;
             assert_staged_inventory(&txn);
             if let Some((bundle, fill, payload)) = &old_tail {
-                assert_ne!(txn.pool.table[txn.pool.table.len() - 2], *bundle);
+                assert_ne!(
+                    txn.pool.ledger.table[txn.pool.ledger.table.len() - 2],
+                    *bundle
+                );
                 assert_tail_payload(txn.pool, *bundle, *fill, payload)?;
             } else {
-                assert!(txn.replaced_tail.is_none());
+                assert!(txn.reservation.replaced_tail.is_none());
             }
             write_layer(&mut txn, 0, start, append_tokens)?;
             assert_eq!(txn.layer_kv(0)?.tokens(), start + append_tokens);
@@ -1152,6 +1648,31 @@ mod tests {
                 page_tokens,
             )?;
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn native_plan_uses_explicit_page_choice_and_one_spare_bundle() -> Result<()> {
+        use kernels::attention::NativePageTokens;
+
+        let geometry = PagedKvGeometry {
+            layers: LAYERS,
+            row_width: ROW_WIDTH,
+            max_context: 20,
+        };
+        let native =
+            NativePagedKvPlan::try_from_geometry(geometry, 1, ROW_WIDTH, NativePageTokens::B32)?;
+        assert_eq!(native.layout().page_tokens(), 32);
+        assert_eq!(native.layout().physical_pages(), 2);
+        assert_eq!(
+            native.layout().backing_elements(),
+            LAYERS * 2 * 32 * ROW_WIDTH
+        );
+        assert!(
+            NativePagedKvPlan::try_from_geometry(geometry, 2, ROW_WIDTH, NativePageTokens::B8,)
+                .is_err()
+        );
         Ok(())
     }
     #[test]
