@@ -30,7 +30,7 @@ struct ModelStep {
 enum NativeModelLayer {
     Full(NativeWeights),
     Recurrent {
-        weights: NativeRecurrentWeights,
+        weights: Box<NativeRecurrentWeights>,
         state: NativeRecurrentState,
         finish: LayerFinishWeights,
     },
@@ -74,10 +74,12 @@ impl ModelDeviceResources {
             .context(NativePagedKvSnafu)?;
         let full_workspace = plan
             .full_workspace
-            .map(|workspace| NativeWorkspace::new(&workspace, device))
+            .as_ref()
+            .map(|workspace| NativeWorkspace::new(workspace, device))
             .transpose()?;
         let recurrent_workspace = plan
             .recurrent_workspace
+            .as_ref()
             .map(|workspace| NativeRecurrentWorkspace::new(workspace, device))
             .transpose()?;
         let finish_workspace = LayerFinishWorkspace::new(plan.finish_workspace, device)?;
@@ -365,7 +367,7 @@ fn upload_layers(
                 NativeModelLayer::Full(NativeWeights::upload(weights, plan, device)?)
             }
             NativeBlockPlan::Recurrent { plan, finish } => NativeModelLayer::Recurrent {
-                weights: NativeRecurrentWeights::upload(weights, plan, device)?,
+                weights: Box::new(NativeRecurrentWeights::upload(weights, plan, device)?),
                 state: NativeRecurrentState::new(plan, device)?,
                 finish: LayerFinishWeights::upload(weights, finish, device)?,
             },
