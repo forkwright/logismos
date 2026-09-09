@@ -1,6 +1,7 @@
 //! Owned native resources for one whole Qwen3.5 main-model step.
 
 use cache::NativePagedKvPool;
+use core::mem::ManuallyDrop;
 use hipcore::{
     Device, DeviceBuffer, InventoryRelease, NonOwnedStream, Stream, TeardownBuffer,
     TeardownInventory,
@@ -85,32 +86,18 @@ pub(super) struct ModelSessionResources {
 /// therefore retain, rather than decrement the last resident `Arc` into the
 /// ordinary `DeviceBuffer` drop path.
 pub(super) struct ResidentRetention<T> {
-    resident: Option<Arc<T>>,
+    resident: ManuallyDrop<Arc<T>>,
 }
 
 impl<T> ResidentRetention<T> {
     const fn new(resident: Arc<T>) -> Self {
         Self {
-            resident: Some(resident),
+            resident: ManuallyDrop::new(resident),
         }
     }
 
-    fn recover(mut self) -> Arc<T> {
-        match self.resident.take() {
-            Some(resident) => resident,
-            None => unreachable!("resident retention is recovered only once"),
-        }
-    }
-}
-
-impl<T> Drop for ResidentRetention<T> {
-    fn drop(&mut self) {
-        if let Some(resident) = self.resident.take() {
-            // Explicit aggregate teardown has no physical-eviction authority
-            // over immutable uploads. Preserve the exact owner rather than
-            // allowing its last Arc decrement to enter ordinary HIP Drop.
-            core::mem::forget(resident);
-        }
+    fn recover(self) -> Arc<T> {
+        ManuallyDrop::into_inner(self.resident)
     }
 }
 
