@@ -14,9 +14,11 @@ is available; the RX 7900 XTX is a
 planned second device and requires its own qualification. The experimental below-HIP
 provider remains unimplemented.
 
-The standalone [`Q8_0 GEMV`](crates/kernels/src/q8_0_gemv/mod.rs) primitive
+The standalone [serialized-row GEMV](crates/kernels/src/row_gemv/mod.rs) primitive
 shares checked format geometry with `quant` and supplies an explicit CPU
-reference plus a HIP launcher. The GPU numerical domain excludes subnormal
+reference plus private HIP launchers for its executable row formats. Serialized
+F32 weights remain f32 rather than being converted to fp16.
+The GPU numerical domain excludes subnormal
 scales, operands and intermediates pending denormal-mode qualification.
 GPU compilation is not numerical or performance
 qualification; native text/retrieval execution is still CPU-only.
