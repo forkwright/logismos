@@ -2,13 +2,12 @@
 
 use smallvec::SmallVec;
 
+use crate::error::{
+    GeometryOverflowSnafu, LayoutEmptyOffsetSnafu, LayoutRankMismatchSnafu, Result,
+};
 use crate::shape::Shape;
 
 /// Layout describing how tensor elements sit in storage.
-///
-/// Strides are in **elements**, not bytes, matching candle's choice
-/// (`candle-core/src/layout.rs:6`). Bytes are recovered by
-/// multiplying through `DType::size_in_bytes_exact`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
     shape: Shape,
@@ -18,33 +17,85 @@ pub struct Layout {
 
 impl Layout {
     /// Canonical row-major contiguous layout for `shape`.
-    #[must_use]
-    pub(crate) fn contiguous(shape: Shape) -> Self {
+    pub(crate) fn contiguous(shape: Shape) -> Result<Self> {
+        shape.checked_elem_count()?;
         let dims = shape.dims();
         let mut stride: SmallVec<[usize; 6]> = SmallVec::with_capacity(dims.len());
         stride.resize(dims.len(), 0);
-        let mut acc: usize = 1;
-        for (i, &d) in dims.iter().enumerate().rev() {
-            if let Some(slot) = stride.get_mut(i) {
-                *slot = acc;
-            }
-            acc = acc.saturating_mul(d);
+        let mut acc = 1usize;
+        for (index, &dimension) in dims.iter().enumerate().rev() {
+            stride[index] = acc;
+            acc = acc.checked_mul(dimension).ok_or_else(|| {
+                GeometryOverflowSnafu {
+                    operation: "contiguous layout stride",
+                }
+                .build()
+            })?;
         }
-        Self {
+        Ok(Self {
             shape,
             stride,
             start_offset: 0,
-        }
+        })
     }
 
-    /// Construct from explicit parts.
-    #[must_use]
-    pub fn from_parts(shape: Shape, stride: SmallVec<[usize; 6]>, start_offset: usize) -> Self {
-        Self {
+    /// Construct a checked layout from explicit parts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::LayoutRankMismatch`] for incoherent ranks,
+    /// [`crate::Error::LayoutEmptyOffset`] for an empty layout with a nonzero
+    /// offset, or [`crate::Error::GeometryOverflow`] for an unrepresentable
+    /// full reachable storage span.
+    pub fn from_parts(
+        shape: Shape,
+        stride: SmallVec<[usize; 6]>,
+        start_offset: usize,
+    ) -> Result<Self> {
+        if shape.rank() != stride.len() {
+            return LayoutRankMismatchSnafu {
+                dimensions: shape.rank(),
+                strides: stride.len(),
+            }
+            .fail();
+        }
+        let elements = shape.checked_elem_count()?;
+        if elements == 0 {
+            if start_offset != 0 {
+                return LayoutEmptyOffsetSnafu { start_offset }.fail();
+            }
+            return Ok(Self {
+                shape,
+                stride,
+                start_offset,
+            });
+        }
+        let max_index = shape.dims().iter().zip(&stride).try_fold(
+            start_offset,
+            |end, (&dimension, &step)| {
+                dimension
+                    .checked_sub(1)
+                    .and_then(|width| width.checked_mul(step))
+                    .and_then(|width| end.checked_add(width))
+                    .ok_or_else(|| {
+                        GeometryOverflowSnafu {
+                            operation: "layout storage span",
+                        }
+                        .build()
+                    })
+            },
+        )?;
+        max_index.checked_add(1).ok_or_else(|| {
+            GeometryOverflowSnafu {
+                operation: "layout storage element span",
+            }
+            .build()
+        })?;
+        Ok(Self {
             shape,
             stride,
             start_offset,
-        }
+        })
     }
 
     /// Per-axis extent (this layout's view over the storage).
@@ -71,27 +122,31 @@ impl Layout {
         self.start_offset
     }
 
-    /// Number of logical elements.
-    #[must_use]
-    pub fn elem_count(&self) -> usize {
-        self.shape.elem_count()
+    /// Return this layout's exact logical element count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::GeometryOverflow`] if the shape product cannot
+    /// be represented.
+    pub fn checked_elem_count(&self) -> Result<usize> {
+        self.shape.checked_elem_count()
     }
 
     /// Is the layout canonical row-major contiguous from offset 0?
     #[must_use]
     pub fn is_contiguous(&self) -> bool {
-        if self.start_offset != 0 {
+        if self.start_offset != 0 || self.shape.rank() != self.stride.len() {
             return false;
         }
-        let mut expected: usize = 1;
-        for (&dim, &stride) in self.shape.dims().iter().rev().zip(self.stride.iter().rev()) {
-            if dim == 1 {
-                continue;
-            }
-            if stride != expected {
+        let mut expected = 1usize;
+        for (&dimension, &stride) in self.shape.dims().iter().rev().zip(self.stride.iter().rev()) {
+            if dimension != 1 && stride != expected {
                 return false;
             }
-            expected = expected.saturating_mul(dim);
+            let Some(next) = expected.checked_mul(dimension) else {
+                return false;
+            };
+            expected = next;
         }
         true
     }
@@ -102,31 +157,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contiguous_3d_strides() {
-        let l = Layout::contiguous(Shape::new(&[2, 3, 4]));
-        assert_eq!(l.stride(), &[12, 4, 1]);
-        assert!(l.is_contiguous());
-        assert_eq!(l.elem_count(), 24);
+    fn contiguous_3d_strides() -> Result<()> {
+        let layout = Layout::contiguous(Shape::new(&[2, 3, 4]))?;
+        assert_eq!(layout.stride(), &[12, 4, 1]);
+        assert!(layout.is_contiguous());
+        assert_eq!(layout.checked_elem_count()?, 24);
+        Ok(())
     }
 
     #[test]
-    fn contiguous_with_unit_dim() {
-        let l = Layout::contiguous(Shape::new(&[2, 1, 4]));
-        assert!(l.is_contiguous());
+    fn singleton_dimension_layout_is_contiguous() -> Result<()> {
+        let layout =
+            Layout::from_parts(Shape::new(&[2, 1, 4]), SmallVec::from_slice(&[4, 4, 1]), 0)?;
+        assert!(layout.is_contiguous());
+        Ok(())
     }
 
     #[test]
-    fn non_zero_start_offset_is_not_contiguous() {
-        // WHY(forkwright/logismos#58): the only prior tests build via
-        // `Layout::contiguous`, where `start_offset` is always 0 — the
-        // `start_offset != 0` branch in `is_contiguous` had zero
-        // coverage. `from_parts` is the only way to set a non-zero
-        // offset (e.g. a future view/slice API). This is the
-        // negative-case fixture for that branch: it fails if the
-        // `start_offset != 0 { return false }` guard is ever dropped.
-        let base = Layout::contiguous(Shape::new(&[2, 3]));
-        let sliced =
-            Layout::from_parts(base.shape().clone(), SmallVec::from_slice(base.stride()), 3);
-        assert!(!sliced.is_contiguous());
+    fn scalar_and_empty_layouts_have_explicit_spans() -> Result<()> {
+        let scalar = Layout::from_parts(Shape::scalar(), SmallVec::new(), 0)?;
+        assert_eq!(scalar.checked_elem_count()?, 1);
+        let empty = Layout::from_parts(Shape::new(&[0, 3]), SmallVec::from_slice(&[3, 1]), 0)?;
+        assert_eq!(empty.checked_elem_count()?, 0);
+        assert!(empty.is_contiguous());
+        Ok(())
+    }
+
+    #[test]
+    fn valid_strided_layout_is_not_contiguous() -> Result<()> {
+        let layout = Layout::from_parts(Shape::new(&[2, 2]), SmallVec::from_slice(&[3, 1]), 0)?;
+        assert!(!layout.is_contiguous());
+        Ok(())
+    }
+
+    #[test]
+    fn offset_layout_is_not_contiguous() -> Result<()> {
+        let layout = Layout::from_parts(Shape::new(&[2, 3]), SmallVec::from_slice(&[3, 1]), 3)?;
+        assert!(!layout.is_contiguous());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_layout_rejects_incoherent_rank() {
+        let err = Layout::from_parts(Shape::new(&[2, 3]), SmallVec::from_slice(&[1]), 0);
+        assert!(matches!(err, Err(crate::Error::LayoutRankMismatch { .. })));
+    }
+
+    #[test]
+    fn explicit_layout_rejects_excess_stride_rank() {
+        let err = Layout::from_parts(Shape::new(&[2]), SmallVec::from_slice(&[1, 1]), 0);
+        assert!(matches!(err, Err(crate::Error::LayoutRankMismatch { .. })));
+    }
+
+    #[test]
+    fn empty_layout_rejects_nonzero_offset() {
+        let err = Layout::from_parts(Shape::new(&[0]), SmallVec::from_slice(&[1]), 1);
+        assert!(matches!(err, Err(crate::Error::LayoutEmptyOffset { .. })));
+    }
+
+    #[test]
+    fn explicit_layout_rejects_overflowing_span() {
+        let err = Layout::from_parts(Shape::new(&[2]), SmallVec::from_slice(&[usize::MAX]), 1);
+        assert!(matches!(err, Err(crate::Error::GeometryOverflow { .. })));
+    }
+
+    #[test]
+    fn scalar_layout_rejects_overflowing_full_span() {
+        let err = Layout::from_parts(Shape::scalar(), SmallVec::new(), usize::MAX);
+        assert!(matches!(err, Err(crate::Error::GeometryOverflow { .. })));
     }
 }

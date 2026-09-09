@@ -1,7 +1,27 @@
 //! Unit tests for the Phase-3 fp32 CPU reference kernels.
 
 use super::*;
-use crate::error::{Error, RmsNormStage};
+use crate::error::{Error, RmsNormStage, UnitNormalizationStage};
+
+fn independent_l2_norm(values: &[f32]) -> f64 {
+    values
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn assert_unit_normalized(values: &[f32]) {
+    assert!(
+        values.iter().all(|value| value.is_finite()),
+        "normalized values must be finite: {values:?}"
+    );
+    let norm = independent_l2_norm(values);
+    assert!(
+        (norm - 1.0).abs() <= UNIT_NORM_TOLERANCE,
+        "normalized L2 norm {norm} exceeded tolerance {UNIT_NORM_TOLERANCE}"
+    );
+}
 
 #[test]
 fn embed_lookup_in_range_copies_rows() {
@@ -368,33 +388,35 @@ fn linear_t_mismatched_b_len_panics() {
 }
 
 #[test]
-fn softmax_rows_sum_to_one() {
+fn softmax_rows_sum_to_one() -> Result<()> {
     let x = [0.0_f32, 1.0, 2.0, -1.0, 0.0, 1.0];
-    let y = softmax_last_dim(&x, 2, 3);
+    let y = softmax_last_dim(&x, 2, 3)?;
     for r in 0..2 {
         let s: f32 = y[r * 3..(r + 1) * 3].iter().sum();
         assert!((s - 1.0).abs() < 1e-6);
     }
+    Ok(())
 }
 
 #[test]
-fn softmax_fully_masked_row_is_uniform_not_nan() {
+fn softmax_fully_masked_row_is_uniform_not_nan() -> Result<()> {
     // WHY(forkwright/logismos#30): a row that is entirely
     // `f32::NEG_INFINITY` (a fully-masked attention row) used to
     // produce `NaN` in every slot via `(NEG_INF - NEG_INF).exp()`.
     // It must instead be a finite, uniform distribution.
     let x = [f32::NEG_INFINITY; 4];
-    let y = softmax_last_dim(&x, 1, 4);
+    let y = softmax_last_dim(&x, 1, 4)?;
     assert!(y.iter().all(|v| v.is_finite()), "row contains NaN: {y:?}");
     let sum: f32 = y.iter().sum();
     assert!((sum - 1.0).abs() < 1e-6, "row does not sum to 1: {sum}");
     for v in &y {
         assert!((v - 0.25).abs() < 1e-6, "row is not uniform: {y:?}");
     }
+    Ok(())
 }
 
 #[test]
-fn softmax_mixed_masked_and_unmasked_rows_both_finite() {
+fn softmax_mixed_masked_and_unmasked_rows_both_finite() -> Result<()> {
     // A batch where one row is fully masked and the other is not —
     // the fully-masked row must not poison the unmasked one, and both
     // must come back finite.
@@ -406,7 +428,7 @@ fn softmax_mixed_masked_and_unmasked_rows_both_finite() {
         1.0,
         2.0,
     ];
-    let y = softmax_last_dim(&x, 2, 3);
+    let y = softmax_last_dim(&x, 2, 3)?;
     assert!(
         y.iter().all(|v| v.is_finite()),
         "output contains NaN: {y:?}"
@@ -415,6 +437,55 @@ fn softmax_mixed_masked_and_unmasked_rows_both_finite() {
     let row1_sum: f32 = y[3..6].iter().sum();
     assert!((row0_sum - 1.0).abs() < 1e-6);
     assert!((row1_sum - 1.0).abs() < 1e-6);
+    Ok(())
+}
+
+#[test]
+fn softmax_rejects_malformed_shapes_in_every_profile() {
+    let short = softmax_last_dim(&[1.0_f32; 3], 1, 4);
+    assert!(matches!(short, Err(Error::SoftmaxShape { .. })));
+
+    let long = softmax_last_dim(&[1.0_f32; 5], 1, 4);
+    assert!(matches!(long, Err(Error::SoftmaxShape { .. })));
+
+    let empty_axis = softmax_last_dim(&[], 0, 0);
+    assert!(matches!(
+        empty_axis,
+        Err(Error::SoftmaxInvalidDimension { .. })
+    ));
+
+    let overflow = softmax_last_dim(&[], usize::MAX, 2);
+    assert!(matches!(overflow, Err(Error::SoftmaxSizeOverflow { .. })));
+}
+
+#[test]
+fn softmax_rejects_nan_and_positive_infinity_without_rejecting_masks() {
+    for logits in [
+        [f32::NAN, f32::NAN],
+        [f32::NAN, f32::NEG_INFINITY],
+        [0.0, f32::NAN],
+        [f32::INFINITY, f32::NEG_INFINITY],
+    ] {
+        let result = softmax_last_dim(&logits, 1, 2);
+        assert!(matches!(result, Err(Error::SoftmaxNonFinite { .. })));
+    }
+}
+
+#[test]
+fn softmax_preserves_row_offsets() -> Result<()> {
+    let x = [-4.0_f32, -3.0, -2.0, 5.0, 4.0, 3.0];
+    let y = softmax_last_dim(&x, 2, 3)?;
+    let expected_first = [0.090_030_57, 0.244_728_48, 0.665_240_94];
+    let expected_rows = [
+        expected_first,
+        [expected_first[2], expected_first[1], expected_first[0]],
+    ];
+    for (row, expected) in y.chunks_exact(3).zip(expected_rows) {
+        for (&actual, expected) in row.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -514,11 +585,80 @@ fn mean_pool_masked_all_zero_mask_stays_finite() {
 }
 
 #[test]
-fn l2_normalize_projects_to_unit() {
-    let mut v = vec![3.0_f32, 4.0];
-    l2_normalize_in_place(&mut v);
-    assert!((v[0] - 0.6).abs() < 1e-6);
-    assert!((v[1] - 0.8).abs() < 1e-6);
+fn l2_normalize_projects_ordinary_values_to_unit() -> Result<()> {
+    let mut values = [3.0_f32, 4.0];
+    l2_normalize_in_place(&mut values)?;
+    assert!((values[0] - 0.6).abs() < 1e-6);
+    assert!((values[1] - 0.8).abs() < 1e-6);
+    assert_unit_normalized(&values);
+    Ok(())
+}
+
+#[test]
+fn l2_normalize_handles_large_finite_values() -> Result<()> {
+    let mut values = [1.0e20_f32, -1.0e20_f32];
+    l2_normalize_in_place(&mut values)?;
+    assert!((values[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+    assert!((values[1] + std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+    assert_unit_normalized(&values);
+    Ok(())
+}
+
+#[test]
+fn l2_normalize_handles_small_finite_values() -> Result<()> {
+    let smallest = f32::from_bits(1);
+    let mut values = [smallest, -smallest];
+    l2_normalize_in_place(&mut values)?;
+    assert!((values[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+    assert!((values[1] + std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+    assert_unit_normalized(&values);
+    Ok(())
+}
+
+#[test]
+fn l2_normalize_handles_mixed_finite_magnitudes() -> Result<()> {
+    let mut values = [f32::MAX, 1.0, f32::MIN_POSITIVE, -f32::MAX];
+    l2_normalize_in_place(&mut values)?;
+    assert!(values[0].is_sign_positive());
+    assert!(values[1].is_sign_positive());
+    assert!(values[2].is_sign_positive());
+    assert!(values[3].is_sign_negative());
+    assert_unit_normalized(&values);
+    Ok(())
+}
+
+#[test]
+fn l2_normalize_refuses_empty_and_zero_vectors_without_writes() {
+    let mut empty = [];
+    assert!(matches!(
+        l2_normalize_in_place(&mut empty),
+        Err(Error::UnitNormalizationZeroNorm { elements: 0, .. })
+    ));
+
+    let mut zero = [0.0_f32, -0.0, 0.0];
+    let before = zero.map(f32::to_bits);
+    assert!(matches!(
+        l2_normalize_in_place(&mut zero),
+        Err(Error::UnitNormalizationZeroNorm { elements: 3, .. })
+    ));
+    assert_eq!(zero.map(f32::to_bits), before);
+}
+
+#[test]
+fn l2_normalize_refuses_non_finite_input_without_partial_writes() {
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut values = [3.0_f32, invalid, 4.0];
+        let before = values.map(f32::to_bits);
+        assert!(matches!(
+            l2_normalize_in_place(&mut values),
+            Err(Error::UnitNormalizationNonFinite {
+                stage: UnitNormalizationStage::Input,
+                index: 1,
+                ..
+            })
+        ));
+        assert_eq!(values.map(f32::to_bits), before);
+    }
 }
 
 #[test]

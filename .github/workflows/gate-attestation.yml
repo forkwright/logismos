@@ -106,6 +106,7 @@ jobs:
       nextest_cmd: "LOGISMOS_HIP_BUILD=cpu-only cargo nextest run --workspace --no-fail-fast && LOGISMOS_HIP_BUILD=cpu-only cargo nextest run --release -p kernels --no-fail-fast"
       doctest_cmd: ""
       system_packages: "libamdhip64-dev"
+      system_packages_ubuntu_only: true
       needs_fleet_repo_token: false
       rust_cache_key: "gate-attestation"
       ai_attribution_check: true

@@ -152,7 +152,7 @@ impl HipStorage {
     ///
     /// [`Error::Hip`] on allocation or zero-fill failure.
     pub fn alloc(device: &Device, dtype: DType, elem_count: usize) -> Result<Self> {
-        let bytes = dtype.byte_count(elem_count);
+        let bytes = dtype.checked_byte_count(elem_count)?;
         let mut buffer = DeviceBuffer::<u8>::alloc(device, bytes)?;
         // WARNING: `hipMalloc` does not zero device memory. This
         // constructor's name and contract promise zeroed output (see

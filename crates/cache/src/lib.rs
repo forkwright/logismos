@@ -22,6 +22,11 @@
 //! sliced views.
 //! Paged geometry and transaction ownership are separate from this legacy
 //! tensor layout and do not initialize a device runtime.
+//!
+//! Legacy flat geometry is constructed only through [`CacheLayout::new`], and
+//! [`FlatKvCache::new`] remains fallible because its validated K/V backing
+//! still requires allocator reservations. This is the intentional migration
+//! from public field literals and infallible flat-cache allocation.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -93,14 +98,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_layout_row_elems_multiplies_heads_by_width() {
-        let layout = CacheLayout {
-            num_layers: 2,
-            num_kv_heads: 4,
-            head_dim: 8,
-            max_seq_len: 16,
-            dtype: taxis::DType::F16,
-        };
+    fn cache_layout_row_elems_multiplies_heads_by_width() -> Result<()> {
+        let layout = CacheLayout::new(2, 4, 8, 16, taxis::DType::F16)?;
         assert_eq!(layout.row_elems(), 32);
+        Ok(())
+    }
+
+    #[test]
+    fn cache_layout_rejects_zero_configured_dimension() {
+        for result in [
+            CacheLayout::new(0, 4, 8, 16, taxis::DType::F16),
+            CacheLayout::new(2, 0, 8, 16, taxis::DType::F16),
+            CacheLayout::new(2, 4, 0, 16, taxis::DType::F16),
+            CacheLayout::new(2, 4, 8, 0, taxis::DType::F16),
+        ] {
+            assert!(matches!(result, Err(Error::FlatZeroDimension { .. })));
+        }
+    }
+
+    #[test]
+    fn cache_layout_rejects_overflowing_row() {
+        let result = CacheLayout::new(1, usize::MAX, 2, 1, taxis::DType::F16);
+        assert!(matches!(result, Err(Error::FlatArithmetic { .. })));
+    }
+
+    #[test]
+    fn cache_layout_rejects_overflowing_dtype_bytes() {
+        let result = CacheLayout::new(1, usize::MAX, 1, 1, taxis::DType::F32);
+        assert!(matches!(result, Err(Error::Taxis { .. })));
+    }
+
+    #[test]
+    fn cache_layout_rejects_overflowing_per_layer_context() {
+        let result = CacheLayout::new(1, 1, 1, usize::MAX, taxis::DType::F32);
+        assert!(matches!(result, Err(Error::FlatArithmetic { .. })));
+    }
+
+    #[test]
+    fn cache_layout_rejects_overflowing_all_layer_backing() {
+        let result = CacheLayout::new(usize::MAX, 1, 1, 1, taxis::DType::F32);
+        assert!(matches!(result, Err(Error::FlatArithmetic { .. })));
     }
 }

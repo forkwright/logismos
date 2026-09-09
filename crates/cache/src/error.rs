@@ -10,6 +10,41 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
+    /// Flat-cache geometry has a zero configured dimension.
+    #[cfg(feature = "flat")]
+    #[snafu(display("cache: flat {field} must be nonzero"))]
+    FlatZeroDimension {
+        /// Invalid geometry field.
+        field: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Checked flat-cache geometry arithmetic overflowed.
+    #[cfg(feature = "flat")]
+    #[snafu(display("cache: flat {operation} overflowed"))]
+    FlatArithmetic {
+        /// Checked arithmetic operation.
+        operation: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Flat-cache allocation could not reserve requested backing.
+    #[cfg(feature = "flat")]
+    #[snafu(display("cache: could not reserve flat {target} backing"))]
+    FlatAllocation {
+        /// Allocation purpose.
+        target: &'static str,
+        /// Allocator error retained for callers.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// Underlying HIP ownership or synchronization failure for the optional native cache.
     #[cfg(feature = "gpu")]
     #[snafu(transparent)]

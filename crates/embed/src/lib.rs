@@ -50,14 +50,66 @@ pub use crate::qwen3::{
 #[cfg(feature = "stella")]
 pub use crate::stella::{StellaDim, StellaModel};
 
+#[cfg(any(feature = "stella", test))]
+fn project_stella_head(
+    mut pooled: Vec<f32>,
+    weight: &[f32],
+    bias: &[f32],
+    output_dim: usize,
+    hidden: usize,
+) -> Result<Vec<f32>> {
+    use snafu::ResultExt;
+
+    kernels::cpu_f32::l2_normalize_in_place(&mut pooled)
+        .context(crate::error::UnitNormalizationSnafu)?;
+    let mut projected =
+        kernels::cpu_f32::linear_t(&pooled, weight, Some(bias), 1, output_dim, hidden);
+    kernels::cpu_f32::l2_normalize_in_place(&mut projected)
+        .context(crate::error::UnitNormalizationSnafu)?;
+    Ok(projected)
+}
+
+#[cfg(any(feature = "stella", test))]
+fn map_compute_error(error: &Error) -> logismos_core::EmbeddingError {
+    logismos_core::ComputeSnafu {
+        message: error.to_string(),
+    }
+    .build()
+}
+
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "stella")]
     use super::*;
+    use logismos_core::EmbeddingError;
 
     #[cfg(feature = "stella")]
     #[test]
     fn stella_dims_include_default_width() {
         assert!(StellaDim::all().contains(&StellaDim::Dim1024));
+    }
+
+    #[test]
+    fn tiny_stella_head_produces_independently_expected_unit_output() -> Result<()> {
+        let output = project_stella_head(vec![3.0, 4.0], &[1.0, 0.0, 0.0, 1.0], &[0.0, 0.0], 2, 2)?;
+        assert!((output[0] - 0.6).abs() <= 1e-6);
+        assert!((output[1] - 0.8).abs() <= 1e-6);
+        let norm = output
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>()
+            .sqrt();
+        assert!((norm - 1.0).abs() <= kernels::cpu_f32::UNIT_NORM_TOLERANCE);
+        Ok(())
+    }
+
+    #[test]
+    fn tiny_stella_zero_head_maps_refusal_to_public_compute_error() {
+        let result = project_stella_head(vec![3.0, 4.0], &[0.0, 0.0, 0.0, 0.0], &[0.0, 0.0], 2, 2)
+            .map_err(|error| map_compute_error(&error));
+        assert!(matches!(
+            result,
+            Err(EmbeddingError::Compute { ref message, .. })
+                if message.contains("zero L2 norm")
+        ));
     }
 }

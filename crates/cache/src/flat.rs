@@ -5,12 +5,12 @@
 //! produces a fresh `taxis::Tensor` of shape
 //! `[len, num_kv_heads * head_dim]`.
 //!
-//! The cache stores bytes rather than typed `Vec<T>` so one impl covers
-//! every dtype. Conversion back to a typed tensor happens only at `get`
-//! time through the dtype-dispatched branch.
+//! The cache stores bytes rather than typed `Vec<T>` and marshals the
+//! supported f32/f16/bf16/i32/i8/u8 storage variants. F8 and I4 tensor
+//! marshalling is unsupported and returns a typed refusal.
 //!
-//! Paged + radix layouts (Phases 6 + 12) will replace the flat arrays
-//! with block tables but keep the same `KvCache` trait contract.
+//! Native hybrid execution uses separate execution-private paged KV. This
+//! legacy cache retains its flat tensor-based [`KvCache`] contract.
 //!
 //! ## Byte-marshalling convention
 //!
@@ -23,48 +23,111 @@
 
 use std::borrow::Cow;
 
+use snafu::ResultExt;
 use taxis::{CpuStorage, DType, Shape, Tensor};
 
 use crate::KvCache;
 use crate::error::{
-    DTypeMismatchSnafu, LayerOutOfRangeSnafu, LenOverflowSnafu, MsgSnafu, ReadBeyondWrittenSnafu,
-    Result, ShapeMismatchSnafu, UnsupportedStorageSnafu,
+    DTypeMismatchSnafu, FlatAllocationSnafu, FlatArithmeticSnafu, FlatZeroDimensionSnafu,
+    LayerOutOfRangeSnafu, LenOverflowSnafu, MsgSnafu, ReadBeyondWrittenSnafu, Result,
+    ShapeMismatchSnafu, UnsupportedStorageSnafu,
 };
 
 /// Shape + dtype invariants of a cache.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheLayout {
     /// Number of transformer layers.
-    pub num_layers: usize,
-    /// Number of KV heads (after GQA reduction from Q heads).
-    pub num_kv_heads: usize,
-    /// Head dimension.
-    pub head_dim: usize,
+    num_layers: usize,
     /// Maximum context length this cache was sized for.
-    pub max_seq_len: usize,
+    max_seq_len: usize,
     /// Dtype of cached K and V tensors.
-    pub dtype: DType,
+    dtype: DType,
+    row_elems: usize,
+    row_bytes: usize,
+    buffer_bytes: usize,
 }
 
 impl CacheLayout {
+    /// Construct checked immutable cache geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::FlatZeroDimension`] for a zero configured
+    /// dimension, [`crate::Error::FlatArithmetic`] when any row, per-layer,
+    /// or all-layer K/V backing extent overflows, and [`crate::Error::Taxis`]
+    /// when the dtype byte extent cannot be represented.
+    pub fn new(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        dtype: DType,
+    ) -> Result<Self> {
+        for (field, value) in [
+            ("num_layers", num_layers),
+            ("num_kv_heads", num_kv_heads),
+            ("head_dim", head_dim),
+            ("max_seq_len", max_seq_len),
+        ] {
+            if value == 0 {
+                return FlatZeroDimensionSnafu { field }.fail();
+            }
+        }
+        let row_elems = num_kv_heads.checked_mul(head_dim).ok_or_else(|| {
+            FlatArithmeticSnafu {
+                operation: "row elements",
+            }
+            .build()
+        })?;
+        let row_bytes = dtype.checked_byte_count(row_elems)?;
+        let buffer_bytes = row_bytes.checked_mul(max_seq_len).ok_or_else(|| {
+            FlatArithmeticSnafu {
+                operation: "per-layer buffer bytes",
+            }
+            .build()
+        })?;
+        buffer_bytes
+            .checked_mul(num_layers)
+            .and_then(|per_kind| per_kind.checked_mul(2))
+            .ok_or_else(|| {
+                FlatArithmeticSnafu {
+                    operation: "all-layer K/V backing bytes",
+                }
+                .build()
+            })?;
+        Ok(Self {
+            num_layers,
+            max_seq_len,
+            dtype,
+            row_elems,
+            row_bytes,
+            buffer_bytes,
+        })
+    }
+
     /// Row stride in bytes: bytes per (token, layer) row across all
     /// KV heads.
     #[must_use]
     pub(crate) fn row_bytes(&self) -> usize {
-        let elems = self.num_kv_heads * self.head_dim;
-        self.dtype.byte_count(elems)
+        self.row_bytes
     }
 
     /// Total byte count per K or V buffer, per layer.
     #[must_use]
     pub(crate) fn buffer_bytes(&self) -> usize {
-        self.row_bytes() * self.max_seq_len
+        self.buffer_bytes
     }
 
     /// Row-width in element count (num_kv_heads × head_dim).
     #[must_use]
     pub fn row_elems(&self) -> usize {
-        self.num_kv_heads * self.head_dim
+        self.row_elems
+    }
+
+    /// Number of configured transformer layers.
+    #[must_use]
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
     }
 }
 
@@ -72,6 +135,75 @@ impl CacheLayout {
 struct TensorBytes<'t> {
     n_tokens: usize,
     bytes: Cow<'t, [u8]>,
+}
+
+struct AppendSpan {
+    next_len: usize,
+    offset: usize,
+    end: usize,
+}
+
+fn append_span(
+    layer_idx: usize,
+    current: usize,
+    append: usize,
+    row_bytes: usize,
+    max_seq_len: usize,
+) -> Result<AppendSpan> {
+    let next_len = current.checked_add(append).ok_or_else(|| {
+        FlatArithmeticSnafu {
+            operation: "append length",
+        }
+        .build()
+    })?;
+    if next_len > max_seq_len {
+        return LenOverflowSnafu {
+            layer_idx,
+            current,
+            n_new: append,
+            max_seq_len,
+        }
+        .fail();
+    }
+    let offset = current.checked_mul(row_bytes).ok_or_else(|| {
+        FlatArithmeticSnafu {
+            operation: "append offset",
+        }
+        .build()
+    })?;
+    let append_bytes = append.checked_mul(row_bytes).ok_or_else(|| {
+        FlatArithmeticSnafu {
+            operation: "append byte count",
+        }
+        .build()
+    })?;
+    let end = offset.checked_add(append_bytes).ok_or_else(|| {
+        FlatArithmeticSnafu {
+            operation: "append end offset",
+        }
+        .build()
+    })?;
+    Ok(AppendSpan {
+        next_len,
+        offset,
+        end,
+    })
+}
+
+fn allocate_buffers(count: usize, bytes: usize, target: &'static str) -> Result<Vec<Vec<u8>>> {
+    let mut buffers = Vec::new();
+    buffers
+        .try_reserve_exact(count)
+        .context(FlatAllocationSnafu { target })?;
+    for _ in 0..count {
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(bytes)
+            .context(FlatAllocationSnafu { target })?;
+        buffer.resize(bytes, 0);
+        buffers.push(buffer);
+    }
+    Ok(buffers)
 }
 
 /// Flat KV cache.
@@ -90,21 +222,26 @@ pub struct FlatKvCache {
 
 impl FlatKvCache {
     /// Allocate a cache sized according to `layout`.
-    #[must_use]
-    pub fn new(layout: CacheLayout) -> Self {
-        let buf_bytes = layout.buffer_bytes();
-        let k_buffers = (0..layout.num_layers)
-            .map(|_| vec![0u8; buf_bytes])
-            .collect();
-        let v_buffers = (0..layout.num_layers)
-            .map(|_| vec![0u8; buf_bytes])
-            .collect();
-        Self {
-            lens: vec![0; layout.num_layers],
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::FlatAllocation`] when any K, V, or length
+    /// backing reservation fails. `layout` has already checked the aggregate
+    /// K/V extent before this method begins allocating.
+    pub fn new(layout: CacheLayout) -> Result<Self> {
+        let buffer_bytes = layout.buffer_bytes();
+        let k_buffers = allocate_buffers(layout.num_layers, buffer_bytes, "K")?;
+        let v_buffers = allocate_buffers(layout.num_layers, buffer_bytes, "V")?;
+        let mut lens = Vec::new();
+        lens.try_reserve_exact(layout.num_layers)
+            .context(FlatAllocationSnafu { target: "length" })?;
+        lens.resize(layout.num_layers, 0);
+        Ok(Self {
             layout,
             k_buffers,
             v_buffers,
-        }
+            lens,
+        })
     }
 
     /// Layout the cache was sized with.
@@ -150,7 +287,13 @@ impl FlatKvCache {
             .build()
         })?;
         let bytes = cpu_storage_bytes(storage)?;
-        let expected = self.layout.dtype.byte_count(n_tokens * row_elems);
+        let expected_elements = n_tokens.checked_mul(row_elems).ok_or_else(|| {
+            FlatArithmeticSnafu {
+                operation: "tensor elements",
+            }
+            .build()
+        })?;
+        let expected = self.layout.dtype.checked_byte_count(expected_elements)?;
         if bytes.len() != expected {
             return ShapeMismatchSnafu {
                 msg: format!(
@@ -200,53 +343,45 @@ impl KvCache for FlatKvCache {
             }
             .build()
         })?;
-        if current + n_k > self.layout.max_seq_len {
-            return LenOverflowSnafu {
-                layer_idx,
-                current,
-                n_new: n_k,
-                max_seq_len: self.layout.max_seq_len,
-            }
-            .fail();
-        }
         let row_bytes = self.layout.row_bytes();
-        let off = current * row_bytes;
-        let end = off + n_k * row_bytes;
+        let span = append_span(layer_idx, current, n_k, row_bytes, self.layout.max_seq_len)?;
+        let AppendSpan {
+            next_len: next,
+            offset: off,
+            end,
+        } = span;
+        let buffer_bytes = self.layout.buffer_bytes();
         let shape_err = || {
             ShapeMismatchSnafu {
                 msg: format!(
                     "layer {layer_idx} buffer overflow (off={off}, end={end}, \
-                     buf_bytes={})",
-                    self.layout.buffer_bytes()
+                     buf_bytes={buffer_bytes})"
                 ),
             }
             .build()
         };
         let num_layers = self.layout.num_layers;
-        let k_buf = self.k_buffers.get_mut(layer_idx).ok_or_else(|| {
+        let (k_buffers, v_buffers) = (&mut self.k_buffers, &mut self.v_buffers);
+        let k_buf = k_buffers.get_mut(layer_idx).ok_or_else(|| {
             LayerOutOfRangeSnafu {
                 layer_idx,
                 num_layers,
             }
             .build()
         })?;
-        k_buf
-            .get_mut(off..end)
-            .ok_or_else(shape_err)?
-            .copy_from_slice(&k_bytes);
-        let v_buf = self.v_buffers.get_mut(layer_idx).ok_or_else(|| {
+        let v_buf = v_buffers.get_mut(layer_idx).ok_or_else(|| {
             LayerOutOfRangeSnafu {
                 layer_idx,
                 num_layers,
             }
             .build()
         })?;
-        v_buf
-            .get_mut(off..end)
-            .ok_or_else(shape_err)?
-            .copy_from_slice(&v_bytes);
+        let k_destination = k_buf.get_mut(off..end).ok_or_else(shape_err)?;
+        let v_destination = v_buf.get_mut(off..end).ok_or_else(shape_err)?;
+        k_destination.copy_from_slice(&k_bytes);
+        v_destination.copy_from_slice(&v_bytes);
         if let Some(slot) = self.lens.get_mut(layer_idx) {
-            *slot = current + n_k;
+            *slot = next;
         }
         Ok(())
     }
@@ -269,7 +404,12 @@ impl KvCache for FlatKvCache {
             .fail();
         }
         let row_bytes = self.layout.row_bytes();
-        let end = len * row_bytes;
+        let end = len.checked_mul(row_bytes).ok_or_else(|| {
+            FlatArithmeticSnafu {
+                operation: "read end offset",
+            }
+            .build()
+        })?;
         let layer_err = || {
             LayerOutOfRangeSnafu {
                 layer_idx,
@@ -365,7 +505,12 @@ fn cpu_storage_bytes(s: &CpuStorage) -> Result<Cow<'_, [u8]>> {
 }
 
 fn cpu_tensor_from_bytes(dtype: DType, bytes: &[u8], shape: Shape) -> Result<Tensor> {
-    let elem_count = shape.elem_count();
+    let elem_count = shape.checked_elem_count().map_err(|_| {
+        FlatArithmeticSnafu {
+            operation: "decoded tensor element count",
+        }
+        .build()
+    })?;
     let storage = match dtype {
         DType::F32 => CpuStorage::F32(chunks_to_f32(bytes, elem_count)?),
         DType::F16 => CpuStorage::F16(chunks_to_f16(bytes, elem_count)?),
@@ -380,16 +525,14 @@ fn cpu_tensor_from_bytes(dtype: DType, bytes: &[u8], shape: Shape) -> Result<Ten
             .fail();
         }
     };
-    Ok(Tensor::from_cpu(storage, shape))
+    Tensor::from_cpu(storage, shape).map_err(crate::Error::from)
 }
 
-/// Postcondition on every `chunks_exact`-based decoder: `chunks_exact`
-/// silently drops a trailing partial chunk, so a byte length that isn't
-/// a whole multiple of the dtype width would otherwise produce a `Vec`
-/// shorter than `expected` — and `Tensor::from_cpu` performs no length
-/// check of its own against the `Shape` it's handed, so that mismatch
-/// would surface later as an out-of-bounds read, not a construction
-/// error.
+/// Reject a decoded-length mismatch at the serialized-byte boundary.
+///
+/// `chunks_exact` omits partial trailing chunks. Refusing here preserves
+/// byte-decoding context before the tensor constructor checks shape/storage
+/// compatibility independently.
 fn check_decoded_len(produced: usize, expected: usize, byte_len: usize) -> Result<()> {
     if produced != expected {
         return ShapeMismatchSnafu {

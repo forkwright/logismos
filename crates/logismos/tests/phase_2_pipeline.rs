@@ -126,26 +126,20 @@ fn phase_2_full_pipeline() -> Result<(), TestError> {
 /// Step 5 of the pipeline: write 3 rows × 2 layers into `FlatKvCache`, read
 /// them back, reset, confirm the cache zeroes its per-layer length.
 fn exercise_kv_cache() -> Result<(), TestError> {
-    let layout = CacheLayout {
-        num_layers: 2,
-        num_kv_heads: 2,
-        head_dim: 4,
-        max_seq_len: 16,
-        dtype: taxis::DType::F32,
-    };
-    let mut kv = FlatKvCache::new(layout);
+    let layout = CacheLayout::new(2, 2, 4, 16, taxis::DType::F32)?;
+    let mut kv = FlatKvCache::new(layout)?;
     let row_elems = layout.row_elems();
-    let mk_row = |val: f32| -> Tensor {
+    let mk_row = |val: f32| -> taxis::Result<Tensor> {
         Tensor::from_cpu(
             CpuStorage::F32(vec![val; row_elems]),
             Shape::new(&[1, row_elems]),
         )
     };
     for step in 0..3u8 {
-        for layer in 0..layout.num_layers {
+        for layer in 0..layout.num_layers() {
             let base = f32::from(step);
-            let k = mk_row(base + 0.1);
-            let v = mk_row(base + 0.9);
+            let k = mk_row(base + 0.1)?;
+            let v = mk_row(base + 0.9)?;
             kv.put(layer, &k, &v)?;
         }
     }

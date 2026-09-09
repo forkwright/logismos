@@ -8,9 +8,8 @@ use kernels::cpu_f32;
 use loader::WeightProvider;
 use loader::safetensors::Reader;
 use logismos_core::{
-    ComputeSnafu as CoreComputeSnafu, EmbeddingError, EmbeddingModel, EncodeOpts,
-    InputTooLongSnafu as CoreInputTooLongSnafu, Prompt, TokenizeSnafu as CoreTokenizeSnafu,
-    UnsupportedDimSnafu as CoreUnsupportedDimSnafu,
+    EmbeddingError, EmbeddingModel, EncodeOpts, InputTooLongSnafu as CoreInputTooLongSnafu, Prompt,
+    TokenizeSnafu as CoreTokenizeSnafu, UnsupportedDimSnafu as CoreUnsupportedDimSnafu,
     UnsupportedPromptSnafu as CoreUnsupportedPromptSnafu,
 };
 use tokenize::Tokenizer;
@@ -217,7 +216,7 @@ impl StellaModel {
     ///
     /// # Errors
     ///
-    /// Propagates encoder / shape failures.
+    /// Propagates encoder, shape, or unit-normalization failures.
     pub(crate) fn encode_raw(&self, ids: &[u32], mask: &[u8], dim: usize) -> Result<Vec<f32>> {
         let head = self
             .heads
@@ -229,22 +228,7 @@ impl StellaModel {
 
         // Mean pool
         let pooled = cpu_f32::mean_pool_masked(&hidden_states, mask, ids.len(), self.cfg.hidden);
-        // L2-normalise pooled (matches sentence-transformers pipeline).
-        let mut pooled_n = pooled;
-        cpu_f32::l2_normalize_in_place(&mut pooled_n);
-
-        // Dense head projection (fp32).
-        let mut y = cpu_f32::linear_t(
-            &pooled_n,
-            &head.weight,
-            Some(&head.bias),
-            1,
-            head.dim,
-            self.cfg.hidden,
-        );
-        // Final L2-normalise.
-        cpu_f32::l2_normalize_in_place(&mut y);
-        Ok(y)
+        crate::project_stella_head(pooled, &head.weight, &head.bias, head.dim, self.cfg.hidden)
     }
 }
 
@@ -316,12 +300,8 @@ impl EmbeddingModel for StellaModel {
             })?;
         check_token_limit(ids.len(), max_tokens)?;
         let mask = vec![1u8; ids.len()];
-        self.encode_raw(&ids, &mask, dim).map_err(|e| {
-            CoreComputeSnafu {
-                message: e.to_string(),
-            }
-            .build()
-        })
+        self.encode_raw(&ids, &mask, dim)
+            .map_err(|error| crate::map_compute_error(&error))
     }
 }
 

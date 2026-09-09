@@ -1,5 +1,7 @@
 //! Runtime dtype enumeration.
 
+use crate::error::{GeometryOverflowSnafu, Result};
+
 /// Runtime dtype tag.
 ///
 /// `#[non_exhaustive]` so the public surface can grow without breaking
@@ -47,10 +49,22 @@ impl DType {
         }
     }
 
-    /// Total byte count for `elem_count` elements, rounded up.
-    #[must_use]
-    pub fn byte_count(self, elem_count: usize) -> usize {
-        (self.size_in_bits() * elem_count).div_ceil(8)
+    /// Return the exact byte count for `elem_count` elements, rounded up.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::GeometryOverflow`] if the byte count cannot
+    /// fit in `usize`.
+    pub fn checked_byte_count(self, elem_count: usize) -> Result<usize> {
+        match self.size_in_bytes_exact() {
+            Some(bytes_per_element) => elem_count.checked_mul(bytes_per_element).ok_or_else(|| {
+                GeometryOverflowSnafu {
+                    operation: "dtype byte count",
+                }
+                .build()
+            }),
+            None => Ok(elem_count / 2 + elem_count % 2),
+        }
     }
 
     /// True when this dtype is supported end-to-end by the Phase-1

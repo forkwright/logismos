@@ -7,6 +7,13 @@
 //! backing. No const generics, no backend trait. Two storage variants:
 //! CPU and HIP. Every HIP storage-backed tensor pins a
 //! `hipcore::Device` for kernel dispatch.
+//!
+//! ## Geometry construction
+//!
+//! Shapes remain descriptive, but every layout and storage binding is now
+//! fallible: use [`Layout::from_parts`] for explicit checked spans and
+//! [`Tensor::from_cpu`] for exact CPU storage compatibility. This migration
+//! intentionally leaves no safe unchecked tensor-construction path.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -45,7 +52,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dtype_byte_count_rounds_subbyte_storage() {
-        assert_eq!(DType::I4.byte_count(3), 2);
+    fn dtype_byte_count_rounds_subbyte_storage() -> Result<()> {
+        assert_eq!(DType::I4.checked_byte_count(3)?, 2);
+        assert_eq!(
+            DType::I4.checked_byte_count(usize::MAX)?,
+            usize::MAX / 2 + 1
+        );
+        assert_eq!(DType::F32.checked_byte_count(1usize << 59)?, 1usize << 61);
+        Ok(())
     }
 }

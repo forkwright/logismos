@@ -49,13 +49,21 @@ resident uploads, per-session state, token controls and returned logits;
 arbitrarily retained outputs and qualified runtime overhead remain separate.
 Explicit close preserves mixed-resource custody through pending or uncertain
 teardown; only acknowledged session release permits recovery of its model
-reference. This is not yet aggregate construction-failure or service-accounting
-integration, and ordinary `Drop` remains no release receipt.
+reference. Aggregate construction failures retain their exact typed source and
+completed owners for explicit release or quarantine. Binding physical custody
+to service accounting remains incomplete; ordinary `Drop` is no release receipt.
 The status checks explicit operations, not hidden math-library temporaries, and
 still requires a qualified denorm-preserving compiler/math/device profile.
 The `logismos` facade selects this surface; direct CPU consumers keep it off.
 This is a qualification boundary, not a safe GPU text pipeline, serving,
 a resource grant, or evidence of W7900/XTX numerical or performance parity.
+
+The opt-in `hermeneus::NativeTextResident` binds one exact prepared-text profile
+to shared native uploads and per-request session plans. Qualified execution
+reuses the text generation policy, a caller-acquired logits row, and explicit
+output/session teardown; unresolved cleanup withholds the generated result.
+This remains an unsafe lower-level integration boundary, not a host-grant
+verifier, safe serving endpoint, or whole-runtime capacity guarantee.
 
 ## Why
 

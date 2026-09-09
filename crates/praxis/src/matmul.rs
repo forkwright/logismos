@@ -149,7 +149,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             Ok(Tensor::from_cpu(
                 taxis::CpuStorage::F16(out),
                 Shape::new(&[m, n]),
-            ))
+            )?)
         }
         // WHY(forkwright/logismos#39): a mixed pair used to fall through
         // the old wildcard arm — commented "CPU fallback — both on
@@ -181,7 +181,7 @@ mod tests {
 
     fn f16_tensor(values: &[f32], shape: &[usize]) -> Tensor {
         let data: Vec<f16> = values.iter().copied().map(f16::from_f32).collect();
-        Tensor::from_cpu(CpuStorage::F16(data), Shape::new(shape))
+        Tensor::from_cpu(CpuStorage::F16(data), Shape::new(shape)).expect("valid tensor fixture")
     }
 
     /// WHY: exercises the `DevicePlacement::BothCpu` arm through the

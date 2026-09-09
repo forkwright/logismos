@@ -202,7 +202,7 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
             Ok(Tensor::from_cpu(
                 taxis::CpuStorage::F16(host),
                 qk.shape().clone(),
-            ))
+            )?)
         }
     }
 }
@@ -247,7 +247,8 @@ mod tests {
         let qk = Tensor::from_cpu(
             CpuStorage::F16(vec![f16::from_f32(0.0); batch * seq * heads * head_dim]),
             Shape::new(&[batch, seq, heads, head_dim]),
-        );
+        )
+        .expect("valid tensor fixture");
         // Bypass `CosSinTable::new` — its CPU table builder
         // debug_asserts an even `head_dim` itself, which would panic
         // before `rope_apply`'s own validation ever ran. Constructing
