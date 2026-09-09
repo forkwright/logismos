@@ -1105,21 +1105,20 @@ mod tests {
         assert_plan_request(wide_b16, wide, 16);
         assert_eq!(PagedKvPlan::select(wide)?.page_tokens, PageTokens::B8);
         assert!(matches!(
-            PagedKvPlan::new(PagedKvGeometry {
-                layers: usize::MAX,
-                row_width: 2,
-                max_context: 1
-            }, PageTokens::B8),
+            PagedKvPlan::new(
+                PagedKvGeometry {
+                    layers: usize::MAX,
+                    row_width: 2,
+                    max_context: 1
+                },
+                PageTokens::B8
+            ),
             Err(Error::PagedArithmetic { .. })
         ));
         Ok(())
     }
 
-    fn assert_plan_request(
-        plan: PagedKvPlan,
-        geometry: PagedKvGeometry,
-        page_tokens: usize,
-    ) {
+    fn assert_plan_request(plan: PagedKvPlan, geometry: PagedKvGeometry, page_tokens: usize) {
         let page_count = geometry.max_context.div_ceil(page_tokens);
         let bundle_count = page_count + 1;
         let requested_f32 = bundle_count * geometry.layers * 2 * page_tokens * geometry.row_width;

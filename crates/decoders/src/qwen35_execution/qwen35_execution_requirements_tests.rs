@@ -330,11 +330,7 @@ fn assert_same_execution_state(
 ) -> std::result::Result<(), String> {
     assert_eq!(left_execution.position, right_execution.position);
     assert_eq!(left_execution.layers.len(), right_execution.layers.len());
-    for (left_layer, right_layer) in left_execution
-        .layers
-        .iter()
-        .zip(&right_execution.layers)
-    {
+    for (left_layer, right_layer) in left_execution.layers.iter().zip(&right_execution.layers) {
         match (left_layer, right_layer) {
             (LayerState::Recurrent(left), LayerState::Recurrent(right)) => {
                 assert_eq!(
