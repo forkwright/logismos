@@ -311,20 +311,31 @@ impl PagedKvPool {
     }
     /// One immutable committed layer.
     pub fn layer_kv(&self, layer: usize) -> Result<PagedLayerKv<'_>> {
-        self.committed().layer_kv(layer)
+        if layer >= self.plan.geometry.layers {
+            return PagedLayerOutOfRangeSnafu {
+                layer,
+                layers: self.plan.geometry.layers,
+            }
+            .fail();
+        }
+        Ok(PagedLayerKv {
+            pool: self,
+            layer,
+            tokens: self.committed_tokens,
+        })
     }
     /// Preflight whole-call capacity, then stage unpublished page changes.
     pub fn begin_append(&mut self, append_tokens: usize) -> Result<PagedAppend<'_>> {
         if append_tokens == 0 {
             return PagedEmptyAppendSnafu.fail();
         }
-        let target = self
-            .committed_tokens
+        let original_tokens = self.committed_tokens;
+        let target = original_tokens
             .checked_add(append_tokens)
             .filter(|x| *x <= self.plan.geometry.max_context)
             .ok_or_else(|| {
                 PagedContextOverflowSnafu {
-                    committed_tokens: self.committed_tokens,
+                    committed_tokens: original_tokens,
                     append_tokens,
                     max_context: self.plan.geometry.max_context,
                 }
@@ -332,7 +343,7 @@ impl PagedKvPool {
             })?;
         let old_pages = self.table.len();
         let target_pages = ceil(target, self.plan.page_tokens.count(), "append target pages")?;
-        let partial = self.committed_tokens % self.plan.page_tokens.count() != 0;
+        let partial = original_tokens % self.plan.page_tokens.count() != 0;
         let new_pages = target_pages.checked_sub(old_pages).ok_or_else(|| {
             PagedLayoutSnafu {
                 operation: "page table monotonicity",
@@ -366,7 +377,7 @@ impl PagedKvPool {
         Ok(PagedAppend {
             pool: self,
             append_tokens,
-            original_tokens: self.committed_tokens,
+            original_tokens,
             original_page_count: old_pages,
             replaced_tail,
             committed: false,

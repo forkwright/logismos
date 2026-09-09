@@ -64,6 +64,7 @@ pub enum Error {
     },
 
     /// Dtype of the supplied tensor does not match the cache.
+    #[cfg(feature = "flat")]
     #[snafu(display("cache: dtype mismatch — cache={cache:?}, supplied={supplied:?}"))]
     DTypeMismatch {
         /// Cache dtype.
