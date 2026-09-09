@@ -55,12 +55,15 @@ pub struct PagedKvPlan {
     page_count: usize,
     bundle_count: usize,
     requested_f32: usize,
+    backing_bytes: usize,
     metadata_bytes: usize,
     tail_copy_f32: usize,
+    tail_copy_bytes: usize,
+    total_requested_bytes: usize,
 }
 
 impl PagedKvPlan {
-    /// Select least backing, then metadata, then tail-copy cost.
+    /// Select the least checked CPU allocation request, then tail-copy cost.
     pub fn select(geometry: PagedKvGeometry) -> Result<Self> {
         let candidates = [
             Self::b8(geometry)?,
@@ -121,6 +124,12 @@ impl PagedKvPlan {
             }
             .build()
         })?;
+        let backing_bytes = requested_f32.checked_mul(size_of::<f32>()).ok_or_else(|| {
+            PagedArithmeticSnafu {
+                operation: "pool backing bytes",
+            }
+            .build()
+        })?;
         let metadata_entries = page_count
             .checked_mul(2)
             .and_then(|x| x.checked_add(bundle_count))
@@ -150,14 +159,29 @@ impl PagedKvPlan {
                 }
                 .build()
             })?;
+        let tail_copy_bytes = tail_copy_f32.checked_mul(size_of::<f32>()).ok_or_else(|| {
+            PagedArithmeticSnafu {
+                operation: "COW tail copy bytes",
+            }
+            .build()
+        })?;
+        let total_requested_bytes = backing_bytes.checked_add(metadata_bytes).ok_or_else(|| {
+            PagedArithmeticSnafu {
+                operation: "total pool requested bytes",
+            }
+            .build()
+        })?;
         Ok(Self {
             geometry,
             page_tokens,
             page_count,
             bundle_count,
             requested_f32,
+            backing_bytes,
             metadata_bytes,
             tail_copy_f32,
+            tail_copy_bytes,
+            total_requested_bytes,
         })
     }
     /// Geometry used to derive this plan.
@@ -185,6 +209,11 @@ impl PagedKvPlan {
     pub const fn requested_f32_elements(self) -> usize {
         self.requested_f32
     }
+    /// F32 backing expressed in checked bytes before allocation.
+    #[must_use]
+    pub const fn backing_bytes(self) -> usize {
+        self.backing_bytes
+    }
     /// Persistent non-f32 metadata capacity.
     #[must_use]
     pub const fn metadata_bytes(self) -> usize {
@@ -195,11 +224,20 @@ impl PagedKvPlan {
     pub const fn max_tail_copy_f32_elements(self) -> usize {
         self.tail_copy_f32
     }
-    fn cost(self) -> (usize, usize, usize, usize) {
+    /// Maximum partial-tail COW payload expressed in checked bytes.
+    #[must_use]
+    pub const fn max_tail_copy_bytes(self) -> usize {
+        self.tail_copy_bytes
+    }
+    /// Exact CPU allocation request: fixed backing plus persistent metadata.
+    #[must_use]
+    pub const fn total_requested_bytes(self) -> usize {
+        self.total_requested_bytes
+    }
+    fn cost(self) -> (usize, usize, usize) {
         (
-            self.requested_f32,
-            self.metadata_bytes,
-            self.tail_copy_f32,
+            self.total_requested_bytes,
+            self.tail_copy_bytes,
             self.page_tokens.count(),
         )
     }
@@ -773,11 +811,17 @@ fn ceil(value: usize, divisor: usize, operation: &'static str) -> Result<usize> 
         .ok_or_else(|| PagedArithmeticSnafu { operation }.build())
 }
 fn reserve<T>(length: usize, target: &'static str) -> Result<Vec<T>> {
+    allocation_layout::<T>(length, target)?;
     let mut values = Vec::new();
     values
         .try_reserve_exact(length)
         .context(PagedAllocationSnafu { target })?;
     Ok(values)
+}
+fn allocation_layout<T>(length: usize, target: &'static str) -> Result<()> {
+    std::alloc::Layout::array::<T>(length)
+        .map(|_| ())
+        .map_err(|_| PagedLayoutSnafu { operation: target }.build())
 }
 
 #[cfg(test)]
@@ -895,12 +939,44 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn selector_uses_owner_costs_and_geometry_overflow_refuses() -> Result<()> {
-        let selected = PagedKvPlan::select(geometry())?;
-        assert_eq!(selected.page_tokens(), PagedKvPageTokens::B8);
-        assert!(
-            selected.requested_f32_elements()
-                < PagedKvPlan::b16(selected.geometry())?.requested_f32_elements()
+    fn selector_minimizes_checked_cpu_request_not_page_size() -> Result<()> {
+        let narrow = PagedKvGeometry {
+            layers: 1,
+            row_width: 1,
+            max_context: 128,
+        };
+        let narrow_b8 = PagedKvPlan::b8(narrow)?;
+        let narrow_b16 = PagedKvPlan::b16(narrow)?;
+        let narrow_b32 = PagedKvPlan::b32(narrow)?;
+        assert_eq!(narrow_b8.backing_bytes(), 1_088);
+        assert_eq!(narrow_b8.metadata_bytes(), 400);
+        assert_eq!(narrow_b8.total_requested_bytes(), 1_488);
+        assert_eq!(narrow_b16.backing_bytes(), 1_152);
+        assert_eq!(narrow_b16.metadata_bytes(), 208);
+        assert_eq!(narrow_b16.total_requested_bytes(), 1_360);
+        assert_eq!(narrow_b32.backing_bytes(), 1_280);
+        assert_eq!(narrow_b32.metadata_bytes(), 112);
+        assert_eq!(narrow_b32.total_requested_bytes(), 1_392);
+        assert_eq!(
+            PagedKvPlan::select(narrow)?.page_tokens(),
+            PagedKvPageTokens::B16
+        );
+        let wide = PagedKvGeometry {
+            layers: 1,
+            row_width: 64,
+            max_context: 128,
+        };
+        let wide_b8 = PagedKvPlan::b8(wide)?;
+        let wide_b16 = PagedKvPlan::b16(wide)?;
+        assert_eq!(wide_b8.backing_bytes(), 69_632);
+        assert_eq!(wide_b8.metadata_bytes(), 400);
+        assert_eq!(wide_b8.total_requested_bytes(), 70_032);
+        assert_eq!(wide_b16.backing_bytes(), 73_728);
+        assert_eq!(wide_b16.metadata_bytes(), 208);
+        assert_eq!(wide_b16.total_requested_bytes(), 73_936);
+        assert_eq!(
+            PagedKvPlan::select(wide)?.page_tokens(),
+            PagedKvPageTokens::B8
         );
         assert!(matches!(
             PagedKvPlan::b8(PagedKvGeometry {
