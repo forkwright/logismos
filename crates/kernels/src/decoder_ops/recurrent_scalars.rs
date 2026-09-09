@@ -64,8 +64,8 @@ impl RecurrentScalarsF32Plan {
 /// Each value head uses this f32 operation order:
 /// `beta = sigmoid(beta_projection)`; `sum = alpha + dt`;
 /// `log_decay = a * softplus(sum)`. The sigmoid and softplus use their stable
-/// CPU-equivalent branches. A negative-infinite `sum` intentionally saturates
-/// softplus to zero; positive infinity and NaN are outside the numerical domain.
+/// branches, but this native operation makes no CPU transcendental bit-parity
+/// claim.
 ///
 /// # Errors
 ///
@@ -79,8 +79,8 @@ impl RecurrentScalarsF32Plan {
 /// device for exactly `plan.value_heads()` f32 values and remain live through
 /// completion. All inputs must remain immutable; both outputs must remain
 /// exclusively writable and must not alias each other or any input. Inputs and
-/// outputs must be finite normal-or-zero, except that finite `alpha + dt` may
-/// overflow only to negative infinity for the documented softplus saturation.
+/// every operand, intermediate, and output must be finite normal-or-zero
+/// through completion.
 #[expect(
     clippy::too_many_arguments,
     reason = "six exact scalar spans are one non-aliased recurrent operation contract"
@@ -285,6 +285,7 @@ mod tests {
     use super::*;
 
     const TOLERANCE: f32 = 1e-3;
+    const TAIL_VALUE_HEADS: usize = 263;
 
     #[test]
     fn native_order_tracks_independent_f64_oracle_and_input_mutations()
@@ -300,6 +301,26 @@ mod tests {
             recurrent_scalars_f64_oracle(&alpha, &dt, &a, &beta_projection);
         assert_close_f64(&beta, &expected_beta, "recurrent beta");
         assert_close_f64(&log_decay, &expected_log_decay, "recurrent log decay");
+        assert_deviates_beyond_tolerance(
+            &beta,
+            &wrong_reversed_sigmoid(&beta_projection),
+            "reversed sigmoid",
+        );
+        assert_deviates_beyond_tolerance(
+            &log_decay,
+            &wrong_reexponentiated_decay(&alpha, &dt, &a),
+            "re-exponentiated log decay",
+        );
+        assert_deviates_beyond_tolerance(
+            &log_decay,
+            &wrong_dt_omitted_decay(&alpha, &a),
+            "dt-omitted log decay",
+        );
+        assert_deviates_beyond_tolerance(
+            &log_decay,
+            &wrong_dt_outside_softplus_decay(&alpha, &dt, &a),
+            "dt-misplaced log decay",
+        );
 
         let mut beta_projection_mutated = beta_projection;
         beta_projection_mutated[3] += 3.0;
@@ -347,8 +368,9 @@ mod tests {
     }
 
     #[test]
-    fn negative_overflow_sum_preserves_cpu_softplus_saturation()
+    fn cpu_only_reference_preserves_negative_overflow_softplus_saturation()
     -> core::result::Result<(), Box<dyn std::error::Error>> {
+        // WHY: accepted CPU recurrence retains this saturation, while the raw native ABI excludes it.
         let plan = RecurrentScalarsF32Plan::try_from_value_heads(1)?;
         let (beta, log_decay) = recurrent_scalars_native_order_reference(
             plan,
@@ -359,6 +381,24 @@ mod tests {
         )?;
         assert_eq!(beta, vec![0.5]);
         assert_eq!(log_decay, vec![0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn native_order_reference_preserves_tail_head_order()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let (alpha, dt, a, beta_projection) = tail_fixture()?;
+        let plan = RecurrentScalarsF32Plan::try_from_value_heads(TAIL_VALUE_HEADS)?;
+        let (beta, log_decay) =
+            recurrent_scalars_native_order_reference(plan, &alpha, &dt, &a, &beta_projection)?;
+        let (expected_beta, expected_log_decay) =
+            recurrent_scalars_f64_oracle(&alpha, &dt, &a, &beta_projection);
+        assert_close_f64(&beta, &expected_beta, "tail recurrent beta");
+        assert_close_f64(&log_decay, &expected_log_decay, "tail recurrent log decay");
+        assert!(
+            beta[255] < beta[256] && beta[256] < beta[257],
+            "tail heads must retain their distinct beta-projection order"
+        );
         Ok(())
     }
 
@@ -431,6 +471,108 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(logismos_no_gpu_kernels))]
+    #[test]
+    #[ignore = "requires an operator-reserved gfx1100 device; source tests do not qualify hardware"]
+    fn reserved_gfx1100_recurrent_scalars_match_independent_f64_oracle_with_tail()
+    -> core::result::Result<(), String> {
+        use hipcore::{Device, DeviceBuffer, Stream};
+
+        const OUTPUT_SENTINEL: f32 = -1_234.5;
+
+        let (alpha, dt, a, beta_projection) = tail_fixture()?;
+        let plan = RecurrentScalarsF32Plan::try_from_value_heads(TAIL_VALUE_HEADS)
+            .map_err(|error| format!("plan recurrent scalars: {error}"))?;
+        let (expected_beta, expected_log_decay) =
+            recurrent_scalars_f64_oracle(&alpha, &dt, &a, &beta_projection);
+        let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
+        let stream = Stream::new(&device).map_err(|error| format!("create stream: {error}"))?;
+        let alpha_device = DeviceBuffer::from_host(&device, &alpha)
+            .map_err(|error| format!("upload alpha: {error}"))?;
+        let dt_device =
+            DeviceBuffer::from_host(&device, &dt).map_err(|error| format!("upload dt: {error}"))?;
+        let a_device =
+            DeviceBuffer::from_host(&device, &a).map_err(|error| format!("upload A: {error}"))?;
+        let beta_projection_device = DeviceBuffer::from_host(&device, &beta_projection)
+            .map_err(|error| format!("upload beta projection: {error}"))?;
+        let sentinel = vec![OUTPUT_SENTINEL; TAIL_VALUE_HEADS];
+        let beta_device = DeviceBuffer::from_host(&device, &sentinel)
+            .map_err(|error| format!("initialize beta output: {error}"))?;
+        let log_decay_device = DeviceBuffer::from_host(&device, &sentinel)
+            .map_err(|error| format!("initialize log-decay output: {error}"))?;
+
+        // SAFETY: all six exact spans are distinct owned device buffers and remain live through synchronization.
+        unsafe {
+            launch_recurrent_scalars_f32(
+                plan,
+                alpha_device.as_device_ptr(),
+                alpha_device.len(),
+                dt_device.as_device_ptr(),
+                dt_device.len(),
+                a_device.as_device_ptr(),
+                a_device.len(),
+                beta_projection_device.as_device_ptr(),
+                beta_projection_device.len(),
+                beta_device.as_device_ptr(),
+                beta_device.len(),
+                log_decay_device.as_device_ptr(),
+                log_decay_device.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch recurrent scalars: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize recurrent scalars: {error}"))?;
+        let mut beta = vec![0.0_f32; TAIL_VALUE_HEADS];
+        beta_device
+            .copy_to_host(&mut beta)
+            .map_err(|error| format!("read beta output: {error}"))?;
+        let mut log_decay = vec![0.0_f32; TAIL_VALUE_HEADS];
+        log_decay_device
+            .copy_to_host(&mut log_decay)
+            .map_err(|error| format!("read log-decay output: {error}"))?;
+        for (name, values) in [("beta", &beta), ("log decay", &log_decay)] {
+            assert!(
+                values.iter().all(|value| value.is_finite()),
+                "{name} output must be finite"
+            );
+            assert!(
+                values.iter().all(|value| *value != OUTPUT_SENTINEL),
+                "{name} output must overwrite every nonzero sentinel"
+            );
+        }
+        assert_close_f64(&beta, &expected_beta, "device recurrent beta");
+        assert_close_f64(
+            &log_decay,
+            &expected_log_decay,
+            "device recurrent log decay",
+        );
+        Ok(())
+    }
+
+    fn tail_fixture() -> core::result::Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        let lane_values = (0..TAIL_VALUE_HEADS)
+            .map(|index| {
+                u16::try_from(index)
+                    .map(f32::from)
+                    .map_err(|error| format!("convert fixture lane {index}: {error}"))
+            })
+            .collect::<core::result::Result<Vec<_>, _>>()?;
+        Ok((
+            lane_values.iter().map(|lane| lane * 0.031 - 4.0).collect(),
+            lane_values
+                .iter()
+                .map(|lane| (lane % 11.0) * 0.07 - 0.35)
+                .collect(),
+            lane_values
+                .iter()
+                .map(|lane| (lane % 7.0) * 0.2 - 0.6)
+                .collect(),
+            lane_values.iter().map(|lane| lane * 0.043 - 5.5).collect(),
+        ))
+    }
+
     fn recurrent_scalars_f64_oracle(
         alpha: &[f32],
         dt: &[f32],
@@ -470,5 +612,64 @@ mod tests {
                 "{operation} index {index}: got {actual}, expected {expected}"
             );
         }
+    }
+
+    fn assert_deviates_beyond_tolerance(actual: &[f32], wrong: &[f64], operation: &str) {
+        assert_eq!(actual.len(), wrong.len(), "{operation} output length");
+        assert!(
+            actual
+                .iter()
+                .zip(wrong.iter())
+                .any(|(actual, wrong)| (f64::from(*actual) - wrong).abs() > f64::from(TOLERANCE)),
+            "{operation} must diverge from the admitted recurrence beyond tolerance"
+        );
+    }
+
+    fn wrong_reversed_sigmoid(beta_projection: &[f32]) -> Vec<f64> {
+        beta_projection
+            .iter()
+            .map(|projection| {
+                let projection = f64::from(*projection);
+                1.0 / (1.0 + projection.exp())
+            })
+            .collect()
+    }
+
+    fn wrong_reexponentiated_decay(alpha: &[f32], dt: &[f32], a: &[f32]) -> Vec<f64> {
+        alpha
+            .iter()
+            .zip(dt.iter())
+            .zip(a.iter())
+            .map(|((alpha, dt), a)| {
+                let sum = f64::from(*alpha) + f64::from(*dt);
+                let softplus = sum.max(0.0) + (-sum.abs()).exp().ln_1p();
+                f64::from(*a) * softplus.exp()
+            })
+            .collect()
+    }
+
+    fn wrong_dt_omitted_decay(alpha: &[f32], a: &[f32]) -> Vec<f64> {
+        alpha
+            .iter()
+            .zip(a.iter())
+            .map(|(alpha, a)| {
+                let alpha = f64::from(*alpha);
+                let softplus = alpha.max(0.0) + (-alpha.abs()).exp().ln_1p();
+                f64::from(*a) * softplus
+            })
+            .collect()
+    }
+
+    fn wrong_dt_outside_softplus_decay(alpha: &[f32], dt: &[f32], a: &[f32]) -> Vec<f64> {
+        alpha
+            .iter()
+            .zip(dt.iter())
+            .zip(a.iter())
+            .map(|((alpha, dt), a)| {
+                let alpha = f64::from(*alpha);
+                let softplus = alpha.max(0.0) + (-alpha.abs()).exp().ln_1p();
+                f64::from(*a) * softplus + f64::from(*dt)
+            })
+            .collect()
     }
 }
