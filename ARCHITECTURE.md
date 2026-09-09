@@ -133,8 +133,12 @@ independent reservations without fabricating v1 workload estimates. Both lease
 forms share revisions, capacity and release authority; dropping a capability
 does not free its accounted bytes.
 The explicit native accounting path separates shared resident bytes from each
-use's mutable peak and optional retained device output. Host results have a
-distinct supplied host envelope; they are never charged as VRAM. Legacy and
+use's mutable peak and optional retained device output. Resident host backing,
+mutable host storage and retained host results compete in one distinct supplied
+host envelope; they are never charged as VRAM. Retained-only callers must opt
+into that broader envelope before accounting additional host owner categories.
+Host charges follow the same explicit construction, teardown and result-discard
+acknowledgements as their associated owners. Legacy and
 native admissions share pending-operation and custody limits. Live uses,
 retained results and quarantined uses all retain a custody slot. Known-finished
 sibling uses can release their own mutable charge without clearing a resident's
@@ -351,6 +355,16 @@ adapter on success, failure or cancellation; the text loop supplies no teardown
 acknowledgement. These limits do not bound total template/tokenizer
 heap use or authenticate the selected model/tokenizer's publisher.
 
+The additive `RecycledGenerationDriver` fills one caller-preacquired vocabulary
+row. Its checked storage plan derives from the prepared tokenizer; the legacy
+and recycled ports share one greedy loop without copying the legacy driver's
+returned row. Both drop their owned row before collective output decoding.
+The recycled port preserves a driver's original owned error separately from
+pipeline errors, without requiring cloning, thread safety or boxing. A native
+adapter can therefore retain uncertain release custody through a failure.
+Storage extents and the tokenizer-owned output plan are accounting inputs, not
+physical capacity or host grants.
+
 `TextPipeline::prepare` returns an opaque `PreparedGeneration` that owns the
 rendered prompt and final token IDs, shares ownership of the immutable pipeline, and retains
 one `Qwen35ExecutionPlan`. Its context is checked prompt plus output tokens;
@@ -364,7 +378,8 @@ decoding loop without allocating that CPU session. Its adapter must bind the
 actual backend and resource authority before constructing or using native state.
 `TextPipeline::owns_preparation` compares the existing shared profile owner;
 it does not reconstruct identity from equal shapes or totals and does not mint
-authority. Cancellation is cooperative,
+authority. Its borrowed execution profile exposes the same weights and configured
+context ceiling for a separate shared execution owner. Cancellation is cooperative,
 so preparation may finish inertly if cancellation arrives during tokenization.
 The decoder report excludes rendered text, u32 prompt/generated IDs, tokenizer
 and decoded strings; it is not a whole-request estimate or admission grant.
