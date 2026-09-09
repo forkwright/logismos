@@ -41,7 +41,7 @@ semantically respects that boundary.
   without linking the device runtime.
 - `decoders` consumes `loader` without its tensor adapter and consumes `quant`
   for explicit CPU row projection, without linking HIP. Its recurrent-attention
-  path uses the standalone CPU `kernels` graph; full-attention history consumes
+  and full-attention paths use the standalone CPU `kernels` graph; full-attention history consumes
   `cache` with its legacy tensor-backed flat feature disabled. Structural profiles remain
   distinct from payload-bound execution. The lower-level `quant` crate owns
   executable block and row geometry; inspection and projection reuse that owner.
@@ -81,7 +81,7 @@ semantically respects that boundary.
 - `taxis` depends locally on `hipcore`.
 - `kernels/gpu` enables the local `hipcore` and `taxis` dependencies and GPU
   launcher modules, including their nested parity references. Standalone
-  `cpu_f32`, `gdn`, and `causal_conv` remain available without that feature;
+  `cpu_f32`, `gdn`, `causal_conv`, and `attention` remain available without that feature;
   `transformers` selects that CPU-only graph, while `praxis` explicitly enables
   GPU launchers. Direct `kernels` users retain the default GPU feature. The
   crate does not depend on `core`.
@@ -90,6 +90,11 @@ semantically respects that boundary.
   build dependency generates HIP layout and reconstruction constants from
   that same authority. This within-tier edge replaces duplicate format
   definitions and remains HIP-free when GPU features are disabled.
+- `kernels::attention` owns checked single-query attention geometry, contiguous
+  GQA mapping and operation workspace. Fallible borrowed-row access keeps it
+  independent of `cache`; the decoder adapts its private paged history directly.
+  The GPU-only native descriptor separately owns physical page geometry and
+  launch admission. CPU page selection is not native device policy.
 - Cross-tier deps must be justified. Within-tier deps are code smell.
 
 ## Key invariants
@@ -151,6 +156,20 @@ residency and grant handling remain above these operations. Their precise
 numerical domains and refusal rules live in the operation rustdoc; standalone
 kernels do not establish native hybrid-model execution or device qualification.
 
+Single-query native paged attention reads separate dense K/V arrays laid out as
+`[physical_page][in_page_token][kv_head][head_width]`, with a caller-owned `u32`
+logical-to-physical page table. Its descriptor admits explicit B8/B16/B32 pages,
+checked allocation spans and launch dimensions. One wave32 block serves each
+query head: lane-strided dot products use a fixed shuffle tree, followed by
+token-ordered online softmax and staged output normalization. The native f32
+order deliberately differs from the CPU operation's preserved materialized
+score/softmax/value order. The unsafe asynchronous launcher requires valid
+device table entries, finite normal-or-zero arithmetic, buffer lifetimes and a
+nonaliasing staged output; it does not inspect device data or validate results.
+CPU arithmetic witnesses and compiled code objects do not qualify GPU numerical
+behavior. Device cache ownership, whole-model composition, admission and
+completion remain separate work.
+
 `loader::gguf::VerifiedArtifact` owns one immutable serialized backing, admitted
 under an explicit byte limit and matched against a required SHA-256 expectation.
 Its metadata and tensor borrows come from those same bytes. This content binding
@@ -187,7 +206,7 @@ selected from 8/16/32-token candidates using allocation-owner costs. This is
 not a qualified GPU alignment, shared-prefix or performance choice.
 Its precomputed `Qwen35CpuRequirements` derives
 logical `f32` backing from allocation owners, not a separate estimator.
-Causal-convolution and grouped-GDN plans are consumed by their kernels;
+Causal-convolution, grouped-GDN and single-query attention plans are consumed by their kernels;
 recurrent, full-attention, FFN and LM-head owners compose named allocation
 phases. The report separates retained state, separately allocated recurrent
 transaction copies, transient workspace upper bound, and returned logits.

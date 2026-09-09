@@ -23,6 +23,12 @@ scales, operands and intermediates pending denormal-mode qualification.
 GPU compilation is not numerical or performance
 qualification; native text/retrieval execution is still CPU-only.
 
+The [single-query paged-attention](crates/kernels/src/attention/mod.rs) operation
+is consumed by the CPU hybrid decoder through borrowed KV rows. Its checked plan
+also owns the decoder's attention-workspace accounting. A separate native
+descriptor and wave32 HIP kernel support explicit 8/16/32-token physical pages;
+they are not yet a GPU model executor or a qualified device-cache policy.
+
 ## Why
 
 Aletheia knows what work needs doing; Logismos owns how inference uses the resources granted
@@ -79,7 +85,8 @@ Each call commits all layer state only after every input token and output projec
 Full-attention history uses execution-private CPU pages: complete committed pages stay
 immutable, partial tails are copied before writing, and attention reads paged rows directly.
 Failed calls publish neither KV history nor recurrent state. This is not cross-session
-prefix sharing, eviction or GPU attention.
+prefix sharing, eviction or a GPU model path; the standalone native attention
+primitive does not move this CPU cache onto a device.
 Other unsupported formats or execution configurations fail explicitly.
 `execution_plan` additionally bounds tokens per step and selects all-token or last-token
 logits; prefill for generation need not retain a vocabulary row for every prompt token.
