@@ -52,6 +52,15 @@ pub struct PagedKvPlan {
     total_requested_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PagedKvAllocation {
+    page_count: usize,
+    bundle_count: usize,
+    requested_f32: usize,
+    tail_copy_bytes: usize,
+    total_requested_bytes: usize,
+}
+
 impl PagedKvPlan {
     /// Select the least checked CPU allocation request, then tail-copy cost.
     pub fn select(geometry: PagedKvGeometry) -> Result<Self> {
@@ -69,6 +78,19 @@ impl PagedKvPlan {
         Ok(selected)
     }
     fn new(geometry: PagedKvGeometry, page_tokens: PageTokens) -> Result<Self> {
+        Self::validate_geometry(geometry)?;
+        let allocation = Self::allocation(geometry, page_tokens)?;
+        Ok(Self {
+            geometry,
+            page_tokens,
+            page_count: allocation.page_count,
+            bundle_count: allocation.bundle_count,
+            requested_f32: allocation.requested_f32,
+            tail_copy_bytes: allocation.tail_copy_bytes,
+            total_requested_bytes: allocation.total_requested_bytes,
+        })
+    }
+    fn validate_geometry(geometry: PagedKvGeometry) -> Result<()> {
         for (field, value) in [
             ("layers", geometry.layers),
             ("row_width", geometry.row_width),
@@ -78,6 +100,9 @@ impl PagedKvPlan {
                 return PagedZeroDimensionSnafu { field }.fail();
             }
         }
+        Ok(())
+    }
+    fn allocation(geometry: PagedKvGeometry, page_tokens: PageTokens) -> Result<PagedKvAllocation> {
         let page_count = ceil(geometry.max_context, page_tokens.count(), "page count")?;
         let bundle_count = page_count.checked_add(1).ok_or_else(|| {
             PagedArithmeticSnafu {
@@ -149,9 +174,7 @@ impl PagedKvPlan {
             }
             .build()
         })?;
-        Ok(Self {
-            geometry,
-            page_tokens,
+        Ok(PagedKvAllocation {
             page_count,
             bundle_count,
             requested_f32,
@@ -255,7 +278,7 @@ impl PagedKvPool {
             })?;
         let old_pages = self.table.len();
         let target_pages = ceil(target, self.plan.page_tokens.count(), "append target pages")?;
-        let partial = original_tokens % self.plan.page_tokens.count() != 0;
+        let partial = !original_tokens.is_multiple_of(self.plan.page_tokens.count());
         let new_pages = target_pages.checked_sub(old_pages).ok_or_else(|| {
             PagedLayoutSnafu {
                 operation: "page table monotonicity",
@@ -440,6 +463,14 @@ pub struct PagedAppend<'a> {
     committed: bool,
 }
 
+#[derive(Debug)]
+struct PagedWriteLocation {
+    page: usize,
+    within: usize,
+    key: Range<usize>,
+    value: Range<usize>,
+}
+
 impl PagedAppend<'_> {
     /// Write one contiguous transaction-relative K/V row for one layer.
     pub fn write_layer_row(
@@ -449,6 +480,18 @@ impl PagedAppend<'_> {
         keys: &[f32],
         values: &[f32],
     ) -> Result<()> {
+        let location = self.write_location(layer, token, keys, values)?;
+        self.copy_row(location.key, keys, "key row write")?;
+        self.copy_row(location.value, values, "value row write")?;
+        self.record_write(layer, location.page, location.within)
+    }
+    fn write_location(
+        &self,
+        layer: usize,
+        token: usize,
+        keys: &[f32],
+        values: &[f32],
+    ) -> Result<PagedWriteLocation> {
         self.check_layer(layer)?;
         if token >= self.append_tokens {
             return PagedAppendTokenOutOfRangeSnafu {
@@ -490,26 +533,36 @@ impl PagedAppend<'_> {
         })?;
         let key = self.pool.span(bundle, layer, within, false, 1)?;
         let value = self.pool.span(bundle, layer, within, true, 1)?;
+        self.check_storage_row(&key, "key row write")?;
+        self.check_storage_row(&value, "value row write")?;
+        Ok(PagedWriteLocation {
+            page,
+            within,
+            key,
+            value,
+        })
+    }
+    fn check_storage_row(&self, row: &Range<usize>, operation: &'static str) -> Result<()> {
         self.pool
             .storage
-            .get_mut(key)
-            .ok_or_else(|| {
-                PagedLayoutSnafu {
-                    operation: "key row write",
-                }
-                .build()
-            })?
-            .copy_from_slice(keys);
+            .get(row.clone())
+            .map(|_| ())
+            .ok_or_else(|| PagedLayoutSnafu { operation }.build())
+    }
+    fn copy_row(
+        &mut self,
+        row: Range<usize>,
+        values: &[f32],
+        operation: &'static str,
+    ) -> Result<()> {
         self.pool
             .storage
-            .get_mut(value)
-            .ok_or_else(|| {
-                PagedLayoutSnafu {
-                    operation: "value row write",
-                }
-                .build()
-            })?
+            .get_mut(row)
+            .ok_or_else(|| PagedLayoutSnafu { operation }.build())?
             .copy_from_slice(values);
+        Ok(())
+    }
+    fn record_write(&mut self, layer: usize, page: usize, within: usize) -> Result<()> {
         if let Some(fill) = self.pool.fills.get_mut(page) {
             *fill = (*fill).max(within + 1);
         } else {
