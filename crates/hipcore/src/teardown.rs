@@ -1,14 +1,18 @@
 //! Explicit one-way teardown state for HIP-owned resources.
 
-use core::mem::ManuallyDrop;
+use core::fmt;
 
 use snafu::Snafu;
 
 use crate::device::Device;
-use crate::error::{Error, InternalSnafu};
-use crate::memory::{DeviceBuffer, attempt_buffer_release};
+use crate::error::Error;
+use crate::memory::{
+    BufferRelease, BufferTeardownHandle, DeviceBuffer, TeardownBuffer, attempt_buffer_release,
+};
 use crate::pod::BytePod;
-use crate::stream::{Stream, StreamQuiesce, attempt_stream_release, quiesce_stream_owner};
+use crate::stream::{
+    NonOwnedStream, Stream, StreamTeardownHandle, attempt_stream_destroy, attempt_stream_quiesce,
+};
 
 /// Kind of HIP resource represented by a teardown outcome.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -16,14 +20,30 @@ use crate::stream::{Stream, StreamQuiesce, attempt_stream_release, quiesce_strea
 pub enum ResourceKind {
     /// A `hipMalloc` allocation.
     Buffer,
-    /// A non-default HIP stream.
+    /// An owned, non-default HIP stream.
     Stream,
 }
+
+/// Stable local identity of an entry captured for explicit teardown.
+///
+/// IDs are meaningful only inside the inventory or standalone transition that
+/// issued them. They are deliberately not process-global resource identities.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum TeardownEntryId {
+    /// A leaf transition outside an aggregate inventory.
+    Standalone,
+    /// The owned stream of an aggregate inventory.
+    Stream,
+    /// A buffer's zero-based registration position in an aggregate inventory.
+    Buffer(usize),
+}
+
 /// Stage at which explicit teardown stopped.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TeardownPhase {
-    /// Selecting the recorded owning device failed before a destructor call.
+    /// Selecting the recorded owning device failed before an operation call.
     Preflight,
     /// A stream did not prove that its queued work had completed.
     Synchronization,
@@ -73,30 +93,10 @@ impl ResourceMetadata {
         &self.device
     }
 
-    /// Stable entry identity within the teardown owner that captured it.
+    /// Local identity assigned when the teardown owner captured this resource.
     #[must_use]
     pub const fn entry(&self) -> TeardownEntryId {
         self.entry
-    }
-}
-
-/// Stable local identity of an entry captured for explicit teardown.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct TeardownEntryId(usize);
-
-impl TeardownEntryId {
-    pub(crate) const fn standalone() -> Self {
-        Self(0)
-    }
-
-    pub(crate) const fn new(value: usize) -> Self {
-        Self(value)
-    }
-
-    /// Zero-based position assigned when the teardown owner captured this entry.
-    #[must_use]
-    pub const fn position(self) -> usize {
-        self.0
     }
 }
 
@@ -105,8 +105,12 @@ impl TeardownEntryId {
 #[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum TeardownError {
-    /// Device selection failed before a destructor was invoked.
-    #[snafu(display("could not prepare {:?} teardown on device {}: {source}", resource.kind, resource.device.ordinal()))]
+    /// Device selection failed before an operation was invoked.
+    #[snafu(display(
+        "could not prepare {:?} teardown on device {}: {source}",
+        resource.kind,
+        resource.device.ordinal()
+    ))]
     Preflight {
         /// Resource facts retained for accounting.
         resource: ResourceMetadata,
@@ -118,7 +122,11 @@ pub enum TeardownError {
     },
 
     /// Synchronization could not establish that queued stream work completed.
-    #[snafu(display("could not synchronize {:?} teardown on device {}: {source}", resource.kind, resource.device.ordinal()))]
+    #[snafu(display(
+        "could not synchronize {:?} teardown on device {}: {source}",
+        resource.kind,
+        resource.device.ordinal()
+    ))]
     Synchronization {
         /// Resource facts retained for accounting.
         resource: ResourceMetadata,
@@ -130,7 +138,11 @@ pub enum TeardownError {
     },
 
     /// HIP did not acknowledge the destructor call, so ownership is indeterminate.
-    #[snafu(display("HIP did not acknowledge {:?} destruction on device {}: {source}", resource.kind, resource.device.ordinal()))]
+    #[snafu(display(
+        "HIP did not acknowledge {:?} destruction on device {}: {source}",
+        resource.kind,
+        resource.device.ordinal()
+    ))]
     Destructor {
         /// Resource facts retained for accounting.
         resource: ResourceMetadata,
@@ -204,40 +216,42 @@ impl TeardownTombstone {
     }
 }
 
-/// Private, disarmed owner shared by real HIP resources and pure transition tests.
+/// Private, already-disarmed owner used by the transition coordinator.
 ///
-/// `ManuallyDrop` is installed before any transition callback runs. Therefore a
-/// failure cannot fall back to an ordinary resource `Drop` implementation.
+/// `R` must be an inert handle whose Rust destructor performs no HIP work.
+/// `DeviceBuffer` and `Stream` are converted to such handles before entering
+/// this type, so every ordinary drop path is non-destructive.
+#[derive(Debug)]
 pub(crate) struct ReleaseOwner<R> {
-    resource: ManuallyDrop<R>,
+    resource: R,
     metadata: ResourceMetadata,
-    dispose_after_ack: fn(R),
 }
 
 impl<R> ReleaseOwner<R> {
-    pub(crate) fn new(resource: R, metadata: ResourceMetadata, dispose_after_ack: fn(R)) -> Self {
-        Self {
-            resource: ManuallyDrop::new(resource),
-            metadata,
-            dispose_after_ack,
-        }
+    pub(crate) fn new(resource: R, metadata: ResourceMetadata) -> Self {
+        Self { resource, metadata }
     }
 
-    pub(crate) fn requested_bytes(&self) -> usize {
-        self.metadata.requested_bytes
+    pub(crate) fn metadata(&self) -> &ResourceMetadata {
+        &self.metadata
+    }
+
+    pub(crate) fn with_entry(mut self, entry: TeardownEntryId) -> Self {
+        self.metadata.entry = entry;
+        self
     }
 
     pub(crate) fn attempt(
         self,
         phase: TeardownPhase,
-        prepare: impl FnOnce(&mut R) -> Result<(), Error>,
-        destroy: impl FnOnce(&mut R) -> Result<(), Error>,
+        prepare: impl FnOnce(&mut R, &ResourceMetadata) -> Result<(), Error>,
+        destroy: impl FnOnce(&mut R, &ResourceMetadata) -> Result<(), Error>,
     ) -> ReleaseAttempt<R> {
         let mut owner = match self.prepare(phase, prepare) {
             Ok(owner) => owner,
             Err(pending) => return ReleaseAttempt::Pending(pending),
         };
-        if let Err(source) = destroy(&mut owner.resource) {
+        if let Err(source) = destroy(&mut owner.resource, &owner.metadata) {
             let error = TeardownError::Destructor {
                 resource: owner.metadata.clone(),
                 source,
@@ -248,370 +262,22 @@ impl<R> ReleaseOwner<R> {
                 tombstone: TeardownTombstone::new(error),
             };
         }
-        let resource = ManuallyDrop::into_inner(owner.resource);
-        (owner.dispose_after_ack)(resource);
-        ReleaseAttempt::Released(ReleaseReceipt::new(owner.metadata))
+        let Self { resource, metadata } = owner;
+        drop(resource);
+        ReleaseAttempt::Released(ReleaseReceipt::new(metadata))
     }
 
     pub(crate) fn prepare(
         mut self,
         phase: TeardownPhase,
-        operation: impl FnOnce(&mut R) -> Result<(), Error>,
+        operation: impl FnOnce(&mut R, &ResourceMetadata) -> Result<(), Error>,
     ) -> core::result::Result<Self, PendingOwner<R>> {
-        if let Err(source) = operation(&mut self.resource) {
+        if let Err(source) = operation(&mut self.resource, &self.metadata) {
             return Err(self.pending(phase, source));
         }
         Ok(self)
     }
-}
 
-/// Internal result from the shared transition machine.
-pub(crate) enum ReleaseAttempt<R> {
-    Released(ReleaseReceipt),
-    Pending(PendingOwner<R>),
-    Quarantined {
-        owner: ReleaseOwner<R>,
-        tombstone: TeardownTombstone,
-    },
-}
-
-/// Non-usable retained owner after a pre-destructor failure.
-pub(crate) struct PendingOwner<R> {
-    owner: ReleaseOwner<R>,
-    error: TeardownError,
-}
-
-impl<R> PendingOwner<R> {
-    pub(crate) fn error(&self) -> &TeardownError {
-        &self.error
-    }
-
-    pub(crate) fn into_owner(self) -> ReleaseOwner<R> {
-        self.owner
-    }
-}
-
-/// Explicit heterogeneous teardown owner for one stream and its touched buffers.
-///
-/// Buffers remain ordinary owners until [`Self::begin_release`] consumes this
-/// inventory. That transition disarms every leaf before synchronizing the
-/// stream, so neither a failed synchronization nor a later partial release can
-/// fall back to ordinary HIP `Drop` behavior.
-pub struct TeardownInventory<T: BytePod> {
-    stream: Stream,
-    buffers: Vec<DeviceBuffer<T>>,
-}
-
-impl<T: BytePod> TeardownInventory<T> {
-    /// Start an inventory with the stream that touched every registered buffer.
-    #[must_use]
-    pub fn new(stream: Stream) -> Self {
-        Self {
-            stream,
-            buffers: Vec::new(),
-        }
-    }
-
-    /// Retain a buffer whose work was submitted to this inventory's stream.
-    pub fn push_buffer(&mut self, buffer: DeviceBuffer<T>) {
-        self.buffers.push(buffer);
-    }
-
-    /// Consume, quiesce, then explicitly release every retained resource.
-    #[must_use]
-    pub fn begin_release(self) -> InventoryRelease<T> {
-        let TeardownInventory { stream, buffers } = self;
-        let buffers = buffers
-            .into_iter()
-            .enumerate()
-            .map(|(entry, buffer)| buffer.into_release_owner(TeardownEntryId::new(entry)))
-            .collect();
-        if !stream.owns_explicit_handle() {
-            return InventoryRelease::NotOwned(NonOwnedInventory { _buffers: buffers });
-        }
-        let stream = stream.into_release_owner(TeardownEntryId::new(usize::MAX));
-        if let Err(error) = inventory_extent(&stream, &buffers) {
-            return InventoryRelease::Pending(PendingInventory {
-                state: PendingInventoryState::Admission {
-                    stream: stream.pending(TeardownPhase::Preflight, error),
-                    buffers,
-                },
-            });
-        }
-        match quiesce_stream_owner(stream) {
-            StreamQuiesce::NotOwned => {
-                InventoryRelease::NotOwned(NonOwnedInventory { _buffers: buffers })
-            }
-            StreamQuiesce::Quiescent(stream) => {
-                resume_buffers(stream.owner, None, buffers, Vec::new())
-            }
-            StreamQuiesce::Pending(stream) => InventoryRelease::Pending(PendingInventory {
-                state: PendingInventoryState::Synchronizing {
-                    stream: stream.pending,
-                    buffers,
-                },
-            }),
-        }
-    }
-}
-
-/// Successful logical acknowledgements from an inventory release.
-#[derive(Debug)]
-pub struct InventoryReceipt {
-    released: Vec<ReleaseReceipt>,
-}
-
-impl InventoryReceipt {
-    /// Per-resource HIP destructor acknowledgements in release order.
-    #[must_use]
-    pub fn released(&self) -> &[ReleaseReceipt] {
-        &self.released
-    }
-}
-
-/// Explicit inventory teardown outcome.
-#[non_exhaustive]
-pub enum InventoryRelease<T: BytePod> {
-    /// The inventory was given the non-owned NULL stream; no destroy acknowledgement exists.
-    NotOwned(NonOwnedInventory<T>),
-    /// Every buffer and the quiescent stream acknowledged destruction.
-    Released(InventoryReceipt),
-    /// No uncertain resource is released automatically; retry is explicit.
-    Pending(PendingInventory<T>),
-    /// A destructor outcome was indeterminate; all unreleased leaves remain quarantined.
-    Quarantined(InventoryQuarantine<T>),
-}
-
-/// Non-usable inventory retained after a known pre-destructor failure.
-pub struct PendingInventory<T: BytePod> {
-    state: PendingInventoryState<T>,
-}
-
-/// Opaque retained buffers from an inventory rejected for a non-owned stream.
-pub struct NonOwnedInventory<T: BytePod> {
-    _buffers: Vec<ReleaseOwner<DeviceBuffer<T>>>,
-}
-
-enum PendingInventoryState<T: BytePod> {
-    Admission {
-        stream: PendingOwner<Stream>,
-        buffers: Vec<ReleaseOwner<DeviceBuffer<T>>>,
-    },
-    Synchronizing {
-        stream: PendingOwner<Stream>,
-        buffers: Vec<ReleaseOwner<DeviceBuffer<T>>>,
-    },
-    Releasing {
-        stream: ReleaseOwner<Stream>,
-        buffer: PendingOwner<DeviceBuffer<T>>,
-        buffers: Vec<ReleaseOwner<DeviceBuffer<T>>>,
-        receipts: Vec<ReleaseReceipt>,
-    },
-    Destroying {
-        stream: PendingOwner<Stream>,
-        receipts: Vec<ReleaseReceipt>,
-    },
-}
-
-impl<T: BytePod> PendingInventory<T> {
-    /// Retry the exact transition that last stopped.
-    #[must_use]
-    pub fn retry(self) -> InventoryRelease<T> {
-        match self.state {
-            PendingInventoryState::Admission { stream, buffers } => {
-                let stream = stream.into_owner();
-                if let Err(error) = inventory_extent(&stream, &buffers) {
-                    return InventoryRelease::Pending(Self {
-                        state: PendingInventoryState::Admission {
-                            stream: stream.pending(TeardownPhase::Preflight, error),
-                            buffers,
-                        },
-                    });
-                }
-                match quiesce_stream_owner(stream) {
-                    StreamQuiesce::NotOwned => {
-                        InventoryRelease::NotOwned(NonOwnedInventory { _buffers: buffers })
-                    }
-                    StreamQuiesce::Quiescent(stream) => {
-                        resume_buffers(stream.owner, None, buffers, Vec::new())
-                    }
-                    StreamQuiesce::Pending(stream) => InventoryRelease::Pending(Self {
-                        state: PendingInventoryState::Synchronizing {
-                            stream: stream.pending,
-                            buffers,
-                        },
-                    }),
-                }
-            }
-            PendingInventoryState::Synchronizing { stream, buffers } => {
-                match quiesce_stream_owner(stream.into_owner()) {
-                    StreamQuiesce::NotOwned => {
-                        InventoryRelease::NotOwned(NonOwnedInventory { _buffers: buffers })
-                    }
-                    StreamQuiesce::Quiescent(stream) => {
-                        resume_buffers(stream.owner, None, buffers, Vec::new())
-                    }
-                    StreamQuiesce::Pending(stream) => InventoryRelease::Pending(Self {
-                        state: PendingInventoryState::Synchronizing {
-                            stream: stream.pending,
-                            buffers,
-                        },
-                    }),
-                }
-            }
-            PendingInventoryState::Releasing {
-                stream,
-                buffer,
-                buffers,
-                receipts,
-            } => resume_buffers(stream, Some(buffer.into_owner()), buffers, receipts),
-            PendingInventoryState::Destroying { stream, receipts } => {
-                finish_inventory(stream.into_owner(), receipts)
-            }
-        }
-    }
-}
-
-fn inventory_extent<T: BytePod>(
-    stream: &ReleaseOwner<Stream>,
-    buffers: &[ReleaseOwner<DeviceBuffer<T>>],
-) -> core::result::Result<usize, Error> {
-    buffers
-        .iter()
-        .try_fold(stream.requested_bytes(), |extent, buffer| {
-            extent.checked_add(buffer.requested_bytes()).ok_or_else(|| {
-                InternalSnafu {
-                    message: "teardown inventory requested-byte extent overflow".to_string(),
-                }
-                .build()
-            })
-        })
-}
-
-/// Opaque conservative charge after a partial inventory destructor failure.
-///
-/// This tombstone intentionally has neither per-buffer access nor retry. It
-/// retains all not-yet-acknowledged owners without dropping them, so an upper
-/// executor must keep the reported requested-byte charge reserved.
-pub struct InventoryQuarantine<T: BytePod> {
-    requested_bytes: usize,
-    tombstone: TeardownTombstone,
-    _retained: InventoryHeld<T>,
-}
-
-impl<T: BytePod> InventoryQuarantine<T> {
-    /// Conservative byte charge for the entire partially released inventory.
-    #[must_use]
-    pub const fn requested_bytes(&self) -> usize {
-        self.requested_bytes
-    }
-
-    /// Indeterminate destructor failure that prevented further teardown.
-    #[must_use]
-    pub fn error(&self) -> &TeardownError {
-        self.tombstone.error()
-    }
-}
-
-struct InventoryHeld<T: BytePod> {
-    _stream: Option<ReleaseOwner<Stream>>,
-    _buffer: Option<ReleaseOwner<DeviceBuffer<T>>>,
-    _buffers: Vec<ReleaseOwner<DeviceBuffer<T>>>,
-}
-
-fn resume_buffers<T: BytePod>(
-    stream: ReleaseOwner<Stream>,
-    current: Option<ReleaseOwner<DeviceBuffer<T>>>,
-    mut buffers: Vec<ReleaseOwner<DeviceBuffer<T>>>,
-    mut receipts: Vec<ReleaseReceipt>,
-) -> InventoryRelease<T> {
-    let mut current = current;
-    loop {
-        let Some(buffer) = current.take().or_else(|| buffers.pop()) else {
-            return finish_inventory(stream, receipts);
-        };
-        match attempt_buffer_release(buffer) {
-            ReleaseAttempt::Released(receipt) => receipts.push(receipt),
-            ReleaseAttempt::Pending(buffer) => {
-                return InventoryRelease::Pending(PendingInventory {
-                    state: PendingInventoryState::Releasing {
-                        stream,
-                        buffer,
-                        buffers,
-                        receipts,
-                    },
-                });
-            }
-            ReleaseAttempt::Quarantined {
-                owner: buffer,
-                tombstone,
-            } => {
-                return InventoryRelease::Quarantined(quarantine_inventory(
-                    stream,
-                    Some(buffer),
-                    buffers,
-                    receipts,
-                    tombstone,
-                ));
-            }
-        }
-    }
-}
-
-fn finish_inventory<T: BytePod>(
-    stream: ReleaseOwner<Stream>,
-    mut receipts: Vec<ReleaseReceipt>,
-) -> InventoryRelease<T> {
-    match attempt_stream_release(stream) {
-        ReleaseAttempt::Released(receipt) => {
-            receipts.push(receipt);
-            InventoryRelease::Released(InventoryReceipt { released: receipts })
-        }
-        ReleaseAttempt::Pending(stream) => InventoryRelease::Pending(PendingInventory {
-            state: PendingInventoryState::Destroying { stream, receipts },
-        }),
-        ReleaseAttempt::Quarantined {
-            owner: stream,
-            tombstone,
-        } => InventoryRelease::Quarantined(quarantine_inventory(
-            stream,
-            None,
-            Vec::new(),
-            receipts,
-            tombstone,
-        )),
-    }
-}
-
-fn quarantine_inventory<T: BytePod>(
-    stream: ReleaseOwner<Stream>,
-    buffer: Option<ReleaseOwner<DeviceBuffer<T>>>,
-    buffers: Vec<ReleaseOwner<DeviceBuffer<T>>>,
-    receipts: Vec<ReleaseReceipt>,
-    tombstone: TeardownTombstone,
-) -> InventoryQuarantine<T> {
-    let requested_bytes = receipts
-        .iter()
-        .map(|receipt| receipt.resource().requested_bytes())
-        .sum::<usize>()
-        + stream.requested_bytes()
-        + buffer.as_ref().map_or(0, ReleaseOwner::requested_bytes)
-        + buffers
-            .iter()
-            .map(ReleaseOwner::requested_bytes)
-            .sum::<usize>();
-    InventoryQuarantine {
-        requested_bytes,
-        tombstone,
-        _retained: InventoryHeld {
-            _stream: Some(stream),
-            _buffer: buffer,
-            _buffers: buffers,
-        },
-    }
-}
-
-impl<R> ReleaseOwner<R> {
     pub(crate) fn pending(self, phase: TeardownPhase, source: Error) -> PendingOwner<R> {
         let error = match phase {
             TeardownPhase::Preflight => TeardownError::Preflight {
@@ -634,177 +300,1043 @@ impl<R> ReleaseOwner<R> {
     }
 }
 
+/// Internal result from one destructor transition.
+pub(crate) enum ReleaseAttempt<R> {
+    Released(ReleaseReceipt),
+    Pending(PendingOwner<R>),
+    Quarantined {
+        owner: ReleaseOwner<R>,
+        tombstone: TeardownTombstone,
+    },
+}
+
+/// Internal result from the two-stage stream quiescence transition.
+pub(crate) enum QuiesceAttempt<R> {
+    Quiescent(ReleaseOwner<R>),
+    PreflightPending(PendingOwner<R>),
+    SynchronizationUnconfirmed(PendingOwner<R>),
+}
+
+/// Non-usable retained owner after a call known not to have reached destruction.
+#[derive(Debug)]
+pub(crate) struct PendingOwner<R> {
+    owner: ReleaseOwner<R>,
+    error: TeardownError,
+}
+
+impl<R> PendingOwner<R> {
+    pub(crate) fn error(&self) -> &TeardownError {
+        &self.error
+    }
+
+    pub(crate) fn into_owner(self) -> ReleaseOwner<R> {
+        self.owner
+    }
+}
+
+/// Immutable expected entries and accumulated destructor acknowledgements.
+///
+/// The byte total is the sum of requested allocation sizes, not measured
+/// physical residency. Every aggregate outcome retains this same full total.
+#[derive(Debug)]
+pub struct InventoryEvidence {
+    requested_bytes: usize,
+    entries: Vec<ResourceMetadata>,
+    released: Vec<ReleaseReceipt>,
+}
+
+impl InventoryEvidence {
+    fn new(stream: &ResourceMetadata) -> Self {
+        Self {
+            requested_bytes: stream.requested_bytes(),
+            entries: vec![stream.clone()],
+            released: Vec::new(),
+        }
+    }
+
+    fn register(
+        &mut self,
+        resource: &ResourceMetadata,
+    ) -> core::result::Result<(), InventoryAccountingError> {
+        let requested_bytes = self
+            .requested_bytes
+            .checked_add(resource.requested_bytes())
+            .ok_or_else(|| InventoryAccountingError {
+                current_requested_bytes: self.requested_bytes,
+                additional_requested_bytes: resource.requested_bytes(),
+            })?;
+        self.requested_bytes = requested_bytes;
+        self.entries.push(resource.clone());
+        Ok(())
+    }
+
+    fn acknowledge(&mut self, receipt: ReleaseReceipt) {
+        self.released.push(receipt);
+    }
+
+    /// Full conservative requested-byte extent captured before teardown.
+    #[must_use]
+    pub const fn requested_bytes(&self) -> usize {
+        self.requested_bytes
+    }
+
+    /// Every entry captured by this inventory, in registration order.
+    #[must_use]
+    pub fn entries(&self) -> &[ResourceMetadata] {
+        &self.entries
+    }
+
+    /// Entries whose destructors have been acknowledged, in release order.
+    #[must_use]
+    pub fn released(&self) -> &[ReleaseReceipt] {
+        &self.released
+    }
+}
+
+/// Checked-accounting failure while adding a buffer to an inventory.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct InventoryAccountingError {
+    current_requested_bytes: usize,
+    additional_requested_bytes: usize,
+}
+
+impl InventoryAccountingError {
+    /// Requested bytes already captured by the inventory.
+    #[must_use]
+    pub const fn current_requested_bytes(&self) -> usize {
+        self.current_requested_bytes
+    }
+
+    /// Requested bytes of the rejected buffer.
+    #[must_use]
+    pub const fn additional_requested_bytes(&self) -> usize {
+        self.additional_requested_bytes
+    }
+}
+
+impl fmt::Display for InventoryAccountingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "teardown inventory requested-byte extent overflow: {} + {}",
+            self.current_requested_bytes, self.additional_requested_bytes
+        )
+    }
+}
+
+impl std::error::Error for InventoryAccountingError {}
+
+/// Rejected buffer retained after checked inventory accounting overflowed.
+///
+/// The buffer was already disarmed before this value was returned. Dropping
+/// this value performs no HIP work; call [`Self::begin_release`] to attempt an
+/// explicit standalone release.
+#[must_use = "the rejected allocation remains owned and must stay accounted"]
+pub struct InventoryPushError {
+    error: InventoryAccountingError,
+    buffer: TeardownBuffer,
+}
+
+impl InventoryPushError {
+    /// Checked accounting failure that rejected the buffer.
+    #[must_use]
+    pub const fn error(&self) -> &InventoryAccountingError {
+        &self.error
+    }
+
+    /// Metadata for the rejected, still-owned allocation.
+    #[must_use]
+    pub fn resource(&self) -> &ResourceMetadata {
+        self.buffer.resource()
+    }
+
+    /// Recover the rejected inert buffer for retention or another inventory.
+    #[must_use]
+    pub fn into_buffer(self) -> TeardownBuffer {
+        self.buffer
+    }
+
+    /// Explicitly release the rejected allocation as a standalone buffer.
+    #[must_use]
+    pub fn begin_release(self) -> BufferRelease {
+        self.buffer.begin_release()
+    }
+}
+
+/// Heterogeneous teardown owner for one explicit stream and its touched buffers.
+///
+/// Every buffer is type-erased only after ownership is transferred into an
+/// inert raw-handle owner. `u8`, `f32`, `u32`, and other [`BytePod`] buffers can
+/// therefore share the same inventory without any ordinary resource destructor
+/// remaining reachable.
+#[must_use = "dropping an inventory abandons native handles without acknowledging release"]
+pub struct TeardownInventory {
+    stream: ReleaseOwner<StreamTeardownHandle>,
+    buffers: Vec<ReleaseOwner<BufferTeardownHandle>>,
+    evidence: InventoryEvidence,
+}
+
+impl TeardownInventory {
+    /// Begin an inventory around an owned, non-default stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original stream inside [`NonOwnedStream`] when `stream` is
+    /// the non-owned NULL stream. This refusal occurs before any buffer can be
+    /// registered or disarmed.
+    pub fn try_new(stream: Stream) -> core::result::Result<Self, NonOwnedStream> {
+        let stream = stream.into_release_owner(TeardownEntryId::Stream)?;
+        let evidence = InventoryEvidence::new(stream.metadata());
+        Ok(Self {
+            stream,
+            buffers: Vec::new(),
+            evidence,
+        })
+    }
+
+    /// Retain a typed buffer and assign its stable inventory-local identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque, explicitly releasable owner if adding the requested
+    /// byte extent would overflow `usize`. No HIP operation is attempted.
+    pub fn push_buffer<T: BytePod>(
+        &mut self,
+        buffer: DeviceBuffer<T>,
+    ) -> core::result::Result<TeardownEntryId, InventoryPushError> {
+        self.push_teardown_buffer(buffer.into_teardown())
+    }
+
+    /// Retain an already-disarmed buffer and assign its inventory-local identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same opaque buffer owner if checked byte accounting overflows.
+    pub fn push_teardown_buffer(
+        &mut self,
+        buffer: TeardownBuffer,
+    ) -> core::result::Result<TeardownEntryId, InventoryPushError> {
+        let entry = TeardownEntryId::Buffer(self.buffers.len());
+        let buffer = buffer.with_entry(entry);
+        if let Err(error) = self.evidence.register(buffer.metadata()) {
+            return Err(InventoryPushError {
+                error,
+                buffer: TeardownBuffer::from_owner(buffer),
+            });
+        }
+        self.buffers.push(buffer);
+        Ok(entry)
+    }
+
+    /// Full inventory evidence captured so far.
+    #[must_use]
+    pub const fn evidence(&self) -> &InventoryEvidence {
+        &self.evidence
+    }
+
+    /// Consume, quiesce, then explicitly release every retained resource.
+    #[must_use]
+    pub fn begin_release(self) -> InventoryRelease {
+        let Self {
+            stream,
+            buffers,
+            evidence,
+        } = self;
+        let mut operations = HipInventoryOperations;
+        map_coordinator_outcome(begin_coordinator(
+            stream,
+            buffers,
+            evidence,
+            &mut operations,
+        ))
+    }
+}
+
+/// Successful evidence that every captured destructor was acknowledged.
+#[derive(Debug)]
+pub struct InventoryReceipt {
+    evidence: InventoryEvidence,
+}
+
+impl InventoryReceipt {
+    /// Complete expected-entry and acknowledgement evidence.
+    #[must_use]
+    pub const fn evidence(&self) -> &InventoryEvidence {
+        &self.evidence
+    }
+
+    /// Per-resource HIP destructor acknowledgements in release order.
+    #[must_use]
+    pub fn released(&self) -> &[ReleaseReceipt] {
+        self.evidence.released()
+    }
+}
+
+/// Explicit aggregate teardown outcome.
+#[non_exhaustive]
+#[must_use = "teardown outcomes carry native ownership and accounting evidence"]
+pub enum InventoryRelease {
+    /// Every captured buffer and the quiescent stream acknowledged destruction.
+    Released(InventoryReceipt),
+    /// A pre-call failure retained a retryable owner without invoking a destructor.
+    Pending(PendingInventory),
+    /// Stream completion remains unproved; only explicit reconciliation is allowed.
+    SynchronizationUnconfirmed(InventorySynchronizationUnconfirmed),
+    /// A destructor outcome was indeterminate; no retry or native access remains.
+    Quarantined(InventoryQuarantine),
+}
+
+/// Retryable aggregate retained after a failure before the relevant HIP call.
+#[must_use = "the retained inventory must remain accounted or be explicitly retried"]
+pub struct PendingInventory {
+    state: PendingState<StreamTeardownHandle, BufferTeardownHandle>,
+    evidence: InventoryEvidence,
+}
+
+impl PendingInventory {
+    /// Failure that stopped the known-not-attempted transition.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.state.error()
+    }
+
+    /// Full expected inventory and acknowledgements completed before failure.
+    #[must_use]
+    pub const fn evidence(&self) -> &InventoryEvidence {
+        &self.evidence
+    }
+
+    /// Retry only the transition known not to have reached its HIP call.
+    #[must_use]
+    pub fn retry(self) -> InventoryRelease {
+        let mut operations = HipInventoryOperations;
+        map_coordinator_outcome(retry_pending(self.state, self.evidence, &mut operations))
+    }
+}
+
+/// Aggregate retained because `hipStreamSynchronize` did not prove completion.
+///
+/// This is not an ordinary retryable eviction failure. The stream and all
+/// buffers remain non-usable and fully charged. A caller may deliberately run
+/// [`Self::reconcile`] to issue another non-destructive synchronization attempt.
+#[must_use = "completion is unproved; retain the full charge or reconcile explicitly"]
+pub struct InventorySynchronizationUnconfirmed {
+    stream: PendingOwner<StreamTeardownHandle>,
+    buffers: Vec<ReleaseOwner<BufferTeardownHandle>>,
+    evidence: InventoryEvidence,
+}
+
+impl InventorySynchronizationUnconfirmed {
+    /// Synchronization failure that left completion unproved.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.stream.error()
+    }
+
+    /// Full expected inventory; no buffer release follows a failed synchronization.
+    #[must_use]
+    pub const fn evidence(&self) -> &InventoryEvidence {
+        &self.evidence
+    }
+
+    /// Deliberately attempt to reconcile completion by synchronizing again.
+    #[must_use]
+    pub fn reconcile(self) -> InventoryRelease {
+        let mut operations = HipInventoryOperations;
+        map_coordinator_outcome(reconcile_synchronization(
+            self.stream,
+            self.buffers,
+            self.evidence,
+            &mut operations,
+        ))
+    }
+}
+
+/// Opaque conservative charge after an indeterminate destructor outcome.
+///
+/// This state exposes evidence but neither raw native handles nor a retry. Its
+/// full requested-byte extent remains charged even when some entries have
+/// acknowledged release; it does not claim measured retained physical bytes.
+#[must_use = "the quarantined inventory must retain its full conservative reservation"]
+pub struct InventoryQuarantine {
+    evidence: InventoryEvidence,
+    tombstone: TeardownTombstone,
+    _held: HeldInventory<StreamTeardownHandle, BufferTeardownHandle>,
+}
+
+impl InventoryQuarantine {
+    /// Full conservative requested-byte extent of the original inventory.
+    #[must_use]
+    pub const fn requested_bytes(&self) -> usize {
+        self.evidence.requested_bytes()
+    }
+
+    /// Expected entries and per-entry acknowledgements completed before uncertainty.
+    #[must_use]
+    pub const fn evidence(&self) -> &InventoryEvidence {
+        &self.evidence
+    }
+
+    /// Indeterminate destructor failure that stopped teardown.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.tombstone.error()
+    }
+}
+
+trait InventoryOperations<S, B> {
+    fn quiesce(&mut self, stream: ReleaseOwner<S>) -> QuiesceAttempt<S>;
+    fn release_buffer(&mut self, buffer: ReleaseOwner<B>) -> ReleaseAttempt<B>;
+    fn release_stream(&mut self, stream: ReleaseOwner<S>) -> ReleaseAttempt<S>;
+}
+
+struct HipInventoryOperations;
+
+impl InventoryOperations<StreamTeardownHandle, BufferTeardownHandle> for HipInventoryOperations {
+    fn quiesce(
+        &mut self,
+        stream: ReleaseOwner<StreamTeardownHandle>,
+    ) -> QuiesceAttempt<StreamTeardownHandle> {
+        attempt_stream_quiesce(stream)
+    }
+
+    fn release_buffer(
+        &mut self,
+        buffer: ReleaseOwner<BufferTeardownHandle>,
+    ) -> ReleaseAttempt<BufferTeardownHandle> {
+        attempt_buffer_release(buffer)
+    }
+
+    fn release_stream(
+        &mut self,
+        stream: ReleaseOwner<StreamTeardownHandle>,
+    ) -> ReleaseAttempt<StreamTeardownHandle> {
+        attempt_stream_destroy(stream)
+    }
+}
+
+enum PendingState<S, B> {
+    Synchronizing {
+        stream: PendingOwner<S>,
+        buffers: Vec<ReleaseOwner<B>>,
+    },
+    Releasing {
+        stream: ReleaseOwner<S>,
+        buffer: PendingOwner<B>,
+        buffers: Vec<ReleaseOwner<B>>,
+    },
+    Destroying {
+        stream: PendingOwner<S>,
+    },
+}
+
+impl<S, B> PendingState<S, B> {
+    fn error(&self) -> &TeardownError {
+        match self {
+            Self::Synchronizing { stream, .. } | Self::Destroying { stream } => stream.error(),
+            Self::Releasing { buffer, .. } => buffer.error(),
+        }
+    }
+}
+
+struct HeldInventory<S, B> {
+    _stream: Option<ReleaseOwner<S>>,
+    _buffer: Option<ReleaseOwner<B>>,
+    _buffers: Vec<ReleaseOwner<B>>,
+}
+
+enum CoordinatorOutcome<S, B> {
+    Released(InventoryEvidence),
+    Pending {
+        state: PendingState<S, B>,
+        evidence: InventoryEvidence,
+    },
+    SynchronizationUnconfirmed {
+        stream: PendingOwner<S>,
+        buffers: Vec<ReleaseOwner<B>>,
+        evidence: InventoryEvidence,
+    },
+    Quarantined {
+        evidence: InventoryEvidence,
+        tombstone: TeardownTombstone,
+        held: HeldInventory<S, B>,
+    },
+}
+
+fn begin_coordinator<S, B, O>(
+    stream: ReleaseOwner<S>,
+    buffers: Vec<ReleaseOwner<B>>,
+    evidence: InventoryEvidence,
+    operations: &mut O,
+) -> CoordinatorOutcome<S, B>
+where
+    O: InventoryOperations<S, B>,
+{
+    let quiesce = operations.quiesce(stream);
+    continue_after_quiesce(quiesce, buffers, evidence, operations)
+}
+
+fn continue_after_quiesce<S, B, O>(
+    quiesce: QuiesceAttempt<S>,
+    buffers: Vec<ReleaseOwner<B>>,
+    evidence: InventoryEvidence,
+    operations: &mut O,
+) -> CoordinatorOutcome<S, B>
+where
+    O: InventoryOperations<S, B>,
+{
+    match quiesce {
+        QuiesceAttempt::Quiescent(stream) => {
+            resume_buffers(stream, None, buffers, evidence, operations)
+        }
+        QuiesceAttempt::PreflightPending(stream) => CoordinatorOutcome::Pending {
+            state: PendingState::Synchronizing { stream, buffers },
+            evidence,
+        },
+        QuiesceAttempt::SynchronizationUnconfirmed(stream) => {
+            CoordinatorOutcome::SynchronizationUnconfirmed {
+                stream,
+                buffers,
+                evidence,
+            }
+        }
+    }
+}
+
+fn retry_pending<S, B, O>(
+    state: PendingState<S, B>,
+    evidence: InventoryEvidence,
+    operations: &mut O,
+) -> CoordinatorOutcome<S, B>
+where
+    O: InventoryOperations<S, B>,
+{
+    match state {
+        PendingState::Synchronizing { stream, buffers } => {
+            let quiesce = operations.quiesce(stream.into_owner());
+            continue_after_quiesce(quiesce, buffers, evidence, operations)
+        }
+        PendingState::Releasing {
+            stream,
+            buffer,
+            buffers,
+        } => resume_buffers(
+            stream,
+            Some(buffer.into_owner()),
+            buffers,
+            evidence,
+            operations,
+        ),
+        PendingState::Destroying { stream } => {
+            finish_inventory(stream.into_owner(), evidence, operations)
+        }
+    }
+}
+
+fn reconcile_synchronization<S, B, O>(
+    stream: PendingOwner<S>,
+    buffers: Vec<ReleaseOwner<B>>,
+    evidence: InventoryEvidence,
+    operations: &mut O,
+) -> CoordinatorOutcome<S, B>
+where
+    O: InventoryOperations<S, B>,
+{
+    let quiesce = operations.quiesce(stream.into_owner());
+    match quiesce {
+        QuiesceAttempt::Quiescent(stream) => {
+            resume_buffers(stream, None, buffers, evidence, operations)
+        }
+        QuiesceAttempt::PreflightPending(stream)
+        | QuiesceAttempt::SynchronizationUnconfirmed(stream) => {
+            CoordinatorOutcome::SynchronizationUnconfirmed {
+                stream,
+                buffers,
+                evidence,
+            }
+        }
+    }
+}
+
+fn resume_buffers<S, B, O>(
+    stream: ReleaseOwner<S>,
+    current: Option<ReleaseOwner<B>>,
+    mut buffers: Vec<ReleaseOwner<B>>,
+    mut evidence: InventoryEvidence,
+    operations: &mut O,
+) -> CoordinatorOutcome<S, B>
+where
+    O: InventoryOperations<S, B>,
+{
+    let mut current = current;
+    loop {
+        let Some(buffer) = current.take().or_else(|| buffers.pop()) else {
+            return finish_inventory(stream, evidence, operations);
+        };
+        match operations.release_buffer(buffer) {
+            ReleaseAttempt::Released(receipt) => evidence.acknowledge(receipt),
+            ReleaseAttempt::Pending(buffer) => {
+                return CoordinatorOutcome::Pending {
+                    state: PendingState::Releasing {
+                        stream,
+                        buffer,
+                        buffers,
+                    },
+                    evidence,
+                };
+            }
+            ReleaseAttempt::Quarantined {
+                owner: buffer,
+                tombstone,
+            } => {
+                return CoordinatorOutcome::Quarantined {
+                    evidence,
+                    tombstone,
+                    held: HeldInventory {
+                        _stream: Some(stream),
+                        _buffer: Some(buffer),
+                        _buffers: buffers,
+                    },
+                };
+            }
+        }
+    }
+}
+
+fn finish_inventory<S, B, O>(
+    stream: ReleaseOwner<S>,
+    mut evidence: InventoryEvidence,
+    operations: &mut O,
+) -> CoordinatorOutcome<S, B>
+where
+    O: InventoryOperations<S, B>,
+{
+    match operations.release_stream(stream) {
+        ReleaseAttempt::Released(receipt) => {
+            evidence.acknowledge(receipt);
+            CoordinatorOutcome::Released(evidence)
+        }
+        ReleaseAttempt::Pending(stream) => CoordinatorOutcome::Pending {
+            state: PendingState::Destroying { stream },
+            evidence,
+        },
+        ReleaseAttempt::Quarantined {
+            owner: stream,
+            tombstone,
+        } => CoordinatorOutcome::Quarantined {
+            evidence,
+            tombstone,
+            held: HeldInventory {
+                _stream: Some(stream),
+                _buffer: None,
+                _buffers: Vec::new(),
+            },
+        },
+    }
+}
+
+fn map_coordinator_outcome(
+    outcome: CoordinatorOutcome<StreamTeardownHandle, BufferTeardownHandle>,
+) -> InventoryRelease {
+    match outcome {
+        CoordinatorOutcome::Released(evidence) => {
+            InventoryRelease::Released(InventoryReceipt { evidence })
+        }
+        CoordinatorOutcome::Pending { state, evidence } => {
+            InventoryRelease::Pending(PendingInventory { state, evidence })
+        }
+        CoordinatorOutcome::SynchronizationUnconfirmed {
+            stream,
+            buffers,
+            evidence,
+        } => InventoryRelease::SynchronizationUnconfirmed(InventorySynchronizationUnconfirmed {
+            stream,
+            buffers,
+            evidence,
+        }),
+        CoordinatorOutcome::Quarantined {
+            evidence,
+            tombstone,
+            held,
+        } => InventoryRelease::Quarantined(InventoryQuarantine {
+            evidence,
+            tombstone,
+            _held: held,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::io;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
 
     use super::*;
-    use crate::device::Device;
-    use crate::error::Error;
 
-    fn owner(value: u8) -> ReleaseOwner<u8> {
-        ReleaseOwner::new(
-            value,
-            ResourceMetadata::new(
-                ResourceKind::Buffer,
-                16,
-                Device::for_test(0),
-                TeardownEntryId::standalone(),
-            ),
-            |_| {},
-        )
+    type TestResult = core::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[derive(Debug)]
+    struct FakeHandle;
+
+    #[derive(Debug)]
+    struct DropTrackedHandle {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropTrackedHandle {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum QuiesceStep {
+        Success,
+        PreflightFailure,
+        SynchronizationFailure,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReleaseStep {
+        Success,
+        PreflightFailure,
+        DestructorFailure,
+    }
+
+    struct ScriptedOperations {
+        quiesce: VecDeque<QuiesceStep>,
+        buffers: VecDeque<ReleaseStep>,
+        stream: VecDeque<ReleaseStep>,
+        calls: Vec<String>,
+    }
+
+    impl ScriptedOperations {
+        fn new(
+            quiesce: impl IntoIterator<Item = QuiesceStep>,
+            buffers: impl IntoIterator<Item = ReleaseStep>,
+            stream: impl IntoIterator<Item = ReleaseStep>,
+        ) -> Self {
+            Self {
+                quiesce: quiesce.into_iter().collect(),
+                buffers: buffers.into_iter().collect(),
+                stream: stream.into_iter().collect(),
+                calls: Vec::new(),
+            }
+        }
+
+        fn release(
+            calls: &mut Vec<String>,
+            step: ReleaseStep,
+            owner: ReleaseOwner<FakeHandle>,
+        ) -> ReleaseAttempt<FakeHandle> {
+            calls.push(format!("preflight:{:?}", owner.metadata().entry()));
+            match step {
+                ReleaseStep::PreflightFailure => {
+                    ReleaseAttempt::Pending(owner.pending(TeardownPhase::Preflight, failure()))
+                }
+                ReleaseStep::Success => {
+                    calls.push(format!("destroy:{:?}", owner.metadata().entry()));
+                    owner.attempt(TeardownPhase::Preflight, |_, _| Ok(()), |_, _| Ok(()))
+                }
+                ReleaseStep::DestructorFailure => {
+                    calls.push(format!("destroy:{:?}", owner.metadata().entry()));
+                    owner.attempt(
+                        TeardownPhase::Preflight,
+                        |_, _| Ok(()),
+                        |_, _| Err(failure()),
+                    )
+                }
+            }
+        }
+    }
+
+    impl InventoryOperations<FakeHandle, FakeHandle> for ScriptedOperations {
+        fn quiesce(&mut self, stream: ReleaseOwner<FakeHandle>) -> QuiesceAttempt<FakeHandle> {
+            self.calls.push("stream-preflight".to_string());
+            let step = self
+                .quiesce
+                .pop_front()
+                .unwrap_or(QuiesceStep::SynchronizationFailure);
+            match step {
+                QuiesceStep::PreflightFailure => QuiesceAttempt::PreflightPending(
+                    stream.pending(TeardownPhase::Preflight, failure()),
+                ),
+                QuiesceStep::SynchronizationFailure => {
+                    self.calls.push("stream-synchronize".to_string());
+                    QuiesceAttempt::SynchronizationUnconfirmed(
+                        stream.pending(TeardownPhase::Synchronization, failure()),
+                    )
+                }
+                QuiesceStep::Success => {
+                    self.calls.push("stream-synchronize".to_string());
+                    QuiesceAttempt::Quiescent(stream)
+                }
+            }
+        }
+
+        fn release_buffer(
+            &mut self,
+            buffer: ReleaseOwner<FakeHandle>,
+        ) -> ReleaseAttempt<FakeHandle> {
+            let step = self
+                .buffers
+                .pop_front()
+                .unwrap_or(ReleaseStep::DestructorFailure);
+            Self::release(&mut self.calls, step, buffer)
+        }
+
+        fn release_stream(
+            &mut self,
+            stream: ReleaseOwner<FakeHandle>,
+        ) -> ReleaseAttempt<FakeHandle> {
+            let step = self
+                .stream
+                .pop_front()
+                .unwrap_or(ReleaseStep::DestructorFailure);
+            Self::release(&mut self.calls, step, stream)
+        }
     }
 
     fn failure() -> Error {
         Error::runtime(1, "synthetic teardown")
     }
 
-    struct RustMetadata {
-        drops: Arc<AtomicUsize>,
+    fn metadata(entry: TeardownEntryId, bytes: usize) -> ResourceMetadata {
+        ResourceMetadata::new(
+            if matches!(entry, TeardownEntryId::Stream) {
+                ResourceKind::Stream
+            } else {
+                ResourceKind::Buffer
+            },
+            bytes,
+            Device::for_test(0),
+            entry,
+        )
     }
 
-    impl Drop for RustMetadata {
-        fn drop(&mut self) {
-            self.drops.fetch_add(1, Ordering::SeqCst);
-        }
+    fn owner(entry: TeardownEntryId, bytes: usize) -> ReleaseOwner<FakeHandle> {
+        ReleaseOwner::new(FakeHandle, metadata(entry, bytes))
+    }
+
+    fn fixture() -> core::result::Result<
+        (
+            ReleaseOwner<FakeHandle>,
+            Vec<ReleaseOwner<FakeHandle>>,
+            InventoryEvidence,
+        ),
+        InventoryAccountingError,
+    > {
+        let stream = owner(TeardownEntryId::Stream, 0);
+        let mut evidence = InventoryEvidence::new(stream.metadata());
+        let first = owner(TeardownEntryId::Buffer(0), 16);
+        let second = owner(TeardownEntryId::Buffer(1), 16);
+        evidence.register(first.metadata())?;
+        evidence.register(second.metadata())?;
+        Ok((stream, vec![first, second], evidence))
     }
 
     #[test]
-    fn successful_transition_invokes_each_callback_once() {
-        let mut prepares = 0;
-        let mut destructors = 0;
-        let outcome = owner(1).attempt(
+    fn production_coordinator_retries_only_unstarted_entry() -> TestResult {
+        let (stream, buffers, evidence) = fixture()?;
+        let mut operations = ScriptedOperations::new(
+            [QuiesceStep::Success],
+            [
+                ReleaseStep::Success,
+                ReleaseStep::PreflightFailure,
+                ReleaseStep::Success,
+            ],
+            [ReleaseStep::Success],
+        );
+        let outcome = begin_coordinator(stream, buffers, evidence, &mut operations);
+        let (state, evidence) = match outcome {
+            CoordinatorOutcome::Pending { state, evidence } => (state, evidence),
+            _ => return Err(io::Error::other("second buffer must remain pending").into()),
+        };
+        assert_eq!(evidence.released().len(), 1);
+        assert_eq!(
+            evidence.released()[0].resource().entry(),
+            TeardownEntryId::Buffer(1)
+        );
+
+        let outcome = retry_pending(state, evidence, &mut operations);
+        let evidence = match outcome {
+            CoordinatorOutcome::Released(evidence) => evidence,
+            _ => {
+                return Err(io::Error::other("retry must finish the retained suffix").into());
+            }
+        };
+        assert_eq!(evidence.released().len(), 3);
+        assert_eq!(evidence.requested_bytes(), 32);
+        assert_eq!(
+            operations.calls.join("|"),
+            "stream-preflight|stream-synchronize|preflight:Buffer(1)|\
+             destroy:Buffer(1)|preflight:Buffer(0)|preflight:Buffer(0)|\
+             destroy:Buffer(0)|preflight:Stream|destroy:Stream"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn synchronization_failure_releases_nothing_until_reconciled() -> TestResult {
+        let (stream, buffers, evidence) = fixture()?;
+        let mut operations = ScriptedOperations::new(
+            [QuiesceStep::SynchronizationFailure, QuiesceStep::Success],
+            [ReleaseStep::Success, ReleaseStep::Success],
+            [ReleaseStep::Success],
+        );
+        let outcome = begin_coordinator(stream, buffers, evidence, &mut operations);
+        let (stream, buffers, evidence) = match outcome {
+            CoordinatorOutcome::SynchronizationUnconfirmed {
+                stream,
+                buffers,
+                evidence,
+            } => (stream, buffers, evidence),
+            _ => {
+                return Err(
+                    io::Error::other("failed synchronization must be a distinct state").into(),
+                );
+            }
+        };
+        assert!(evidence.released().is_empty());
+        assert_eq!(
+            operations.calls.join("|"),
+            "stream-preflight|stream-synchronize"
+        );
+
+        let outcome = reconcile_synchronization(stream, buffers, evidence, &mut operations);
+        assert!(matches!(outcome, CoordinatorOutcome::Released(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn destructor_failure_quarantines_without_touching_suffix_or_stream() -> TestResult {
+        let (stream, buffers, evidence) = fixture()?;
+        let mut operations = ScriptedOperations::new(
+            [QuiesceStep::Success],
+            [ReleaseStep::DestructorFailure, ReleaseStep::Success],
+            [ReleaseStep::Success],
+        );
+        let outcome = begin_coordinator(stream, buffers, evidence, &mut operations);
+        let (evidence, tombstone) = match outcome {
+            CoordinatorOutcome::Quarantined {
+                evidence,
+                tombstone,
+                ..
+            } => (evidence, tombstone),
+            _ => {
+                return Err(
+                    io::Error::other("destructor failure must quarantine the inventory").into(),
+                );
+            }
+        };
+        assert!(evidence.released().is_empty());
+        assert_eq!(evidence.requested_bytes(), 32);
+        assert_eq!(
+            tombstone.error().resource().entry(),
+            TeardownEntryId::Buffer(1)
+        );
+        assert_eq!(
+            operations.calls.join("|"),
+            "stream-preflight|stream-synchronize|preflight:Buffer(1)|destroy:Buffer(1)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_failure_never_invokes_destructor() -> TestResult {
+        let resource = owner(TeardownEntryId::Standalone, 16);
+        let mut destructor_calls = 0;
+        let outcome = resource.attempt(
             TeardownPhase::Preflight,
-            |_| {
-                prepares += 1;
-                Ok(())
-            },
-            |_| {
-                destructors += 1;
+            |_, _| Err(failure()),
+            |_, _| {
+                destructor_calls += 1;
                 Ok(())
             },
         );
-        assert!(matches!(outcome, ReleaseAttempt::Released(_)));
-        assert_eq!(prepares, 1);
-        assert_eq!(destructors, 1);
+        assert!(matches!(outcome, ReleaseAttempt::Pending(_)));
+        assert_eq!(destructor_calls, 0);
+        Ok(())
     }
 
     #[test]
-    fn acknowledged_release_disposes_rust_metadata_without_repeating_destructor() {
+    fn acknowledged_release_drops_inert_rust_metadata_once() -> TestResult {
         let drops = Arc::new(AtomicUsize::new(0));
         let owner = ReleaseOwner::new(
-            RustMetadata {
+            DropTrackedHandle {
                 drops: Arc::clone(&drops),
             },
-            ResourceMetadata::new(
-                ResourceKind::Buffer,
-                16,
-                Device::for_test(0),
-                TeardownEntryId::standalone(),
-            ),
-            |_| {},
+            metadata(TeardownEntryId::Standalone, 16),
         );
-        let outcome = owner.attempt(TeardownPhase::Preflight, |_| Ok(()), |_| Ok(()));
+        let outcome = owner.attempt(TeardownPhase::Preflight, |_, _| Ok(()), |_, _| Ok(()));
         assert!(matches!(outcome, ReleaseAttempt::Released(_)));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     #[test]
-    fn preflight_failure_never_invokes_destructor_and_requires_explicit_retry() {
-        let mut destructors = 0;
-        let outcome = owner(1).attempt(
-            TeardownPhase::Preflight,
-            |_| Err(failure()),
-            |_| {
-                destructors += 1;
-                Ok(())
-            },
+    fn duplicate_extents_retain_distinct_entry_identity() -> TestResult {
+        let (_, _, evidence) = fixture()?;
+        assert_eq!(evidence.entries().len(), 3);
+        assert_eq!(evidence.entries()[1].requested_bytes(), 16);
+        assert_eq!(evidence.entries()[2].requested_bytes(), 16);
+        assert_ne!(evidence.entries()[1].entry(), evidence.entries()[2].entry());
+        Ok(())
+    }
+
+    #[test]
+    fn scripted_preflight_can_be_retried_without_synchronizing_early() -> TestResult {
+        let (stream, buffers, evidence) = fixture()?;
+        let mut operations = ScriptedOperations::new(
+            [QuiesceStep::PreflightFailure, QuiesceStep::Success],
+            [ReleaseStep::Success, ReleaseStep::Success],
+            [ReleaseStep::Success],
         );
-        let ReleaseAttempt::Pending(pending) = outcome else {
-            panic!("preflight failure must retain a pending owner");
+        let outcome = begin_coordinator(stream, buffers, evidence, &mut operations);
+        let (state, evidence) = match outcome {
+            CoordinatorOutcome::Pending { state, evidence } => (state, evidence),
+            _ => return Err(io::Error::other("preflight failure must remain retryable").into()),
         };
-        assert_eq!(destructors, 0);
-        drop(pending);
-        assert_eq!(destructors, 0);
+        assert_eq!(operations.calls.join("|"), "stream-preflight");
+        assert!(matches!(
+            retry_pending(state, evidence, &mut operations),
+            CoordinatorOutcome::Released(_)
+        ));
+        Ok(())
     }
 
     #[test]
-    fn synchronization_failure_never_invokes_destructor() {
-        let mut destructors = 0;
-        let outcome = owner(1).attempt(
-            TeardownPhase::Synchronization,
-            |_| Err(failure()),
-            |_| {
-                destructors += 1;
-                Ok(())
-            },
+    fn reconciliation_preflight_failure_remains_completion_unconfirmed() -> TestResult {
+        let (stream, buffers, evidence) = fixture()?;
+        let mut operations = ScriptedOperations::new(
+            [
+                QuiesceStep::SynchronizationFailure,
+                QuiesceStep::PreflightFailure,
+            ],
+            [],
+            [],
         );
-        let ReleaseAttempt::Pending(pending) = outcome else {
-            panic!("synchronization failure must retain every resource");
+        let outcome = begin_coordinator(stream, buffers, evidence, &mut operations);
+        let (stream, buffers, evidence) = match outcome {
+            CoordinatorOutcome::SynchronizationUnconfirmed {
+                stream,
+                buffers,
+                evidence,
+            } => (stream, buffers, evidence),
+            _ => return Err(io::Error::other("initial sync failure must be unconfirmed").into()),
         };
-        drop(pending);
-        assert_eq!(destructors, 0);
-    }
-
-    #[test]
-    fn pending_retry_runs_the_destructor_exactly_once() {
-        let pending =
-            match owner(1).attempt(TeardownPhase::Preflight, |_| Err(failure()), |_| Ok(())) {
-                ReleaseAttempt::Pending(pending) => pending,
-                _ => panic!("preflight failure must create a pending transition"),
-            };
-        let mut destructors = 0;
-        let outcome = pending.into_owner().attempt(
-            TeardownPhase::Preflight,
-            |_| Ok(()),
-            |_| {
-                destructors += 1;
-                Ok(())
-            },
+        assert!(matches!(
+            reconcile_synchronization(stream, buffers, evidence, &mut operations),
+            CoordinatorOutcome::SynchronizationUnconfirmed { .. }
+        ));
+        assert_eq!(
+            operations.calls.join("|"),
+            "stream-preflight|stream-synchronize|stream-preflight"
         );
-        assert!(matches!(outcome, ReleaseAttempt::Released(_)));
-        assert_eq!(destructors, 1);
-    }
-
-    #[test]
-    fn partial_batch_retains_the_unstarted_remainder() {
-        let first = owner(1).attempt(TeardownPhase::Preflight, |_| Ok(()), |_| Ok(()));
-        assert!(matches!(first, ReleaseAttempt::Released(_)));
-
-        let mut destructors = 0;
-        let remainder = owner(2).attempt(
-            TeardownPhase::Preflight,
-            |_| Err(failure()),
-            |_| {
-                destructors += 1;
-                Ok(())
-            },
-        );
-        let ReleaseAttempt::Pending(remainder) = remainder else {
-            panic!("second resource must remain pending after its preflight failure");
-        };
-        drop(remainder);
-        assert_eq!(destructors, 0);
-    }
-
-    #[test]
-    fn destructor_failure_is_terminal_and_drop_does_not_retry() {
-        let mut destructors = 0;
-        let outcome = owner(1).attempt(
-            TeardownPhase::Preflight,
-            |_| Ok(()),
-            |_| {
-                destructors += 1;
-                Err(failure())
-            },
-        );
-        let ReleaseAttempt::Quarantined { tombstone, .. } = outcome else {
-            panic!("destructor failure must quarantine the resource");
-        };
-        drop(tombstone);
-        assert_eq!(destructors, 1);
+        Ok(())
     }
 }

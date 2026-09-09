@@ -13,7 +13,7 @@ use crate::pod::BytePod;
 use crate::stream::Stream;
 use crate::teardown::{
     PendingOwner, ReleaseAttempt, ReleaseOwner, ReleaseReceipt, ResourceKind, ResourceMetadata,
-    TeardownError, TeardownPhase, TeardownTombstone,
+    TeardownEntryId, TeardownError, TeardownPhase, TeardownTombstone,
 };
 
 /// Owned allocation in device memory.
@@ -93,6 +93,11 @@ impl<T: BytePod> DeviceBuffer<T> {
 
     /// Allocate and copy `data` to device memory.
     ///
+    /// This convenience constructor uses ordinary buffer destruction if the
+    /// copy fails. Custody-sensitive construction transactions must instead
+    /// call [`Self::alloc`], then [`Self::copy_from_host`], and capture the
+    /// still-owned buffer before propagating a copy error.
+    ///
     /// # Errors
     ///
     /// As [`Self::alloc`] plus [`Error::Runtime`] from the memcpy.
@@ -115,26 +120,33 @@ impl<T: BytePod> DeviceBuffer<T> {
     /// quiescence first. [`crate::TeardownInventory`] encodes that order for a
     /// stream and all of its registered buffers.
     #[must_use]
-    pub fn begin_release(self) -> BufferRelease<T> {
-        map_buffer_release(self.into_release_owner(crate::teardown::TeardownEntryId::standalone()))
+    pub fn begin_release(self) -> BufferRelease {
+        self.into_teardown().begin_release()
+    }
+
+    /// Disarm ordinary destruction and return an opaque teardown-only owner.
+    ///
+    /// The returned value has no pointer or typed-buffer access. Dropping it
+    /// performs no HIP work, so aggregate builders can retain heterogeneous
+    /// allocations without an implicit destructor during error unwinding.
+    #[must_use = "the allocation remains live until explicitly released or quarantined"]
+    pub fn into_teardown(self) -> TeardownBuffer {
+        TeardownBuffer::from_owner(self.into_release_owner(TeardownEntryId::Standalone))
     }
 
     pub(crate) fn into_release_owner(
         self,
-        entry: crate::teardown::TeardownEntryId,
-    ) -> ReleaseOwner<Self> {
-        let metadata = ResourceMetadata::new(
-            ResourceKind::Buffer,
-            self.byte_len(),
-            self.device.clone(),
-            entry,
-        );
-        ReleaseOwner::new(self, metadata, Self::dispose_after_release)
-    }
-
-    fn dispose_after_release(buffer: Self) {
-        let Self { device, .. } = buffer;
-        drop(device);
+        entry: TeardownEntryId,
+    ) -> ReleaseOwner<BufferTeardownHandle> {
+        let requested_bytes = self.byte_len();
+        let buffer = ManuallyDrop::new(self);
+        let ptr = buffer.ptr.as_ptr().cast::<c_void>();
+        // SAFETY: `buffer` is never ordinarily dropped. Moving its sole
+        // Rust-owned field into metadata retires it exactly once while the
+        // copied raw pointer becomes an inert teardown handle.
+        let device = unsafe { core::ptr::read(&buffer.device) };
+        let metadata = ResourceMetadata::new(ResourceKind::Buffer, requested_bytes, device, entry);
+        ReleaseOwner::new(BufferTeardownHandle { ptr }, metadata)
     }
 
     /// Number of `T` elements.
@@ -169,11 +181,16 @@ impl<T: BytePod> DeviceBuffer<T> {
 
     /// Host → device memcpy (synchronous).
     ///
+    /// On failure this method returns with `self` still owned by the caller,
+    /// but its device contents are unspecified. Construction transactions must
+    /// move that allocation into explicit teardown custody before propagating
+    /// the error; they must not publish it as initialized.
+    ///
     /// # Errors
     ///
     /// - [`Error::Internal`] if `data.len() != self.len()`.
     /// - [`Error::Runtime`] on HIP failure.
-    pub(crate) fn copy_from_host(&mut self, data: &[T]) -> Result<()> {
+    pub fn copy_from_host(&mut self, data: &[T]) -> Result<()> {
         if data.len() != self.len {
             return InternalSnafu {
                 message: format!(
@@ -208,7 +225,8 @@ impl<T: BytePod> DeviceBuffer<T> {
     ///
     /// # Errors
     ///
-    /// [`Error::Runtime`] on HIP failure.
+    /// [`Error::Runtime`] on HIP failure. The allocation remains owned, but its
+    /// contents are unspecified and must not be treated as zero-initialized.
     pub fn zero_fill(&mut self) -> Result<()> {
         self.device.make_current()?;
         // SAFETY: `ptr` is owned, sized `byte_len()` bytes, and the
@@ -332,23 +350,67 @@ impl<T: BytePod> DeviceBuffer<T> {
     }
 }
 
+/// Opaque, type-erased allocation owner prepared for explicit teardown.
+///
+/// This value contains an inert raw handle and accounting metadata only. It
+/// offers neither typed-buffer recovery nor pointer access, and its destructor
+/// never calls HIP.
+#[must_use = "the allocation remains live until explicitly released or quarantined"]
+pub struct TeardownBuffer {
+    owner: ReleaseOwner<BufferTeardownHandle>,
+}
+
+impl TeardownBuffer {
+    pub(crate) fn from_owner(owner: ReleaseOwner<BufferTeardownHandle>) -> Self {
+        Self { owner }
+    }
+
+    pub(crate) fn with_entry(self, entry: TeardownEntryId) -> ReleaseOwner<BufferTeardownHandle> {
+        self.owner.with_entry(entry)
+    }
+
+    /// Immutable allocation accounting facts.
+    #[must_use]
+    pub fn resource(&self) -> &ResourceMetadata {
+        self.owner.metadata()
+    }
+
+    /// Attempt explicit standalone release of this allocation.
+    #[must_use]
+    pub fn begin_release(self) -> BufferRelease {
+        map_buffer_release(self.owner)
+    }
+}
+
+/// Inert type-erased pointer used only by explicit teardown internals.
+#[derive(Debug)]
+pub(crate) struct BufferTeardownHandle {
+    ptr: *mut c_void,
+}
+
+// SAFETY: this is an inert, inaccessible copy of a HIP allocation handle.
+// Moving it between threads cannot access device memory; the controlled
+// release transition selects the recorded device before passing it to HIP.
+unsafe impl Send for BufferTeardownHandle {}
+
 /// Explicit outcome of releasing a device allocation.
 #[non_exhaustive]
-pub enum BufferRelease<T: BytePod> {
+#[must_use = "release outcomes carry native ownership or acknowledgement evidence"]
+pub enum BufferRelease {
     /// HIP acknowledged the `hipFree` request.
     Released(ReleaseReceipt),
     /// A preflight failure retained the allocation without calling `hipFree`.
-    Pending(PendingBufferTeardown<T>),
+    Pending(PendingBufferTeardown),
     /// `hipFree` returned non-success, leaving ownership indeterminate.
     Quarantined(BufferTeardownQuarantine),
 }
 
 /// Non-usable allocation retained after a pre-`hipFree` failure.
-pub struct PendingBufferTeardown<T: BytePod> {
-    pending: PendingOwner<DeviceBuffer<T>>,
+pub struct PendingBufferTeardown {
+    pending: PendingOwner<BufferTeardownHandle>,
 }
 
-impl<T: BytePod> PendingBufferTeardown<T> {
+impl PendingBufferTeardown {
     /// Recorded preflight failure and resource accounting facts.
     #[must_use]
     pub fn error(&self) -> &TeardownError {
@@ -357,7 +419,7 @@ impl<T: BytePod> PendingBufferTeardown<T> {
 
     /// Retry the previously unstarted release exactly once per call.
     #[must_use]
-    pub fn retry(self) -> BufferRelease<T> {
+    pub fn retry(self) -> BufferRelease {
         map_buffer_release(self.pending.into_owner())
     }
 }
@@ -366,6 +428,7 @@ impl<T: BytePod> PendingBufferTeardown<T> {
 #[derive(Debug)]
 pub struct BufferTeardownQuarantine {
     tombstone: TeardownTombstone,
+    _owner: ReleaseOwner<BufferTeardownHandle>,
 }
 
 impl BufferTeardownQuarantine {
@@ -376,31 +439,31 @@ impl BufferTeardownQuarantine {
     }
 }
 
-pub(crate) fn attempt_buffer_release<T: BytePod>(
-    owner: ReleaseOwner<DeviceBuffer<T>>,
-) -> ReleaseAttempt<DeviceBuffer<T>> {
+pub(crate) fn attempt_buffer_release(
+    owner: ReleaseOwner<BufferTeardownHandle>,
+) -> ReleaseAttempt<BufferTeardownHandle> {
     owner.attempt(
         TeardownPhase::Preflight,
-        |buffer| buffer.device.make_current(),
-        |buffer| {
+        |_, metadata| metadata.device().make_current(),
+        |buffer, _| {
             // SAFETY: the consuming owner disarmed `DeviceBuffer::drop`, the
             // pointer came from `hipMalloc`, and preflight selected its device.
-            check(
-                unsafe { ffi::hipFree(buffer.ptr.as_ptr().cast::<c_void>()) },
-                "hipFree",
-            )
+            check(unsafe { ffi::hipFree(buffer.ptr) }, "hipFree")
         },
     )
 }
 
-fn map_buffer_release<T: BytePod>(owner: ReleaseOwner<DeviceBuffer<T>>) -> BufferRelease<T> {
+pub(crate) fn map_buffer_release(owner: ReleaseOwner<BufferTeardownHandle>) -> BufferRelease {
     match attempt_buffer_release(owner) {
         ReleaseAttempt::Released(receipt) => BufferRelease::Released(receipt),
         ReleaseAttempt::Pending(pending) => {
             BufferRelease::Pending(PendingBufferTeardown { pending })
         }
-        ReleaseAttempt::Quarantined { tombstone, .. } => {
-            BufferRelease::Quarantined(BufferTeardownQuarantine { tombstone })
+        ReleaseAttempt::Quarantined { owner, tombstone } => {
+            BufferRelease::Quarantined(BufferTeardownQuarantine {
+                tombstone,
+                _owner: owner,
+            })
         }
     }
 }

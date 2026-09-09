@@ -52,14 +52,16 @@ pub use crate::device::{
 pub use crate::error::{Error, ErrorKind, Result, check};
 pub use crate::memory::{
     BufferRelease, BufferTeardownQuarantine, DeviceBuffer, PendingBufferTeardown, PendingCopy,
+    TeardownBuffer,
 };
 pub use crate::pod::BytePod;
 pub use crate::stream::{
-    Event, PendingStreamDestroy, PendingStreamQuiesce, QuiescentStream, Stream, StreamQuiesce,
-    StreamRelease, StreamTeardownQuarantine,
+    Event, NonOwnedStream, PendingStreamDestroy, PendingStreamQuiesce, QuiescentStream, Stream,
+    StreamQuiesce, StreamRelease, StreamSynchronizationUnconfirmed, StreamTeardownQuarantine,
 };
 pub use crate::teardown::{
-    InventoryQuarantine, InventoryReceipt, InventoryRelease, NonOwnedInventory, PendingInventory,
+    InventoryAccountingError, InventoryEvidence, InventoryPushError, InventoryQuarantine,
+    InventoryReceipt, InventoryRelease, InventorySynchronizationUnconfirmed, PendingInventory,
     ReleaseReceipt, ResourceKind, ResourceMetadata, TeardownEntryId, TeardownError,
     TeardownInventory, TeardownPhase, TeardownTombstone,
 };
