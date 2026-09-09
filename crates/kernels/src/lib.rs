@@ -41,6 +41,7 @@
     clippy::missing_safety_doc
 )]
 
+pub mod attention;
 pub mod causal_conv;
 pub mod cpu_f32;
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
@@ -60,6 +61,10 @@ pub mod softmax;
 pub use crate::causal_conv::{
     CausalConvAllocationPlan, CausalConvError, CausalConvInput, CausalConvOutput, CausalConvResult,
     causal_conv_fwd,
+};
+pub use crate::attention::{
+    PagedDecodeError, PagedDecodePlan, PagedDecodeRowsError, PagedDecodeRowsResult,
+    PagedDecodeResult, paged_decode_cpu,
 };
 pub use crate::error::{Error, Result};
 pub use crate::gdn::{
