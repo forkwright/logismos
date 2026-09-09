@@ -14,6 +14,7 @@ gpu = [
     "decoders/gpu",
     "dep:hipcore",
     "dep:kernels",
+    "dep:snafu",
     "dep:text",
 ]
 
@@ -21,6 +22,7 @@ gpu = [
 decoders = { path = "../decoders", default-features = false, optional = true }
 hipcore = { workspace = true, optional = true }
 kernels = { workspace = true, optional = true }
+snafu = { workspace = true, optional = true }
 text = { workspace = true, optional = true }
 
 [lints]

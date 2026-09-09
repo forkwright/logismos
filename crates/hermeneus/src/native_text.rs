@@ -11,6 +11,7 @@ use decoders::{
 };
 use hipcore::{BufferRelease, Device, DeviceBuffer};
 use kernels::attention::NativePageTokens;
+use snafu::Snafu;
 use text::{
     Cancellation, Generation, PreparedGeneration, RecycledGenerationDriver,
     RecycledGenerationError, RecycledLogitsPlan, RecycledLogitsStorage, TextPipeline,
@@ -32,20 +33,30 @@ struct NativeTextResidentInner {
 
 /// Failure while creating a shared native text resident.
 #[must_use = "native construction failure retains its exact typed source"]
+#[derive(Snafu)]
+#[non_exhaustive]
 pub enum NativeTextResidentBuildFailure {
     /// The exact pipeline profile could not form a native execution plan.
+    #[snafu(display("native text plan failed: {source}"))]
     Plan {
         /// Original checked decoder-plan failure.
         source: decoders::Error,
         /// Exact text pipeline retained by the failed construction.
         pipeline: TextPipeline,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
     /// Native creation failed after retaining typed partial native custody.
+    #[snafu(display("native text resident construction failed: {source}"))]
     Native {
         /// Original typed native construction custody.
         source: Box<NativeBuildFailure>,
         /// Exact text pipeline retained by the failed construction.
         pipeline: TextPipeline,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 }
 
@@ -64,31 +75,9 @@ impl fmt::Debug for NativeTextResidentBuildFailure {
     }
 }
 
-impl fmt::Display for NativeTextResidentBuildFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Plan { source, .. } => write!(formatter, "native text plan failed: {source}"),
-            Self::Native { source, .. } => {
-                write!(
-                    formatter,
-                    "native text resident construction failed: {source}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for NativeTextResidentBuildFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Plan { source, .. } => Some(source),
-            Self::Native { source, .. } => Some(source.as_ref()),
-        }
-    }
-}
-
 /// Result of explicitly closing a native text resident.
 #[must_use = "resident close retains the model or its explicit teardown custody"]
+#[non_exhaustive]
 pub enum NativeTextResidentClose {
     /// A planned or active use still retains this resident.
     InUse(NativeTextResident),
@@ -160,6 +149,7 @@ impl NativeTextResident {
             .map_err(|source| NativeTextResidentBuildFailure::Plan {
                 source,
                 pipeline: pipeline.clone(),
+                location: snafu::location!(),
             })?;
         let context_ceiling = profile.context_ceiling().min(artifact_ceiling);
         let plan = Qwen35NativeExecutionPlan::try_from_weights(
@@ -170,12 +160,14 @@ impl NativeTextResident {
         .map_err(|source| NativeTextResidentBuildFailure::Plan {
             source,
             pipeline: pipeline.clone(),
+            location: snafu::location!(),
         })?;
         // SAFETY: this boundary forwards the caller's qualified device contract.
         let model = unsafe { plan.into_model(device) }.map_err(|source| {
             NativeTextResidentBuildFailure::Native {
                 source: Box::new(source),
                 pipeline: pipeline.clone(),
+                location: snafu::location!(),
             }
         })?;
         Ok(Self {
@@ -197,13 +189,18 @@ impl NativeTextResident {
         prepared: PreparedGeneration,
     ) -> Result<NativeTextUsePlan, NativeTextUsePlanFailure> {
         if !self.inner.pipeline.owns_preparation(&prepared) {
-            return Err(NativeTextUsePlanFailure::ForeignPreparation);
+            return Err(NativeTextUsePlanFailure::ForeignPreparation {
+                location: snafu::location!(),
+            });
         }
         let session = self
             .inner
             .model
             .plan_session(prepared.context_tokens())
-            .map_err(|source| NativeTextUsePlanFailure::NativePlan { source })?;
+            .map_err(|source| NativeTextUsePlanFailure::NativePlan {
+                source,
+                location: snafu::location!(),
+            })?;
         Ok(NativeTextUsePlan {
             resident: Arc::clone(&self.inner),
             recycled_logits_plan: prepared.recycled_logits_plan(),
@@ -234,38 +231,25 @@ impl NativeTextResident {
 }
 
 /// Failure while binding one consumed text preparation to a native use plan.
-#[derive(Debug)]
+#[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum NativeTextUsePlanFailure {
     /// The preparation belongs to an independently constructed text pipeline.
-    ForeignPreparation,
+    #[snafu(display("prepared generation belongs to a different native text resident pipeline"))]
+    ForeignPreparation {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// The resident refused the prepared request's exact context plan.
+    #[snafu(display("native text session plan failed: {source}"))]
     NativePlan {
         /// Original checked decoder-plan failure.
         source: decoders::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
-}
-
-impl fmt::Display for NativeTextUsePlanFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ForeignPreparation => formatter.write_str(
-                "prepared generation belongs to a different native text resident pipeline",
-            ),
-            Self::NativePlan { source } => {
-                write!(formatter, "native text session plan failed: {source}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for NativeTextUsePlanFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::ForeignPreparation => None,
-            Self::NativePlan { source } => Some(source),
-        }
-    }
 }
 
 /// Opaque one-use plan retaining an exact preparation and resident.
@@ -375,21 +359,6 @@ pub enum NativeTextDriverError {
     EmptyTokenBatch,
 }
 
-impl NativeTextDriverError {
-    fn retry_release(self) -> Self {
-        match self {
-            Self::Copy { source, release } => Self::Copy {
-                source,
-                release: retry_buffer_release(release),
-            },
-            Self::OutputRelease { release } => Self::OutputRelease {
-                release: retry_buffer_release(release),
-            },
-            error => error,
-        }
-    }
-}
-
 impl fmt::Debug for NativeTextDriverError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -458,22 +427,27 @@ impl NativeTextUseClose {
         session: Qwen35NativeExecutionSession,
     ) -> Self {
         match session.close() {
-            Ok(teardown)
-                if teardown.state() == Qwen35NativeExecutionSessionTeardownState::Released =>
-            {
-                Self {
-                    resident,
-                    outcome: NativeTextUseCloseOutcome::Released,
-                }
-            }
-            Ok(teardown) => Self {
-                resident,
-                outcome: NativeTextUseCloseOutcome::Teardown(Box::new(teardown)),
-            },
+            Ok(teardown) => Self::from_teardown(resident, teardown),
             Err(source) => Self {
                 resident,
                 outcome: NativeTextUseCloseOutcome::Failed(source),
             },
+        }
+    }
+
+    fn from_teardown(
+        resident: Arc<NativeTextResidentInner>,
+        teardown: Qwen35NativeExecutionSessionTeardown,
+    ) -> Self {
+        if teardown.state() == Qwen35NativeExecutionSessionTeardownState::Released {
+            return Self {
+                resident,
+                outcome: NativeTextUseCloseOutcome::Released,
+            };
+        }
+        Self {
+            resident,
+            outcome: NativeTextUseCloseOutcome::Teardown(Box::new(teardown)),
         }
     }
 
@@ -497,26 +471,24 @@ impl NativeTextUseClose {
     #[must_use]
     pub fn retry(self) -> Self {
         let Self { resident, outcome } = self;
-        let outcome = match outcome {
+        match outcome {
             NativeTextUseCloseOutcome::Teardown(teardown) => {
-                NativeTextUseCloseOutcome::Teardown(Box::new(teardown.retry()))
+                Self::from_teardown(resident, teardown.retry())
             }
-            outcome => outcome,
-        };
-        Self { resident, outcome }
+            outcome => Self { resident, outcome },
+        }
     }
 
     /// Reconcile only native session completion that remains unproved.
     #[must_use]
     pub fn reconcile(self) -> Self {
         let Self { resident, outcome } = self;
-        let outcome = match outcome {
+        match outcome {
             NativeTextUseCloseOutcome::Teardown(teardown) => {
-                NativeTextUseCloseOutcome::Teardown(Box::new(teardown.reconcile()))
+                Self::from_teardown(resident, teardown.reconcile())
             }
-            outcome => outcome,
-        };
-        Self { resident, outcome }
+            outcome => Self { resident, outcome },
+        }
     }
 
     fn is_released(&self) -> bool {
@@ -526,6 +498,7 @@ impl NativeTextUseClose {
 
 /// Failure after a native text use consumed its exact preparation.
 #[must_use = "generation failure retains every unresolved native owner"]
+#[non_exhaustive]
 pub enum NativeTextGenerationFailure {
     /// The caller's row did not match this preparation before session allocation.
     Storage {
@@ -543,17 +516,10 @@ pub enum NativeTextGenerationFailure {
         /// Exact resident, request, and host row retained by the failed use.
         custody: NativeTextUseConstructionCustody,
     },
-    /// The shared text pipeline stopped after native session creation.
-    Pipeline {
-        /// Original typed text pipeline failure.
-        source: text::Error,
-        /// Explicit session close evidence retained alongside the source.
-        close: NativeTextUseClose,
-    },
-    /// The native driver stopped after native session creation.
-    Driver {
-        /// Original typed native driver failure.
-        source: NativeTextDriverError,
+    /// The shared recycled text execution stopped after native session creation.
+    Execution {
+        /// Original text or driver failure, including future owned variants.
+        source: RecycledGenerationError<NativeTextDriverError>,
         /// Explicit session close evidence retained alongside the source.
         close: NativeTextUseClose,
     },
@@ -569,11 +535,7 @@ impl NativeTextGenerationFailure {
     #[must_use]
     pub fn retry(self) -> Self {
         match self {
-            Self::Driver { source, close } => Self::Driver {
-                source: source.retry_release(),
-                close: close.retry(),
-            },
-            Self::Pipeline { source, close } => Self::Pipeline {
+            Self::Execution { source, close } => Self::Execution {
                 source,
                 close: close.retry(),
             },
@@ -588,11 +550,7 @@ impl NativeTextGenerationFailure {
     #[must_use]
     pub fn reconcile(self) -> Self {
         match self {
-            Self::Driver { source, close } => Self::Driver {
-                source,
-                close: close.reconcile(),
-            },
-            Self::Pipeline { source, close } => Self::Pipeline {
+            Self::Execution { source, close } => Self::Execution {
                 source,
                 close: close.reconcile(),
             },
@@ -607,9 +565,7 @@ impl NativeTextGenerationFailure {
     #[must_use]
     pub fn session_teardown_state(&self) -> Option<Qwen35NativeExecutionSessionTeardownState> {
         match self {
-            Self::Pipeline { close, .. } | Self::Driver { close, .. } | Self::Close { close } => {
-                close.state()
-            }
+            Self::Execution { close, .. } | Self::Close { close } => close.state(),
             Self::Storage { .. } | Self::Construction { .. } => None,
         }
     }
@@ -626,12 +582,8 @@ impl fmt::Debug for NativeTextGenerationFailure {
                 .debug_struct("NativeTextGenerationFailure::Construction")
                 .field("source", source)
                 .finish_non_exhaustive(),
-            Self::Pipeline { source, .. } => formatter
-                .debug_struct("NativeTextGenerationFailure::Pipeline")
-                .field("source", source)
-                .finish_non_exhaustive(),
-            Self::Driver { source, .. } => formatter
-                .debug_struct("NativeTextGenerationFailure::Driver")
+            Self::Execution { source, .. } => formatter
+                .debug_struct("NativeTextGenerationFailure::Execution")
                 .field("source", source)
                 .finish_non_exhaustive(),
             Self::Close { .. } => formatter
@@ -653,10 +605,9 @@ impl fmt::Display for NativeTextGenerationFailure {
                     "native text session construction failed: {source}"
                 )
             }
-            Self::Pipeline { source, .. } => {
-                write!(formatter, "native text pipeline failed: {source}")
+            Self::Execution { source, .. } => {
+                write!(formatter, "native text generation failed: {source}")
             }
-            Self::Driver { source, .. } => write!(formatter, "native text driver failed: {source}"),
             Self::Close { close } => match close.source_error() {
                 Some(source) => write!(formatter, "native text session close failed: {source}"),
                 None => formatter.write_str("native text session close was not acknowledged"),
@@ -668,9 +619,9 @@ impl fmt::Display for NativeTextGenerationFailure {
 impl std::error::Error for NativeTextGenerationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Storage { source, .. } | Self::Pipeline { source, .. } => Some(source),
+            Self::Storage { source, .. } => Some(source),
             Self::Construction { source, .. } => Some(source.as_ref()),
-            Self::Driver { source, .. } => Some(source),
+            Self::Execution { source, .. } => Some(source),
             Self::Close { close } => close
                 .source_error()
                 .map(|source| source as &(dyn std::error::Error + 'static)),
@@ -777,12 +728,7 @@ fn finish_generation(
     match generation {
         Ok(generation) if close.is_released() => Ok(generation),
         Ok(_) => Err(NativeTextGenerationFailure::Close { close }),
-        Err(RecycledGenerationError::Pipeline { source }) => {
-            Err(NativeTextGenerationFailure::Pipeline { source, close })
-        }
-        Err(RecycledGenerationError::Driver { source }) => {
-            Err(NativeTextGenerationFailure::Driver { source, close })
-        }
+        Err(source) => Err(NativeTextGenerationFailure::Execution { source, close }),
     }
 }
 
@@ -809,17 +755,143 @@ fn copy_and_release_final(
     }
 }
 
-fn retry_buffer_release(release: BufferRelease) -> BufferRelease {
-    match release {
-        BufferRelease::Pending(pending) => pending.retry(),
-        release => release,
-    }
-}
-
 fn release_error(release: &BufferRelease) -> Option<&(dyn std::error::Error + 'static)> {
     match release {
         BufferRelease::Released(_) => None,
         BufferRelease::Pending(pending) => Some(pending.error()),
         BufferRelease::Quarantined(quarantine) => Some(quarantine.error()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct SyntheticDriver {
+        stepped: Vec<u32>,
+        released: Vec<u32>,
+        final_output: Option<u32>,
+        fails_on: Option<u32>,
+    }
+
+    impl NativeTokenDriver for SyntheticDriver {
+        type Output = u32;
+
+        fn step_token(&mut self, token: u32) -> Result<Self::Output, NativeTextDriverError> {
+            self.stepped.push(token);
+            if self.fails_on == Some(token) {
+                return Err(NativeTextDriverError::EmptyTokenBatch);
+            }
+            Ok(token)
+        }
+
+        fn release_intermediate(
+            &mut self,
+            output: Self::Output,
+        ) -> Result<(), NativeTextDriverError> {
+            self.released.push(output);
+            Ok(())
+        }
+
+        fn copy_and_release_final(
+            &mut self,
+            output: Self::Output,
+            logits: &mut [f32],
+        ) -> Result<(), NativeTextDriverError> {
+            self.final_output = Some(output);
+            logits[0] = output as f32;
+            Ok(())
+        }
+    }
+
+    struct CancelAt {
+        call: Cell<usize>,
+        cancelled_call: usize,
+    }
+
+    impl Cancellation for CancelAt {
+        fn is_cancelled(&self) -> bool {
+            let call = self.call.get();
+            self.call.set(call + 1);
+            call == self.cancelled_call
+        }
+    }
+
+    #[test]
+    fn prefill_releases_every_nonfinal_native_output() {
+        let mut driver = SyntheticDriver::default();
+        let mut logits = [0.0];
+        let cancellation = CancelAt {
+            call: Cell::new(0),
+            cancelled_call: usize::MAX,
+        };
+
+        let result = drive_token_batch(&mut driver, &[11, 12, 13], &mut logits, &cancellation);
+
+        assert!(result.is_ok());
+        assert_eq!(driver.stepped, [11, 12, 13]);
+        assert_eq!(driver.released, [11, 12]);
+        assert_eq!(driver.final_output, Some(13));
+        assert_eq!(logits, [13.0]);
+    }
+
+    #[test]
+    fn continuation_uses_only_one_final_native_output() {
+        let mut driver = SyntheticDriver::default();
+        let mut logits = [0.0];
+        let cancellation = CancelAt {
+            call: Cell::new(0),
+            cancelled_call: usize::MAX,
+        };
+
+        let result = drive_token_batch(&mut driver, &[29], &mut logits, &cancellation);
+
+        assert!(result.is_ok());
+        assert_eq!(driver.stepped, [29]);
+        assert!(driver.released.is_empty());
+        assert_eq!(driver.final_output, Some(29));
+    }
+
+    #[test]
+    fn cancellation_prevents_the_next_native_prompt_token() {
+        let mut driver = SyntheticDriver::default();
+        let mut logits = [0.0];
+        let cancellation = CancelAt {
+            call: Cell::new(0),
+            cancelled_call: 1,
+        };
+
+        let result = drive_token_batch(&mut driver, &[41, 42, 43], &mut logits, &cancellation);
+
+        assert!(matches!(result, Err(NativeTextDriverError::Cancelled)));
+        assert_eq!(driver.stepped, [41]);
+        assert_eq!(driver.released, [41]);
+        assert_eq!(driver.final_output, None);
+    }
+
+    #[test]
+    fn native_failure_keeps_later_outputs_unvisited() {
+        let mut driver = SyntheticDriver {
+            fails_on: Some(52),
+            ..Self::default()
+        };
+        let mut logits = [0.0];
+        let cancellation = CancelAt {
+            call: Cell::new(0),
+            cancelled_call: usize::MAX,
+        };
+
+        let result = drive_token_batch(&mut driver, &[51, 52, 53], &mut logits, &cancellation);
+
+        assert!(matches!(
+            result,
+            Err(NativeTextDriverError::EmptyTokenBatch)
+        ));
+        assert_eq!(driver.stepped, [51, 52]);
+        assert_eq!(driver.released, [51]);
+        assert_eq!(driver.final_output, None);
     }
 }
