@@ -35,7 +35,7 @@ use loader::gguf::{MetaValue, VerifiedArtifact};
 use serde::Serialize;
 use snafu::{IntoError, ResultExt};
 use templates::{BoundedTemplate, TemplateLimits};
-use tokenize::{TokenizerByteLimit, TokenizerIdentity, VerifiedTokenizer};
+use tokenize::{DecodeStoragePlan, TokenizerByteLimit, TokenizerIdentity, VerifiedTokenizer};
 
 use crate::error::{
     AllocationSnafu, CancelledSnafu, DecodeSnafu, DecoderSnafu, EmptyPromptSnafu,
@@ -77,10 +77,11 @@ impl<'bytes> TokenizerCompanion<'bytes> {
 
 /// Static upper bounds for one artifact-bound pipeline.
 ///
-/// These bounds cover request input and retained output. MiniJinja temporary
-/// allocations, tokenizer parse/encode/decode allocations, and output decoding
-/// are deliberately outside the decoder execution memory report; this is not a
-/// hostile-template or total-process-memory sandbox.
+/// These bounds cover request input and retained output. The generated IDs,
+/// output string, and collective transform arenas are acquired from an owned
+/// plan before the first decoder step. MiniJinja, tokenizer parsing/encoding,
+/// the persistent tokenizer program, allocator metadata, and native regex
+/// overhead remain separate; this is not a total-process-memory sandbox.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PipelineLimits {
     /// Maximum accepted tokenizer companion bytes before hashing or parsing.
@@ -239,6 +240,7 @@ pub struct PreparedGeneration {
     rendered_prompt: String,
     prompt_token_ids: Vec<u32>,
     max_output_tokens: usize,
+    output_storage_plan: DecodeStoragePlan,
 }
 
 /// Per-request token execution consumed by the bounded greedy driver.
@@ -357,6 +359,7 @@ impl PreparedGeneration {
             rendered_prompt,
             prompt_token_ids,
             max_output_tokens,
+            output_storage_plan,
         } = self;
         drop(rendered_prompt);
         check_cancelled(cancellation, "decoder session construction")?;
@@ -367,6 +370,7 @@ impl PreparedGeneration {
             &pipeline,
             &prompt_token_ids,
             max_output_tokens,
+            output_storage_plan,
             &mut driver,
             cancellation,
         )
@@ -406,6 +410,7 @@ impl PreparedGeneration {
             rendered_prompt,
             prompt_token_ids,
             max_output_tokens,
+            output_storage_plan,
         } = self;
         drop(rendered_prompt);
         check_cancelled(cancellation, "decoder session construction")?;
@@ -413,6 +418,7 @@ impl PreparedGeneration {
             &pipeline,
             &prompt_token_ids,
             max_output_tokens,
+            output_storage_plan,
             driver,
             cancellation,
         )
@@ -423,17 +429,15 @@ fn run_generation(
     pipeline: &TextPipeline,
     prompt_token_ids: &[u32],
     max_output_tokens: usize,
+    output_storage_plan: DecodeStoragePlan,
     driver: &mut dyn GenerationDriver,
     cancellation: &dyn Cancellation,
 ) -> Result<Generation> {
+    let mut output_storage = output_storage_plan
+        .acquire()
+        .map_err(map_collective_decode_error)?;
     check_cancelled(cancellation, "prompt decoder step")?;
     let mut logits = driver.step(prompt_token_ids, cancellation)?;
-    let mut generated = Vec::new();
-    generated
-        .try_reserve_exact(max_output_tokens)
-        .context(AllocationSnafu {
-            target: "generated token IDs",
-        })?;
     let finish_reason = loop {
         check_cancelled(cancellation, "greedy selection")?;
         let next =
@@ -441,8 +445,10 @@ fn run_generation(
         if pipeline.profile.special_tokens.stop_ids.contains(&next) {
             break FinishReason::EndOfSequence;
         }
-        generated.push(next);
-        if generated.len() == max_output_tokens {
+        output_storage
+            .push_token_id(next)
+            .map_err(map_collective_decode_error)?;
+        if output_storage.token_ids().len() == max_output_tokens {
             break FinishReason::Length;
         }
         check_cancelled(cancellation, "next decoder step")?;
@@ -452,24 +458,19 @@ fn run_generation(
         logits = driver.step(&[next], cancellation)?;
     };
     // The final vocabulary row is no longer needed once selection completes;
-    // release it before collective tokenizer output allocation and decoding.
+    // release it before using the already acquired collective-decode buffers.
     drop(logits);
     check_cancelled(cancellation, "collective output decoding")?;
-    let text = pipeline
+    let (text, token_ids) = pipeline
         .profile
         .tokenizer
         .tokenizer()
-        .decode(&generated, false)
-        .context(TokenizerSnafu)?;
-    check_limit(
-        "decoded output bytes",
-        text.len(),
-        pipeline.profile.limits.output_bytes,
-    )?;
+        .decode_with_storage(output_storage, false)
+        .map_err(map_collective_decode_error)?;
     check_cancelled(cancellation, "publishing completed response")?;
     Ok(Generation {
         text,
-        token_ids: generated,
+        token_ids,
         finish_reason,
     })
 }
@@ -663,12 +664,19 @@ impl TextPipeline {
                 Qwen35LogitSelection::LastToken,
             )
             .context(DecoderSnafu)?;
+        let output_storage_plan = self
+            .profile
+            .tokenizer
+            .tokenizer()
+            .decode_storage_plan(request.max_output_tokens, self.profile.limits.output_bytes)
+            .context(TokenizerSnafu)?;
         Ok(PreparedGeneration {
             pipeline: self.clone(),
             plan,
             rendered_prompt: rendered,
             prompt_token_ids: prompt,
             max_output_tokens: request.max_output_tokens,
+            output_storage_plan,
         })
     }
 
@@ -1032,6 +1040,21 @@ fn check_cancelled(cancellation: &dyn Cancellation, boundary: &'static str) -> R
         return CancelledSnafu { boundary }.fail();
     }
     Ok(())
+}
+
+fn map_collective_decode_error(error: tokenize::Error) -> Error {
+    match error {
+        tokenize::Error::DecodeStorageAllocation { target, source, .. } => {
+            AllocationSnafu { target }.into_error(source)
+        }
+        tokenize::Error::DecodedByteLimitExceeded { limit, actual, .. } => LimitExceededSnafu {
+            field: "decoded output bytes",
+            actual,
+            limit,
+        }
+        .build(),
+        error => TokenizerSnafu.into_error(error),
+    }
 }
 
 #[cfg(test)]

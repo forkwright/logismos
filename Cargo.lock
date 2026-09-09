@@ -1292,6 +1292,8 @@ dependencies = [
 name = "tokenize"
 version = "1.0.11"
 dependencies = [
+ "serde",
+ "serde_json",
  "sha2",
  "snafu",
  "tokenizers",

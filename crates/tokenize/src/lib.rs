@@ -29,6 +29,8 @@
 
 pub mod error;
 
+mod collective;
+
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -43,6 +45,7 @@ use crate::error::{
     VocabularyIdOutOfRangeSnafu, VocabularyLengthMismatchSnafu, VocabularyMismatchSnafu,
 };
 
+pub use crate::collective::{DecodeStorage, DecodeStoragePlan};
 pub use crate::error::{Error, Result};
 
 const SHA256_BYTES: usize = 32;
@@ -342,6 +345,7 @@ impl fmt::Debug for VerifiedTokenizer {
 /// live behind this boundary.
 pub struct Tokenizer {
     inner: ::tokenizers::Tokenizer,
+    collective_decoder: collective::CollectiveDecoder,
 }
 
 impl Tokenizer {
@@ -353,7 +357,7 @@ impl Tokenizer {
     pub fn from_file(path: &Path) -> Result<Self> {
         let inner = ::tokenizers::Tokenizer::from_file(path)
             .map_err(|error| upstream_error(error.to_string()))?;
-        Ok(Self { inner })
+        Self::from_inner(inner)
     }
 
     /// Parse a HuggingFace `tokenizer.json` byte sequence.
@@ -368,7 +372,7 @@ impl Tokenizer {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let inner = ::tokenizers::Tokenizer::from_bytes(bytes)
             .map_err(|error| upstream_error(error.to_string()))?;
-        Ok(Self { inner })
+        Self::from_inner(inner)
     }
 
     /// Encode a single string to a token-id vector.
@@ -403,6 +407,58 @@ impl Tokenizer {
             .map_err(|error| upstream_error(error.to_string()))
     }
 
+    /// Derive the complete owned storage needed by one bounded collective decode.
+    ///
+    /// The returned plan covers generated IDs, retained output, both transform
+    /// arenas, their sparse span indexes, and byte-oriented transform scratch.
+    /// It does not claim to bound allocator metadata or the native Onig regex
+    /// engine's internal region and match-stack allocations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DecodePlanOverflow`] when any derived capacity or
+    /// requested byte-accounting sum exceeds `usize`.
+    pub fn decode_storage_plan(
+        &self,
+        token_capacity: usize,
+        output_byte_limit: usize,
+    ) -> Result<DecodeStoragePlan> {
+        self.collective_decoder
+            .storage_plan(token_capacity, output_byte_limit)
+    }
+
+    /// Return owned persistent bytes attributable to the compiled decoder containers.
+    ///
+    /// This includes actual capacities for the packed spelling slab, sparse
+    /// index, flattened stage vector, and its owned configuration strings. It
+    /// deliberately excludes the upstream tokenizer, allocator metadata, and
+    /// native Onig regions and match stacks; those require separate residency
+    /// and runtime qualification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DecodePlanOverflow`] if summing actual container
+    /// capacities exceeds `usize`.
+    pub fn collective_decoder_resident_bytes(&self) -> Result<usize> {
+        self.collective_decoder.owned_resident_bytes()
+    }
+
+    /// Decode acquired generated-ID storage without any container growth.
+    ///
+    /// The returned string and ID vector are moved directly out of `storage`;
+    /// all transform scratch is dropped before this method returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed capacity, UTF-8-invariant, or decoded-byte-limit error.
+    pub fn decode_with_storage(
+        &self,
+        storage: DecodeStorage,
+        skip_special_tokens: bool,
+    ) -> Result<(String, Vec<u32>)> {
+        self.collective_decoder.decode(storage, skip_special_tokens)
+    }
+
     /// Vocabulary size, including added tokens.
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
@@ -434,6 +490,14 @@ impl Tokenizer {
             .get_added_tokens_decoder()
             .get(&id)
             .is_some_and(|token| token.special)
+    }
+
+    fn from_inner(inner: ::tokenizers::Tokenizer) -> Result<Self> {
+        let collective_decoder = collective::CollectiveDecoder::compile(&inner)?;
+        Ok(Self {
+            inner,
+            collective_decoder,
+        })
     }
 }
 
@@ -843,3 +907,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod collective_tests;

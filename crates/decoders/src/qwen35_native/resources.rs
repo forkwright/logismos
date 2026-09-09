@@ -4,9 +4,12 @@ use cache::NativePagedKvPool;
 use hipcore::{Device, DeviceBuffer, Stream};
 use snafu::ResultExt;
 
+use super::custody::{NativeBufferSink, NativeBuildResult, NativeBuildScope, NativeBuildSource};
+use super::model_resources::{StreamRetention, build_native_kv, build_numerical_status};
+use super::model_session::NativeBuildFailure;
 use crate::error::{
     ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionPagedDecodePlanSnafu,
-    NativeDeviceSnafu, NativePagedKvSnafu, NativeSessionStateSnafu,
+    NativeDeviceSnafu, NativeSessionStateSnafu,
 };
 use crate::qwen35_mrope::{TextMrope, text_mrope_coefficient};
 use crate::qwen35_native::finish::LayerFinishWorkspace;
@@ -48,6 +51,14 @@ pub(super) struct StepBuffers {
     pub(super) attention: kernels::attention::NativePagedDecodePlan,
 }
 
+struct DeviceBuildFields {
+    weights: NativeWeights,
+    kv: NativePagedKvPool,
+    numerical_status: kernels::numerical_status::NativeNumericalStatus,
+    workspace: NativeWorkspace,
+    finish_workspace: LayerFinishWorkspace,
+}
+
 pub(super) struct FullAttentionStep<'buffers> {
     pub(super) input: &'buffers DeviceBuffer<f32>,
     pub(super) output: &'buffers DeviceBuffer<f32>,
@@ -61,23 +72,46 @@ impl DeviceResources {
         weights: &Qwen35Weights,
         plan: DeviceFullAttentionPlan,
         device: &Device,
-    ) -> Result<Self> {
-        let _ = plan.bytes.total()?;
-        let stream = Stream::new(device).context(NativeDeviceSnafu)?;
-        let numerical_status = kernels::numerical_status::NativeNumericalStatus::new(device)
-            .context(crate::error::NativeKernelSnafu)?;
-        let owned_weights = NativeWeights::upload(weights, &plan, device)?;
-        let kv = NativePagedKvPool::new(plan.kv, device).context(NativePagedKvSnafu)?;
-        let workspace = NativeWorkspace::new(&plan.workspace, device)?;
-        let finish_workspace = LayerFinishWorkspace::new(plan.finish.workspace, device)?;
+    ) -> core::result::Result<Self, NativeBuildFailure> {
+        let scope = NativeBuildScope::new();
+        if let Err(error) = plan.bytes.total() {
+            return Err(NativeBuildFailure::standalone(
+                NativeBuildSource::decoder(error),
+                scope,
+                None,
+                device.clone(),
+            ));
+        }
+        let stream = match Stream::new_tracked(device) {
+            Ok(stream) => StreamRetention::new(stream),
+            Err(error) => {
+                return Err(NativeBuildFailure::standalone(
+                    NativeBuildSource::stream(error),
+                    scope,
+                    None,
+                    device.clone(),
+                ));
+            }
+        };
+        let fields = match build_device_fields(weights, &plan, device, &scope) {
+            Ok(fields) => fields,
+            Err(source) => {
+                return Err(NativeBuildFailure::standalone(
+                    source,
+                    scope,
+                    Some(stream),
+                    device.clone(),
+                ));
+            }
+        };
         Ok(Self {
             plan,
-            weights: owned_weights,
-            kv,
-            stream,
-            numerical_status,
-            workspace,
-            finish_workspace,
+            weights: fields.weights,
+            kv: fields.kv,
+            stream: stream.recover(),
+            numerical_status: fields.numerical_status,
+            workspace: fields.workspace,
+            finish_workspace: fields.finish_workspace,
             step: None,
             position: 0,
         })
@@ -137,6 +171,44 @@ impl DeviceResources {
     }
 }
 
+fn build_device_fields(
+    weights: &Qwen35Weights,
+    plan: &DeviceFullAttentionPlan,
+    device: &Device,
+    scope: &NativeBuildScope,
+) -> NativeBuildResult<DeviceBuildFields> {
+    let numerical_status = scope.guard(build_numerical_status(device, scope)?, |status, sink| {
+        sink.push_u32(status.into_buffer());
+    });
+    let owned_weights = scope.guard(
+        NativeWeights::upload(weights, plan, device, scope)?,
+        NativeWeights::into_buffer_sink,
+    );
+    let kv = scope.guard(build_native_kv(plan.kv, device, scope)?, retain_device_kv);
+    let workspace = scope.guard(
+        NativeWorkspace::new(&plan.workspace, device, scope)?,
+        NativeWorkspace::into_buffer_sink,
+    );
+    let finish_workspace = scope.guard(
+        LayerFinishWorkspace::new(plan.finish.workspace, device, scope)?,
+        LayerFinishWorkspace::into_buffer_sink,
+    );
+    Ok(DeviceBuildFields {
+        weights: owned_weights.commit(),
+        kv: kv.commit(),
+        numerical_status: numerical_status.commit(),
+        workspace: workspace.commit(),
+        finish_workspace: finish_workspace.commit(),
+    })
+}
+
+fn retain_device_kv(pool: NativePagedKvPool, sink: &mut impl NativeBufferSink) {
+    let (keys, values, table) = pool.into_buffers().into_parts();
+    sink.push_f32(keys);
+    sink.push_f32(values);
+    sink.push_u32(table);
+}
+
 impl StepBuffers {
     pub(super) fn full_attention(&self) -> FullAttentionStep<'_> {
         FullAttentionStep {
@@ -150,25 +222,54 @@ impl StepBuffers {
 }
 
 impl NativeWorkspace {
-    pub(super) fn new(plan: &WorkspacePlan, device: &Device) -> Result<Self> {
+    pub(super) fn new(
+        plan: &WorkspacePlan,
+        device: &Device,
+        scope: &NativeBuildScope,
+    ) -> NativeBuildResult<Self> {
         macro_rules! buffer {
             ($field:ident) => {
-                DeviceBuffer::alloc(device, plan.$field).context(NativeDeviceSnafu)?
+                scope.allocate_f32(device, plan.$field)?
             };
         }
+        let hidden = buffer!(hidden);
+        let q_gate = buffer!(q_gate);
+        let query = buffer!(query);
+        let gate = buffer!(gate_values);
+        let normalized_query = buffer!(normalized_query);
+        let key = buffer!(key);
+        let normalized_key = buffer!(normalized_key);
+        let value = buffer!(value);
+        let attention = buffer!(attention);
+        let gated = buffer!(gated);
+        let output_projection = buffer!(output_projection);
         Ok(Self {
-            hidden: buffer!(hidden),
-            q_gate: buffer!(q_gate),
-            query: buffer!(query),
-            gate: buffer!(gate_values),
-            normalized_query: buffer!(normalized_query),
-            key: buffer!(key),
-            normalized_key: buffer!(normalized_key),
-            value: buffer!(value),
-            attention: buffer!(attention),
-            gated: buffer!(gated),
-            output_projection: buffer!(output_projection),
+            hidden: hidden.commit(),
+            q_gate: q_gate.commit(),
+            query: query.commit(),
+            gate: gate.commit(),
+            normalized_query: normalized_query.commit(),
+            key: key.commit(),
+            normalized_key: normalized_key.commit(),
+            value: value.commit(),
+            attention: attention.commit(),
+            gated: gated.commit(),
+            output_projection: output_projection.commit(),
         })
+    }
+
+    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        sink.push_f32(self.hidden);
+        sink.push_f32(self.q_gate);
+        sink.push_f32(self.query);
+        sink.push_f32(self.gate);
+        sink.push_f32(self.normalized_query);
+        sink.push_f32(self.key);
+        sink.push_f32(self.normalized_key);
+        sink.push_f32(self.value);
+        sink.push_f32(self.attention);
+        sink.push_f32(self.gated);
+        sink.push_f32(self.output_projection);
     }
 }
 

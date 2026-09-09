@@ -44,8 +44,11 @@ pub use crate::qwen35::Qwen35StructuralProfile;
 pub use crate::qwen35_execution::{Qwen35Execution, Qwen35ExecutionPlan, Qwen35LogitSelection};
 #[cfg(feature = "gpu")]
 pub use crate::qwen35_native::{
-    Qwen35NativeExecutionDeviceDemand, Qwen35NativeExecutionModel, Qwen35NativeExecutionPlan,
-    Qwen35NativeExecutionSession, Qwen35NativeExecutionSessionPlan, Qwen35NativeLayerDeviceDemand,
+    NativeBuildFailure, NativeBuildRelease, NativeBuildReleaseState, NativeBuildSource,
+    Qwen35NativeExecutionDeviceDemand, Qwen35NativeExecutionModel, Qwen35NativeExecutionModelClose,
+    Qwen35NativeExecutionModelTeardown, Qwen35NativeExecutionPlan, Qwen35NativeExecutionSession,
+    Qwen35NativeExecutionSessionPlan, Qwen35NativeExecutionSessionTeardown,
+    Qwen35NativeExecutionSessionTeardownState, Qwen35NativeLayerDeviceDemand,
     Qwen35NativeLayerPlan, Qwen35NativeLayerSession, Qwen35NativeLayerSessionState,
     Qwen35NativeSessionState,
 };

@@ -4,13 +4,21 @@ use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 use std::ffi::c_void;
+use std::fmt;
 use std::io::{self, Write};
 
+use crate::creation::{
+    CreationAttempt, CreationPort, CreationResolution, attempt_creation, resolve_creation,
+};
 use crate::device::Device;
 use crate::error::{Error, InternalSnafu, OutOfMemorySnafu, Result, check, hipError_t_code};
 use crate::ffi;
 use crate::pod::BytePod;
 use crate::stream::Stream;
+use crate::teardown::{
+    PendingOwner, ReleaseAttempt, ReleaseOwner, ReleaseReceipt, ResourceKind, ResourceMetadata,
+    TeardownEntryId, TeardownError, TeardownPhase, TeardownTombstone,
+};
 
 /// Owned allocation in device memory.
 ///
@@ -43,51 +51,76 @@ unsafe impl<T: BytePod + Sync> Sync for DeviceBuffer<T> {}
 impl<T: BytePod> DeviceBuffer<T> {
     /// Allocate `len` elements of `T` on `device`.
     ///
+    /// This compatibility entry point returns the historical [`crate::Result`]
+    /// shape. It cannot return custody when a failed `hipMalloc` anomalously
+    /// writes a non-null output pointer. Construction transactions that require
+    /// truthful native ownership must use [`Self::alloc_tracked`] instead.
+    ///
     /// # Errors
     ///
     /// - [`Error::OutOfMemory`] when `hipMalloc` returns an
     ///   out-of-memory status.
     /// - [`Error::Runtime`] for any other HIP failure.
     pub fn alloc(device: &Device, len: usize) -> Result<Self> {
-        device.make_current()?;
-        let bytes = len.checked_mul(core::mem::size_of::<T>()).ok_or_else(|| {
-            InternalSnafu {
-                message: "allocation size overflow",
+        let (_, attempt) = allocation_attempt::<T>(device, len)?;
+        match resolve_creation(
+            attempt,
+            |ptr| Self::from_created_handle(device, len, ptr),
+            |_, error| error,
+        ) {
+            CreationResolution::Created(buffer) => Ok(buffer),
+            CreationResolution::NoHandle(error) | CreationResolution::Quarantined(error) => {
+                Err(error)
             }
-            .build()
-        })?;
-        let mut ptr: *mut c_void = core::ptr::null_mut();
-        // SAFETY: FFI call; `&mut ptr` valid. HIP returns either a
-        // non-null pointer with status success, or null with a failure
-        // code; we validate both.
-        let status = unsafe { ffi::hipMalloc(&mut ptr, bytes) };
-        if status != ffi::hipError_t::hipSuccess {
-            let free = device.memory_budget().map(|b| b.free).unwrap_or(0);
-            return Err(if status == ffi::hipError_t::hipErrorOutOfMemory {
-                OutOfMemorySnafu {
-                    requested: bytes,
-                    free,
-                }
-                .build()
-            } else {
-                Error::runtime(hipError_t_code(status), "hipMalloc")
-            });
         }
-        let nn = NonNull::new(ptr.cast::<T>()).ok_or_else(|| {
-            InternalSnafu {
-                message: "hipMalloc returned success with null ptr",
+    }
+
+    /// Allocate with explicit custody for every observed output-handle state.
+    ///
+    /// This is the authoritative constructor for native ownership
+    /// transactions. A preflight failure, size rejection, or HIP error whose
+    /// output slot remains null returns [`BufferAllocationError::NoHandle`]. A
+    /// creation or owner-admission error with a retained non-null output returns
+    /// an opaque terminal [`BufferCreationQuarantine`]; that pointer is never
+    /// exposed, freed, or retried without an admitted resource owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferAllocationError`] for wrapper rejection or HIP failure.
+    pub fn alloc_tracked(
+        device: &Device,
+        len: usize,
+    ) -> core::result::Result<Self, BufferAllocationError> {
+        let (bytes, attempt) =
+            allocation_attempt::<T>(device, len).map_err(BufferAllocationError::NoHandle)?;
+        match resolve_creation(
+            attempt,
+            |ptr| Self::from_created_handle(device, len, ptr),
+            |handle, error| BufferCreationQuarantine {
+                error,
+                resource: ResourceMetadata::new(
+                    ResourceKind::Buffer,
+                    bytes,
+                    device.clone(),
+                    TeardownEntryId::Standalone,
+                ),
+                _handle: BufferTeardownHandle { ptr: handle },
+            },
+        ) {
+            CreationResolution::Created(buffer) => Ok(buffer),
+            CreationResolution::NoHandle(error) => Err(BufferAllocationError::NoHandle(error)),
+            CreationResolution::Quarantined(quarantine) => {
+                Err(BufferAllocationError::Quarantined(quarantine))
             }
-            .build()
-        })?;
-        Ok(Self {
-            ptr: nn,
-            len,
-            device: device.clone(),
-            _marker: PhantomData,
-        })
+        }
     }
 
     /// Allocate and copy `data` to device memory.
+    ///
+    /// This convenience constructor uses ordinary buffer destruction if the
+    /// copy fails. Custody-sensitive construction transactions must instead
+    /// call [`Self::alloc_tracked`], then [`Self::copy_from_host`], and capture
+    /// the still-owned buffer before propagating a copy error.
     ///
     /// # Errors
     ///
@@ -96,6 +129,62 @@ impl<T: BytePod> DeviceBuffer<T> {
         let mut buf = Self::alloc(device, data.len())?;
         buf.copy_from_host(data)?;
         Ok(buf)
+    }
+
+    fn from_created_handle(device: &Device, len: usize, ptr: *mut c_void) -> Result<Self> {
+        let ptr = NonNull::new(ptr.cast::<T>()).ok_or_else(|| {
+            InternalSnafu {
+                message: "hipMalloc returned success with null ptr",
+            }
+            .build()
+        })?;
+        Ok(Self {
+            ptr,
+            len,
+            device: device.clone(),
+            _marker: PhantomData,
+        })
+    }
+
+    /// Start explicit, one-way release of this allocation.
+    ///
+    /// This consumes and disarms the ordinary destructor before selecting the
+    /// owning device or calling `hipFree`. A preflight failure returns a
+    /// non-usable [`PendingBufferTeardown`] that can only be retried
+    /// explicitly. A `hipFree` failure produces a terminal accounting
+    /// tombstone: HIP did not establish whether the allocation remains live,
+    /// so no retry or raw-pointer access is available.
+    ///
+    /// Callers that submitted work touching this buffer must establish stream
+    /// quiescence first. [`crate::TeardownInventory`] encodes that order for a
+    /// stream and all of its registered buffers.
+    pub fn begin_release(self) -> BufferRelease {
+        self.into_teardown().begin_release()
+    }
+
+    /// Disarm ordinary destruction and return an opaque teardown-only owner.
+    ///
+    /// The returned value has no pointer or typed-buffer access. Dropping it
+    /// performs no HIP work, so aggregate builders can retain heterogeneous
+    /// allocations without an implicit destructor during error unwinding.
+    #[must_use = "the allocation remains live until explicitly released or quarantined"]
+    pub fn into_teardown(self) -> TeardownBuffer {
+        TeardownBuffer::from_owner(self.into_release_owner(TeardownEntryId::Standalone))
+    }
+
+    pub(crate) fn into_release_owner(
+        self,
+        entry: TeardownEntryId,
+    ) -> ReleaseOwner<BufferTeardownHandle> {
+        let requested_bytes = self.byte_len();
+        let buffer = ManuallyDrop::new(self);
+        let ptr = buffer.ptr.as_ptr().cast::<c_void>();
+        // SAFETY: `buffer` is never ordinarily dropped. Moving its sole
+        // Rust-owned field into metadata retires it exactly once while the
+        // copied raw pointer becomes an inert teardown handle.
+        let device = unsafe { core::ptr::read(&buffer.device) };
+        let metadata = ResourceMetadata::new(ResourceKind::Buffer, requested_bytes, device, entry);
+        ReleaseOwner::new(BufferTeardownHandle { ptr }, metadata)
     }
 
     /// Number of `T` elements.
@@ -130,11 +219,16 @@ impl<T: BytePod> DeviceBuffer<T> {
 
     /// Host → device memcpy (synchronous).
     ///
+    /// On failure this method returns with `self` still owned by the caller,
+    /// but its device contents are unspecified. Construction transactions must
+    /// move that allocation into explicit teardown custody before propagating
+    /// the error; they must not publish it as initialized.
+    ///
     /// # Errors
     ///
     /// - [`Error::Internal`] if `data.len() != self.len()`.
     /// - [`Error::Runtime`] on HIP failure.
-    pub(crate) fn copy_from_host(&mut self, data: &[T]) -> Result<()> {
+    pub fn copy_from_host(&mut self, data: &[T]) -> Result<()> {
         if data.len() != self.len {
             return InternalSnafu {
                 message: format!(
@@ -169,7 +263,8 @@ impl<T: BytePod> DeviceBuffer<T> {
     ///
     /// # Errors
     ///
-    /// [`Error::Runtime`] on HIP failure.
+    /// [`Error::Runtime`] on HIP failure. The allocation remains owned, but its
+    /// contents are unspecified and must not be treated as zero-initialized.
     pub fn zero_fill(&mut self) -> Result<()> {
         self.device.make_current()?;
         // SAFETY: `ptr` is owned, sized `byte_len()` bytes, and the
@@ -290,6 +385,275 @@ impl<T: BytePod> DeviceBuffer<T> {
             stream,
             synced: false,
         })
+    }
+}
+
+struct BufferAllocationPort<'a> {
+    device: &'a Device,
+    requested_bytes: usize,
+}
+
+impl CreationPort for BufferAllocationPort<'_> {
+    type Handle = *mut c_void;
+
+    fn null_handle(&self) -> Self::Handle {
+        core::ptr::null_mut()
+    }
+
+    fn is_null(&self, handle: Self::Handle) -> bool {
+        handle.is_null()
+    }
+
+    fn preflight(&mut self) -> Result<()> {
+        self.device.make_current()
+    }
+
+    fn create(&mut self, output: &mut Self::Handle) -> Result<()> {
+        // SAFETY: `output` is a valid writable pointer slot for this call.
+        let status = unsafe { ffi::hipMalloc(output, self.requested_bytes) };
+        if status == ffi::hipError_t::hipSuccess {
+            Ok(())
+        } else if status == ffi::hipError_t::hipErrorOutOfMemory {
+            let free = self
+                .device
+                .memory_budget()
+                .map(|budget| budget.free)
+                .unwrap_or(0);
+            Err(OutOfMemorySnafu {
+                requested: self.requested_bytes,
+                free,
+            }
+            .build())
+        } else {
+            Err(Error::runtime(hipError_t_code(status), "hipMalloc"))
+        }
+    }
+
+    fn success_with_null_error(&self) -> Error {
+        InternalSnafu {
+            message: "hipMalloc returned success with null ptr",
+        }
+        .build()
+    }
+}
+
+fn allocation_attempt<T: BytePod>(
+    device: &Device,
+    len: usize,
+) -> Result<(usize, CreationAttempt<*mut c_void>)> {
+    let requested_bytes = len.checked_mul(core::mem::size_of::<T>()).ok_or_else(|| {
+        InternalSnafu {
+            message: "allocation size overflow",
+        }
+        .build()
+    })?;
+    let mut port = BufferAllocationPort {
+        device,
+        requested_bytes,
+    };
+    Ok((requested_bytes, attempt_creation(&mut port)))
+}
+
+/// Failure from an explicitly tracked device allocation attempt.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BufferAllocationError {
+    /// The call was rejected before creation or its output slot remained null.
+    ///
+    /// This state owns no native handle and makes no claim about measured VRAM
+    /// reclamation.
+    NoHandle(Error),
+    /// Creation or owner admission failed with a retained non-null output.
+    Quarantined(BufferCreationQuarantine),
+}
+
+impl BufferAllocationError {
+    /// Underlying wrapper or HIP failure.
+    #[must_use]
+    pub fn error(&self) -> &Error {
+        match self {
+            Self::NoHandle(error) => error,
+            Self::Quarantined(quarantine) => quarantine.error(),
+        }
+    }
+}
+
+impl fmt::Display for BufferAllocationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoHandle(error) => fmt::Display::fmt(error, formatter),
+            Self::Quarantined(quarantine) => write!(
+                formatter,
+                "HIP allocation returned an indeterminate non-null output: {}",
+                quarantine.error()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BufferAllocationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error())
+    }
+}
+
+/// Terminal custody for a non-null output that could not become an owned buffer.
+///
+/// The output is neither assumed valid nor passed to `hipFree`. This value
+/// exposes accounting facts and the creation error, but no pointer, retry, or
+/// release transition. Dropping it performs no HIP work.
+#[must_use = "the indeterminate allocation must remain conservatively accounted"]
+pub struct BufferCreationQuarantine {
+    error: Error,
+    resource: ResourceMetadata,
+    _handle: BufferTeardownHandle,
+}
+
+impl fmt::Debug for BufferCreationQuarantine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BufferCreationQuarantine")
+            .field("error", &self.error)
+            .field("resource", &self.resource)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BufferCreationQuarantine {
+    /// Creation or owner-admission failure retained with the output.
+    #[must_use]
+    pub const fn error(&self) -> &Error {
+        &self.error
+    }
+
+    /// Requested allocation facts retained for conservative accounting.
+    #[must_use]
+    pub const fn resource(&self) -> &ResourceMetadata {
+        &self.resource
+    }
+}
+
+/// Opaque, type-erased allocation owner prepared for explicit teardown.
+///
+/// This value contains an inert raw handle and accounting metadata only. It
+/// offers neither typed-buffer recovery nor pointer access, and its destructor
+/// never calls HIP.
+#[must_use = "the allocation remains live until explicitly released or quarantined"]
+pub struct TeardownBuffer {
+    owner: ReleaseOwner<BufferTeardownHandle>,
+}
+
+impl TeardownBuffer {
+    pub(crate) fn from_owner(owner: ReleaseOwner<BufferTeardownHandle>) -> Self {
+        Self { owner }
+    }
+
+    pub(crate) fn with_entry(self, entry: TeardownEntryId) -> ReleaseOwner<BufferTeardownHandle> {
+        self.owner.with_entry(entry)
+    }
+
+    /// Immutable allocation accounting facts.
+    #[must_use]
+    pub fn resource(&self) -> &ResourceMetadata {
+        self.owner.metadata()
+    }
+
+    /// Attempt explicit standalone release of this allocation.
+    pub fn begin_release(self) -> BufferRelease {
+        map_buffer_release(self.owner)
+    }
+}
+
+/// Inert type-erased pointer used only by explicit teardown internals.
+#[derive(Debug)]
+pub(crate) struct BufferTeardownHandle {
+    ptr: *mut c_void,
+}
+
+// SAFETY: this is an inert, inaccessible copy of a HIP allocation handle.
+// Moving it between threads cannot access device memory; the controlled
+// release transition selects the recorded device before passing it to HIP.
+unsafe impl Send for BufferTeardownHandle {}
+
+/// Explicit outcome of releasing a device allocation.
+#[non_exhaustive]
+#[must_use = "release outcomes carry native ownership or acknowledgement evidence"]
+pub enum BufferRelease {
+    /// HIP acknowledged the `hipFree` request.
+    Released(ReleaseReceipt),
+    /// A preflight failure retained the allocation without calling `hipFree`.
+    Pending(PendingBufferTeardown),
+    /// `hipFree` returned non-success, leaving ownership indeterminate.
+    Quarantined(BufferTeardownQuarantine),
+}
+
+/// Non-usable allocation retained after a pre-`hipFree` failure.
+pub struct PendingBufferTeardown {
+    pending: PendingOwner<BufferTeardownHandle>,
+}
+
+impl PendingBufferTeardown {
+    /// Recorded preflight failure and resource accounting facts.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.pending.error()
+    }
+
+    /// Retry the previously unstarted release exactly once per call.
+    pub fn retry(self) -> BufferRelease {
+        map_buffer_release(self.pending.into_owner())
+    }
+}
+
+/// Opaque terminal allocation record after an indeterminate `hipFree` outcome.
+pub struct BufferTeardownQuarantine {
+    tombstone: TeardownTombstone,
+    _owner: ReleaseOwner<BufferTeardownHandle>,
+}
+
+impl fmt::Debug for BufferTeardownQuarantine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BufferTeardownQuarantine")
+            .field("tombstone", &self.tombstone)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BufferTeardownQuarantine {
+    /// Indeterminate destructor failure retained for accounting.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.tombstone.error()
+    }
+}
+
+pub(crate) fn attempt_buffer_release(
+    owner: ReleaseOwner<BufferTeardownHandle>,
+) -> ReleaseAttempt<BufferTeardownHandle> {
+    owner.attempt(
+        TeardownPhase::Preflight,
+        |_, metadata| metadata.device().make_current(),
+        |buffer, _| {
+            // SAFETY: the consuming owner disarmed `DeviceBuffer::drop`, the
+            // pointer came from `hipMalloc`, and preflight selected its device.
+            check(unsafe { ffi::hipFree(buffer.ptr) }, "hipFree")
+        },
+    )
+}
+
+pub(crate) fn map_buffer_release(owner: ReleaseOwner<BufferTeardownHandle>) -> BufferRelease {
+    match attempt_buffer_release(owner) {
+        ReleaseAttempt::Released(receipt) => BufferRelease::Released(receipt),
+        ReleaseAttempt::Pending(pending) => {
+            BufferRelease::Pending(PendingBufferTeardown { pending })
+        }
+        ReleaseAttempt::Quarantined { owner, tombstone } => {
+            BufferRelease::Quarantined(BufferTeardownQuarantine {
+                tombstone,
+                _owner: owner,
+            })
+        }
     }
 }
 

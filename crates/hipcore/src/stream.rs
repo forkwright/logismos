@@ -1,11 +1,20 @@
 //! HIP streams and events.
 
+use core::mem::ManuallyDrop;
+use std::fmt;
 use std::io::{self, Write};
 use std::ptr;
 
+use crate::creation::{
+    CreationAttempt, CreationPort, CreationResolution, attempt_creation, resolve_creation,
+};
 use crate::device::Device;
-use crate::error::{Result, check, hipError_t_code};
+use crate::error::{Error, InternalSnafu, Result, check, hipError_t_code};
 use crate::ffi;
+use crate::teardown::{
+    PendingOwner, QuiesceAttempt, ReleaseAttempt, ReleaseOwner, ReleaseReceipt, ResourceKind,
+    ResourceMetadata, TeardownEntryId, TeardownError, TeardownPhase, TeardownTombstone,
+};
 
 /// Handle to a HIP stream.
 ///
@@ -27,17 +36,68 @@ unsafe impl Send for Stream {}
 impl Stream {
     /// Create a new non-blocking stream on `device`.
     ///
+    /// This compatibility entry point returns the historical [`crate::Result`]
+    /// shape. It cannot return custody when a failed stream creation call
+    /// anomalously writes a non-null output handle. Construction transactions
+    /// that require truthful native ownership must use [`Self::new_tracked`].
+    ///
     /// # Errors
     ///
     /// [`crate::Error::Runtime`] on HIP failure.
     pub fn new(device: &Device) -> Result<Self> {
-        device.make_current()?;
-        let mut handle: ffi::hipStream_t = ptr::null_mut();
-        // SAFETY: FFI call; `&mut handle` valid.
-        check(
-            unsafe { ffi::hipStreamCreateWithFlags(&mut handle, ffi::hipStreamNonBlocking) },
-            "hipStreamCreateWithFlags",
-        )?;
+        match resolve_creation(
+            stream_creation_attempt(device),
+            |handle| Self::from_created_handle(device, handle),
+            |_, error| error,
+        ) {
+            CreationResolution::Created(stream) => Ok(stream),
+            CreationResolution::NoHandle(error) | CreationResolution::Quarantined(error) => {
+                Err(error)
+            }
+        }
+    }
+
+    /// Create a non-blocking stream with explicit output-handle custody.
+    ///
+    /// A preflight failure or HIP error whose output slot remains null returns
+    /// [`StreamCreationError::NoHandle`]. A creation or owner-admission error
+    /// with a retained non-null output returns an opaque terminal
+    /// [`StreamCreationQuarantine`]; the handle is never exposed, destroyed, or
+    /// retried without an admitted resource owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamCreationError`] for wrapper rejection or HIP failure.
+    pub fn new_tracked(device: &Device) -> core::result::Result<Self, StreamCreationError> {
+        match resolve_creation(
+            stream_creation_attempt(device),
+            |handle| Self::from_created_handle(device, handle),
+            |handle, error| StreamCreationQuarantine {
+                error,
+                resource: ResourceMetadata::new(
+                    ResourceKind::Stream,
+                    0,
+                    device.clone(),
+                    TeardownEntryId::Standalone,
+                ),
+                _handle: StreamTeardownHandle { handle },
+            },
+        ) {
+            CreationResolution::Created(stream) => Ok(stream),
+            CreationResolution::NoHandle(error) => Err(StreamCreationError::NoHandle(error)),
+            CreationResolution::Quarantined(quarantine) => {
+                Err(StreamCreationError::Quarantined(quarantine))
+            }
+        }
+    }
+
+    fn from_created_handle(device: &Device, handle: ffi::hipStream_t) -> Result<Self> {
+        if handle.is_null() {
+            return InternalSnafu {
+                message: "hipStreamCreateWithFlags returned success with null handle",
+            }
+            .fail();
+        }
         Ok(Self {
             handle,
             device: device.clone(),
@@ -97,6 +157,20 @@ impl Stream {
         )
     }
 
+    /// Consume this stream and prove that its queued work has completed.
+    ///
+    /// HIP documents that `hipStreamDestroy` may destroy a queue while work is
+    /// still inflight. Explicit teardown therefore has no direct stream
+    /// destructor from this state: callers must first receive a
+    /// [`QuiescentStream`], then destroy it after every buffer touched by the
+    /// stream has been released.
+    pub fn begin_quiesce(self) -> StreamQuiesce {
+        match self.into_release_owner(TeardownEntryId::Standalone) {
+            Ok(owner) => map_stream_quiesce(attempt_stream_quiesce(owner)),
+            Err(stream) => StreamQuiesce::NotOwned(stream),
+        }
+    }
+
     /// Queue `event` on this stream.
     ///
     /// # Errors
@@ -112,6 +186,364 @@ impl Stream {
             unsafe { ffi::hipEventRecord(event.handle, self.handle) },
             "hipEventRecord",
         )
+    }
+
+    pub(crate) fn into_release_owner(
+        self,
+        entry: TeardownEntryId,
+    ) -> core::result::Result<ReleaseOwner<StreamTeardownHandle>, NonOwnedStream> {
+        if !self.owns_handle || self.handle.is_null() {
+            return Err(NonOwnedStream { stream: self });
+        }
+        let stream = ManuallyDrop::new(self);
+        let handle = stream.handle;
+        // SAFETY: `stream` is never ordinarily dropped. Moving its sole
+        // Rust-owned field into metadata retires it exactly once while the
+        // copied opaque handle becomes inert teardown state.
+        let device = unsafe { core::ptr::read(&stream.device) };
+        let metadata = ResourceMetadata::new(ResourceKind::Stream, 0, device, entry);
+        Ok(ReleaseOwner::new(StreamTeardownHandle { handle }, metadata))
+    }
+}
+
+struct StreamCreationPort<'a> {
+    device: &'a Device,
+}
+
+impl CreationPort for StreamCreationPort<'_> {
+    type Handle = ffi::hipStream_t;
+
+    fn null_handle(&self) -> Self::Handle {
+        ptr::null_mut()
+    }
+
+    fn is_null(&self, handle: Self::Handle) -> bool {
+        handle.is_null()
+    }
+
+    fn preflight(&mut self) -> Result<()> {
+        self.device.make_current()
+    }
+
+    fn create(&mut self, output: &mut Self::Handle) -> Result<()> {
+        // SAFETY: `output` is a valid writable stream-handle slot.
+        check(
+            unsafe { ffi::hipStreamCreateWithFlags(output, ffi::hipStreamNonBlocking) },
+            "hipStreamCreateWithFlags",
+        )
+    }
+
+    fn success_with_null_error(&self) -> Error {
+        InternalSnafu {
+            message: "hipStreamCreateWithFlags returned success with null handle",
+        }
+        .build()
+    }
+}
+
+fn stream_creation_attempt(device: &Device) -> CreationAttempt<ffi::hipStream_t> {
+    let mut port = StreamCreationPort { device };
+    attempt_creation(&mut port)
+}
+
+/// Failure from an explicitly tracked stream creation attempt.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum StreamCreationError {
+    /// The call was rejected before creation or its output slot remained null.
+    ///
+    /// This state owns no native handle and makes no claim about runtime-side
+    /// cleanup or resource reclamation.
+    NoHandle(Error),
+    /// Creation or owner admission failed with a retained non-null output.
+    Quarantined(StreamCreationQuarantine),
+}
+
+impl StreamCreationError {
+    /// Underlying wrapper or HIP failure.
+    #[must_use]
+    pub fn error(&self) -> &Error {
+        match self {
+            Self::NoHandle(error) => error,
+            Self::Quarantined(quarantine) => quarantine.error(),
+        }
+    }
+}
+
+impl fmt::Display for StreamCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoHandle(error) => fmt::Display::fmt(error, formatter),
+            Self::Quarantined(quarantine) => write!(
+                formatter,
+                "HIP stream creation returned an indeterminate non-null output: {}",
+                quarantine.error()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StreamCreationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error())
+    }
+}
+
+/// Terminal custody for a non-null output that could not become an owned stream.
+///
+/// The output is neither assumed valid nor passed to `hipStreamDestroy`. This
+/// value exposes accounting facts and the creation error, but no handle, retry,
+/// or release transition. Dropping it performs no HIP work.
+#[must_use = "the indeterminate stream output must remain conservatively accounted"]
+pub struct StreamCreationQuarantine {
+    error: Error,
+    resource: ResourceMetadata,
+    _handle: StreamTeardownHandle,
+}
+
+impl fmt::Debug for StreamCreationQuarantine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamCreationQuarantine")
+            .field("error", &self.error)
+            .field("resource", &self.resource)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamCreationQuarantine {
+    /// Creation or owner-admission failure retained with the output.
+    #[must_use]
+    pub const fn error(&self) -> &Error {
+        &self.error
+    }
+
+    /// Stream creation facts retained for conservative accounting.
+    #[must_use]
+    pub const fn resource(&self) -> &ResourceMetadata {
+        &self.resource
+    }
+}
+
+/// Original NULL stream rejected by owned-stream teardown admission.
+///
+/// No HIP call or ownership conversion occurs before this value is returned.
+#[must_use = "the non-owned stream is returned intact"]
+pub struct NonOwnedStream {
+    stream: Stream,
+}
+
+impl NonOwnedStream {
+    /// Recover the original non-owned stream.
+    #[must_use]
+    pub fn into_stream(self) -> Stream {
+        self.stream
+    }
+}
+
+/// Inert opaque stream handle used only by explicit teardown internals.
+#[derive(Debug)]
+pub(crate) struct StreamTeardownHandle {
+    handle: ffi::hipStream_t,
+}
+
+// SAFETY: this is an inert, inaccessible copy of an owned HIP stream handle.
+// Moving it between threads cannot submit work; controlled transitions select
+// the recorded device before passing it back to HIP.
+unsafe impl Send for StreamTeardownHandle {}
+
+/// Outcome of consuming a stream for explicit synchronization.
+#[non_exhaustive]
+#[must_use = "quiescence outcomes retain the consumed stream"]
+pub enum StreamQuiesce {
+    /// This is the non-owned NULL stream, so no destroy acknowledgement exists.
+    NotOwned(NonOwnedStream),
+    /// Synchronization proved that submitted stream work completed.
+    Quiescent(QuiescentStream),
+    /// Device selection failed before synchronization was invoked.
+    Pending(PendingStreamQuiesce),
+    /// Synchronization returned non-success, so completion remains unproved.
+    SynchronizationUnconfirmed(StreamSynchronizationUnconfirmed),
+}
+
+/// A stream proven quiescent but not yet destroyed.
+#[must_use = "the quiescent stream still requires explicit destruction"]
+pub struct QuiescentStream {
+    pub(crate) owner: ReleaseOwner<StreamTeardownHandle>,
+}
+
+impl QuiescentStream {
+    /// Explicitly destroy this already-quiescent stream.
+    pub fn destroy(self) -> StreamRelease {
+        release_stream_owner(self.owner)
+    }
+}
+
+/// Non-usable stream retained after a failed quiescence transition.
+#[must_use = "the retained stream must remain accounted or be explicitly retried"]
+pub struct PendingStreamQuiesce {
+    pub(crate) pending: PendingOwner<StreamTeardownHandle>,
+}
+
+impl PendingStreamQuiesce {
+    /// Recorded pre-synchronization failure and resource facts.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.pending.error()
+    }
+
+    /// Retry the explicit quiescence transition.
+    pub fn retry(self) -> StreamQuiesce {
+        map_stream_quiesce(attempt_stream_quiesce(self.pending.into_owner()))
+    }
+}
+
+/// Non-usable stream retained after synchronization failed to prove completion.
+#[must_use = "completion remains unproved until explicitly reconciled"]
+pub struct StreamSynchronizationUnconfirmed {
+    pending: PendingOwner<StreamTeardownHandle>,
+}
+
+impl StreamSynchronizationUnconfirmed {
+    /// Synchronization failure and resource facts.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.pending.error()
+    }
+
+    /// Deliberately issue another non-destructive synchronization attempt.
+    pub fn reconcile(self) -> StreamQuiesce {
+        map_stream_reconciliation(attempt_stream_quiesce(self.pending.into_owner()))
+    }
+}
+
+/// Outcome of destroying a quiescent stream.
+#[non_exhaustive]
+#[must_use = "release outcomes carry native ownership or acknowledgement evidence"]
+pub enum StreamRelease {
+    /// HIP acknowledged `hipStreamDestroy` for the owned stream.
+    Released(ReleaseReceipt),
+    /// Device selection failed before `hipStreamDestroy` was invoked.
+    Pending(PendingStreamDestroy),
+    /// `hipStreamDestroy` returned non-success, leaving ownership indeterminate.
+    Quarantined(StreamTeardownQuarantine),
+}
+
+/// Non-usable quiescent stream retained after a pre-destruction failure.
+#[must_use = "the retained stream must remain accounted or be explicitly retried"]
+pub struct PendingStreamDestroy {
+    pending: PendingOwner<StreamTeardownHandle>,
+}
+
+impl PendingStreamDestroy {
+    /// Recorded preflight failure and resource facts.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.pending.error()
+    }
+
+    /// Retry the explicit stream destruction.
+    pub fn retry(self) -> StreamRelease {
+        release_stream_owner(self.pending.into_owner())
+    }
+}
+
+/// Opaque terminal stream record after an indeterminate destroy outcome.
+pub struct StreamTeardownQuarantine {
+    tombstone: TeardownTombstone,
+    _owner: ReleaseOwner<StreamTeardownHandle>,
+}
+
+impl fmt::Debug for StreamTeardownQuarantine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamTeardownQuarantine")
+            .field("tombstone", &self.tombstone)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamTeardownQuarantine {
+    /// Indeterminate destructor failure retained for accounting.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.tombstone.error()
+    }
+}
+
+pub(crate) fn attempt_stream_quiesce(
+    owner: ReleaseOwner<StreamTeardownHandle>,
+) -> QuiesceAttempt<StreamTeardownHandle> {
+    let owner = match owner.prepare(TeardownPhase::Preflight, |_, metadata| {
+        metadata.device().make_current()
+    }) {
+        Ok(owner) => owner,
+        Err(pending) => return QuiesceAttempt::PreflightPending(*pending),
+    };
+    match owner.prepare(TeardownPhase::Synchronization, |stream, _| {
+        // SAFETY: preflight selected the owner device and `handle` is retained
+        // by the disarmed stream owner for the full synchronization call.
+        check(
+            unsafe { ffi::hipStreamSynchronize(stream.handle) },
+            "hipStreamSynchronize",
+        )
+    }) {
+        Ok(owner) => QuiesceAttempt::Quiescent(owner),
+        Err(pending) => QuiesceAttempt::SynchronizationUnconfirmed(*pending),
+    }
+}
+
+pub(crate) fn attempt_stream_destroy(
+    owner: ReleaseOwner<StreamTeardownHandle>,
+) -> ReleaseAttempt<StreamTeardownHandle> {
+    owner.attempt(
+        TeardownPhase::Preflight,
+        |_, metadata| metadata.device().make_current(),
+        |stream, _| {
+            // SAFETY: admission accepts only owned, non-null handles; the
+            // original Stream destructor was disarmed before this transition.
+            check(
+                unsafe { ffi::hipStreamDestroy(stream.handle) },
+                "hipStreamDestroy",
+            )
+        },
+    )
+}
+
+fn map_stream_quiesce(attempt: QuiesceAttempt<StreamTeardownHandle>) -> StreamQuiesce {
+    match attempt {
+        QuiesceAttempt::Quiescent(owner) => StreamQuiesce::Quiescent(QuiescentStream { owner }),
+        QuiesceAttempt::PreflightPending(pending) => {
+            StreamQuiesce::Pending(PendingStreamQuiesce { pending })
+        }
+        QuiesceAttempt::SynchronizationUnconfirmed(pending) => {
+            StreamQuiesce::SynchronizationUnconfirmed(StreamSynchronizationUnconfirmed { pending })
+        }
+    }
+}
+
+fn map_stream_reconciliation(attempt: QuiesceAttempt<StreamTeardownHandle>) -> StreamQuiesce {
+    match attempt {
+        QuiesceAttempt::Quiescent(owner) => StreamQuiesce::Quiescent(QuiescentStream { owner }),
+        QuiesceAttempt::PreflightPending(pending)
+        | QuiesceAttempt::SynchronizationUnconfirmed(pending) => {
+            StreamQuiesce::SynchronizationUnconfirmed(StreamSynchronizationUnconfirmed { pending })
+        }
+    }
+}
+
+fn release_stream_owner(owner: ReleaseOwner<StreamTeardownHandle>) -> StreamRelease {
+    match attempt_stream_destroy(owner) {
+        ReleaseAttempt::Released(receipt) => StreamRelease::Released(receipt),
+        ReleaseAttempt::Pending(pending) => {
+            StreamRelease::Pending(PendingStreamDestroy { pending })
+        }
+        ReleaseAttempt::Quarantined { owner, tombstone } => {
+            StreamRelease::Quarantined(StreamTeardownQuarantine {
+                tombstone,
+                _owner: owner,
+            })
+        }
     }
 }
 

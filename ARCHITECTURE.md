@@ -259,6 +259,24 @@ receipt. Demand is neither a resource grant nor
 measured physical residency. Native numeric obligations remain explicitly
 unsafe; compiler-checked, ignored device witnesses are not execution evidence.
 
+Explicit model/session close transfers original buffers into `hipcore`'s
+heterogeneous teardown inventory. The inventory preserves a checked manifest
+and individual release receipts, synchronizes before freeing its buffers, and
+destroys its stream last. A pre-call failure retains retryable custody;
+unconfirmed synchronization requires deliberate reconciliation; an error after
+a destructor call retains terminal quarantine without a usable or retryable
+handle. Abandoning inert custody invokes no HIP teardown. Logical release
+acknowledgements do not measure globally reclaimed VRAM.
+
+Session teardown separately retains its shared model reference, including on
+abandonment. Only the actual fully released HIP outcome permits explicit
+recovery of that model owner; normal completion need not permanently pin the
+resident. Resident close first requires unique ownership, but that reference
+count alone is never a release receipt. Aggregate construction-failure custody
+and binding these outcomes to service accounting remain incomplete under
+[#173](https://github.com/forkwright/logismos/issues/173); ordinary constructor
+errors or resource `Drop` must not be interpreted as successful load rollback.
+
 `loader::gguf::VerifiedArtifact` owns one immutable serialized backing, admitted
 under an explicit byte limit and matched against a required SHA-256 expectation.
 Its metadata and tensor borrows come from those same bytes; clones retain one

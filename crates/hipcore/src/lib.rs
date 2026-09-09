@@ -37,18 +37,34 @@
     clippy::too_many_lines
 )]
 
+mod creation;
+
 pub mod device;
 pub mod error;
 pub mod ffi;
 pub mod memory;
 pub mod pod;
 pub mod stream;
+pub mod teardown;
 
 pub use crate::device::{
     Device, DeviceIdentity, DeviceInfo, DeviceProps, DeviceSelector, DeviceUuid, MemoryBudget,
     PciBusId, enumerate_devices,
 };
 pub use crate::error::{Error, ErrorKind, Result, check};
-pub use crate::memory::{DeviceBuffer, PendingCopy};
+pub use crate::memory::{
+    BufferAllocationError, BufferCreationQuarantine, BufferRelease, BufferTeardownQuarantine,
+    DeviceBuffer, PendingBufferTeardown, PendingCopy, TeardownBuffer,
+};
 pub use crate::pod::BytePod;
-pub use crate::stream::{Event, Stream};
+pub use crate::stream::{
+    Event, NonOwnedStream, PendingStreamDestroy, PendingStreamQuiesce, QuiescentStream, Stream,
+    StreamCreationError, StreamCreationQuarantine, StreamQuiesce, StreamRelease,
+    StreamSynchronizationUnconfirmed, StreamTeardownQuarantine,
+};
+pub use crate::teardown::{
+    InventoryAccountingError, InventoryEvidence, InventoryPushError, InventoryQuarantine,
+    InventoryReceipt, InventoryRelease, InventorySynchronizationUnconfirmed, PendingInventory,
+    ReleaseReceipt, ResourceKind, ResourceMetadata, TeardownEntryId, TeardownError,
+    TeardownInventory, TeardownPhase, TeardownTombstone,
+};
