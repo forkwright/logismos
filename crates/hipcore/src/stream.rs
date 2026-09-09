@@ -478,7 +478,7 @@ pub(crate) fn attempt_stream_quiesce(
         metadata.device().make_current()
     }) {
         Ok(owner) => owner,
-        Err(pending) => return QuiesceAttempt::PreflightPending(pending),
+        Err(pending) => return QuiesceAttempt::PreflightPending(*pending),
     };
     match owner.prepare(TeardownPhase::Synchronization, |stream, _| {
         // SAFETY: preflight selected the owner device and `handle` is retained
@@ -489,7 +489,7 @@ pub(crate) fn attempt_stream_quiesce(
         )
     }) {
         Ok(owner) => QuiesceAttempt::Quiescent(owner),
-        Err(pending) => QuiesceAttempt::SynchronizationUnconfirmed(pending),
+        Err(pending) => QuiesceAttempt::SynchronizationUnconfirmed(*pending),
     }
 }
 
