@@ -255,7 +255,7 @@ impl<R> ReleaseOwner<R> {
             let error = TeardownError::Destructor {
                 resource: owner.metadata.clone(),
                 source,
-                location: snafu::Location::caller(),
+                location: core::panic::Location::caller(),
             };
             return ReleaseAttempt::Quarantined {
                 owner,
@@ -283,17 +283,17 @@ impl<R> ReleaseOwner<R> {
             TeardownPhase::Preflight => TeardownError::Preflight {
                 resource: self.metadata.clone(),
                 source,
-                location: snafu::Location::caller(),
+                location: core::panic::Location::caller(),
             },
             TeardownPhase::Synchronization => TeardownError::Synchronization {
                 resource: self.metadata.clone(),
                 source,
-                location: snafu::Location::caller(),
+                location: core::panic::Location::caller(),
             },
             TeardownPhase::Destructor => TeardownError::Destructor {
                 resource: self.metadata.clone(),
                 source,
-                location: snafu::Location::caller(),
+                location: core::panic::Location::caller(),
             },
         };
         PendingOwner { owner: self, error }
