@@ -1,5 +1,10 @@
 //! Owned native full-attention resource lifecycle.
 
+#[cfg(feature = "gpu")]
+mod plan;
+#[cfg(feature = "gpu")]
+mod weights;
+
 /// One resource bundle whose submitted work can be synchronized.
 ///
 /// This private seam lets the native session exercise the same ownership and

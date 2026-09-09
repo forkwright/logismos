@@ -1251,6 +1251,10 @@ impl Layout {
     pub(crate) fn is_full(self, block: usize) -> bool {
         (block + 1).is_multiple_of(self.full_interval)
     }
+
+    pub(crate) fn is_admitted_full_block(self, block: usize) -> bool {
+        block < self.main_blocks && self.is_full(block)
+    }
     pub(crate) const fn text_mrope(self) -> TextMrope {
         TextMrope::new(self.n_rot, self.rope_base, self.rope_sections)
     }
