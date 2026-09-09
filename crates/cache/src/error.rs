@@ -26,17 +26,6 @@ pub enum Error {
         source: kernels::Error,
     },
 
-    /// Checked native paged-attention plan admission failed.
-    #[cfg(feature = "gpu")]
-    #[snafu(display("cache: native paged-attention plan failed: {source}"))]
-    PagedAttention {
-        /// Source logical or native paged-attention plan failure.
-        source: kernels::PagedDecodeError,
-        /// Source code location where the error was propagated.
-        #[snafu(implicit)]
-        location: snafu::Location,
-    },
-
     /// Underlying tensor-layer failure.
     #[cfg(feature = "flat")]
     #[snafu(transparent)]

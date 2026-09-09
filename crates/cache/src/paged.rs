@@ -17,7 +17,7 @@ use crate::error::{
     Result,
 };
 #[cfg(feature = "gpu")]
-use crate::error::{PagedAttentionSnafu, PagedNativeDeviceMismatchSnafu, PagedNativePoisonedSnafu};
+use crate::error::{PagedNativeDeviceMismatchSnafu, PagedNativePoisonedSnafu};
 #[cfg(any(feature = "gpu", test))]
 use crate::error::{PagedNativeCommitNotPreparedSnafu, PagedNativeCommitPreparedSnafu};
 
@@ -1834,7 +1834,8 @@ mod tests {
 
     #[cfg(feature = "gpu")]
     #[test]
-    fn native_attention_binding_rejects_same_row_width_with_different_gqa_axes() -> Result<()> {
+    fn native_attention_binding_rejects_same_row_width_with_different_gqa_axes()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         use kernels::attention::{NativePageTokens, PagedDecodePlan};
 
         let cache = NativePagedKvPlan::try_from_geometry(
@@ -1848,19 +1849,17 @@ mod tests {
             NativePageTokens::B8,
         )?;
         let accepted = NativePagedDecodePlan::try_from_paged_decode(
-            PagedDecodePlan::try_from_dimensions(1, 2, 1, 8).context(PagedAttentionSnafu)?,
+            PagedDecodePlan::try_from_dimensions(1, 2, 1, 8)?,
             8,
             cache.layout().physical_pages(),
-        )
-        .context(PagedAttentionSnafu)?;
+        )?;
         assert!(validate_native_attention_binding(cache, 1, accepted).is_ok());
 
         let remapped = NativePagedDecodePlan::try_from_paged_decode(
-            PagedDecodePlan::try_from_dimensions(1, 2, 2, 4).context(PagedAttentionSnafu)?,
+            PagedDecodePlan::try_from_dimensions(1, 2, 2, 4)?,
             8,
             cache.layout().physical_pages(),
-        )
-        .context(PagedAttentionSnafu)?;
+        )?;
         assert!(matches!(
             validate_native_attention_binding(cache, 1, remapped),
             Err(Error::PagedLayout { .. })
