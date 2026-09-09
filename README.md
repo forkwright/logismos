@@ -86,6 +86,11 @@ A service owner must use one controller per resource grant and drain or reconcil
 Supplied memory estimates are not yet artifact-derived requirements or measured residency.
 In-process requested-byte leases compete with v1 workload reservations in the
 same per-device ledger. Dropping a lease does not release its accounting.
+The native accounting path separates resident, per-use and retained-result
+charges; host results use a distinct supplied host envelope. Quarantine and
+returned results retain bounded custody. These contracts still require the
+private executor's exact request binding, current host grant and truthful
+physical lifecycle acknowledgements before serving.
 
 `logismos inspect --input PATH` retains its v1 digest/census receipt. Explicit `--metadata`
 adds typed metadata (including empty-array element types and float bits) and source-order
