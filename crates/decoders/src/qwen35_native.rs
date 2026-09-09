@@ -1,9 +1,15 @@
-//! Owned native full-attention resource lifecycle.
+//! Owned native main-model and full-attention resource lifecycle.
 
 #[cfg(feature = "gpu")]
 mod dispatch;
 #[cfg(feature = "gpu")]
 mod finish;
+#[cfg(feature = "gpu")]
+mod model_resources;
+#[cfg(feature = "gpu")]
+mod model_session;
+#[cfg(feature = "gpu")]
+mod model_step;
 #[cfg(feature = "gpu")]
 mod plan;
 #[cfg(all(test, feature = "gpu"))]
@@ -20,9 +26,13 @@ mod session;
 mod weights;
 
 #[cfg(feature = "gpu")]
+pub use model_session::{
+    Qwen35NativeExecutionDeviceDemand, Qwen35NativeExecutionPlan, Qwen35NativeExecutionSession,
+};
+#[cfg(feature = "gpu")]
 pub use session::{
     Qwen35NativeLayerDeviceDemand, Qwen35NativeLayerPlan, Qwen35NativeLayerSession,
-    Qwen35NativeLayerSessionState,
+    Qwen35NativeLayerSessionState, Qwen35NativeSessionState,
 };
 
 /// One owned resource bundle whose submitted work can be synchronized.
