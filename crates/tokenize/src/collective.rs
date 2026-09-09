@@ -1004,10 +1004,7 @@ fn write_lossy_utf8(raw: &[u8], target: &mut TokenBuffer) -> Result<()> {
     target.finish_token(token_start)
 }
 
-fn remaining_after_error<'bytes>(
-    remaining: &'bytes [u8],
-    error: std::str::Utf8Error,
-) -> Result<&'bytes [u8]> {
+fn remaining_after_error(remaining: &[u8], error: std::str::Utf8Error) -> Result<&[u8]> {
     let Some(error_length) = error.error_len() else {
         return Ok(&[]);
     };
