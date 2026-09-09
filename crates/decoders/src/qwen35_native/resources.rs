@@ -9,50 +9,54 @@ use crate::error::{
     NativeDeviceSnafu, NativePagedKvSnafu, NativeSessionStateSnafu,
 };
 use crate::qwen35_mrope::text_mrope_coefficient;
+use crate::qwen35_native::finish::LayerFinishWorkspace;
 use crate::qwen35_native::plan::{DeviceFullAttentionPlan, WorkspacePlan};
 use crate::qwen35_native::weights::NativeWeights;
 use crate::{Qwen35Weights, Result};
 
-pub(crate) struct DeviceResources {
-    pub(crate) plan: DeviceFullAttentionPlan,
-    pub(crate) weights: NativeWeights,
-    pub(crate) kv: NativePagedKvPool,
-    pub(crate) stream: Stream,
-    pub(crate) workspace: NativeWorkspace,
-    pub(crate) step: Option<StepBuffers>,
-    pub(crate) position: usize,
+pub(super) struct DeviceResources {
+    pub(super) plan: DeviceFullAttentionPlan,
+    pub(super) weights: NativeWeights,
+    pub(super) kv: NativePagedKvPool,
+    pub(super) stream: Stream,
+    pub(super) workspace: NativeWorkspace,
+    pub(super) finish_workspace: LayerFinishWorkspace,
+    pub(super) step: Option<StepBuffers>,
+    pub(super) position: usize,
 }
 
-pub(crate) struct NativeWorkspace {
-    pub(crate) hidden: DeviceBuffer<f32>,
-    pub(crate) q_gate: DeviceBuffer<f32>,
-    pub(crate) query: DeviceBuffer<f32>,
-    pub(crate) gate: DeviceBuffer<f32>,
-    pub(crate) normalized_query: DeviceBuffer<f32>,
-    pub(crate) key: DeviceBuffer<f32>,
-    pub(crate) normalized_key: DeviceBuffer<f32>,
-    pub(crate) value: DeviceBuffer<f32>,
-    pub(crate) attention: DeviceBuffer<f32>,
-    pub(crate) gated: DeviceBuffer<f32>,
-    pub(crate) output_projection: DeviceBuffer<f32>,
-    pub(crate) attention_residual: DeviceBuffer<f32>,
-    pub(crate) post_norm: DeviceBuffer<f32>,
-    pub(crate) ffn_gate: DeviceBuffer<f32>,
-    pub(crate) ffn_up: DeviceBuffer<f32>,
-    pub(crate) ffn_product: DeviceBuffer<f32>,
-    pub(crate) ffn_down: DeviceBuffer<f32>,
+pub(super) struct NativeWorkspace {
+    pub(super) hidden: DeviceBuffer<f32>,
+    pub(super) q_gate: DeviceBuffer<f32>,
+    pub(super) query: DeviceBuffer<f32>,
+    pub(super) gate: DeviceBuffer<f32>,
+    pub(super) normalized_query: DeviceBuffer<f32>,
+    pub(super) key: DeviceBuffer<f32>,
+    pub(super) normalized_key: DeviceBuffer<f32>,
+    pub(super) value: DeviceBuffer<f32>,
+    pub(super) attention: DeviceBuffer<f32>,
+    pub(super) gated: DeviceBuffer<f32>,
+    pub(super) output_projection: DeviceBuffer<f32>,
 }
 
-pub(crate) struct StepBuffers {
-    pub(crate) input: DeviceBuffer<f32>,
-    pub(crate) output: DeviceBuffer<f32>,
-    pub(crate) cosine: DeviceBuffer<f32>,
-    pub(crate) sine: DeviceBuffer<f32>,
-    pub(crate) attention: kernels::attention::NativePagedDecodePlan,
+pub(super) struct StepBuffers {
+    pub(super) input: DeviceBuffer<f32>,
+    pub(super) output: DeviceBuffer<f32>,
+    pub(super) cosine: DeviceBuffer<f32>,
+    pub(super) sine: DeviceBuffer<f32>,
+    pub(super) attention: kernels::attention::NativePagedDecodePlan,
+}
+
+pub(super) struct FullAttentionStep<'buffers> {
+    pub(super) input: &'buffers DeviceBuffer<f32>,
+    pub(super) output: &'buffers DeviceBuffer<f32>,
+    pub(super) cosine: &'buffers DeviceBuffer<f32>,
+    pub(super) sine: &'buffers DeviceBuffer<f32>,
+    pub(super) attention: kernels::attention::NativePagedDecodePlan,
 }
 
 impl DeviceResources {
-    pub(crate) fn new(
+    pub(super) fn new(
         weights: &Qwen35Weights<'_>,
         plan: DeviceFullAttentionPlan,
         device: &Device,
@@ -62,18 +66,20 @@ impl DeviceResources {
         let owned_weights = NativeWeights::upload(weights, &plan, device)?;
         let kv = NativePagedKvPool::new(plan.kv, device).context(NativePagedKvSnafu)?;
         let workspace = NativeWorkspace::new(&plan.workspace, device)?;
+        let finish_workspace = LayerFinishWorkspace::new(plan.finish.workspace, device)?;
         Ok(Self {
             plan,
             weights: owned_weights,
             kv,
             stream,
             workspace,
+            finish_workspace,
             step: None,
             position: 0,
         })
     }
 
-    pub(crate) fn prepare_step(&mut self, input: DeviceBuffer<f32>) -> Result<()> {
+    pub(super) fn prepare_step(&mut self, input: DeviceBuffer<f32>) -> Result<()> {
         if self.step.is_some()
             || input.device().ordinal() != self.stream.device().ordinal()
             || input.len() != self.plan.workspace.hidden
@@ -141,6 +147,19 @@ impl DeviceResources {
         Ok(())
     }
 }
+
+impl StepBuffers {
+    pub(super) fn full_attention(&self) -> FullAttentionStep<'_> {
+        FullAttentionStep {
+            input: &self.input,
+            output: &self.output,
+            cosine: &self.cosine,
+            sine: &self.sine,
+            attention: self.attention,
+        }
+    }
+}
+
 impl NativeWorkspace {
     fn new(plan: &WorkspacePlan, device: &Device) -> Result<Self> {
         macro_rules! buffer {
@@ -160,12 +179,6 @@ impl NativeWorkspace {
             attention: buffer!(attention),
             gated: buffer!(gated),
             output_projection: buffer!(output_projection),
-            attention_residual: buffer!(attention_residual),
-            post_norm: buffer!(post_norm),
-            ffn_gate: buffer!(ffn_gate),
-            ffn_up: buffer!(ffn_up),
-            ffn_product: buffer!(ffn_product),
-            ffn_down: buffer!(ffn_down),
         })
     }
 }

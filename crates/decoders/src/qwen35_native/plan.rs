@@ -10,92 +10,83 @@ use crate::error::{
     NativeSessionStateSnafu,
 };
 use crate::qwen35_execution::{Layout, block_name, read_f32};
+use crate::qwen35_native::finish::LayerFinishPlan;
 use crate::{Qwen35Weights, Result};
 
 #[derive(Debug)]
-pub(crate) struct DeviceFullAttentionPlan {
-    pub(crate) layout: Layout,
-    pub(crate) matrices: ProjectionWeights,
-    pub(crate) norms: NormalizationWeights,
-    pub(crate) workspace: WorkspacePlan,
-    pub(crate) kv: NativePagedKvPlan,
-    pub(crate) bytes: DeviceByteDemand,
+pub(super) struct DeviceFullAttentionPlan {
+    pub(super) layout: Layout,
+    pub(super) matrices: AttentionProjectionWeights,
+    pub(super) norms: AttentionNormalizationWeights,
+    pub(super) workspace: WorkspacePlan,
+    pub(super) finish: LayerFinishPlan,
+    pub(super) kv: NativePagedKvPlan,
+    pub(super) bytes: DeviceByteDemand,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct WorkspacePlan {
-    pub(crate) hidden_norm: kernels::decoder_ops::RmsNormF32Plan,
-    pub(crate) query_norm: kernels::decoder_ops::RmsNormF32Plan,
-    pub(crate) key_norm: kernels::decoder_ops::RmsNormF32Plan,
-    pub(crate) query_rotary: kernels::decoder_ops::RotaryHalfSplitF32Plan,
-    pub(crate) key_rotary: kernels::decoder_ops::RotaryHalfSplitF32Plan,
-    pub(crate) split: kernels::decoder_ops::SplitQGateF32Plan,
-    pub(crate) gate: kernels::decoder_ops::ElementwiseF32Plan,
-    pub(crate) ffn: kernels::decoder_ops::ElementwiseF32Plan,
-    pub(crate) residual: kernels::decoder_ops::ElementwiseF32Plan,
-    pub(crate) hidden: usize,
-    pub(crate) q_gate: usize,
-    pub(crate) query: usize,
-    pub(crate) gate_values: usize,
-    pub(crate) normalized_query: usize,
-    pub(crate) key: usize,
-    pub(crate) normalized_key: usize,
-    pub(crate) value: usize,
-    pub(crate) attention: usize,
-    pub(crate) gated: usize,
-    pub(crate) output_projection: usize,
-    pub(crate) attention_residual: usize,
-    pub(crate) post_norm: usize,
-    pub(crate) ffn_gate: usize,
-    pub(crate) ffn_up: usize,
-    pub(crate) ffn_product: usize,
-    pub(crate) ffn_down: usize,
+pub(super) struct WorkspacePlan {
+    pub(super) hidden_norm: kernels::decoder_ops::RmsNormF32Plan,
+    pub(super) query_norm: kernels::decoder_ops::RmsNormF32Plan,
+    pub(super) key_norm: kernels::decoder_ops::RmsNormF32Plan,
+    pub(super) query_rotary: kernels::decoder_ops::RotaryHalfSplitF32Plan,
+    pub(super) key_rotary: kernels::decoder_ops::RotaryHalfSplitF32Plan,
+    pub(super) split: kernels::decoder_ops::SplitQGateF32Plan,
+    pub(super) gate: kernels::decoder_ops::ElementwiseF32Plan,
+    pub(super) hidden: usize,
+    pub(super) q_gate: usize,
+    pub(super) query: usize,
+    pub(super) gate_values: usize,
+    pub(super) normalized_query: usize,
+    pub(super) key: usize,
+    pub(super) normalized_key: usize,
+    pub(super) value: usize,
+    pub(super) attention: usize,
+    pub(super) gated: usize,
+    pub(super) output_projection: usize,
 }
 #[derive(Debug)]
-pub(crate) struct ProjectionWeight {
-    pub(crate) name: String,
-    pub(crate) shape: kernels::row_gemv::RowGemvShape,
-    pub(crate) serialized_bytes: usize,
+pub(super) struct ProjectionWeight {
+    pub(super) name: String,
+    pub(super) shape: kernels::row_gemv::RowGemvShape,
+    pub(super) serialized_bytes: usize,
 }
 
 #[derive(Debug)]
-pub(crate) struct ProjectionWeights {
-    pub(crate) q_gate: ProjectionWeight,
-    pub(crate) key: ProjectionWeight,
-    pub(crate) value: ProjectionWeight,
-    pub(crate) output: ProjectionWeight,
-    pub(crate) ffn_gate: ProjectionWeight,
-    pub(crate) ffn_up: ProjectionWeight,
-    pub(crate) ffn_down: ProjectionWeight,
+pub(super) struct AttentionProjectionWeights {
+    pub(super) q_gate: ProjectionWeight,
+    pub(super) key: ProjectionWeight,
+    pub(super) value: ProjectionWeight,
+    pub(super) output: ProjectionWeight,
 }
 
 #[derive(Debug)]
-pub(crate) struct ScalarWeight {
-    pub(crate) name: String,
-    pub(crate) elements: usize,
+pub(super) struct F32Parameter {
+    pub(super) name: String,
+    pub(super) dimensions: Vec<u64>,
+    pub(super) elements: usize,
 }
 
 #[derive(Debug)]
-pub(crate) struct NormalizationWeights {
-    pub(crate) input: ScalarWeight,
-    pub(crate) query: ScalarWeight,
-    pub(crate) key: ScalarWeight,
-    pub(crate) post_attention: ScalarWeight,
+pub(super) struct AttentionNormalizationWeights {
+    pub(super) input: F32Parameter,
+    pub(super) query: F32Parameter,
+    pub(super) key: F32Parameter,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct DeviceByteDemand {
-    pub(crate) weights: usize,
-    pub(crate) scratch: usize,
-    pub(crate) input: usize,
-    pub(crate) output: usize,
-    pub(crate) controls: usize,
-    pub(crate) key_values: usize,
-    pub(crate) table: usize,
+pub(super) struct DeviceByteDemand {
+    pub(super) weights: usize,
+    pub(super) scratch: usize,
+    pub(super) input: usize,
+    pub(super) output: usize,
+    pub(super) controls: usize,
+    pub(super) key_values: usize,
+    pub(super) table: usize,
 }
 
 impl DeviceByteDemand {
-    pub(crate) fn total(self) -> Result<usize> {
+    pub(super) fn total(self) -> Result<usize> {
         sum(
             &[
                 self.weights,
@@ -111,7 +102,7 @@ impl DeviceByteDemand {
     }
 }
 impl DeviceFullAttentionPlan {
-    pub(crate) fn from_weights(
+    pub(super) fn from_weights(
         weights: &Qwen35Weights<'_>,
         block: usize,
         max_context: usize,
@@ -124,9 +115,10 @@ impl DeviceFullAttentionPlan {
             }
             .fail();
         }
-        let matrices = ProjectionWeights::from_weights(weights, block)?;
-        let norms = NormalizationWeights::from_weights(weights, layout, block)?;
+        let matrices = AttentionProjectionWeights::from_weights(weights, block)?;
+        let norms = AttentionNormalizationWeights::from_weights(weights, layout, block)?;
         let workspace = WorkspacePlan::from_layout(layout)?;
+        let finish = LayerFinishPlan::from_weights(weights, layout, block)?;
         let kv = NativePagedKvPlan::try_from_geometry(
             PagedKvGeometry {
                 layers: 1,
@@ -153,8 +145,17 @@ impl DeviceFullAttentionPlan {
         .context(ExecutionPagedDecodePlanSnafu)?;
         let f32_bytes = size_of::<f32>();
         let bytes = DeviceByteDemand {
-            weights: sum(&[matrices.bytes()?, norms.bytes()?], "native weight bytes")?,
-            scratch: elements_bytes(workspace.elements()?, f32_bytes, "native scratch bytes")?,
+            weights: sum(
+                &[matrices.bytes()?, norms.bytes()?, finish.demand.weights],
+                "native weight bytes",
+            )?,
+            scratch: sum(
+                &[
+                    elements_bytes(workspace.elements()?, f32_bytes, "native scratch bytes")?,
+                    finish.demand.scratch,
+                ],
+                "native scratch bytes",
+            )?,
             input: elements_bytes(layout.hidden, f32_bytes, "native input bytes")?,
             output: elements_bytes(layout.hidden, f32_bytes, "native output bytes")?,
             controls: elements_bytes(
@@ -186,22 +187,20 @@ impl DeviceFullAttentionPlan {
             matrices,
             norms,
             workspace,
+            finish,
             kv,
             bytes,
         })
     }
 }
 
-impl ProjectionWeights {
+impl AttentionProjectionWeights {
     fn from_weights(weights: &Qwen35Weights<'_>, block: usize) -> Result<Self> {
         Ok(Self {
             q_gate: projection(weights, block_name(block, "attn_q.weight"))?,
             key: projection(weights, block_name(block, "attn_k.weight"))?,
             value: projection(weights, block_name(block, "attn_v.weight"))?,
             output: projection(weights, block_name(block, "attn_output.weight"))?,
-            ffn_gate: projection(weights, block_name(block, "ffn_gate.weight"))?,
-            ffn_up: projection(weights, block_name(block, "ffn_up.weight"))?,
-            ffn_down: projection(weights, block_name(block, "ffn_down.weight"))?,
         })
     }
 
@@ -212,40 +211,38 @@ impl ProjectionWeights {
                 self.key.serialized_bytes,
                 self.value.serialized_bytes,
                 self.output.serialized_bytes,
-                self.ffn_gate.serialized_bytes,
-                self.ffn_up.serialized_bytes,
-                self.ffn_down.serialized_bytes,
             ],
             "native serialized projection bytes",
         )
     }
 }
 
-impl NormalizationWeights {
+impl AttentionNormalizationWeights {
     fn from_weights(weights: &Qwen35Weights<'_>, layout: Layout, block: usize) -> Result<Self> {
         Ok(Self {
-            input: scalar(
+            input: f32_parameter(
                 weights,
                 block_name(block, "attn_norm.weight"),
+                vec![dimension(layout.hidden, "native attention norm width")?],
                 layout.hidden,
             )?,
-            query: scalar(weights, block_name(block, "attn_q_norm.weight"), layout.key)?,
-            key: scalar(weights, block_name(block, "attn_k_norm.weight"), layout.key)?,
-            post_attention: scalar(
+            query: f32_parameter(
                 weights,
-                block_name(block, "post_attention_norm.weight"),
-                layout.hidden,
+                block_name(block, "attn_q_norm.weight"),
+                vec![dimension(layout.key, "native query norm width")?],
+                layout.key,
+            )?,
+            key: f32_parameter(
+                weights,
+                block_name(block, "attn_k_norm.weight"),
+                vec![dimension(layout.key, "native key norm width")?],
+                layout.key,
             )?,
         })
     }
 
     fn bytes(&self) -> Result<usize> {
-        let widths = [
-            self.input.elements,
-            self.query.elements,
-            self.key.elements,
-            self.post_attention.elements,
-        ];
+        let widths = [self.input.elements, self.query.elements, self.key.elements];
         elements_bytes(
             sum(&widths, "native scalar weight elements")?,
             size_of::<f32>(),
@@ -254,7 +251,7 @@ impl NormalizationWeights {
     }
 }
 
-fn projection(weights: &Qwen35Weights<'_>, name: String) -> Result<ProjectionWeight> {
+pub(super) fn projection(weights: &Qwen35Weights<'_>, name: String) -> Result<ProjectionWeight> {
     let matrix = weights.checked_matrix(&name)?;
     let shape = matrix.native_shape().context(NativeKernelSnafu)?;
     Ok(ProjectionWeight {
@@ -264,21 +261,28 @@ fn projection(weights: &Qwen35Weights<'_>, name: String) -> Result<ProjectionWei
     })
 }
 
-fn scalar(weights: &Qwen35Weights<'_>, name: String, elements: usize) -> Result<ScalarWeight> {
-    let dimension = u64::try_from(elements).map_err(|_| {
-        ArithmeticOverflowSnafu {
-            context: "native scalar width",
-        }
-        .build()
-    })?;
-    let values = read_f32(weights, &name, &[dimension], elements)?;
+pub(super) fn dimension(elements: usize, context: &'static str) -> Result<u64> {
+    u64::try_from(elements).map_err(|_| ArithmeticOverflowSnafu { context }.build())
+}
+
+pub(super) fn f32_parameter(
+    weights: &Qwen35Weights<'_>,
+    name: String,
+    dimensions: Vec<u64>,
+    elements: usize,
+) -> Result<F32Parameter> {
+    let values = read_f32(weights, &name, &dimensions, elements)?;
     if values.len() != elements {
         return NativeSessionStateSnafu {
-            rule: "native scalar descriptor must match verified tensor elements",
+            rule: "native F32 parameter descriptor must match verified tensor elements",
         }
         .fail();
     }
-    Ok(ScalarWeight { name, elements })
+    Ok(F32Parameter {
+        name,
+        dimensions,
+        elements,
+    })
 }
 
 impl WorkspacePlan {
@@ -318,10 +322,6 @@ impl WorkspacePlan {
                 .context(NativeKernelSnafu)?;
         let gate = kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(layout.query_width)
             .context(NativeKernelSnafu)?;
-        let ffn = kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(layout.feed_forward)
-            .context(NativeKernelSnafu)?;
-        let residual = kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(layout.hidden)
-            .context(NativeKernelSnafu)?;
         Ok(Self {
             hidden_norm,
             query_norm,
@@ -330,8 +330,6 @@ impl WorkspacePlan {
             key_rotary,
             split,
             gate,
-            ffn,
-            residual,
             hidden: layout.hidden,
             q_gate: split.input_elements(),
             query: split.output_elements(),
@@ -343,12 +341,6 @@ impl WorkspacePlan {
             attention: gate.elements(),
             gated: gate.elements(),
             output_projection: layout.hidden,
-            attention_residual: residual.elements(),
-            post_norm: hidden_norm.elements(),
-            ffn_gate: ffn.elements(),
-            ffn_up: ffn.elements(),
-            ffn_product: ffn.elements(),
-            ffn_down: layout.hidden,
         })
     }
 
@@ -366,12 +358,6 @@ impl WorkspacePlan {
                 self.attention,
                 self.gated,
                 self.output_projection,
-                self.attention_residual,
-                self.post_norm,
-                self.ffn_gate,
-                self.ffn_up,
-                self.ffn_product,
-                self.ffn_down,
             ],
             "native scratch elements",
         )
@@ -390,13 +376,17 @@ impl WorkspacePlan {
     }
 }
 
-fn elements_bytes(elements: usize, bytes: usize, context: &'static str) -> Result<usize> {
+pub(super) fn elements_bytes(
+    elements: usize,
+    bytes: usize,
+    context: &'static str,
+) -> Result<usize> {
     elements
         .checked_mul(bytes)
         .ok_or_else(|| ArithmeticOverflowSnafu { context }.build())
 }
 
-fn sum(values: &[usize], context: &'static str) -> Result<usize> {
+pub(super) fn sum(values: &[usize], context: &'static str) -> Result<usize> {
     values.iter().try_fold(0_usize, |total, value| {
         total
             .checked_add(*value)

@@ -5,8 +5,11 @@ use hipcore::{DeviceBuffer, Stream};
 use snafu::ResultExt;
 
 use super::CompletionResource;
+use super::finish::{
+    DeferredLayerFinish, LayerFinishPlan, LayerFinishWeights, LayerFinishWorkspace,
+};
 use super::plan::WorkspacePlan;
-use super::resources::{DeviceResources, NativeWorkspace, StepBuffers};
+use super::resources::{DeviceResources, FullAttentionStep, NativeWorkspace};
 use super::weights::{NativeMatrix, NativeWeights};
 use crate::Result;
 use crate::error::{
@@ -25,8 +28,11 @@ impl CompletionResource for DeviceResources {
 pub(super) struct DeferredFullAttention<'resources> {
     pub(super) weights: &'resources NativeWeights,
     pub(super) workspace: &'resources NativeWorkspace,
+    pub(super) finish_plan: &'resources LayerFinishPlan,
+    pub(super) finish_weights: &'resources LayerFinishWeights,
+    pub(super) finish_workspace: &'resources LayerFinishWorkspace,
     pub(super) plan: WorkspacePlan,
-    pub(super) step: &'resources StepBuffers,
+    pub(super) step: FullAttentionStep<'resources>,
     pub(super) stream: &'resources Stream,
     pub(super) full_layer: usize,
 }
@@ -60,8 +66,11 @@ impl DeviceResources {
         let deferred = DeferredFullAttention {
             weights: &self.weights,
             workspace: &self.workspace,
+            finish_plan: &self.plan.finish,
+            finish_weights: &self.weights.finish,
+            finish_workspace: &self.finish_workspace,
             plan: self.plan.workspace,
-            step,
+            step: step.full_attention(),
             stream,
             full_layer: 0,
         };
@@ -80,224 +89,177 @@ impl DeferredFullAttention<'_> {
     /// The borrowed buffers and append must remain exclusively owned on this
     /// stream through completion. All inputs, weights, controls, and
     /// intermediates must satisfy the native finite normal-or-zero contract.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the pinned native full-attention operation order is one bounded transactional unit"
-    )]
     pub(super) unsafe fn submit(&self, append: &mut NativePagedAppend<'_>) -> Result<()> {
+        // SAFETY: submit's contract retains the exact checked pre-attention
+        // buffers and weights through completion.
+        unsafe { self.project_input() }?;
+        // SAFETY: submit's contract retains the checked Q/K and controls.
+        unsafe { self.normalize_and_rotate() }?;
+        // SAFETY: submit's contract retains the append and opaque cache spans.
+        unsafe { self.append_and_attend(append) }?;
+        // SAFETY: submit's contract retains the checked attention projection spans.
+        unsafe { self.project_attention() }?;
+        let finish = DeferredLayerFinish {
+            input: self.step.input,
+            attention_projection: &self.workspace.output_projection,
+            output: self.step.output,
+            plan: self.finish_plan,
+            weights: self.finish_weights,
+            workspace: self.finish_workspace,
+            stream: self.stream,
+        };
+        // SAFETY: submit's contract retains the exact input, attention
+        // projection, output, finish weights, and finish scratch through completion.
+        unsafe { finish.submit() }
+    }
+
+    unsafe fn project_input(&self) -> Result<()> {
         let weights = self.weights;
         let workspace = self.workspace;
-        let plan = self.plan;
-        let step = self.step;
         let stream = self.stream;
-
-        // SAFETY: submit's contract retains distinct owned buffers with
-        // verified exact plan extents and finite normal-or-zero operands.
+        // SAFETY: this method's caller retains the exact checked spans and
+        // finite normal-or-zero operands through completion.
         unsafe {
             launch_rms_norm(
-                plan.hidden_norm,
-                &step.input,
+                self.plan.hidden_norm,
+                self.step.input,
                 &weights.input_norm,
                 &workspace.hidden,
                 stream,
             )
         }?;
-        // SAFETY: the row descriptor and distinct owned spans were admitted
-        // from the verified matrix and workspace plans.
+        // SAFETY: the checked matrix descriptor and distinct spans remain live.
         unsafe {
             weights
                 .q_gate
                 .launch(&workspace.hidden, &workspace.q_gate, stream)
         }?;
-        // SAFETY: the row descriptor and distinct owned spans were admitted
-        // from the verified matrix and workspace plans.
+        // SAFETY: the checked matrix descriptor and distinct spans remain live.
         unsafe {
             weights
                 .key
                 .launch(&workspace.hidden, &workspace.key, stream)
         }?;
-        // SAFETY: the row descriptor and distinct owned spans were admitted
-        // from the verified matrix and workspace plans.
+        // SAFETY: the checked matrix descriptor and distinct spans remain live.
         unsafe {
             weights
                 .value
                 .launch(&workspace.hidden, &workspace.value, stream)
         }?;
-        // SAFETY: submit's contract retains distinct owned buffers with the
-        // checked split geometry through completion.
+        // SAFETY: the checked split geometry and exact spans remain live.
         unsafe {
             launch_split(
-                plan.split,
+                self.plan.split,
                 &workspace.q_gate,
                 &workspace.query,
                 &workspace.gate,
                 stream,
             )
-        }?;
-        // SAFETY: submit's contract retains distinct owned buffers with
-        // verified Q/K normal-or-zero operands through completion.
+        }
+    }
+
+    unsafe fn normalize_and_rotate(&self) -> Result<()> {
+        let weights = self.weights;
+        let workspace = self.workspace;
+        let stream = self.stream;
+        // SAFETY: this method's caller retains the exact checked spans and
+        // finite normal-or-zero operands through completion.
         unsafe {
             launch_rms_norm(
-                plan.query_norm,
+                self.plan.query_norm,
                 &workspace.query,
                 &weights.query_norm,
                 &workspace.normalized_query,
                 stream,
             )
         }?;
-        // SAFETY: submit's contract retains distinct owned buffers with
-        // verified Q/K normal-or-zero operands through completion.
+        // SAFETY: the exact checked K-normalization spans remain live.
         unsafe {
             launch_rms_norm(
-                plan.key_norm,
+                self.plan.key_norm,
                 &workspace.key,
                 &weights.key_norm,
                 &workspace.normalized_key,
                 stream,
             )
         }?;
-        // SAFETY: the coefficient controls and rotated Q span are distinct
-        // owned buffers with the plan's exact half-split extents.
+        // SAFETY: the controls and rotated Q span are distinct exact buffers.
         unsafe {
             launch_rotary(
-                plan.query_rotary,
+                self.plan.query_rotary,
                 &workspace.normalized_query,
-                &step.cosine,
-                &step.sine,
+                self.step.cosine,
+                self.step.sine,
                 stream,
             )
         }?;
-        // SAFETY: the coefficient controls and rotated K span are distinct
-        // owned buffers with the plan's exact half-split extents.
+        // SAFETY: the controls and rotated K span are distinct exact buffers.
         unsafe {
             launch_rotary(
-                plan.key_rotary,
+                self.plan.key_rotary,
                 &workspace.normalized_key,
-                &step.cosine,
-                &step.sine,
+                self.step.cosine,
+                self.step.sine,
                 stream,
             )
-        }?;
-        // SAFETY: the normalized K and V buffers are exact native row spans
-        // on the cache stream's device and remain owned through completion.
+        }
+    }
+
+    unsafe fn append_and_attend(&self, append: &mut NativePagedAppend<'_>) -> Result<()> {
+        let workspace = self.workspace;
+        // SAFETY: this method's caller retains the exact native row spans and
+        // append through completion on the ordered stream.
         unsafe {
             append.write_layer_row(
                 self.full_layer,
                 0,
                 &workspace.normalized_key,
                 &workspace.value,
-                stream,
+                self.stream,
             )
         }
         .context(NativePagedKvSnafu)?;
-        {
-            let layer = append
-                .layer_kv(self.full_layer)
-                .context(NativePagedKvSnafu)?;
-            if layer.tokens() != step.attention.logical().visible_tokens() {
-                return NativeSessionStateSnafu {
-                    rule: "native staged KV visibility must match the checked attention plan",
-                }
-                .fail();
-            }
-            // SAFETY: the opaque cache view retains K/V/table spans, while
-            // query and output are separate owned exact spans on its stream.
-            unsafe {
-                layer.launch_paged_decode(
-                    step.attention,
-                    &workspace.normalized_query,
-                    &workspace.attention,
-                    stream,
-                )
-            }
+        let layer = append
+            .layer_kv(self.full_layer)
             .context(NativePagedKvSnafu)?;
+        if layer.tokens() != self.step.attention.logical().visible_tokens() {
+            return NativeSessionStateSnafu {
+                rule: "native staged KV visibility must match the checked attention plan",
+            }
+            .fail();
         }
+        // SAFETY: the opaque cache view retains K/V/table spans, while query
+        // and output are separate owned exact spans on its stream.
+        unsafe {
+            layer.launch_paged_decode(
+                self.step.attention,
+                &workspace.normalized_query,
+                &workspace.attention,
+                self.stream,
+            )
+        }
+        .context(NativePagedKvSnafu)
+    }
 
-        // SAFETY: submit's contract retains distinct owned buffers with
-        // the checked elementwise extent through completion.
+    unsafe fn project_attention(&self) -> Result<()> {
+        let workspace = self.workspace;
+        // SAFETY: this method's caller retains the checked exact elementwise
+        // spans and finite normal-or-zero operands through completion.
         unsafe {
             launch_sigmoid_mul(
-                plan.gate,
+                self.plan.gate,
                 &workspace.attention,
                 &workspace.gate,
                 &workspace.gated,
-                stream,
+                self.stream,
             )
         }?;
-        // SAFETY: the row descriptor and distinct owned spans were admitted
-        // from the verified matrix and workspace plans.
+        // SAFETY: the checked matrix descriptor and distinct spans remain live.
         unsafe {
-            weights
+            self.weights
                 .output
-                .launch(&workspace.gated, &workspace.output_projection, stream)
-        }?;
-        // SAFETY: submit's contract retains distinct owned buffers with
-        // the checked residual extent through completion.
-        unsafe {
-            launch_residual(
-                plan.residual,
-                &step.input,
-                &workspace.output_projection,
-                &workspace.attention_residual,
-                stream,
-            )
-        }?;
-        // SAFETY: submit's contract retains distinct owned buffers with
-        // verified normal-or-zero operands through completion.
-        unsafe {
-            launch_rms_norm(
-                plan.hidden_norm,
-                &workspace.attention_residual,
-                &weights.post_attention_norm,
-                &workspace.post_norm,
-                stream,
-            )
-        }?;
-        // SAFETY: the row descriptor and distinct owned spans were admitted
-        // from the verified matrix and workspace plans.
-        unsafe {
-            weights
-                .ffn_gate
-                .launch(&workspace.post_norm, &workspace.ffn_gate, stream)
-        }?;
-        // SAFETY: the row descriptor and distinct owned spans were admitted
-        // from the verified matrix and workspace plans.
-        unsafe {
-            weights
-                .ffn_up
-                .launch(&workspace.post_norm, &workspace.ffn_up, stream)
-        }?;
-        // SAFETY: submit's contract retains distinct owned buffers with
-        // the checked elementwise extent through completion.
-        unsafe {
-            launch_silu_mul(
-                plan.ffn,
-                &workspace.ffn_gate,
-                &workspace.ffn_up,
-                &workspace.ffn_product,
-                stream,
-            )
-        }?;
-        // SAFETY: the row descriptor and distinct owned spans were admitted
-        // from the verified matrix and workspace plans.
-        unsafe {
-            weights
-                .ffn_down
-                .launch(&workspace.ffn_product, &workspace.ffn_down, stream)
-        }?;
-        // SAFETY: submit_step's contract retains distinct owned buffers with
-        // the checked residual extent through completion.
-        unsafe {
-            launch_residual(
-                plan.residual,
-                &workspace.attention_residual,
-                &workspace.ffn_down,
-                &step.output,
-                stream,
-            )
-        }?;
-
-        Ok(())
+                .launch(&workspace.gated, &workspace.output_projection, self.stream)
+        }
     }
 }
 
@@ -417,7 +379,7 @@ unsafe fn launch_split(
 ///
 /// The two inputs and output must be distinct exact spans on `stream`'s device
 /// with finite normal-or-zero operands through completion.
-unsafe fn launch_sigmoid_mul(
+pub(super) unsafe fn launch_sigmoid_mul(
     plan: kernels::decoder_ops::ElementwiseF32Plan,
     value: &DeviceBuffer<f32>,
     gate: &DeviceBuffer<f32>,

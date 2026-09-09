@@ -51,10 +51,13 @@ fn verified_full_block_plan_accepts_each_explicit_native_page_size()
     ] {
         let plan = DeviceFullAttentionPlan::from_weights(&weights, 3, 4, page_tokens)
             .map_err(|error| error.to_string())?;
-        assert_eq!(plan.bytes.weights, 25_804, "seven matrices plus four norms");
+        assert_eq!(
+            plan.bytes.weights, 25_804,
+            "four attention and three shared-finish matrices plus four norms"
+        );
         assert_eq!(
             plan.bytes.scratch, 17_528,
-            "seventeen named workspace buffers"
+            "eleven attention and six shared-finish workspace buffers"
         );
         assert_eq!(plan.bytes.input, 12, "one hidden f32 input row");
         assert_eq!(plan.bytes.output, 12, "one hidden f32 output row");
