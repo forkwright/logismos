@@ -6,7 +6,7 @@ use hipcore::{
     BufferAllocationError, Device, DeviceBuffer, InventoryRelease, Stream, StreamCreationError,
     TeardownBuffer, TeardownInventory,
 };
-use snafu::ResultExt;
+use snafu::{IntoError, ResultExt};
 use std::sync::Arc;
 
 use super::CompletionResource;
