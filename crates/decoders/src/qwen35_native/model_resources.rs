@@ -133,7 +133,7 @@ impl ModelSessionResources {
             DeviceBuffer::alloc(&model.device, plan.layout.hidden).context(NativeDeviceSnafu)?;
         let final_normalized = DeviceBuffer::alloc(&model.device, plan.output_rms.elements())
             .context(NativeDeviceSnafu)?;
-        let layers = allocate_session_layers(plan, &model.device)?;
+        let layers = allocate_session_layers(&plan, &model.device)?;
         Ok(Self {
             model,
             plan,
