@@ -8,17 +8,17 @@ use snafu::ResultExt;
 use super::finish::{LayerFinishPlan, LayerFinishWorkspacePlan};
 use super::plan::{
     DeviceFullAttentionPlan, F32Parameter, ProjectionWeight, WorkspacePlan, elements_bytes,
-    f32_parameter, projection, sum,
+    f32_parameter, native_decode_plan, projection, sum,
 };
 use super::recurrent_plan::{DeviceRecurrentPlan, RecurrentWorkspacePlan};
 use crate::error::{
-    ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionPagedDecodePlanSnafu,
-    NativeKernelSnafu, NativePagedKvSnafu, NativeSessionStateSnafu,
+    ArithmeticOverflowSnafu, ExecutionAllocationSnafu, NativeKernelSnafu, NativePagedKvSnafu,
+    NativeSessionStateSnafu,
 };
 use crate::qwen35_execution::{Layout, OUTPUT, OUTPUT_NORM, TOKEN_EMBEDDING};
 use crate::{Qwen35Weights, Result};
 
-/// One verified main block in artifact order, excluding terminal NextN blocks.
+/// One verified main block in artifact order, excluding terminal `NextN` blocks.
 #[derive(Debug)]
 pub(super) enum NativeBlockPlan {
     Full(DeviceFullAttentionPlan),
@@ -144,7 +144,6 @@ impl DeviceModelPlan {
             output.shape.rows(),
             &blocks,
             kv,
-            page_tokens,
         )?;
         let _ = bytes.total()?;
         Ok(Self {
@@ -277,12 +276,14 @@ impl ModelDeviceByteDemand {
         vocabulary: usize,
         blocks: &ModelBlockPlans,
         kv: Option<NativePagedKvPlan>,
-        page_tokens: kernels::attention::NativePageTokens,
     ) -> Result<Self> {
         Ok(Self {
             weights: blocks.weights_bytes,
-            full_workspace: workspace_bytes(blocks.full_workspace, "native full workspace bytes")?,
-            recurrent_workspace: recurrent_workspace_bytes(blocks.recurrent_workspace)?,
+            full_workspace: workspace_bytes(
+                blocks.full_workspace.as_ref(),
+                "native full workspace bytes",
+            )?,
+            recurrent_workspace: recurrent_workspace_bytes(blocks.recurrent_workspace.as_ref())?,
             finish_workspace: blocks.finish_workspace_bytes.ok_or_else(|| {
                 NativeSessionStateSnafu {
                     rule: "native main model requires checked layer-finish workspace bytes",
@@ -300,9 +301,9 @@ impl ModelDeviceByteDemand {
                 "native final normalized bytes",
             )?,
             logits: elements_bytes(vocabulary, size_of::<f32>(), "native logits bytes")?,
-            mrope_controls: controls_bytes(blocks.full_workspace)?,
+            mrope_controls: controls_bytes(blocks.full_workspace.as_ref())?,
             key_values: kv_bytes(kv)?,
-            page_table: page_table_bytes(kv, layout, page_tokens)?,
+            page_table: page_table_bytes(kv, layout)?,
             recurrent_history_active: recurrent_bytes(
                 blocks.recurrent_history_elements,
                 "native active recurrent convolution history bytes",
@@ -369,16 +370,16 @@ fn verify_vocabulary_matrix(
     Ok(())
 }
 
-fn workspace_bytes(plan: Option<WorkspacePlan>, context: &'static str) -> Result<usize> {
-    plan.map(WorkspacePlan::elements)
+fn workspace_bytes(plan: Option<&WorkspacePlan>, context: &'static str) -> Result<usize> {
+    plan.map(|plan| plan.elements())
         .transpose()?
         .map(|elements| elements_bytes(elements, size_of::<f32>(), context))
         .transpose()
         .map(|bytes| bytes.unwrap_or(0))
 }
 
-fn recurrent_workspace_bytes(plan: Option<RecurrentWorkspacePlan>) -> Result<usize> {
-    plan.map(RecurrentWorkspacePlan::elements)
+fn recurrent_workspace_bytes(plan: Option<&RecurrentWorkspacePlan>) -> Result<usize> {
+    plan.map(|plan| plan.elements())
         .map(|elements| {
             elements_bytes(
                 elements,
@@ -390,8 +391,8 @@ fn recurrent_workspace_bytes(plan: Option<RecurrentWorkspacePlan>) -> Result<usi
         .map(|bytes| bytes.unwrap_or(0))
 }
 
-fn controls_bytes(plan: Option<WorkspacePlan>) -> Result<usize> {
-    plan.map(WorkspacePlan::coefficient_elements)
+fn controls_bytes(plan: Option<&WorkspacePlan>) -> Result<usize> {
+    plan.map(|plan| plan.coefficient_elements())
         .transpose()?
         .map(|elements| elements_bytes(elements, size_of::<f32>(), "native mRoPE control bytes"))
         .transpose()
@@ -445,27 +446,11 @@ fn kv_bytes(plan: Option<NativePagedKvPlan>) -> Result<usize> {
     )
 }
 
-fn page_table_bytes(
-    plan: Option<NativePagedKvPlan>,
-    layout: Layout,
-    page_tokens: kernels::attention::NativePageTokens,
-) -> Result<usize> {
+fn page_table_bytes(plan: Option<NativePagedKvPlan>, layout: Layout) -> Result<usize> {
     let Some(plan) = plan else {
         return Ok(0);
     };
-    let logical = kernels::PagedDecodePlan::try_from_dimensions(
-        layout.max_context(),
-        layout.heads,
-        layout.kv_heads,
-        layout.key,
-    )
-    .context(ExecutionPagedDecodePlanSnafu)?;
-    let native = kernels::attention::NativePagedDecodePlan::try_from_paged_decode(
-        logical,
-        page_tokens.get(),
-        plan.layout().physical_pages(),
-    )
-    .context(ExecutionPagedDecodePlanSnafu)?;
+    let native = native_decode_plan(layout, layout.max_context(), plan)?;
     elements_bytes(
         native.page_table_entries(),
         size_of::<u32>(),

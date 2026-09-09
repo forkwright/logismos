@@ -3,11 +3,9 @@
 use snafu::ResultExt;
 
 use super::model_plan::DeviceModelPlan;
+use super::plan::native_decode_plan;
 use crate::Result;
-use crate::error::{
-    ArithmeticOverflowSnafu, ExecutionPagedDecodePlanSnafu, NativeKernelSnafu,
-    NativeSessionStateSnafu,
-};
+use crate::error::{ArithmeticOverflowSnafu, NativeKernelSnafu, NativeSessionStateSnafu};
 
 /// Complete action-free geometry admitted before a native model allocates or submits.
 #[derive(Debug, Clone, Copy)]
@@ -48,21 +46,7 @@ impl ModelTokenPlan {
             .context(NativeKernelSnafu)?;
         let attention = plan
             .kv
-            .map(|kv| {
-                let logical = kernels::PagedDecodePlan::try_from_dimensions(
-                    next_position,
-                    plan.layout.heads,
-                    plan.layout.kv_heads,
-                    plan.layout.key,
-                )
-                .context(ExecutionPagedDecodePlanSnafu)?;
-                kernels::attention::NativePagedDecodePlan::try_from_paged_decode(
-                    logical,
-                    kv.layout().page_tokens(),
-                    kv.layout().physical_pages(),
-                )
-                .context(ExecutionPagedDecodePlanSnafu)
-            })
+            .map(|kv| native_decode_plan(plan.layout, next_position, kv))
             .transpose()?;
 
         Ok(Self {

@@ -101,6 +101,27 @@ impl DeviceByteDemand {
         )
     }
 }
+
+pub(super) fn native_decode_plan(
+    layout: Layout,
+    visible: usize,
+    kv: NativePagedKvPlan,
+) -> Result<kernels::attention::NativePagedDecodePlan> {
+    let logical = kernels::PagedDecodePlan::try_from_dimensions(
+        visible,
+        layout.heads,
+        layout.kv_heads,
+        layout.key,
+    )
+    .context(ExecutionPagedDecodePlanSnafu)?;
+    kernels::attention::NativePagedDecodePlan::try_from_paged_decode(
+        logical,
+        kv.layout().page_tokens(),
+        kv.layout().physical_pages(),
+    )
+    .context(ExecutionPagedDecodePlanSnafu)
+}
+
 impl DeviceFullAttentionPlan {
     pub(super) fn from_weights(
         weights: &Qwen35Weights<'_>,
@@ -139,19 +160,7 @@ impl DeviceFullAttentionPlan {
             page_tokens,
         )
         .context(NativePagedKvSnafu)?;
-        let logical = kernels::PagedDecodePlan::try_from_dimensions(
-            layout.max_context(),
-            layout.heads,
-            layout.kv_heads,
-            layout.key,
-        )
-        .context(ExecutionPagedDecodePlanSnafu)?;
-        let attention = kernels::attention::NativePagedDecodePlan::try_from_paged_decode(
-            logical,
-            page_tokens.get(),
-            kv.layout().physical_pages(),
-        )
-        .context(ExecutionPagedDecodePlanSnafu)?;
+        let attention = native_decode_plan(layout, layout.max_context(), kv)?;
         let f32_bytes = size_of::<f32>();
         let bytes = DeviceByteDemand {
             weights: sum(

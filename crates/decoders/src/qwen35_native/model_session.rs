@@ -122,7 +122,7 @@ impl Qwen35NativeExecutionDeviceDemand {
 ///
 /// This plan borrows the exact verified weights that it will upload. Its block
 /// sequence contains the artifact's main blocks and terminal normalization and
-/// output head; optional auxiliary NextN blocks are intentionally outside that
+/// output head; optional auxiliary `NextN` blocks are intentionally outside that
 /// baseline and are not a reason to reject an otherwise supported artifact.
 #[derive(Debug)]
 pub struct Qwen35NativeExecutionPlan<'weights, 'artifact> {
@@ -203,7 +203,7 @@ impl Qwen35NativeExecutionSession {
     ///
     /// The blocking step covers embedding, every admitted full or recurrent
     /// main block, final normalization, and the distinct output head. It does
-    /// not execute optional NextN auxiliary blocks.
+    /// not execute optional `NextN` auxiliary blocks.
     ///
     /// # Errors
     ///
