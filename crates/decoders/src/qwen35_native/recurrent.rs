@@ -5,6 +5,7 @@ use core::ptr::{null, null_mut};
 use hipcore::{Device, DeviceBuffer, Stream};
 use snafu::ResultExt;
 
+use super::custody::NativeBufferSink;
 use super::dispatch::{launch_rms_norm, launch_silu_mul};
 use super::finish::{
     DeferredLayerFinish, LayerFinishPlan, LayerFinishWeights, LayerFinishWorkspace,
@@ -93,6 +94,19 @@ impl NativeRecurrentWeights {
             output_norm: f32_parameter_buffer(weights, &plan.parameters.output_norm, device)?,
         })
     }
+
+    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        self.qkv.into_buffer_sink(sink);
+        self.gate.into_buffer_sink(sink);
+        self.alpha.into_buffer_sink(sink);
+        self.beta.into_buffer_sink(sink);
+        self.output.into_buffer_sink(sink);
+        sink.push_f32(self.attention_norm);
+        sink.push_f32(self.a);
+        sink.push_f32(self.dt);
+        sink.push_f32(self.convolution);
+        sink.push_f32(self.output_norm);
+    }
 }
 
 impl NativeRecurrentWorkspace {
@@ -120,6 +134,24 @@ impl NativeRecurrentWorkspace {
             gated_output: buffer!(gated_output),
             projected_attention: buffer!(projected_attention),
         })
+    }
+
+    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        sink.push_f32(self.normalized_hidden);
+        sink.push_f32(self.qkv);
+        sink.push_f32(self.z);
+        sink.push_f32(self.alpha);
+        sink.push_f32(self.beta_projection);
+        sink.push_f32(self.raw_convolution);
+        sink.push_f32(self.activated_convolution);
+        sink.push_f32(self.tiled_query);
+        sink.push_f32(self.tiled_key);
+        sink.push_f32(self.beta);
+        sink.push_f32(self.log_decay);
+        sink.push_f32(self.recurrence_output);
+        sink.push_f32(self.normalized_output);
+        sink.push_f32(self.gated_output);
+        sink.push_f32(self.projected_attention);
     }
 }
 
@@ -159,6 +191,17 @@ impl NativeRecurrentState {
             &mut self.committed_recurrent_state,
             &mut self.staged_recurrent_state,
         );
+    }
+
+    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        if let Some(history) = self.committed_convolution_history {
+            sink.push_f32(history);
+        }
+        if let Some(history) = self.staged_convolution_history {
+            sink.push_f32(history);
+        }
+        sink.push_f32(self.committed_recurrent_state);
+        sink.push_f32(self.staged_recurrent_state);
     }
 }
 

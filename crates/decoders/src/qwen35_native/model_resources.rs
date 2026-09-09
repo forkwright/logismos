@@ -6,6 +6,7 @@ use snafu::ResultExt;
 use std::sync::Arc;
 
 use super::CompletionResource;
+use super::custody::NativeBufferSink;
 use super::dispatch::{DeferredFullAttention, launch_rms_norm};
 use super::finish::{LayerFinishWeights, LayerFinishWorkspace};
 use super::model_plan::{DeviceModelPlan, NativeBlockPlan};
@@ -101,6 +102,15 @@ impl NativeResidentModelResources {
     pub(super) const fn context_ceiling(&self) -> usize {
         self.plan.layout.max_context()
     }
+
+    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        self.embedding.into_buffer_sink(sink);
+        self.output.into_buffer_sink(sink);
+        sink.push_f32(self.output_norm);
+        for layer in self.layers {
+            layer.into_buffer_sink(sink);
+        }
+    }
 }
 
 impl ModelSessionResources {
@@ -150,6 +160,51 @@ impl ModelSessionResources {
             step: None,
             position: 0,
         })
+    }
+
+    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) -> Stream {
+        let Self {
+            model,
+            plan,
+            kv,
+            stream,
+            numerical_status,
+            full_workspace,
+            recurrent_workspace,
+            finish_workspace,
+            hidden_a,
+            hidden_b,
+            final_normalized,
+            layers,
+            step,
+            position: _,
+        } = self;
+        drop(model);
+        drop(plan);
+        if let Some(kv) = kv {
+            let (keys, values, table) = kv.into_buffers().into_parts();
+            sink.push_f32(keys);
+            sink.push_f32(values);
+            sink.push_u32(table);
+        }
+        sink.push_u32(numerical_status.into_buffer());
+        if let Some(workspace) = full_workspace {
+            workspace.into_buffer_sink(sink);
+        }
+        if let Some(workspace) = recurrent_workspace {
+            workspace.into_buffer_sink(sink);
+        }
+        finish_workspace.into_buffer_sink(sink);
+        sink.push_f32(hidden_a);
+        sink.push_f32(hidden_b);
+        sink.push_f32(final_normalized);
+        for layer in layers {
+            layer.into_buffer_sink(sink);
+        }
+        if let Some(step) = step {
+            step.into_buffer_sink(sink);
+        }
+        stream
     }
 
     pub(super) fn prepare_step(&mut self, token: u32) -> Result<()> {
@@ -398,6 +453,43 @@ impl ModelSessionResources {
             ),
             Some(DeviceBuffer::from_host(self.stream.device(), &sine).context(NativeDeviceSnafu)?),
         ))
+    }
+}
+
+impl ModelStep {
+    fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        sink.push_f32(self.logits);
+        if let Some(cosine) = self.cosine {
+            sink.push_f32(cosine);
+        }
+        if let Some(sine) = self.sine {
+            sink.push_f32(sine);
+        }
+    }
+}
+
+impl NativeModelLayer {
+    fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        match self {
+            Self::Full(weights) => weights.into_buffer_sink(sink),
+            Self::Recurrent(weights) => weights.into_buffer_sink(sink),
+        }
+    }
+}
+
+impl NativeRecurrentLayerWeights {
+    fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        self.weights.into_buffer_sink(sink);
+        self.finish.into_buffer_sink(sink);
+    }
+}
+
+impl NativeSessionLayer {
+    fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        match self {
+            Self::Full => {}
+            Self::Recurrent(state) => state.into_buffer_sink(sink),
+        }
     }
 }
 

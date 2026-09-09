@@ -5,6 +5,7 @@ use core::mem::size_of;
 use hipcore::{DeviceBuffer, Stream};
 use snafu::ResultExt;
 
+use super::custody::NativeBufferSink;
 use super::dispatch::{launch_residual, launch_rms_norm, launch_silu_mul};
 use super::plan::{
     F32Parameter, ProjectionWeight, dimension, elements_bytes, f32_parameter, projection, sum,
@@ -189,6 +190,13 @@ impl LayerFinishWeights {
             ffn_down: NativeMatrix::upload(weights, &plan.weights.ffn_down, device)?,
         })
     }
+
+    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        sink.push_f32(self.post_attention_norm);
+        self.ffn_gate.into_buffer_sink(sink);
+        self.ffn_up.into_buffer_sink(sink);
+        self.ffn_down.into_buffer_sink(sink);
+    }
 }
 
 impl LayerFinishWorkspace {
@@ -206,6 +214,15 @@ impl LayerFinishWorkspace {
             ffn_product: buffer!(ffn_product),
             ffn_down: buffer!(ffn_down),
         })
+    }
+
+    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        sink.push_f32(self.attention_residual);
+        sink.push_f32(self.post_norm);
+        sink.push_f32(self.ffn_gate);
+        sink.push_f32(self.ffn_up);
+        sink.push_f32(self.ffn_product);
+        sink.push_f32(self.ffn_down);
     }
 }
 

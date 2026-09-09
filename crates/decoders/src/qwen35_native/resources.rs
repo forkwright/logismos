@@ -4,6 +4,7 @@ use cache::NativePagedKvPool;
 use hipcore::{Device, DeviceBuffer, Stream};
 use snafu::ResultExt;
 
+use super::custody::NativeBufferSink;
 use crate::error::{
     ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionPagedDecodePlanSnafu,
     NativeDeviceSnafu, NativePagedKvSnafu, NativeSessionStateSnafu,
@@ -135,6 +136,33 @@ impl DeviceResources {
         });
         Ok(())
     }
+
+    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) -> Stream {
+        let Self {
+            plan,
+            weights,
+            kv,
+            stream,
+            numerical_status,
+            workspace,
+            finish_workspace,
+            step,
+            position: _,
+        } = self;
+        drop(plan);
+        weights.into_buffer_sink(sink);
+        let (keys, values, table) = kv.into_buffers().into_parts();
+        sink.push_f32(keys);
+        sink.push_f32(values);
+        sink.push_u32(table);
+        sink.push_u32(numerical_status.into_buffer());
+        workspace.into_buffer_sink(sink);
+        finish_workspace.into_buffer_sink(sink);
+        if let Some(step) = step {
+            step.into_buffer_sink(sink);
+        }
+        stream
+    }
 }
 
 impl StepBuffers {
@@ -146,6 +174,13 @@ impl StepBuffers {
             sine: &self.sine,
             attention: self.attention,
         }
+    }
+
+    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        sink.push_f32(self.input);
+        sink.push_f32(self.output);
+        sink.push_f32(self.cosine);
+        sink.push_f32(self.sine);
     }
 }
 
@@ -169,6 +204,20 @@ impl NativeWorkspace {
             gated: buffer!(gated),
             output_projection: buffer!(output_projection),
         })
+    }
+
+    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
+        sink.push_f32(self.hidden);
+        sink.push_f32(self.q_gate);
+        sink.push_f32(self.query);
+        sink.push_f32(self.gate);
+        sink.push_f32(self.normalized_query);
+        sink.push_f32(self.key);
+        sink.push_f32(self.normalized_key);
+        sink.push_f32(self.value);
+        sink.push_f32(self.attention);
+        sink.push_f32(self.gated);
+        sink.push_f32(self.output_projection);
     }
 }
 

@@ -1,6 +1,8 @@
 //! Owned native main-model and full-attention resource lifecycle.
 
 #[cfg(feature = "gpu")]
+mod custody;
+#[cfg(feature = "gpu")]
 mod dispatch;
 #[cfg(feature = "gpu")]
 mod finish;
