@@ -26,14 +26,6 @@ const KERNEL: &str = "row_gemv_f32";
 
 #[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 unsafe extern "C" {
-    fn logismos_launch_f32_row_gemv_f32(
-        matrix: *const c_void,
-        activations: *const c_void,
-        output: *mut c_void,
-        rows: i32,
-        width: i32,
-        stream: *mut c_void,
-    ) -> u32;
     fn logismos_launch_f32_row_gemv_f32_checked(
         matrix: *const c_void,
         activations: *const c_void,
@@ -41,14 +33,6 @@ unsafe extern "C" {
         rows: i32,
         width: i32,
         numerical_status: *mut c_void,
-        stream: *mut c_void,
-    ) -> u32;
-    fn logismos_launch_q8_0_row_gemv_f32(
-        matrix: *const c_void,
-        activations: *const c_void,
-        output: *mut c_void,
-        rows: i32,
-        width: i32,
         stream: *mut c_void,
     ) -> u32;
     fn logismos_launch_q8_0_row_gemv_f32_checked(
@@ -60,14 +44,6 @@ unsafe extern "C" {
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
-    fn logismos_launch_q4_k_row_gemv_f32(
-        matrix: *const c_void,
-        activations: *const c_void,
-        output: *mut c_void,
-        rows: i32,
-        width: i32,
-        stream: *mut c_void,
-    ) -> u32;
     fn logismos_launch_q4_k_row_gemv_f32_checked(
         matrix: *const c_void,
         activations: *const c_void,
@@ -75,14 +51,6 @@ unsafe extern "C" {
         rows: i32,
         width: i32,
         numerical_status: *mut c_void,
-        stream: *mut c_void,
-    ) -> u32;
-    fn logismos_launch_q5_k_row_gemv_f32(
-        matrix: *const c_void,
-        activations: *const c_void,
-        output: *mut c_void,
-        rows: i32,
-        width: i32,
         stream: *mut c_void,
     ) -> u32;
     fn logismos_launch_q5_k_row_gemv_f32_checked(
@@ -94,14 +62,6 @@ unsafe extern "C" {
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
-    fn logismos_launch_q6_k_row_gemv_f32(
-        matrix: *const c_void,
-        activations: *const c_void,
-        output: *mut c_void,
-        rows: i32,
-        width: i32,
-        stream: *mut c_void,
-    ) -> u32;
     fn logismos_launch_q6_k_row_gemv_f32_checked(
         matrix: *const c_void,
         activations: *const c_void,
@@ -109,14 +69,6 @@ unsafe extern "C" {
         rows: i32,
         width: i32,
         numerical_status: *mut c_void,
-        stream: *mut c_void,
-    ) -> u32;
-    fn logismos_launch_iq4_nl_row_gemv_f32(
-        matrix: *const c_void,
-        activations: *const c_void,
-        output: *mut c_void,
-        rows: i32,
-        width: i32,
         stream: *mut c_void,
     ) -> u32;
     fn logismos_launch_iq4_nl_row_gemv_f32_checked(
@@ -128,14 +80,6 @@ unsafe extern "C" {
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
-    fn logismos_launch_iq4_xs_row_gemv_f32(
-        matrix: *const c_void,
-        activations: *const c_void,
-        output: *mut c_void,
-        rows: i32,
-        width: i32,
-        stream: *mut c_void,
-    ) -> u32;
     fn logismos_launch_iq4_xs_row_gemv_f32_checked(
         matrix: *const c_void,
         activations: *const c_void,
@@ -143,13 +87,6 @@ unsafe extern "C" {
         rows: i32,
         width: i32,
         numerical_status: *mut c_void,
-        stream: *mut c_void,
-    ) -> u32;
-    fn logismos_launch_f32_row_decode_f32(
-        matrix: *const c_void,
-        output: *mut c_void,
-        row: i32,
-        width: i32,
         stream: *mut c_void,
     ) -> u32;
     fn logismos_launch_f32_row_decode_f32_checked(
@@ -160,26 +97,12 @@ unsafe extern "C" {
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
-    fn logismos_launch_q8_0_row_decode_f32(
-        matrix: *const c_void,
-        output: *mut c_void,
-        row: i32,
-        width: i32,
-        stream: *mut c_void,
-    ) -> u32;
     fn logismos_launch_q8_0_row_decode_f32_checked(
         matrix: *const c_void,
         output: *mut c_void,
         row: i32,
         width: i32,
         numerical_status: *mut c_void,
-        stream: *mut c_void,
-    ) -> u32;
-    fn logismos_launch_q4_k_row_decode_f32(
-        matrix: *const c_void,
-        output: *mut c_void,
-        row: i32,
-        width: i32,
         stream: *mut c_void,
     ) -> u32;
     fn logismos_launch_q4_k_row_decode_f32_checked(
@@ -190,26 +113,12 @@ unsafe extern "C" {
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
-    fn logismos_launch_q5_k_row_decode_f32(
-        matrix: *const c_void,
-        output: *mut c_void,
-        row: i32,
-        width: i32,
-        stream: *mut c_void,
-    ) -> u32;
     fn logismos_launch_q5_k_row_decode_f32_checked(
         matrix: *const c_void,
         output: *mut c_void,
         row: i32,
         width: i32,
         numerical_status: *mut c_void,
-        stream: *mut c_void,
-    ) -> u32;
-    fn logismos_launch_q6_k_row_decode_f32(
-        matrix: *const c_void,
-        output: *mut c_void,
-        row: i32,
-        width: i32,
         stream: *mut c_void,
     ) -> u32;
     fn logismos_launch_q6_k_row_decode_f32_checked(
@@ -220,26 +129,12 @@ unsafe extern "C" {
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
-    fn logismos_launch_iq4_nl_row_decode_f32(
-        matrix: *const c_void,
-        output: *mut c_void,
-        row: i32,
-        width: i32,
-        stream: *mut c_void,
-    ) -> u32;
     fn logismos_launch_iq4_nl_row_decode_f32_checked(
         matrix: *const c_void,
         output: *mut c_void,
         row: i32,
         width: i32,
         numerical_status: *mut c_void,
-        stream: *mut c_void,
-    ) -> u32;
-    fn logismos_launch_iq4_xs_row_decode_f32(
-        matrix: *const c_void,
-        output: *mut c_void,
-        row: i32,
-        width: i32,
         stream: *mut c_void,
     ) -> u32;
     fn logismos_launch_iq4_xs_row_decode_f32_checked(
@@ -482,9 +377,9 @@ pub unsafe fn launch_row_gemv_f32(
     output_len: usize,
     stream: &Stream,
 ) -> Result<()> {
-    #[cfg(logismos_no_gpu_kernels)]
-    {
-        let _ = (
+    // SAFETY: the raw caller retains the documented allocation and numerical obligations.
+    unsafe {
+        launch_row_gemv_f32_impl(
             shape,
             matrix,
             matrix_bytes,
@@ -493,47 +388,8 @@ pub unsafe fn launch_row_gemv_f32(
             output,
             output_len,
             stream,
-        );
-        no_gpu_build_refusal()
-    }
-
-    #[cfg(not(logismos_no_gpu_kernels))]
-    {
-        validate_device_buffers(
-            shape,
-            matrix,
-            matrix_bytes,
-            activations,
-            activation_len,
-            output,
-            output_len,
-        )?;
-        let rows = i32::try_from(shape.rows).map_err(|_| abi_error("rows", shape.rows))?;
-        let width = i32::try_from(shape.width).map_err(|_| abi_error("width", shape.width))?;
-        stream.make_current()?;
-        // SAFETY: caller and validator establish the documented device spans,
-        // ownership, alignment, and numerical domain before private ABI entry.
-        let code = unsafe {
-            launch_format(
-                shape.format,
-                matrix.cast::<c_void>(),
-                activations.cast::<c_void>(),
-                output.cast::<c_void>(),
-                rows,
-                width,
-                stream.raw().cast::<c_void>(),
-            )?
-        };
-        if code == 0 {
-            Ok(())
-        } else {
-            LaunchSnafu {
-                kernel: KERNEL,
-                kind: hipcore::ErrorKind::from_raw(code),
-                code,
-            }
-            .fail()
-        }
+            None,
+        )
     }
 }
 
@@ -570,22 +426,52 @@ pub unsafe fn launch_row_gemv_f32_checked(
     stream: &Stream,
     status: &NativeNumericalStatus,
 ) -> Result<()> {
+    // SAFETY: the checked caller retains all device and status allocation obligations.
+    unsafe {
+        launch_row_gemv_f32_impl(
+            shape,
+            matrix,
+            matrix_bytes,
+            activations,
+            activation_len,
+            output,
+            output_len,
+            stream,
+            Some(status),
+        )
+    }
+}
+
+#[cfg(feature = "gpu")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one launch owner validates both raw and checked serialized-row GEMV calls"
+)]
+unsafe fn launch_row_gemv_f32_impl(
+    shape: RowGemvShape,
+    matrix: *const u8,
+    matrix_bytes: usize,
+    activations: *const f32,
+    activation_len: usize,
+    output: *mut f32,
+    output_len: usize,
+    stream: &Stream,
+    status: Option<&NativeNumericalStatus>,
+) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
-        let _ = status;
-        // SAFETY: preserve the raw CPU-only refusal without entering HIP.
-        unsafe {
-            launch_row_gemv_f32(
-                shape,
-                matrix,
-                matrix_bytes,
-                activations,
-                activation_len,
-                output,
-                output_len,
-                stream,
-            )
-        }
+        let _ = (
+            shape,
+            matrix,
+            matrix_bytes,
+            activations,
+            activation_len,
+            output,
+            output_len,
+            stream,
+            status,
+        );
+        no_gpu_build_refusal()
     }
 
     #[cfg(not(logismos_no_gpu_kernels))]
@@ -601,18 +487,26 @@ pub unsafe fn launch_row_gemv_f32_checked(
         )?;
         let rows = i32::try_from(shape.rows).map_err(|_| abi_error("rows", shape.rows))?;
         let width = i32::try_from(shape.width).map_err(|_| abi_error("width", shape.width))?;
+        let numerical_status = match status {
+            Some(status) => {
+                // SAFETY: the caller retains this distinct status on the stream device.
+                unsafe { status.as_device_ptr().cast::<c_void>() }
+            }
+            None => core::ptr::null_mut(),
+        };
         stream.make_current()?;
-        // SAFETY: validated spans and the distinct status owner remain live on
-        // the caller-qualified stream device through completion.
+        // SAFETY: caller and validator establish the documented device spans,
+        // ownership, alignment, and raw-or-checked numerical contract before
+        // the sole private format dispatch.
         let code = unsafe {
-            launch_format_checked(
+            launch_format(
                 shape.format,
                 matrix.cast::<c_void>(),
                 activations.cast::<c_void>(),
                 output.cast::<c_void>(),
                 rows,
                 width,
-                status.as_device_ptr().cast::<c_void>(),
+                numerical_status,
                 stream.raw().cast::<c_void>(),
             )?
         };
@@ -655,38 +549,9 @@ pub unsafe fn launch_row_decode_f32(
     output_len: usize,
     stream: &Stream,
 ) -> Result<()> {
-    #[cfg(logismos_no_gpu_kernels)]
-    {
-        let _ = (plan, matrix, matrix_bytes, output, output_len, stream);
-        no_gpu_build_refusal()
-    }
-    #[cfg(not(logismos_no_gpu_kernels))]
-    {
-        validate_decode_buffers(plan, matrix, matrix_bytes, output, output_len)?;
-        stream.make_current()?;
-        // SAFETY: the checked plan and local span validation establish the
-        // private ABI; the caller upholds device ownership, lifetime, and
-        // normal-or-zero numerical-domain obligations through completion.
-        let code = unsafe {
-            launch_decode_format(
-                plan.shape.format,
-                matrix.cast::<c_void>(),
-                output.cast::<c_void>(),
-                plan.row_i32,
-                plan.width_i32,
-                stream.raw().cast::<c_void>(),
-            )?
-        };
-        if code == 0 {
-            Ok(())
-        } else {
-            LaunchSnafu {
-                kernel: KERNEL,
-                kind: hipcore::ErrorKind::from_raw(code),
-                code,
-            }
-            .fail()
-        }
+    // SAFETY: the raw caller retains the documented allocation and numerical obligations.
+    unsafe {
+        launch_row_decode_f32_impl(plan, matrix, matrix_bytes, output, output_len, stream, None)
     }
 }
 
@@ -716,26 +581,64 @@ pub unsafe fn launch_row_decode_f32_checked(
     stream: &Stream,
     status: &NativeNumericalStatus,
 ) -> Result<()> {
+    // SAFETY: the checked caller retains all device and status allocation obligations.
+    unsafe {
+        launch_row_decode_f32_impl(
+            plan,
+            matrix,
+            matrix_bytes,
+            output,
+            output_len,
+            stream,
+            Some(status),
+        )
+    }
+}
+
+#[cfg(feature = "gpu")]
+unsafe fn launch_row_decode_f32_impl(
+    plan: RowDecodePlan,
+    matrix: *const u8,
+    matrix_bytes: usize,
+    output: *mut f32,
+    output_len: usize,
+    stream: &Stream,
+    status: Option<&NativeNumericalStatus>,
+) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
-        let _ = status;
-        // SAFETY: preserve the raw CPU-only refusal without entering HIP.
-        unsafe { launch_row_decode_f32(plan, matrix, matrix_bytes, output, output_len, stream) }
+        let _ = (
+            plan,
+            matrix,
+            matrix_bytes,
+            output,
+            output_len,
+            stream,
+            status,
+        );
+        no_gpu_build_refusal()
     }
     #[cfg(not(logismos_no_gpu_kernels))]
     {
         validate_decode_buffers(plan, matrix, matrix_bytes, output, output_len)?;
+        let numerical_status = match status {
+            Some(status) => {
+                // SAFETY: the caller retains this distinct status on the stream device.
+                unsafe { status.as_device_ptr().cast::<c_void>() }
+            }
+            None => core::ptr::null_mut(),
+        };
         stream.make_current()?;
-        // SAFETY: the plan, exact spans, and distinct status allocation remain
-        // live on the caller-qualified stream device through completion.
+        // SAFETY: the plan, exact spans, and raw-or-checked numerical contract
+        // establish the sole private format dispatch.
         let code = unsafe {
-            launch_decode_format_checked(
+            launch_decode_format(
                 plan.shape.format,
                 matrix.cast::<c_void>(),
                 output.cast::<c_void>(),
                 plan.row_i32,
                 plan.width_i32,
-                status.as_device_ptr().cast::<c_void>(),
+                numerical_status,
                 stream.raw().cast::<c_void>(),
             )?
         };
@@ -760,86 +663,11 @@ unsafe fn launch_format(
     output: *mut c_void,
     rows: i32,
     width: i32,
-    stream: *mut c_void,
-) -> Result<u32> {
-    // SAFETY: caller chooses the format-specific private entry point after all
-    // Rust shape and device-span checks; each C ABI has the same pointer ABI.
-    unsafe {
-        match format {
-            quant::RowFormat::F32 => Ok(logismos_launch_f32_row_gemv_f32(
-                matrix,
-                activations,
-                output,
-                rows,
-                width,
-                stream,
-            )),
-            quant::RowFormat::Q8_0 => Ok(logismos_launch_q8_0_row_gemv_f32(
-                matrix,
-                activations,
-                output,
-                rows,
-                width,
-                stream,
-            )),
-            quant::RowFormat::Q4K => Ok(logismos_launch_q4_k_row_gemv_f32(
-                matrix,
-                activations,
-                output,
-                rows,
-                width,
-                stream,
-            )),
-            quant::RowFormat::Q5K => Ok(logismos_launch_q5_k_row_gemv_f32(
-                matrix,
-                activations,
-                output,
-                rows,
-                width,
-                stream,
-            )),
-            quant::RowFormat::Q6K => Ok(logismos_launch_q6_k_row_gemv_f32(
-                matrix,
-                activations,
-                output,
-                rows,
-                width,
-                stream,
-            )),
-            quant::RowFormat::IQ4NL => Ok(logismos_launch_iq4_nl_row_gemv_f32(
-                matrix,
-                activations,
-                output,
-                rows,
-                width,
-                stream,
-            )),
-            quant::RowFormat::IQ4XS => Ok(logismos_launch_iq4_xs_row_gemv_f32(
-                matrix,
-                activations,
-                output,
-                rows,
-                width,
-                stream,
-            )),
-            _ => unsupported_shape(format!("native HIP row GEMV does not support {format}")),
-        }
-    }
-}
-
-#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
-unsafe fn launch_format_checked(
-    format: quant::RowFormat,
-    matrix: *const c_void,
-    activations: *const c_void,
-    output: *mut c_void,
-    rows: i32,
-    width: i32,
     numerical_status: *mut c_void,
     stream: *mut c_void,
 ) -> Result<u32> {
-    // SAFETY: caller chooses the format-specific checked entry after exact
-    // span validation and retains the status allocation through completion.
+    // SAFETY: caller chooses the format-specific checked private entry after
+    // exact span validation and retains any status allocation through completion.
     unsafe {
         match format {
             quant::RowFormat::F32 => Ok(logismos_launch_f32_row_gemv_f32_checked(
@@ -917,50 +745,11 @@ unsafe fn launch_decode_format(
     output: *mut c_void,
     row: i32,
     width: i32,
-    stream: *mut c_void,
-) -> Result<u32> {
-    // SAFETY: caller selected the same checked RowFormat owner as GEMV and
-    // validated the exact matrix/output spans before this private ABI entry.
-    unsafe {
-        match format {
-            quant::RowFormat::F32 => Ok(logismos_launch_f32_row_decode_f32(
-                matrix, output, row, width, stream,
-            )),
-            quant::RowFormat::Q8_0 => Ok(logismos_launch_q8_0_row_decode_f32(
-                matrix, output, row, width, stream,
-            )),
-            quant::RowFormat::Q4K => Ok(logismos_launch_q4_k_row_decode_f32(
-                matrix, output, row, width, stream,
-            )),
-            quant::RowFormat::Q5K => Ok(logismos_launch_q5_k_row_decode_f32(
-                matrix, output, row, width, stream,
-            )),
-            quant::RowFormat::Q6K => Ok(logismos_launch_q6_k_row_decode_f32(
-                matrix, output, row, width, stream,
-            )),
-            quant::RowFormat::IQ4NL => Ok(logismos_launch_iq4_nl_row_decode_f32(
-                matrix, output, row, width, stream,
-            )),
-            quant::RowFormat::IQ4XS => Ok(logismos_launch_iq4_xs_row_decode_f32(
-                matrix, output, row, width, stream,
-            )),
-            _ => unsupported_shape(format!("native HIP row decode does not support {format}")),
-        }
-    }
-}
-
-#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
-unsafe fn launch_decode_format_checked(
-    format: quant::RowFormat,
-    matrix: *const c_void,
-    output: *mut c_void,
-    row: i32,
-    width: i32,
     numerical_status: *mut c_void,
     stream: *mut c_void,
 ) -> Result<u32> {
-    // SAFETY: caller selected the checked format owner and retains the status
-    // allocation with the exact matrix/output spans through completion.
+    // SAFETY: caller selected the checked private format owner and retains any
+    // status allocation with the exact matrix/output spans through completion.
     unsafe {
         match format {
             quant::RowFormat::F32 => Ok(logismos_launch_f32_row_decode_f32_checked(

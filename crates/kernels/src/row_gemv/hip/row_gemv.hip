@@ -699,18 +699,12 @@ extern "C" hipError_t logismos_launch_##NAME##_row_decode_f32_checked( \
 { \
     const dim3 block(ROW_DECODE_THREADS_PER_BLOCK, 1, 1); \
     const dim3 grid(row_decode_blocks(width), 1, 1); \
-    /* SAFETY: Rust validates exact spans; its caller retains them plus status through completion. */ \
+    /* SAFETY: Rust validates exact spans; its caller retains them plus any status through completion. */ \
     logismos_##NAME##_row_decode_f32_kernel<<<grid, block, 0, stream>>>( \
         reinterpret_cast<const std::uint8_t*>(matrix), \
         reinterpret_cast<float*>(output), row, width, \
         reinterpret_cast<std::uint32_t*>(numerical_status)); \
     return hipGetLastError(); \
-} \
-extern "C" hipError_t logismos_launch_##NAME##_row_decode_f32( \
-    const void* matrix, void* output, int row, int width, hipStream_t stream) \
-{ \
-    return logismos_launch_##NAME##_row_decode_f32_checked( \
-        matrix, output, row, width, nullptr, stream); \
 }
 
 LOGISMOS_ROW_DECODE_LAUNCHER(f32)
