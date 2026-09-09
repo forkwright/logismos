@@ -1019,11 +1019,7 @@ mod tests {
         assert!(matches!(
             validate_causal_conv_step_launch(
                 plan,
-                aligned_f32
-                    .as_ptr()
-                    .cast::<u8>()
-                    .wrapping_add(1)
-                    .cast::<f32>(),
+                aligned_f32.as_ptr().wrapping_byte_add(1),
                 aligned.input.len(),
                 aligned.weights.as_ptr(),
                 aligned.weights.len(),
