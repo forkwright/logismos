@@ -17,7 +17,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install boundary dependency
-        run: sudo apt-get update && sudo apt-get install --yes bubblewrap shellcheck util-linux
+        uses: forkwright/.github/.github/actions/install-ubuntu-packages@637f0e9d1b795e455d1dea96824ad7322002019f # Ubuntu-only package sources
+        with:
+          packages: bubblewrap shellcheck util-linux
       - name: Admit unprivileged namespace bootstrap
         run: bash scripts/ci-hosted-userns.sh
       - name: Resolve repository Rust toolchain
