@@ -198,6 +198,33 @@ impl CollectiveDecoder {
         )
     }
 
+    pub(crate) fn owned_resident_bytes(&self) -> Result<usize> {
+        let vocabulary_index = checked_mul(
+            self.vocabulary.entries.capacity(),
+            size_of::<VocabularyEntry>(),
+            "resident sparse vocabulary index bytes",
+        )?;
+        let stage_vector = checked_mul(
+            self.stages.capacity(),
+            size_of::<Stage>(),
+            "resident decoder stage-vector bytes",
+        )?;
+        let mut total = checked_add(
+            self.vocabulary.slab.capacity(),
+            vocabulary_index,
+            "resident vocabulary container bytes",
+        )?;
+        total = checked_add(total, stage_vector, "resident decoder program bytes")?;
+        for stage in &self.stages {
+            total = checked_add(
+                total,
+                stage.owned_text_capacity()?,
+                "resident decoder text bytes",
+            )?;
+        }
+        Ok(total)
+    }
+
     pub(crate) fn decode(
         &self,
         storage: DecodeStorage,
@@ -475,6 +502,22 @@ impl Stage {
 
     const fn uses_raw_bytes(&self) -> bool {
         matches!(self, Self::ByteLevel | Self::ByteFallback)
+    }
+
+    fn owned_text_capacity(&self) -> Result<usize> {
+        match self {
+            Self::Bpe { suffix } => Ok(suffix.capacity()),
+            Self::WordPiecePrefix { prefix } => Ok(prefix.capacity()),
+            Self::ReplaceLiteral {
+                pattern, content, ..
+            } => checked_add(
+                pattern.capacity(),
+                content.capacity(),
+                "resident literal replacement text bytes",
+            ),
+            Self::ReplaceRegex { content, .. } => Ok(content.capacity()),
+            _ => Ok(0),
+        }
     }
 
     fn apply(
@@ -1117,4 +1160,68 @@ fn reserved_string(capacity: usize, target: &'static str) -> Result<String> {
 
 fn decoder_program_error(message: String) -> Error {
     DecoderProgramSnafu { message }.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_byte_limit_is_checked_before_the_output_buffer_is_written() -> Result<()> {
+        let mut source = TokenBuffer::acquire(5, 1)?;
+        source.push_str("hello")?;
+        let mut output = reserved_string(4, "test retained output")?;
+
+        let result = write_output(&source, false, &mut output, 4);
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::DecodedByteLimitExceeded {
+                    limit: 4,
+                    actual: 5,
+                    ..
+                })
+            ),
+            "the exact completed byte length must be refused"
+        );
+        assert!(
+            output.is_empty(),
+            "the retained output buffer must remain unwritten after refusal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn requested_retained_and_scratch_extents_name_distinct_owners() -> Result<()> {
+        let plan = make_storage_plan(2, 7, 11, 2, 5, 12)?;
+        let identifier_bytes = 2usize.checked_mul(size_of::<u32>()).ok_or_else(|| {
+            DecodePlanOverflowSnafu {
+                target: "test identifier bytes",
+            }
+            .build()
+        })?;
+        let expected_retained = 7usize.checked_add(identifier_bytes).ok_or_else(|| {
+            DecodePlanOverflowSnafu {
+                target: "test retained bytes",
+            }
+            .build()
+        })?;
+
+        assert_eq!(
+            plan.requested_retained_bytes(),
+            expected_retained,
+            "retained accounting must contain only output and generated IDs"
+        );
+        assert_eq!(
+            plan.maximum_decoded_bytes(),
+            12,
+            "the semantic decoded maximum must remain distinct from output capacity"
+        );
+        assert!(
+            plan.requested_scratch_bytes() > plan.requested_retained_bytes(),
+            "paired transform arenas and indexes must remain scratch-owned"
+        );
+        Ok(())
+    }
 }

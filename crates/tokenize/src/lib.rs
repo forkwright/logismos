@@ -427,6 +427,22 @@ impl Tokenizer {
             .storage_plan(token_capacity, output_byte_limit)
     }
 
+    /// Return owned persistent bytes attributable to the compiled decoder containers.
+    ///
+    /// This includes actual capacities for the packed spelling slab, sparse
+    /// index, flattened stage vector, and its owned configuration strings. It
+    /// deliberately excludes the upstream tokenizer, allocator metadata, and
+    /// native Onig regions and match stacks; those require separate residency
+    /// and runtime qualification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DecodePlanOverflow`] if summing actual container
+    /// capacities exceeds `usize`.
+    pub fn collective_decoder_resident_bytes(&self) -> Result<usize> {
+        self.collective_decoder.owned_resident_bytes()
+    }
+
     /// Decode acquired generated-ID storage without any container growth.
     ///
     /// The returned string and ID vector are moved directly out of `storage`;
@@ -891,3 +907,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod collective_tests;
