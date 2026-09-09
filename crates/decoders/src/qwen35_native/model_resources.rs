@@ -315,18 +315,12 @@ impl ModelDeviceResources {
         &self,
         token: ModelTokenPlan,
     ) -> Result<(Option<DeviceBuffer<f32>>, Option<DeviceBuffer<f32>>)> {
-        let Some(attention) = token.attention else {
+        if token.attention.is_none() {
             return Ok((None, None));
-        };
+        }
         let Some(workspace) = self.plan.full_workspace else {
             return NativeSessionStateSnafu {
                 rule: "native model paged attention requires full-attention workspace",
-            }
-            .fail();
-        };
-        if attention.logical().visible_tokens() != token.visible_tokens {
-            return NativeSessionStateSnafu {
-                rule: "native MRoPE controls must bind the checked visible attention prefix",
             }
             .fail();
         };
