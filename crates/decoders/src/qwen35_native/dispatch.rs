@@ -1,11 +1,13 @@
 //! One-token native full-attention launch ordering.
 
+use cache::NativePagedAppend;
 use hipcore::{DeviceBuffer, Stream};
 use snafu::ResultExt;
 
 use super::CompletionResource;
-use super::resources::DeviceResources;
-use super::weights::NativeMatrix;
+use super::plan::WorkspacePlan;
+use super::resources::{DeviceResources, NativeWorkspace, StepBuffers};
+use super::weights::{NativeMatrix, NativeWeights};
 use crate::Result;
 use crate::error::{
     NativeDeviceSnafu, NativeKernelSnafu, NativePagedKvSnafu, NativeSessionStateSnafu,
@@ -17,6 +19,16 @@ impl CompletionResource for DeviceResources {
     fn synchronize(&mut self) -> Result<()> {
         self.stream.synchronize().context(NativeDeviceSnafu)
     }
+}
+
+/// Borrowed native full-attention launch inputs with no cache-publication authority.
+pub(super) struct DeferredFullAttention<'resources> {
+    pub(super) weights: &'resources NativeWeights,
+    pub(super) workspace: &'resources NativeWorkspace,
+    pub(super) plan: WorkspacePlan,
+    pub(super) step: &'resources StepBuffers,
+    pub(super) stream: &'resources Stream,
+    pub(super) full_layer: usize,
 }
 
 impl DeviceResources {
@@ -34,10 +46,6 @@ impl DeviceResources {
     /// all owned resources must remain exclusively owned on this stream's
     /// device until the caller has established completion or retained them
     /// after uncertainty.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the pinned native full-attention operation order is one bounded transactional unit"
-    )]
     pub(crate) unsafe fn submit_step(&mut self) -> Result<()> {
         let step = self.step.as_ref().ok_or_else(|| {
             NativeSessionStateSnafu {
@@ -45,12 +53,45 @@ impl DeviceResources {
             }
             .build()
         })?;
-        let workspace = &self.workspace;
-        let weights = &self.weights;
-        let plan = self.plan.workspace;
         let stream = &self.stream;
+        // SAFETY: this session owns the cache, stream, and exact one-token
+        // append row buffers; all remain live until guard completion.
+        let mut append = unsafe { self.kv.begin_append(1, stream) }.context(NativePagedKvSnafu)?;
+        let deferred = DeferredFullAttention {
+            weights: &self.weights,
+            workspace: &self.workspace,
+            plan: self.plan.workspace,
+            step,
+            stream,
+            full_layer: 0,
+        };
+        // SAFETY: submit_step's contract retains the bundle, and this private
+        // session supplies the one checked cache append through completion.
+        unsafe { deferred.submit(&mut append) }?;
+        append.prepare_commit().context(NativePagedKvSnafu)
+    }
+}
 
-        // SAFETY: submit_step's contract retains distinct owned buffers with
+impl DeferredFullAttention<'_> {
+    /// Submit one checked full-attention chain without synchronizing or publishing KV.
+    ///
+    /// # Safety
+    ///
+    /// The borrowed buffers and append must remain exclusively owned on this
+    /// stream through completion. All inputs, weights, controls, and
+    /// intermediates must satisfy the native finite normal-or-zero contract.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the pinned native full-attention operation order is one bounded transactional unit"
+    )]
+    pub(super) unsafe fn submit(&self, append: &mut NativePagedAppend<'_>) -> Result<()> {
+        let weights = self.weights;
+        let workspace = self.workspace;
+        let plan = self.plan;
+        let step = self.step;
+        let stream = self.stream;
+
+        // SAFETY: submit's contract retains distinct owned buffers with
         // verified exact plan extents and finite normal-or-zero operands.
         unsafe {
             launch_rms_norm(
@@ -82,8 +123,8 @@ impl DeviceResources {
                 .value
                 .launch(&workspace.hidden, &workspace.value, stream)
         }?;
-        // SAFETY: submit_step's contract retains distinct owned buffers with
-        // the checked split geometry through completion.
+        // SAFETY: submit's contract retains distinct owned buffers with the
+        // checked split geometry through completion.
         unsafe {
             launch_split(
                 plan.split,
@@ -93,7 +134,7 @@ impl DeviceResources {
                 stream,
             )
         }?;
-        // SAFETY: submit_step's contract retains distinct owned buffers with
+        // SAFETY: submit's contract retains distinct owned buffers with
         // verified Q/K normal-or-zero operands through completion.
         unsafe {
             launch_rms_norm(
@@ -104,7 +145,7 @@ impl DeviceResources {
                 stream,
             )
         }?;
-        // SAFETY: submit_step's contract retains distinct owned buffers with
+        // SAFETY: submit's contract retains distinct owned buffers with
         // verified Q/K normal-or-zero operands through completion.
         unsafe {
             launch_rms_norm(
@@ -137,18 +178,22 @@ impl DeviceResources {
                 stream,
             )
         }?;
-
-        // SAFETY: this session owns the cache, stream, and exact one-token
-        // append row buffers; all remain live until guard completion.
-        let mut append = unsafe { self.kv.begin_append(1, stream) }.context(NativePagedKvSnafu)?;
         // SAFETY: the normalized K and V buffers are exact native row spans
         // on the cache stream's device and remain owned through completion.
         unsafe {
-            append.write_layer_row(0, 0, &workspace.normalized_key, &workspace.value, stream)
+            append.write_layer_row(
+                self.full_layer,
+                0,
+                &workspace.normalized_key,
+                &workspace.value,
+                stream,
+            )
         }
         .context(NativePagedKvSnafu)?;
         {
-            let layer = append.layer_kv(0).context(NativePagedKvSnafu)?;
+            let layer = append
+                .layer_kv(self.full_layer)
+                .context(NativePagedKvSnafu)?;
             if layer.tokens() != step.attention.logical().visible_tokens() {
                 return NativeSessionStateSnafu {
                     rule: "native staged KV visibility must match the checked attention plan",
@@ -168,7 +213,7 @@ impl DeviceResources {
             .context(NativePagedKvSnafu)?;
         }
 
-        // SAFETY: submit_step's contract retains distinct owned buffers with
+        // SAFETY: submit's contract retains distinct owned buffers with
         // the checked elementwise extent through completion.
         unsafe {
             launch_sigmoid_mul(
@@ -186,7 +231,7 @@ impl DeviceResources {
                 .output
                 .launch(&workspace.gated, &workspace.output_projection, stream)
         }?;
-        // SAFETY: submit_step's contract retains distinct owned buffers with
+        // SAFETY: submit's contract retains distinct owned buffers with
         // the checked residual extent through completion.
         unsafe {
             launch_residual(
@@ -197,7 +242,7 @@ impl DeviceResources {
                 stream,
             )
         }?;
-        // SAFETY: submit_step's contract retains distinct owned buffers with
+        // SAFETY: submit's contract retains distinct owned buffers with
         // verified normal-or-zero operands through completion.
         unsafe {
             launch_rms_norm(
@@ -222,7 +267,7 @@ impl DeviceResources {
                 .ffn_up
                 .launch(&workspace.post_norm, &workspace.ffn_up, stream)
         }?;
-        // SAFETY: submit_step's contract retains distinct owned buffers with
+        // SAFETY: submit's contract retains distinct owned buffers with
         // the checked elementwise extent through completion.
         unsafe {
             launch_silu_mul(
@@ -252,7 +297,7 @@ impl DeviceResources {
             )
         }?;
 
-        append.prepare_commit().context(NativePagedKvSnafu)
+        Ok(())
     }
 }
 
@@ -263,7 +308,7 @@ impl NativeMatrix {
     ///
     /// `input` and `output` must be non-overlapping device spans on `stream`'s
     /// device with finite normal-or-zero operands through completion.
-    unsafe fn launch(
+    pub(super) unsafe fn launch(
         &self,
         input: &DeviceBuffer<f32>,
         output: &DeviceBuffer<f32>,
@@ -291,7 +336,7 @@ impl NativeMatrix {
 ///
 /// The three spans must be distinct exact buffers on `stream`'s device and
 /// retain finite normal-or-zero values through completion.
-unsafe fn launch_rms_norm(
+pub(super) unsafe fn launch_rms_norm(
     plan: kernels::decoder_ops::RmsNormF32Plan,
     input: &DeviceBuffer<f32>,
     weight: &DeviceBuffer<f32>,
@@ -399,7 +444,7 @@ unsafe fn launch_sigmoid_mul(
 ///
 /// The two inputs and output must be distinct exact spans on `stream`'s device
 /// with finite normal-or-zero operands through completion.
-unsafe fn launch_silu_mul(
+pub(super) unsafe fn launch_silu_mul(
     plan: kernels::decoder_ops::ElementwiseF32Plan,
     gate: &DeviceBuffer<f32>,
     up: &DeviceBuffer<f32>,
@@ -426,7 +471,7 @@ unsafe fn launch_silu_mul(
 ///
 /// The two inputs and output must be distinct exact spans on `stream`'s device
 /// with finite normal-or-zero operands through completion.
-unsafe fn launch_residual(
+pub(super) unsafe fn launch_residual(
     plan: kernels::decoder_ops::ElementwiseF32Plan,
     left: &DeviceBuffer<f32>,
     right: &DeviceBuffer<f32>,
