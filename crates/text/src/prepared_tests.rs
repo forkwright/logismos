@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::mem::size_of;
 
 use decoders::Qwen35LogitSelection;
 use sha2::{Digest, Sha256};
@@ -183,6 +184,116 @@ fn shared_driver_receives_prompt_then_selected_decode_ids_and_retains_output() -
     assert_eq!(generation.token_ids(), [3, 4]);
     assert_eq!(generation.finish_reason(), FinishReason::Length);
     assert_eq!(generation.text(), "hello assistant");
+    assert!(
+        generation.text.capacity() >= 128,
+        "the returned string must be the pre-acquired retained output owner"
+    );
+    assert!(
+        generation.token_ids.capacity() >= 2,
+        "the returned IDs must be the pre-acquired retained ID owner"
+    );
+    Ok(())
+}
+
+#[test]
+fn output_storage_is_acquired_before_the_first_driver_step() -> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let mut limits = test_limits(tokenizer_json.len())?;
+    limits.output_bytes = usize::MAX
+        .checked_sub(size_of::<u32>())
+        .ok_or_else(|| std::io::Error::other("usize cannot hold one token ID"))?;
+    let pipeline = pipeline_result(&artifact, &tokenizer_json, limits)?;
+    let messages = [TextMessage::new(TextRole::User, "hello")];
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+    let mut driver = FakeDriver::with_steps([FakeStep::Logits(logits_for(3))]);
+
+    let error = text_error(prepared.generate_with_driver(&mut driver, &NeverCancelled))?;
+
+    assert!(
+        matches!(
+            error,
+            Error::Allocation {
+                target: "decoded output bytes",
+                ..
+            }
+        ),
+        "the impossible retained output reservation must remain a typed allocation failure"
+    );
+    assert!(
+        driver.calls.is_empty(),
+        "no driver step may begin before every output and scratch owner is acquired"
+    );
+    Ok(())
+}
+
+#[test]
+fn prepared_storage_plan_separates_retained_and_scratch_extents() -> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let limits = test_limits(tokenizer_json.len())?;
+    let pipeline = pipeline_result(&artifact, &tokenizer_json, limits)?;
+    let messages = [TextMessage::new(TextRole::User, "hello")];
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 2, false), &NeverCancelled)?;
+    let generated_id_bytes = 2usize
+        .checked_mul(size_of::<u32>())
+        .ok_or_else(|| std::io::Error::other("generated ID byte count overflowed"))?;
+    let retained_bytes = limits
+        .output_bytes
+        .checked_add(generated_id_bytes)
+        .ok_or_else(|| std::io::Error::other("retained byte count overflowed"))?;
+
+    assert_eq!(
+        prepared.output_storage_plan.requested_retained_bytes(),
+        retained_bytes,
+        "retained accounting must contain only the moved output and ID owners"
+    );
+    assert!(
+        prepared.output_storage_plan.requested_scratch_bytes() > 0,
+        "transform arenas and indexes must remain separately scratch-owned"
+    );
+    Ok(())
+}
+
+#[test]
+fn injected_driver_decode_limit_failure_publishes_no_generation() -> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let mut limits = test_limits(tokenizer_json.len())?;
+    limits.output_bytes = 4;
+    let pipeline = pipeline_result(&artifact, &tokenizer_json, limits)?;
+    let messages = [TextMessage::new(TextRole::User, "hello")];
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+    let mut driver = FakeDriver::with_steps([FakeStep::Logits(logits_for(3))]);
+
+    let error = text_error(prepared.generate_with_driver(&mut driver, &NeverCancelled))?;
+
+    assert!(
+        matches!(
+            error,
+            Error::LimitExceeded {
+                field: "decoded output bytes",
+                actual: 5,
+                limit: 4,
+                ..
+            }
+        ),
+        "bounded collective decoding must preserve the established text limit error"
+    );
+    assert_eq!(
+        driver.calls,
+        [vec![3]],
+        "the failure must occur after selection but before publishing a generation"
+    );
     Ok(())
 }
 
