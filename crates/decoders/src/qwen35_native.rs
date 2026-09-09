@@ -347,7 +347,7 @@ mod tests {
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         let error = guard
-            .complete(|_| Err(TestError::ScriptFailure))
+            .complete(|_| Err::<(), _>(TestError::ScriptFailure))
             .err()
             .ok_or(BeginError::MissingResource)?;
         assert!(matches!(
@@ -450,7 +450,9 @@ mod tests {
         // This controlled unwind proves the real guard's destructor synchronizes
         // and poisons the bundle if logical publication cannot finish.
         let unwind = catch_unwind(AssertUnwindSafe(|| {
-            drop(guard.complete(|_| panic_any(ControlledUnwind)));
+            drop(guard.complete(|_| -> core::result::Result<(), TestError> {
+                panic_any(ControlledUnwind)
+            }));
         }));
         assert!(unwind.is_err());
         assert!(matches!(
