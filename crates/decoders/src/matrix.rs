@@ -164,7 +164,9 @@ impl<'artifact> CheckedMatrix<'artifact> {
     }
 
     #[cfg(feature = "gpu")]
-    pub(crate) fn native_shape(&self) -> std::result::Result<kernels::RowGemvShape, kernels::Error> {
+    pub(crate) fn native_shape(
+        &self,
+    ) -> std::result::Result<kernels::RowGemvShape, kernels::Error> {
         kernels::RowGemvShape::new(
             self.format,
             self.output_width,

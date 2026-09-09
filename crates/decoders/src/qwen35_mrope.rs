@@ -1,8 +1,8 @@
 //! Shared Qwen3.5 text MRoPE coefficient derivation.
 
-use num_traits::ToPrimitive;
 use crate::Result;
 use crate::error::{ArithmeticOverflowSnafu, ExecutionArithmeticSnafu};
+use num_traits::ToPrimitive;
 
 /// Validated text MRoPE parameters reused by CPU and native execution.
 #[derive(Debug, Clone, Copy)]
@@ -13,11 +13,7 @@ pub(crate) struct TextMrope {
 }
 
 impl TextMrope {
-    pub(crate) const fn new(
-        rotary_width: usize,
-        rope_base: f64,
-        sections: [usize; 4],
-    ) -> Self {
+    pub(crate) const fn new(rotary_width: usize, rope_base: f64, sections: [usize; 4]) -> Self {
         Self {
             rotary_width,
             rope_base,
@@ -106,17 +102,13 @@ mod tests {
     const COEFFICIENT_EPSILON: f32 = 1.0e-6;
 
     #[test]
-    fn coefficients_match_independent_text_position_angles()
-    -> std::result::Result<(), String> {
+    fn coefficients_match_independent_text_position_angles() -> std::result::Result<(), String> {
         let position = POSITION as f64;
         let expected = [position, position / ROPE_BASE.sqrt()];
         for (index, angle) in expected.into_iter().enumerate() {
-            let (actual_cosine, actual_sine) = text_mrope_coefficient(
-                TextMrope::new(4, ROPE_BASE, [1, 1, 0, 0]),
-                POSITION,
-                index,
-            )
-            .map_err(|error| error.to_string())?;
+            let (actual_cosine, actual_sine) =
+                text_mrope_coefficient(TextMrope::new(4, ROPE_BASE, [1, 1, 0, 0]), POSITION, index)
+                    .map_err(|error| error.to_string())?;
             let expected_cosine = angle.cos() as f32;
             let expected_sine = angle.sin() as f32;
             assert!(
