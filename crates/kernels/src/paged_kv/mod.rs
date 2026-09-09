@@ -8,9 +8,8 @@ use std::ffi::c_void;
 
 #[cfg(feature = "gpu")]
 use hipcore::Stream;
-use snafu::Snafu;
 
-#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 use crate::device_span::{
     checked_device_span, checked_f32_device_span, reject_overlapping_device_spans,
 };
@@ -151,6 +150,7 @@ impl PagedKvNativeLayout {
         self.backing_elements
     }
 
+    #[cfg(not(logismos_no_gpu_kernels))]
     fn abi(self) -> Result<PagedKvNativeAbi> {
         Ok(PagedKvNativeAbi {
             layers: u32::try_from(self.layers).map_err(|_| abi("layers", self.layers))?,
@@ -164,7 +164,7 @@ impl PagedKvNativeLayout {
     }
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 #[derive(Clone, Copy)]
 struct PagedKvNativeAbi {
     layers: u32,
