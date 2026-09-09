@@ -276,7 +276,7 @@ fn owner_overflows_are_rejected_before_execution() -> std::result::Result<(), St
 
     let logits_overflow = Qwen35RequirementElements::try_from_layout(
         Layout {
-            vocabulary: usize::MAX,
+            vocabulary: usize::MAX / 2 + 1,
             ..demanding_layout()
         },
         demanding_recurrent_layout(),
