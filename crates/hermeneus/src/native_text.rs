@@ -62,7 +62,7 @@ pub enum NativeTextResidentBuildFailure {
     #[snafu(display("native text plan failed: {source}"))]
     Plan {
         /// Original checked decoder-plan failure.
-        source: decoders::Error,
+        source: Box<decoders::Error>,
         /// Exact text pipeline retained by the failed construction.
         pipeline: TextPipeline,
         /// Source code location where the error was reported.
@@ -128,7 +128,6 @@ impl NativeTextResidentTeardown {
     }
 
     /// Retry only an unstarted native teardown.
-    #[must_use]
     pub fn retry(self) -> Self {
         Self {
             pipeline: self.pipeline,
@@ -137,7 +136,6 @@ impl NativeTextResidentTeardown {
     }
 
     /// Reconcile only native stream completion that remains unproved.
-    #[must_use]
     pub fn reconcile(self) -> Self {
         Self {
             pipeline: self.pipeline,
@@ -167,7 +165,7 @@ impl NativeTextResident {
         let profile = pipeline.execution_profile();
         let context_ceiling = effective_context_ceiling(profile).map_err(|source| {
             NativeTextResidentBuildFailure::Plan {
-                source,
+                source: Box::new(source),
                 pipeline: pipeline.clone(),
                 location: snafu::location!(),
             }
@@ -178,7 +176,7 @@ impl NativeTextResident {
             page_tokens,
         )
         .map_err(|source| NativeTextResidentBuildFailure::Plan {
-            source,
+            source: Box::new(source),
             pipeline: pipeline.clone(),
             location: snafu::location!(),
         })?;
@@ -343,7 +341,7 @@ impl NativeTextUsePlan {
     ) -> Result<Generation, NativeTextGenerationFailure> {
         if let Err(source) = self.recycled_logits_plan.validate_storage(&storage) {
             return Err(NativeTextGenerationFailure::Storage {
-                source,
+                source: Box::new(source),
                 plan: Box::new(self),
                 storage,
             });
@@ -374,11 +372,11 @@ impl NativeTextUsePlan {
             ConstructionAttempt::Attempted(Err(source)) => {
                 Err(NativeTextGenerationFailure::Construction {
                     source: Box::new(source),
-                    custody: NativeTextUseConstructionCustody {
+                    custody: Box::new(NativeTextUseConstructionCustody {
                         _resident: resident,
                         _prepared: prepared,
                         _storage: storage,
-                    },
+                    }),
                 })
             }
             ConstructionAttempt::Attempted(Ok(session)) => {
@@ -430,12 +428,12 @@ pub enum NativeTextDriverError {
         /// Original synchronous device-to-host copy failure.
         source: hipcore::Error,
         /// Explicit release outcome for the copied-from native output.
-        release: BufferRelease,
+        release: Box<BufferRelease>,
     },
     /// A native output could not be acknowledged released before reuse or publication.
     OutputRelease {
         /// Explicit release outcome retaining unresolved output custody.
-        release: BufferRelease,
+        release: Box<BufferRelease>,
     },
     /// Cancellation was observed between complete native prompt-token operations.
     Cancelled,
@@ -497,10 +495,10 @@ impl NativeTextDriverError {
         match self {
             Self::Copy { source, release } => Self::Copy {
                 source,
-                release: retry_buffer_release(release),
+                release: Box::new(retry_buffer_release(*release)),
             },
             Self::OutputRelease { release } => Self::OutputRelease {
-                release: retry_buffer_release(release),
+                release: Box::new(retry_buffer_release(*release)),
             },
             error => error,
         }
@@ -557,7 +555,7 @@ pub struct NativeTextUseClose {
 enum NativeTextUseCloseOutcome {
     Released,
     Teardown(Box<Qwen35NativeExecutionSessionTeardown>),
-    Failed(decoders::Error),
+    Failed(Box<decoders::Error>),
 }
 
 trait ReleasedSessionTeardown: Sized {
@@ -606,7 +604,7 @@ impl NativeTextUseClose {
             Ok(teardown) => Self::from_teardown(resident, teardown),
             Err(source) => Self {
                 resident,
-                outcome: NativeTextUseCloseOutcome::Failed(source),
+                outcome: NativeTextUseCloseOutcome::Failed(Box::new(source)),
             },
         }
     }
@@ -640,13 +638,12 @@ impl NativeTextUseClose {
 
     fn source_error(&self) -> Option<&decoders::Error> {
         match &self.outcome {
-            NativeTextUseCloseOutcome::Failed(source) => Some(source),
+            NativeTextUseCloseOutcome::Failed(source) => Some(source.as_ref()),
             NativeTextUseCloseOutcome::Released | NativeTextUseCloseOutcome::Teardown(_) => None,
         }
     }
 
     /// Retry only a native session teardown that did not begin.
-    #[must_use]
     pub fn retry(self) -> Self {
         let Self { resident, outcome } = self;
         match outcome {
@@ -658,7 +655,6 @@ impl NativeTextUseClose {
     }
 
     /// Reconcile only native session completion that remains unproved.
-    #[must_use]
     pub fn reconcile(self) -> Self {
         let Self { resident, outcome } = self;
         match outcome {
@@ -723,7 +719,7 @@ pub enum NativeTextGenerationFailure {
     /// The caller's row did not match this preparation before session allocation.
     Storage {
         /// Original typed text storage validation failure.
-        source: text::Error,
+        source: Box<text::Error>,
         /// Unallocated native use plan retained with its exact preparation.
         plan: Box<NativeTextUsePlan>,
         /// Caller-acquired row retained with the rejected plan.
@@ -734,12 +730,12 @@ pub enum NativeTextGenerationFailure {
         /// Original typed native construction failure.
         source: Box<NativeBuildFailure>,
         /// Exact resident, request, and host row retained by the failed use.
-        custody: NativeTextUseConstructionCustody,
+        custody: Box<NativeTextUseConstructionCustody>,
     },
     /// The shared recycled text execution stopped after native session creation.
     Execution {
         /// Original text or driver failure, including future owned variants.
-        source: RecycledGenerationError<NativeTextDriverError>,
+        source: Box<RecycledGenerationError<NativeTextDriverError>>,
         /// Explicit session close evidence retained alongside the source.
         close: NativeTextUseClose,
     },
@@ -752,11 +748,10 @@ pub enum NativeTextGenerationFailure {
 
 impl NativeTextGenerationFailure {
     /// Retry only pending output or session releases while retaining the source.
-    #[must_use]
     pub fn retry(self) -> Self {
         match self {
             Self::Execution { source, close } => Self::Execution {
-                source: retry_generation_source(source),
+                source: Box::new(retry_generation_source(*source)),
                 close: close.retry(),
             },
             Self::Close { close } => Self::Close {
@@ -767,7 +762,6 @@ impl NativeTextGenerationFailure {
     }
 
     /// Reconcile only session completion that remains unproved.
-    #[must_use]
     pub fn reconcile(self) -> Self {
         match self {
             Self::Execution { source, close } => Self::Execution {
@@ -845,9 +839,9 @@ impl std::error::Error for NativeTextGenerationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Cancelled { .. } => None,
-            Self::Storage { source, .. } => Some(source),
+            Self::Storage { source, .. } => Some(source.as_ref()),
             Self::Construction { source, .. } => Some(source.as_ref()),
-            Self::Execution { source, .. } => Some(source),
+            Self::Execution { source, .. } => Some(source.as_ref()),
             Self::Close { close } => close
                 .source_error()
                 .map(|source| source as &(dyn std::error::Error + 'static)),
@@ -954,7 +948,10 @@ fn finish_generation(
     match retain_before_publish(generation, close) {
         PublishAfterClose::Published(generation) => Ok(generation),
         PublishAfterClose::Execution { source, close } => {
-            Err(NativeTextGenerationFailure::Execution { source, close })
+            Err(NativeTextGenerationFailure::Execution {
+                source: Box::new(source),
+                close,
+            })
         }
         PublishAfterClose::Close { close } => Err(NativeTextGenerationFailure::Close { close }),
     }
@@ -963,7 +960,9 @@ fn finish_generation(
 fn release_intermediate(output: DeviceBuffer<f32>) -> Result<(), NativeTextDriverError> {
     match output.begin_release() {
         BufferRelease::Released(_) => Ok(()),
-        release => Err(NativeTextDriverError::OutputRelease { release }),
+        release => Err(NativeTextDriverError::OutputRelease {
+            release: Box::new(release),
+        }),
     }
 }
 
@@ -974,18 +973,19 @@ fn copy_and_release_final(
     if let Err(source) = output.copy_to_host(logits) {
         return Err(NativeTextDriverError::Copy {
             source,
-            release: output.begin_release(),
+            release: Box::new(output.begin_release()),
         });
     }
     match output.begin_release() {
         BufferRelease::Released(_) => Ok(()),
-        release => Err(NativeTextDriverError::OutputRelease { release }),
+        release => Err(NativeTextDriverError::OutputRelease {
+            release: Box::new(release),
+        }),
     }
 }
 
 fn release_error(release: &BufferRelease) -> Option<&(dyn std::error::Error + 'static)> {
     match release {
-        BufferRelease::Released(_) => None,
         BufferRelease::Pending(pending) => Some(pending.error()),
         BufferRelease::Quarantined(quarantine) => Some(quarantine.error()),
         _ => None,
@@ -996,6 +996,7 @@ fn release_error(release: &BufferRelease) -> Option<&(dyn std::error::Error + 's
 mod tests {
     use std::cell::Cell;
     use std::num::{NonZeroU64, NonZeroUsize};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use loader::gguf::{ArtifactByteLimit, Sha256Digest, VerifiedArtifact};
     use sha2::{Digest, Sha256};
@@ -1120,12 +1121,12 @@ mod tests {
     }
 
     struct DropProbe<'a> {
-        drops: &'a Cell<usize>,
+        drops: &'a AtomicUsize,
     }
 
     impl Drop for DropProbe<'_> {
         fn drop(&mut self) {
-            self.drops.set(self.drops.get() + 1);
+            self.drops.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1142,7 +1143,7 @@ mod tests {
 
     struct SyntheticClose<'a> {
         released: bool,
-        drops: &'a Cell<usize>,
+        drops: &'a AtomicUsize,
     }
 
     impl CloseAcknowledgement for SyntheticClose<'_> {
@@ -1153,7 +1154,7 @@ mod tests {
 
     impl Drop for SyntheticClose<'_> {
         fn drop(&mut self) {
-            self.drops.set(self.drops.get() + 1);
+            self.drops.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1203,8 +1204,8 @@ mod tests {
     #[test]
     fn released_session_duplicate_is_consumed_while_resident_is_retained()
     -> Result<(), Box<dyn std::error::Error>> {
-        let resident_drops = Cell::new(0);
-        let duplicate_drops = Cell::new(0);
+        let resident_drops = AtomicUsize::new(0);
+        let duplicate_drops = AtomicUsize::new(0);
         let resolution = resolve_session_teardown(
             DropProbe {
                 drops: &resident_drops,
@@ -1216,22 +1217,22 @@ mod tests {
             },
         );
 
-        assert_eq!(duplicate_drops.get(), 1);
-        assert_eq!(resident_drops.get(), 0);
+        assert_eq!(duplicate_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(resident_drops.load(Ordering::Relaxed), 0);
         let SessionTeardownResolution::Released(resident) = resolution else {
             return Err(std::io::Error::other("released teardown remained retained").into());
         };
         drop(resident);
-        assert_eq!(resident_drops.get(), 1);
-        assert_eq!(duplicate_drops.get(), 1);
+        assert_eq!(resident_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(duplicate_drops.load(Ordering::Relaxed), 1);
         Ok(())
     }
 
     #[test]
     fn nonreleased_close_withholds_output_and_retains_close()
     -> Result<(), Box<dyn std::error::Error>> {
-        let output_drops = Cell::new(0);
-        let close_drops = Cell::new(0);
+        let output_drops = AtomicUsize::new(0);
+        let close_drops = AtomicUsize::new(0);
         let result = retain_before_publish::<_, (), _>(
             Ok(DropProbe {
                 drops: &output_drops,
@@ -1242,13 +1243,13 @@ mod tests {
             },
         );
 
-        assert_eq!(output_drops.get(), 1);
-        assert_eq!(close_drops.get(), 0);
+        assert_eq!(output_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(close_drops.load(Ordering::Relaxed), 0);
         let PublishAfterClose::Close { close } = result else {
             return Err(std::io::Error::other("nonreleased close published output").into());
         };
         drop(close);
-        assert_eq!(close_drops.get(), 1);
+        assert_eq!(close_drops.load(Ordering::Relaxed), 1);
         Ok(())
     }
 
@@ -1280,23 +1281,23 @@ mod tests {
 
     #[test]
     fn shared_explicit_owner_never_drops_on_arc_abandonment() {
-        let abandoned_drops = Cell::new(0);
+        let abandoned_drops = AtomicUsize::new(0);
         let owner = Arc::new(ExplicitReleaseOwner::new(DropProbe {
             drops: &abandoned_drops,
         }));
         let sibling = Arc::clone(&owner);
 
         drop(owner);
-        assert_eq!(abandoned_drops.get(), 0);
+        assert_eq!(abandoned_drops.load(Ordering::Relaxed), 0);
         drop(sibling);
-        assert_eq!(abandoned_drops.get(), 0);
+        assert_eq!(abandoned_drops.load(Ordering::Relaxed), 0);
 
-        let released_drops = Cell::new(0);
+        let released_drops = AtomicUsize::new(0);
         let released = ExplicitReleaseOwner::new(DropProbe {
             drops: &released_drops,
         });
         drop(released.into_inner());
-        assert_eq!(released_drops.get(), 1);
+        assert_eq!(released_drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]
