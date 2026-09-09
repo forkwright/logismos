@@ -837,107 +837,361 @@ fn allocation_layout<T>(length: usize, target: &'static str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::Error;
 
-    fn geometry() -> PagedKvGeometry {
+    const LAYERS: usize = 2;
+    const ROW_WIDTH: usize = 3;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ModelRow {
+        key: [f32; ROW_WIDTH],
+        value: [f32; ROW_WIDTH],
+    }
+
+    fn geometry(max_context: usize) -> PagedKvGeometry {
         PagedKvGeometry {
-            layers: 2,
-            row_width: 3,
-            max_context: 20,
+            layers: LAYERS,
+            row_width: ROW_WIDTH,
+            max_context,
         }
     }
-    fn write_all(txn: &mut PagedAppend<'_>, tokens: usize, value: f32) -> Result<()> {
-        for layer in 0..2 {
-            for token in 0..tokens {
-                txn.write_layer_row(
-                    layer,
-                    token,
-                    &[value + layer as f32; 3],
-                    &[value + 10.0 + layer as f32; 3],
-                )?;
+
+    fn token_seed(token: usize) -> f32 {
+        let mut seed = 0.25;
+        for _ in 0..token {
+            seed += 1.0;
+        }
+        seed
+    }
+
+    fn layer_seed(layer: usize) -> f32 {
+        match layer {
+            0 => 10.0,
+            1 => 100.0,
+            _ => 1_000.0,
+        }
+    }
+
+    fn model_row(layer: usize, token: usize) -> ModelRow {
+        let layer = layer_seed(layer);
+        let token = token_seed(token);
+        ModelRow {
+            key: [layer + token, layer - token, token * 2.0],
+            value: [layer * 2.0 + token, token - layer, layer + token * 3.0],
+        }
+    }
+
+    fn empty_model() -> [Vec<ModelRow>; LAYERS] {
+        std::array::from_fn(|_| Vec::new())
+    }
+
+    fn append_model(model: &mut [Vec<ModelRow>; LAYERS], start: usize, tokens: usize) {
+        for layer in 0..LAYERS {
+            for relative in 0..tokens {
+                model[layer].push(model_row(layer, start + relative));
             }
         }
+    }
+
+    fn write_layer(
+        txn: &mut PagedAppend<'_>,
+        layer: usize,
+        start: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        for relative in 0..tokens {
+            let row = model_row(layer, start + relative);
+            txn.write_layer_row(layer, relative, &row.key, &row.value)?;
+        }
         Ok(())
     }
+
+    fn write_all(txn: &mut PagedAppend<'_>, start: usize, tokens: usize) -> Result<()> {
+        write_layer(txn, 0, start, tokens)?;
+        write_layer(txn, 1, start, tokens)
+    }
+
+    fn assert_inventory(pool: &PagedKvPool, held_old_tail: Option<usize>) {
+        assert_eq!(pool.table.len(), pool.fills.len());
+        let mut seen = BTreeSet::new();
+        for bundle in &pool.table {
+            assert!(*bundle < pool.plan.bundle_count());
+            assert!(seen.insert(*bundle));
+        }
+        for bundle in &pool.free {
+            assert!(*bundle < pool.plan.bundle_count());
+            assert!(seen.insert(*bundle));
+        }
+        if let Some(bundle) = held_old_tail {
+            assert!(bundle < pool.plan.bundle_count());
+            assert!(seen.insert(bundle));
+        }
+        assert_eq!(seen.len(), pool.plan.bundle_count());
+        assert_eq!(
+            pool.table.len() + pool.free.len() + usize::from(held_old_tail.is_some()),
+            pool.plan.bundle_count()
+        );
+    }
+
+    fn assert_future_rows_refused(pool: &PagedKvPool, visible: usize) -> Result<()> {
+        for layer in 0..LAYERS {
+            let rows = pool.layer_kv(layer)?;
+            assert_eq!(rows.tokens(), visible);
+            assert!(matches!(
+                rows.key_row(visible),
+                Err(Error::PagedReadBeyondVisible { .. })
+            ));
+            assert!(matches!(
+                rows.value_row(visible),
+                Err(Error::PagedReadBeyondVisible { .. })
+            ));
+        }
+        Ok(())
+    }
+
+    fn assert_committed_matches(pool: &PagedKvPool, model: &[Vec<ModelRow>; LAYERS]) -> Result<()> {
+        let tokens = model[0].len();
+        assert!(model.iter().all(|layer| layer.len() == tokens));
+        assert_eq!(pool.committed_tokens(), tokens);
+        for (layer, expected_rows) in model.iter().enumerate() {
+            let rows = pool.committed().layer_kv(layer)?;
+            assert_eq!(rows.tokens(), tokens);
+            for (token, expected) in expected_rows.iter().enumerate() {
+                assert_eq!(rows.key_row(token)?, expected.key);
+                assert_eq!(rows.value_row(token)?, expected.value);
+            }
+        }
+        assert_future_rows_refused(pool, tokens)
+    }
+
+    fn tail_payload(pool: &PagedKvPool, bundle: usize, fill: usize) -> Result<Vec<Vec<f32>>> {
+        let mut payload = Vec::new();
+        for layer in 0..LAYERS {
+            for value in [false, true] {
+                let range = pool.span(bundle, layer, 0, value, fill)?;
+                payload.push(pool.storage[range].to_vec());
+            }
+        }
+        Ok(payload)
+    }
+
+    fn assert_tail_payload(
+        pool: &PagedKvPool,
+        bundle: usize,
+        fill: usize,
+        expected: &[Vec<f32>],
+    ) -> Result<()> {
+        assert_eq!(tail_payload(pool, bundle, fill)?, expected);
+        Ok(())
+    }
+
+    fn seed_committed(
+        pool: &mut PagedKvPool,
+        model: &mut [Vec<ModelRow>; LAYERS],
+        tokens: usize,
+    ) -> Result<()> {
+        let mut txn = pool.begin_append(tokens)?;
+        write_all(&mut txn, 0, tokens)?;
+        txn.commit()?;
+        append_model(model, 0, tokens);
+        assert_inventory(pool, None);
+        assert_committed_matches(pool, model)
+    }
+
+    fn assert_staged_inventory(txn: &PagedAppend<'_>) {
+        assert_inventory(
+            txn.pool,
+            txn.replaced_tail
+                .map(|replacement| replacement.original_bundle),
+        );
+    }
+
+    fn exercise_partial_tail_rollback(page_tokens: usize, plan: PagedKvPlan) -> Result<()> {
+        let mut pool = PagedKvPool::new(plan)?;
+        let mut model = empty_model();
+        let start = page_tokens - 1;
+        assert_inventory(&pool, None);
+
+        {
+            let mut seed = pool.begin_append(start)?;
+            write_layer(&mut seed, 0, 0, start)?;
+            assert_eq!(seed.layer_kv(0)?.tokens(), start);
+            assert_eq!(seed.layer_kv(1)?.tokens(), 0);
+            assert!(matches!(
+                seed.layer_kv(1)?.key_row(0),
+                Err(Error::PagedReadBeyondVisible { .. })
+            ));
+            assert_staged_inventory(&seed);
+            write_layer(&mut seed, 1, 0, start)?;
+            seed.commit()?;
+        }
+        append_model(&mut model, 0, start);
+        assert_inventory(&pool, None);
+        assert_committed_matches(&pool, &model)?;
+
+        let original_bundle = pool.table[0];
+        let original_fill = pool.fills[0];
+        let original_payload = tail_payload(&pool, original_bundle, original_fill)?;
+        {
+            let mut incomplete = pool.begin_append(2)?;
+            assert!(incomplete.replaced_tail.is_some());
+            assert_ne!(incomplete.pool.table[0], original_bundle);
+            assert_staged_inventory(&incomplete);
+            assert_tail_payload(
+                incomplete.pool,
+                original_bundle,
+                original_fill,
+                &original_payload,
+            )?;
+
+            let first = model_row(0, start);
+            incomplete.write_layer_row(0, 0, &first.key, &first.value)?;
+            assert_eq!(incomplete.layer_kv(0)?.tokens(), start + 1);
+            assert_eq!(incomplete.layer_kv(0)?.key_row(start)?, first.key);
+            assert_eq!(incomplete.layer_kv(0)?.value_row(start)?, first.value);
+            let second = model_row(0, start + 1);
+            assert!(matches!(
+                incomplete.write_layer_row(0, 1, &second.key[..2], &second.value),
+                Err(Error::PagedRowWidth { .. })
+            ));
+            assert!(matches!(
+                incomplete.write_layer_row(0, 0, &first.key, &first.value),
+                Err(Error::PagedWriteOrder { .. })
+            ));
+            assert_eq!(incomplete.layer_kv(0)?.tokens(), start + 1);
+            assert_eq!(incomplete.layer_kv(0)?.key_row(start)?, first.key);
+            assert_eq!(incomplete.layer_kv(0)?.value_row(start)?, first.value);
+            assert_eq!(incomplete.layer_kv(1)?.tokens(), start);
+            assert_staged_inventory(&incomplete);
+
+            assert!(matches!(
+                incomplete.layer_kv(1)?.value_row(start),
+                Err(Error::PagedReadBeyondVisible { .. })
+            ));
+            incomplete.write_layer_row(0, 1, &second.key, &second.value)?;
+            assert_tail_payload(
+                incomplete.pool,
+                original_bundle,
+                original_fill,
+                &original_payload,
+            )?;
+            assert_staged_inventory(&incomplete);
+            assert!(matches!(
+                incomplete.commit(),
+                Err(Error::PagedIncompleteAppend { .. })
+            ));
+        }
+        assert_eq!(pool.table[0], original_bundle);
+        assert_tail_payload(&pool, original_bundle, original_fill, &original_payload)?;
+        assert_inventory(&pool, None);
+        assert_committed_matches(&pool, &model)?;
+
+        {
+            let mut dropped = pool.begin_append(2)?;
+            write_layer(&mut dropped, 0, start, 2)?;
+            assert_staged_inventory(&dropped);
+        }
+        assert_eq!(pool.table[0], original_bundle);
+        assert_tail_payload(&pool, original_bundle, original_fill, &original_payload)?;
+        assert_inventory(&pool, None);
+        assert_committed_matches(&pool, &model)?;
+
+        {
+            let mut retry = pool.begin_append(2)?;
+            write_all(&mut retry, start, 2)?;
+            assert_staged_inventory(&retry);
+            retry.commit()?;
+        }
+        append_model(&mut model, start, 2);
+        assert_inventory(&pool, None);
+        assert_committed_matches(&pool, &model)
+    }
+
+    fn exercise_start_and_multi_page_append(
+        page_tokens: usize,
+        plan: PagedKvPlan,
+        start: usize,
+        append_tokens: usize,
+    ) -> Result<()> {
+        let mut pool = PagedKvPool::new(plan)?;
+        let mut model = empty_model();
+        seed_committed(&mut pool, &mut model, start)?;
+
+        let old_tail = if start % page_tokens == 0 {
+            None
+        } else {
+            let page = pool.table.len() - 1;
+            let bundle = pool.table[page];
+            Some((
+                bundle,
+                pool.fills[page],
+                tail_payload(&pool, bundle, pool.fills[page])?,
+            ))
+        };
+        {
+            let mut txn = pool.begin_append(append_tokens)?;
+            assert_staged_inventory(&txn);
+            if let Some((bundle, fill, payload)) = &old_tail {
+                assert_ne!(txn.pool.table[txn.pool.table.len() - 2], *bundle);
+                assert_tail_payload(txn.pool, *bundle, *fill, payload)?;
+            } else {
+                assert!(txn.replaced_tail.is_none());
+            }
+            write_layer(&mut txn, 0, start, append_tokens)?;
+            assert_eq!(txn.layer_kv(0)?.tokens(), start + append_tokens);
+            assert_eq!(txn.layer_kv(1)?.tokens(), start);
+            assert!(matches!(
+                txn.layer_kv(1)?.key_row(start),
+                Err(Error::PagedReadBeyondVisible { .. })
+            ));
+            assert_staged_inventory(&txn);
+            write_layer(&mut txn, 1, start, append_tokens)?;
+            txn.commit()?;
+        }
+        append_model(&mut model, start, append_tokens);
+        assert_inventory(&pool, None);
+        assert_committed_matches(&pool, &model)
+    }
+
     #[test]
-    fn supported_pages_commit_exact_rows() -> Result<()> {
-        for plan in [
-            PagedKvPlan::b8(geometry())?,
-            PagedKvPlan::b16(geometry())?,
-            PagedKvPlan::b32(geometry())?,
+    fn all_page_sizes_match_independent_transaction_row_models() -> Result<()> {
+        for (page_tokens, make_plan) in [
+            (
+                8,
+                PagedKvPlan::b8 as fn(PagedKvGeometry) -> Result<PagedKvPlan>,
+            ),
+            (
+                16,
+                PagedKvPlan::b16 as fn(PagedKvGeometry) -> Result<PagedKvPlan>,
+            ),
+            (
+                32,
+                PagedKvPlan::b32 as fn(PagedKvGeometry) -> Result<PagedKvPlan>,
+            ),
         ] {
-            let mut pool = PagedKvPool::new(plan)?;
-            let mut txn = pool.begin_append(2)?;
-            write_all(&mut txn, 2, 1.0)?;
-            txn.commit()?;
-            let view = pool.layer_kv(1)?;
-            assert_eq!(view.tokens(), 2);
-            assert_eq!(view.key_row(1)?, &[2.0; 3]);
-            assert_eq!(view.value_row(1)?, &[12.0; 3]);
+            let max_context = page_tokens * 2 + 1;
+            exercise_partial_tail_rollback(page_tokens, make_plan(geometry(max_context))?)?;
+            exercise_start_and_multi_page_append(
+                page_tokens,
+                make_plan(geometry(max_context))?,
+                page_tokens,
+                page_tokens + 1,
+            )?;
+            exercise_start_and_multi_page_append(
+                page_tokens,
+                make_plan(geometry(max_context))?,
+                page_tokens + 1,
+                page_tokens,
+            )?;
         }
-        Ok(())
-    }
-    #[test]
-    fn partial_tail_drop_restores_and_retry_is_clean() -> Result<()> {
-        let mut pool = PagedKvPool::new(PagedKvPlan::b8(geometry())?)?;
-        {
-            let mut txn = pool.begin_append(3)?;
-            write_all(&mut txn, 3, 1.0)?;
-            txn.commit()?;
-        }
-        {
-            let mut txn = pool.begin_append(2)?;
-            write_all(&mut txn, 2, 20.0)?;
-            assert_eq!(txn.layer_kv(0)?.tokens(), 5);
-        }
-        assert_eq!(pool.committed_tokens(), 3);
-        assert_eq!(pool.layer_kv(0)?.key_row(2)?, &[1.0; 3]);
-        let mut retry = pool.begin_append(2)?;
-        write_all(&mut retry, 2, 30.0)?;
-        retry.commit()?;
-        assert_eq!(pool.layer_kv(0)?.key_row(3)?, &[30.0; 3]);
-        Ok(())
-    }
-    #[test]
-    fn page_crossing_appends_keep_prior_full_rows() -> Result<()> {
-        let mut pool = PagedKvPool::new(PagedKvPlan::b8(geometry())?)?;
-        let mut first = pool.begin_append(7)?;
-        write_all(&mut first, 7, 1.0)?;
-        first.commit()?;
-        let mut crossing = pool.begin_append(2)?;
-        write_all(&mut crossing, 2, 9.0)?;
-        crossing.commit()?;
-        let layer = pool.layer_kv(0)?;
-        assert_eq!(layer.tokens(), 9);
-        assert_eq!(layer.key_row(6)?, &[1.0; 3]);
-        assert_eq!(layer.key_row(7)?, &[9.0; 3]);
-        assert_eq!(layer.key_row(8)?, &[9.0; 3]);
-        Ok(())
-    }
-    #[test]
-    fn incomplete_or_out_of_order_rows_never_publish() -> Result<()> {
-        let mut pool = PagedKvPool::new(PagedKvPlan::b8(geometry())?)?;
-        let mut txn = pool.begin_append(2)?;
-        assert!(matches!(
-            txn.write_layer_row(0, 1, &[1.0; 3], &[2.0; 3]),
-            Err(Error::PagedWriteOrder { .. })
-        ));
-        txn.write_layer_row(0, 0, &[1.0; 3], &[2.0; 3])?;
-        assert!(matches!(
-            txn.commit(),
-            Err(Error::PagedIncompleteAppend { .. })
-        ));
-        assert_eq!(pool.committed_tokens(), 0);
-        assert!(matches!(
-            pool.layer_kv(0)?.key_row(0),
-            Err(Error::PagedReadBeyondVisible { .. })
-        ));
         Ok(())
     }
     #[test]
     fn boundary_capacity_and_shape_are_typed() -> Result<()> {
-        let mut pool = PagedKvPool::new(PagedKvPlan::b8(geometry())?)?;
+        let mut pool = PagedKvPool::new(PagedKvPlan::b8(geometry(20))?)?;
         assert!(matches!(
             pool.begin_append(21),
             Err(Error::PagedContextOverflow { .. })
@@ -951,6 +1205,7 @@ mod tests {
     }
     #[test]
     fn selector_minimizes_checked_cpu_request_not_page_size() -> Result<()> {
+        let word = size_of::<usize>();
         let narrow = PagedKvGeometry {
             layers: 1,
             row_width: 1,
@@ -960,14 +1215,14 @@ mod tests {
         let narrow_b16 = PagedKvPlan::b16(narrow)?;
         let narrow_b32 = PagedKvPlan::b32(narrow)?;
         assert_eq!(narrow_b8.backing_bytes(), 1_088);
-        assert_eq!(narrow_b8.metadata_bytes(), 400);
-        assert_eq!(narrow_b8.total_requested_bytes(), 1_488);
+        assert_eq!(narrow_b8.metadata_bytes(), 50 * word);
+        assert_eq!(narrow_b8.total_requested_bytes(), 1_088 + 50 * word);
         assert_eq!(narrow_b16.backing_bytes(), 1_152);
-        assert_eq!(narrow_b16.metadata_bytes(), 208);
-        assert_eq!(narrow_b16.total_requested_bytes(), 1_360);
+        assert_eq!(narrow_b16.metadata_bytes(), 26 * word);
+        assert_eq!(narrow_b16.total_requested_bytes(), 1_152 + 26 * word);
         assert_eq!(narrow_b32.backing_bytes(), 1_280);
-        assert_eq!(narrow_b32.metadata_bytes(), 112);
-        assert_eq!(narrow_b32.total_requested_bytes(), 1_392);
+        assert_eq!(narrow_b32.metadata_bytes(), 14 * word);
+        assert_eq!(narrow_b32.total_requested_bytes(), 1_280 + 14 * word);
         assert_eq!(
             PagedKvPlan::select(narrow)?.page_tokens(),
             PagedKvPageTokens::B16
@@ -980,11 +1235,11 @@ mod tests {
         let wide_b8 = PagedKvPlan::b8(wide)?;
         let wide_b16 = PagedKvPlan::b16(wide)?;
         assert_eq!(wide_b8.backing_bytes(), 69_632);
-        assert_eq!(wide_b8.metadata_bytes(), 400);
-        assert_eq!(wide_b8.total_requested_bytes(), 70_032);
+        assert_eq!(wide_b8.metadata_bytes(), 50 * word);
+        assert_eq!(wide_b8.total_requested_bytes(), 69_632 + 50 * word);
         assert_eq!(wide_b16.backing_bytes(), 73_728);
-        assert_eq!(wide_b16.metadata_bytes(), 208);
-        assert_eq!(wide_b16.total_requested_bytes(), 73_936);
+        assert_eq!(wide_b16.metadata_bytes(), 26 * word);
+        assert_eq!(wide_b16.total_requested_bytes(), 73_728 + 26 * word);
         assert_eq!(
             PagedKvPlan::select(wide)?.page_tokens(),
             PagedKvPageTokens::B8
