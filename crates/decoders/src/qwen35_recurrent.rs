@@ -290,7 +290,7 @@ impl Qwen35RecurrentExecution {
         allocations: &RecurrentStepAllocations,
     ) -> Result<ProjectedInputs> {
         let qkv = project_tokens(
-            self.weights,
+            &self.weights,
             &block_tensor_name(self.block_index, ATTN_QKV_ROLE),
             normalized,
             token_count,
@@ -299,7 +299,7 @@ impl Qwen35RecurrentExecution {
             allocations.qkv_projection,
         )?;
         let z = project_tokens(
-            self.weights,
+            &self.weights,
             &block_tensor_name(self.block_index, ATTN_GATE_ROLE),
             normalized,
             token_count,
@@ -308,7 +308,7 @@ impl Qwen35RecurrentExecution {
             allocations.gate_projection,
         )?;
         let alpha = project_tokens(
-            self.weights,
+            &self.weights,
             &block_tensor_name(self.block_index, SSM_ALPHA_ROLE),
             normalized,
             token_count,
@@ -317,7 +317,7 @@ impl Qwen35RecurrentExecution {
             allocations.alpha_projection,
         )?;
         let beta_projection = project_tokens(
-            self.weights,
+            &self.weights,
             &block_tensor_name(self.block_index, SSM_BETA_ROLE),
             normalized,
             token_count,
@@ -516,7 +516,7 @@ impl Qwen35RecurrentExecution {
             kernels::cpu_f32::try_hadamard(&normalized_output, &gate).context(RecurrentCpuSnafu)?;
         ensure_finite(&gated_output, "recurrent output gate", 0)?;
         project_tokens(
-            self.weights,
+            &self.weights,
             &block_tensor_name(self.block_index, SSM_OUT_ROLE),
             &gated_output,
             token_count,

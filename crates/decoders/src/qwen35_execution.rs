@@ -313,7 +313,7 @@ impl StagedExecution {
             }
             let lm_head = LmHeadWorkspaceAllocations::try_from_layout(self.layout)?;
             let output_norm = read_f32(
-                self.weights,
+                &self.weights,
                 OUTPUT_NORM,
                 &[self.layout.hidden_u64],
                 lm_head.output_norm,
@@ -335,7 +335,7 @@ impl StagedExecution {
                 || token_index + 1 == token_ids.len()
             {
                 logits.extend(project_checked(
-                    self.weights,
+                    &self.weights,
                     OUTPUT,
                     &normalized,
                     lm_head.vocabulary_projection,
@@ -360,7 +360,7 @@ impl StagedExecution {
         )?;
         add_in_place(hidden, attention, "attention residual")?;
         let post_norm = read_f32(
-            self.weights,
+            &self.weights,
             &block_name(block, "post_attention_norm.weight"),
             &[self.layout.hidden_u64],
             finish.post_attention_norm,
@@ -417,13 +417,13 @@ impl StagedExecution {
         allocations: FeedForwardWorkspaceAllocations,
     ) -> Result<Vec<f32>> {
         let gate = project_checked(
-            self.weights,
+            &self.weights,
             &block_name(block, "ffn_gate.weight"),
             input,
             allocations.gate_projection,
         )?;
         let up = project_checked(
-            self.weights,
+            &self.weights,
             &block_name(block, "ffn_up.weight"),
             input,
             allocations.up_projection,
@@ -441,7 +441,7 @@ impl StagedExecution {
             fused.push(value);
         }
         project_checked(
-            self.weights,
+            &self.weights,
             &block_name(block, "ffn_down.weight"),
             &fused,
             allocations.down_projection,

@@ -257,7 +257,7 @@ impl PreparedGeneration {
     ///
     /// WHY: prompt IDs only have meaning with their verified tokenizer bytes.
     #[must_use]
-    pub const fn tokenizer_identity(&self) -> TokenizerIdentity {
+    pub fn tokenizer_identity(&self) -> TokenizerIdentity {
         self.pipeline.profile.tokenizer.identity()
     }
 
