@@ -55,7 +55,10 @@ impl Q4KBlock {
         let _ = finite_half(
             RowFormat::Q4K,
             "scale",
-            [stored[Q4_K_SUPER_SCALE_OFFSET], stored[Q4_K_SUPER_SCALE_OFFSET + 1]],
+            [
+                stored[Q4_K_SUPER_SCALE_OFFSET],
+                stored[Q4_K_SUPER_SCALE_OFFSET + 1],
+            ],
         )?;
         let _ = finite_half(
             RowFormat::Q4K,
@@ -71,18 +74,16 @@ impl Q4KBlock {
     /// Decode this block into 256 f32 values.
     #[must_use]
     pub fn decode_f32(&self) -> [f32; Q4_K_VALUES_PER_BLOCK] {
-        let super_scale =
-            half::f16::from_bits(u16::from_le_bytes([
-                self.bytes[Q4_K_SUPER_SCALE_OFFSET],
-                self.bytes[Q4_K_SUPER_SCALE_OFFSET + 1],
-            ]))
-            .to_f32();
-        let super_minimum =
-            half::f16::from_bits(u16::from_le_bytes([
-                self.bytes[Q4_K_SUPER_MINIMUM_OFFSET],
-                self.bytes[Q4_K_SUPER_MINIMUM_OFFSET + 1],
-            ]))
-            .to_f32();
+        let super_scale = half::f16::from_bits(u16::from_le_bytes([
+            self.bytes[Q4_K_SUPER_SCALE_OFFSET],
+            self.bytes[Q4_K_SUPER_SCALE_OFFSET + 1],
+        ]))
+        .to_f32();
+        let super_minimum = half::f16::from_bits(u16::from_le_bytes([
+            self.bytes[Q4_K_SUPER_MINIMUM_OFFSET],
+            self.bytes[Q4_K_SUPER_MINIMUM_OFFSET + 1],
+        ]))
+        .to_f32();
         let mut scales = [0; K_SCALE_BYTES];
         scales.copy_from_slice(&self.bytes[Q4_K_SCALE_OFFSET..Q4_K_QUANT_OFFSET]);
         let quantized = &self.bytes[Q4_K_QUANT_OFFSET..];

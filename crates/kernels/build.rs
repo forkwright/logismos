@@ -186,13 +186,21 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         std::mem::size_of::<u16>(),
         "Q4_K super-minimum offset must follow the super-scale",
     )?;
-    require_equal(q4_scale_offset, q4_prefix, "Q4_K scale offset must follow the prefix")?;
+    require_equal(
+        q4_scale_offset,
+        q4_prefix,
+        "Q4_K scale offset must follow the prefix",
+    )?;
     require_equal(
         q4_quant_offset,
         checked_sum(&[q4_scale_offset, q4_scales], "Q4_K quant offset")?,
         "Q4_K quant offset must follow scales",
     )?;
-    require_equal(q5_values, q4_values, "Q5_K values must share Q4_K pair geometry")?;
+    require_equal(
+        q5_values,
+        q4_values,
+        "Q5_K values must share Q4_K pair geometry",
+    )?;
     require_equal(
         q5_quant,
         q4_quant,
@@ -213,7 +221,11 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         std::mem::size_of::<u16>(),
         "Q5_K super-minimum offset must follow the super-scale",
     )?;
-    require_equal(q5_scale_offset, q5_prefix, "Q5_K scale offset must follow the prefix")?;
+    require_equal(
+        q5_scale_offset,
+        q5_prefix,
+        "Q5_K scale offset must follow the prefix",
+    )?;
     require_equal(
         q5_high_offset,
         checked_sum(&[q5_scale_offset, q5_scales], "Q5_K high-bit offset")?,
@@ -231,10 +243,14 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         "Q6_K values per half block",
     )?;
     let q6_half_block_count = checked_div_exact(q6_values, q6_half_width, "Q6_K half blocks")?;
-    let q6_low_bytes_per_half = checked_div_exact(q6_low, q6_half_block_count, "Q6_K low bytes per half")?;
-    let q6_high_bytes_per_half = checked_div_exact(q6_high, q6_half_block_count, "Q6_K high bytes per half")?;
-    let q6_scales_per_half = checked_div_exact(q6_scales, q6_half_block_count, "Q6_K scales per half")?;
-    let q6_values_per_half = checked_div_exact(q6_values, q6_half_block_count, "Q6_K values per half")?;
+    let q6_low_bytes_per_half =
+        checked_div_exact(q6_low, q6_half_block_count, "Q6_K low bytes per half")?;
+    let q6_high_bytes_per_half =
+        checked_div_exact(q6_high, q6_half_block_count, "Q6_K high bytes per half")?;
+    let q6_scales_per_half =
+        checked_div_exact(q6_scales, q6_half_block_count, "Q6_K scales per half")?;
+    let q6_values_per_half =
+        checked_div_exact(q6_values, q6_half_block_count, "Q6_K values per half")?;
     let q6_values_per_scale = checked_div_exact(q6_values, q6_scales, "Q6_K values per scale")?;
     require_equal(
         q6_low_bytes_per_half,
@@ -256,7 +272,11 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         checked_mul(q6_values_per_scale, 2, "Q6_K values per quarter relation")?,
         "Q6_K quarters must contain two scale groups",
     )?;
-    require_equal(q6_high_offset, q6_low, "Q6_K high-bit offset must follow low planes")?;
+    require_equal(
+        q6_high_offset,
+        q6_low,
+        "Q6_K high-bit offset must follow low planes",
+    )?;
     require_equal(
         q6_scale_offset,
         checked_sum(&[q6_high_offset, q6_high], "Q6_K scale offset")?,
@@ -277,11 +297,8 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         iq4_nl_scale,
         "IQ4_NL quant offset must follow the block scale",
     )?;
-    let iq4_xs_group_count = checked_div_exact(
-        iq4_xs_values,
-        iq4_xs_group_values,
-        "IQ4_XS group count",
-    )?;
+    let iq4_xs_group_count =
+        checked_div_exact(iq4_xs_values, iq4_xs_group_values, "IQ4_XS group count")?;
     require_equal(
         checked_mul(iq4_xs_quant, 2, "IQ4_XS reconstructed values")?,
         iq4_xs_values,
@@ -304,12 +321,18 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
     )?;
     require_equal(
         iq4_xs_scale_low_offset,
-        checked_sum(&[iq4_xs_scale_high_offset, iq4_xs_scale_high], "IQ4_XS low-scale offset")?,
+        checked_sum(
+            &[iq4_xs_scale_high_offset, iq4_xs_scale_high],
+            "IQ4_XS low-scale offset",
+        )?,
         "IQ4_XS low-scale offset must follow high scale bits",
     )?;
     require_equal(
         iq4_xs_quant_offset,
-        checked_sum(&[iq4_xs_scale_low_offset, iq4_xs_scale_low], "IQ4_XS quant offset")?,
+        checked_sum(
+            &[iq4_xs_scale_low_offset, iq4_xs_scale_low],
+            "IQ4_XS quant offset",
+        )?,
         "IQ4_XS quant offset must follow low scale bits",
     )?;
     if quant::f32_row::F32_ROW_VALUE_BYTES != std::mem::size_of::<u32>()
@@ -399,17 +422,23 @@ fn checked_mul(left: usize, right: usize, label: &str) -> Result<usize, String> 
 
 fn checked_div_exact(dividend: usize, divisor: usize, label: &str) -> Result<usize, String> {
     if divisor == 0 {
-        return Err(format!("quant layout relation has zero divisor while deriving {label}"));
+        return Err(format!(
+            "quant layout relation has zero divisor while deriving {label}"
+        ));
     }
     if !dividend.is_multiple_of(divisor) {
-        return Err(format!("quant layout relation is not exact while deriving {label}"));
+        return Err(format!(
+            "quant layout relation is not exact while deriving {label}"
+        ));
     }
     Ok(dividend / divisor)
 }
 
 fn require_equal(actual: usize, expected: usize, relation: &str) -> Result<(), String> {
     if actual != expected {
-        return Err(format!("quant layout relation violated: {relation} ({actual} != {expected})"));
+        return Err(format!(
+            "quant layout relation violated: {relation} ({actual} != {expected})"
+        ));
     }
     Ok(())
 }
