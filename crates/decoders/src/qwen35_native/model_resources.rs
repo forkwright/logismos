@@ -77,6 +77,36 @@ pub(super) struct ModelSessionResources {
     position: usize,
 }
 
+/// Shared immutable uploads retained by session teardown without an ordinary
+/// native destructor reachable on abandonment.
+///
+/// A pending, synchronization-unconfirmed, or quarantined session stream may
+/// still reference resident weights. Dropping public teardown custody must
+/// therefore retain, rather than decrement the last resident `Arc` into the
+/// ordinary `DeviceBuffer` drop path.
+struct ResidentRetention {
+    resident: Option<Arc<NativeResidentModelResources>>,
+}
+
+impl ResidentRetention {
+    const fn new(resident: Arc<NativeResidentModelResources>) -> Self {
+        Self {
+            resident: Some(resident),
+        }
+    }
+}
+
+impl Drop for ResidentRetention {
+    fn drop(&mut self) {
+        if let Some(resident) = self.resident.take() {
+            // Explicit aggregate teardown has no physical-eviction authority
+            // over immutable uploads. Preserve the exact owner rather than
+            // allowing its last Arc decrement to enter ordinary HIP Drop.
+            core::mem::forget(resident);
+        }
+    }
+}
+
 /// Fully disarmed immutable uploads awaiting a dedicated teardown stream.
 #[must_use = "resident uploads remain live until explicit HIP teardown"]
 pub(super) struct NativeResidentTeardownParts {
@@ -119,13 +149,13 @@ pub(super) enum ModelSessionTeardown {
     PartiallyAdmitted {
         inventory: TeardownInventory,
         buffers: Vec<TeardownBuffer>,
-        resident: Arc<NativeResidentModelResources>,
+        resident: ResidentRetention,
     },
     /// The HIP inventory owns the stream and all session buffers; its exact
     /// release outcome is retained with the resident owner.
     Releasing {
         release: InventoryRelease,
-        resident: Arc<NativeResidentModelResources>,
+        resident: ResidentRetention,
     },
 }
 
@@ -235,7 +265,7 @@ impl NativeResidentTeardown {
 pub(super) struct ModelSessionTeardownParts {
     stream: Stream,
     buffers: Vec<TeardownBuffer>,
-    resident: Arc<NativeResidentModelResources>,
+    resident: ResidentRetention,
 }
 
 impl ModelSessionTeardownParts {
@@ -483,7 +513,7 @@ impl ModelSessionResources {
         ModelSessionTeardownParts {
             stream,
             buffers: buffers.into_buffers(),
-            resident: model,
+            resident: ResidentRetention::new(model),
         }
     }
 
