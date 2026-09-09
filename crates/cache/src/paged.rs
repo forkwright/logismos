@@ -539,11 +539,11 @@ impl PagedKvPool {
     /// Preflight whole-call capacity, then stage unpublished page changes.
     pub fn begin_append(&mut self, append_tokens: usize) -> Result<PagedAppend<'_>> {
         let reservation = self.ledger.begin_append(append_tokens)?;
-        if let Some(replacement) = reservation.replaced_tail {
-            if let Err(error) = self.copy_tail(replacement) {
-                self.ledger.rollback(&reservation);
-                return Err(error);
-            }
+        if let Some(replacement) = reservation.replaced_tail
+            && let Err(error) = self.copy_tail(replacement)
+        {
+            self.ledger.rollback(&reservation);
+            return Err(error);
         }
         Ok(PagedAppend {
             pool: self,
@@ -1077,6 +1077,10 @@ impl NativePagedKvPool {
         ensure_same_process_device(self.keys.device().ordinal(), stream.device().ordinal())
     }
 
+    fn ensure_buffer_device(&self, buffer: &DeviceBuffer<f32>) -> Result<()> {
+        ensure_same_process_device(self.keys.device().ordinal(), buffer.device().ordinal())
+    }
+
     unsafe fn prepare_device_append(
         &mut self,
         reservation: &AppendReservation,
@@ -1095,8 +1099,8 @@ impl NativePagedKvPool {
                     replacement.replacement_bundle,
                     replacement.fill,
                     stream,
-                )?
-            };
+                )
+            }?;
             // SAFETY: the ledger selected this in-range logical/physical page mapping.
             unsafe {
                 kernels::paged_kv::write_table_u32(
@@ -1105,8 +1109,8 @@ impl NativePagedKvPool {
                     replacement.page,
                     replacement.replacement_bundle,
                     stream,
-                )?
-            };
+                )
+            }?;
         }
         for logical_page in reservation.original_page_count..self.ledger.table.len() {
             let physical_page = *self.ledger.table.get(logical_page).ok_or_else(|| {
@@ -1123,8 +1127,8 @@ impl NativePagedKvPool {
                     logical_page,
                     physical_page,
                     stream,
-                )?
-            };
+                )
+            }?;
         }
         Ok(())
     }
@@ -1143,12 +1147,11 @@ impl NativePagedAppend<'_> {
     ///
     /// # Safety
     ///
-    /// Source rows must be correctly aligned device allocations of the declared
-    /// width on this pool's device and remain live and immutable through stream
-    /// completion. `stream` must be the same ordered pool-device stream passed
-    /// to [`NativePagedKvPool::begin_append`]. The caller owns completion and
-    /// must poison its whole session if submission completion becomes
-    /// uncertain.
+    /// `keys` and `values` must contain finite normal-or-zero rows and remain
+    /// live and immutable through stream completion. Their device must match
+    /// this pool and `stream`, which must be the ordered pool-device stream passed to
+    /// [`NativePagedKvPool::begin_append`]. The caller owns completion and
+    /// must poison its whole session if submission completion becomes uncertain.
     ///
     /// # Errors
     ///
@@ -1159,14 +1162,14 @@ impl NativePagedAppend<'_> {
         &mut self,
         layer: usize,
         token: usize,
-        key_f32: *const f32,
-        key_elements: usize,
-        value_f32: *const f32,
-        value_elements: usize,
+        keys: &DeviceBuffer<f32>,
+        values: &DeviceBuffer<f32>,
         stream: &Stream,
     ) -> Result<()> {
         self.pool.ensure_not_poisoned()?;
         self.pool.ensure_stream_device(stream)?;
+        self.pool.ensure_buffer_device(keys)?;
+        self.pool.ensure_buffer_device(values)?;
         let reservation = self.reservation()?;
         let location = self.pool.ledger.write_location(reservation, layer, token)?;
         let submitted = unsafe {
@@ -1176,10 +1179,10 @@ impl NativePagedAppend<'_> {
                 self.pool.keys.len(),
                 self.pool.values.as_device_ptr(),
                 self.pool.values.len(),
-                key_f32,
-                key_elements,
-                value_f32,
-                value_elements,
+                keys.as_device_ptr(),
+                keys.len(),
+                values.as_device_ptr(),
+                values.len(),
                 layer,
                 location.bundle,
                 location.within,
@@ -1289,8 +1292,9 @@ impl NativePagedLayerKv<'_> {
     ///
     /// # Safety
     ///
-    /// The query/output buffers and stream must uphold the attention launcher's
-    /// device lifetime, non-aliasing, and finite normal-or-zero obligations.
+    /// `query` must contain finite normal-or-zero values and remain live and
+    /// immutable through completion. `output` must remain exclusively owned
+    /// through completion; both buffers must be on this pool's device.
     /// `stream` must be this pool's device stream and exactly the ordered
     /// stream passed to begin/row submission for this transaction.
     ///
@@ -1301,13 +1305,13 @@ impl NativePagedLayerKv<'_> {
     pub unsafe fn launch_paged_decode(
         &self,
         plan: NativePagedDecodePlan,
-        query_f32: *const f32,
-        query_elements: usize,
-        output_f32: *mut f32,
-        output_elements: usize,
+        query: &DeviceBuffer<f32>,
+        output: &DeviceBuffer<f32>,
         stream: &Stream,
     ) -> Result<()> {
         self.pool.ensure_stream_device(stream)?;
+        self.pool.ensure_buffer_device(query)?;
+        self.pool.ensure_buffer_device(output)?;
         validate_native_attention_binding(self.pool.plan, self.tokens, plan)?;
         let layer_offset = self
             .layer
@@ -1324,19 +1328,19 @@ impl NativePagedLayerKv<'_> {
         unsafe {
             kernels::attention::launch_paged_decode_q1_f32(
                 plan,
-                query_f32,
-                query_elements,
+                query.as_device_ptr(),
+                query.len(),
                 key_base,
                 self.pool.plan.layout.layer_elements(),
                 value_base,
                 self.pool.plan.layout.layer_elements(),
                 self.pool.table.as_device_ptr(),
                 plan.page_table_entries(),
-                output_f32,
-                output_elements,
+                output.as_device_ptr(),
+                output.len(),
                 stream,
-            )?
-        };
+            )
+        }?;
         Ok(())
     }
 }

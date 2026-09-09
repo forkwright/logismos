@@ -59,29 +59,29 @@ impl DeviceResources {
                 &weights.input_norm,
                 &workspace.hidden,
                 stream,
-            )?
-        };
+            )
+        }?;
         // SAFETY: the row descriptor and distinct owned spans were admitted
         // from the verified matrix and workspace plans.
         unsafe {
             weights
                 .q_gate
-                .launch(&workspace.hidden, &workspace.q_gate, stream)?
-        };
+                .launch(&workspace.hidden, &workspace.q_gate, stream)
+        }?;
         // SAFETY: the row descriptor and distinct owned spans were admitted
         // from the verified matrix and workspace plans.
         unsafe {
             weights
                 .key
-                .launch(&workspace.hidden, &workspace.key, stream)?
-        };
+                .launch(&workspace.hidden, &workspace.key, stream)
+        }?;
         // SAFETY: the row descriptor and distinct owned spans were admitted
         // from the verified matrix and workspace plans.
         unsafe {
             weights
                 .value
-                .launch(&workspace.hidden, &workspace.value, stream)?
-        };
+                .launch(&workspace.hidden, &workspace.value, stream)
+        }?;
         // SAFETY: submit_step's contract retains distinct owned buffers with
         // the checked split geometry through completion.
         unsafe {
@@ -91,8 +91,8 @@ impl DeviceResources {
                 &workspace.query,
                 &workspace.gate,
                 stream,
-            )?
-        };
+            )
+        }?;
         // SAFETY: submit_step's contract retains distinct owned buffers with
         // verified Q/K normal-or-zero operands through completion.
         unsafe {
@@ -102,8 +102,8 @@ impl DeviceResources {
                 &weights.query_norm,
                 &workspace.normalized_query,
                 stream,
-            )?
-        };
+            )
+        }?;
         // SAFETY: submit_step's contract retains distinct owned buffers with
         // verified Q/K normal-or-zero operands through completion.
         unsafe {
@@ -113,8 +113,8 @@ impl DeviceResources {
                 &weights.key_norm,
                 &workspace.normalized_key,
                 stream,
-            )?
-        };
+            )
+        }?;
         // SAFETY: the coefficient controls and rotated Q span are distinct
         // owned buffers with the plan's exact half-split extents.
         unsafe {
@@ -124,8 +124,8 @@ impl DeviceResources {
                 &step.cosine,
                 &step.sine,
                 stream,
-            )?
-        };
+            )
+        }?;
         // SAFETY: the coefficient controls and rotated K span are distinct
         // owned buffers with the plan's exact half-split extents.
         unsafe {
@@ -135,8 +135,8 @@ impl DeviceResources {
                 &step.cosine,
                 &step.sine,
                 stream,
-            )?
-        };
+            )
+        }?;
 
         // SAFETY: this session owns the cache, stream, and exact one-token
         // append row buffers; all remain live until guard completion.
@@ -144,15 +144,7 @@ impl DeviceResources {
         // SAFETY: the normalized K and V buffers are exact native row spans
         // on the cache stream's device and remain owned through completion.
         unsafe {
-            append.write_layer_row(
-                0,
-                0,
-                workspace.normalized_key.as_device_ptr(),
-                workspace.normalized_key.len(),
-                workspace.value.as_device_ptr(),
-                workspace.value.len(),
-                stream,
-            )
+            append.write_layer_row(0, 0, &workspace.normalized_key, &workspace.value, stream)
         }
         .context(NativePagedKvSnafu)?;
         {
@@ -168,10 +160,8 @@ impl DeviceResources {
             unsafe {
                 layer.launch_paged_decode(
                     step.attention,
-                    workspace.normalized_query.as_device_ptr(),
-                    workspace.normalized_query.len(),
-                    workspace.attention.as_device_ptr(),
-                    workspace.attention.len(),
+                    &workspace.normalized_query,
+                    &workspace.attention,
                     stream,
                 )
             }
@@ -187,15 +177,15 @@ impl DeviceResources {
                 &workspace.gate,
                 &workspace.gated,
                 stream,
-            )?
-        };
+            )
+        }?;
         // SAFETY: the row descriptor and distinct owned spans were admitted
         // from the verified matrix and workspace plans.
         unsafe {
             weights
                 .output
-                .launch(&workspace.gated, &workspace.output_projection, stream)?
-        };
+                .launch(&workspace.gated, &workspace.output_projection, stream)
+        }?;
         // SAFETY: submit_step's contract retains distinct owned buffers with
         // the checked residual extent through completion.
         unsafe {
@@ -205,8 +195,8 @@ impl DeviceResources {
                 &workspace.output_projection,
                 &workspace.attention_residual,
                 stream,
-            )?
-        };
+            )
+        }?;
         // SAFETY: submit_step's contract retains distinct owned buffers with
         // verified normal-or-zero operands through completion.
         unsafe {
@@ -216,22 +206,22 @@ impl DeviceResources {
                 &weights.post_attention_norm,
                 &workspace.post_norm,
                 stream,
-            )?
-        };
+            )
+        }?;
         // SAFETY: the row descriptor and distinct owned spans were admitted
         // from the verified matrix and workspace plans.
         unsafe {
             weights
                 .ffn_gate
-                .launch(&workspace.post_norm, &workspace.ffn_gate, stream)?
-        };
+                .launch(&workspace.post_norm, &workspace.ffn_gate, stream)
+        }?;
         // SAFETY: the row descriptor and distinct owned spans were admitted
         // from the verified matrix and workspace plans.
         unsafe {
             weights
                 .ffn_up
-                .launch(&workspace.post_norm, &workspace.ffn_up, stream)?
-        };
+                .launch(&workspace.post_norm, &workspace.ffn_up, stream)
+        }?;
         // SAFETY: submit_step's contract retains distinct owned buffers with
         // the checked elementwise extent through completion.
         unsafe {
@@ -241,15 +231,15 @@ impl DeviceResources {
                 &workspace.ffn_up,
                 &workspace.ffn_product,
                 stream,
-            )?
-        };
+            )
+        }?;
         // SAFETY: the row descriptor and distinct owned spans were admitted
         // from the verified matrix and workspace plans.
         unsafe {
             weights
                 .ffn_down
-                .launch(&workspace.ffn_product, &workspace.ffn_down, stream)?
-        };
+                .launch(&workspace.ffn_product, &workspace.ffn_down, stream)
+        }?;
         // SAFETY: submit_step's contract retains distinct owned buffers with
         // the checked residual extent through completion.
         unsafe {
@@ -259,8 +249,8 @@ impl DeviceResources {
                 &workspace.ffn_down,
                 &step.output,
                 stream,
-            )?
-        };
+            )
+        }?;
 
         append.prepare_commit().context(NativePagedKvSnafu)
     }
