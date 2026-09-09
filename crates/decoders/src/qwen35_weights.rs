@@ -34,7 +34,7 @@ use crate::qwen35_recurrent::Qwen35RecurrentExecution;
 ///     let _ = Qwen35Weights::try_from_verified(observed);
 /// }
 /// ```
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Qwen35Weights {
     payload: VerifiedArtifact,
     recurrent_layout: Qwen35RecurrentLayout,
@@ -120,7 +120,7 @@ impl Qwen35Weights {
     ///
     /// Returns [`crate::Error`] when the selected block is not recurrent or
     /// when its execution-only finite parameters cannot be admitted.
-    pub fn recurrent_execution(&self, block_index: u64) -> Result<Qwen35RecurrentExecution<'_>> {
+    pub fn recurrent_execution(&self, block_index: u64) -> Result<Qwen35RecurrentExecution> {
         Qwen35RecurrentExecution::try_from_weights(self, block_index)
     }
 
@@ -133,7 +133,7 @@ impl Qwen35Weights {
     ///
     /// Returns [`crate::Error`] when execution-only Qwen3.5 metadata is
     /// incomplete, unsupported, or the requested context is out of range.
-    pub fn execution(&self, max_context: usize) -> Result<Qwen35Execution<'_>> {
+    pub fn execution(&self, max_context: usize) -> Result<Qwen35Execution> {
         Qwen35Execution::try_from_weights(self, max_context)
     }
 
@@ -148,7 +148,7 @@ impl Qwen35Weights {
         max_context: usize,
         max_step_tokens: usize,
         selection: Qwen35LogitSelection,
-    ) -> Result<Qwen35ExecutionPlan<'_>> {
+    ) -> Result<Qwen35ExecutionPlan> {
         Qwen35ExecutionPlan::try_from_weights(self, max_context, max_step_tokens, selection)
     }
 }

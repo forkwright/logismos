@@ -58,8 +58,8 @@ pub(crate) enum RecurrentTensorRole {
 /// delta recurrence, gated `RMSNorm`, and output projection. It does not execute
 /// residuals, FFN, dense attention, `NextN`, tokenization, logits, or a model.
 #[derive(Debug)]
-pub struct Qwen35RecurrentExecution<'weights> {
-    weights: &'weights Qwen35Weights,
+pub struct Qwen35RecurrentExecution {
+    weights: Qwen35Weights,
     block_index: u64,
     layout: ExecutionLayout,
     attention_norm: Vec<f32>,
@@ -125,7 +125,7 @@ impl RecurrentRetainedAllocations {
     }
 }
 
-impl<'weights> Qwen35RecurrentExecution<'weights> {
+impl Qwen35RecurrentExecution {
     pub(crate) fn retained_elements(layout: Qwen35RecurrentLayout, epsilon: f32) -> Result<usize> {
         let layout = ExecutionLayout::try_from_profile(layout, epsilon)?;
         RecurrentRetainedAllocations::try_from_layout(layout)?.total_elements()
@@ -139,10 +139,7 @@ impl<'weights> Qwen35RecurrentExecution<'weights> {
         let layout = ExecutionLayout::try_from_profile(layout, epsilon)?;
         Ok(RecurrentStepAllocations::try_from_layout(layout, token_count)?.workspace_elements())
     }
-    pub(crate) fn try_from_weights(
-        weights: &'weights Qwen35Weights,
-        block_index: u64,
-    ) -> Result<Self> {
+    pub(crate) fn try_from_weights(weights: &Qwen35Weights, block_index: u64) -> Result<Self> {
         let epsilon = recurrent_layernorm_rms_epsilon(weights.payload().observation().metadata())?;
         let layout = ExecutionLayout::try_from_profile(weights.recurrent_layout(), epsilon)?;
         layout.validate_recurrent_block(block_index)?;
@@ -182,7 +179,7 @@ impl<'weights> Qwen35RecurrentExecution<'weights> {
         let recurrent_state = zeroed_f32("GDN state", allocations.recurrent_state)?;
 
         Ok(Self {
-            weights,
+            weights: weights.clone(),
             block_index,
             layout,
             attention_norm,
@@ -222,7 +219,7 @@ impl<'weights> Qwen35RecurrentExecution<'weights> {
     pub(crate) fn try_clone_for_transaction(&self) -> Result<Self> {
         let allocations = RecurrentRetainedAllocations::try_from_layout(self.layout)?;
         Ok(Self {
-            weights: self.weights,
+            weights: self.weights.clone(),
             block_index: self.block_index,
             layout: self.layout,
             attention_norm: clone_f32(

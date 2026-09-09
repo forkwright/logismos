@@ -169,7 +169,7 @@ fn mixed_quantized_private_state_matches_f64_oracle_and_rolls_back()
 }
 
 fn private_state_snapshot(
-    execution: &Qwen35Execution<'_>,
+    execution: &Qwen35Execution,
 ) -> std::result::Result<ExecutionStateSnapshot, String> {
     let recurrent = execution
         .layers
@@ -196,7 +196,7 @@ fn private_state_snapshot(
 }
 
 fn assert_private_state_matches_oracle(
-    execution: &Qwen35Execution<'_>,
+    execution: &Qwen35Execution,
     expected: &OracleStateSnapshot,
 ) -> std::result::Result<(), String> {
     assert_eq!(

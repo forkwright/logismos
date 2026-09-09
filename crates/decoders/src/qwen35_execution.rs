@@ -44,8 +44,8 @@ pub enum Qwen35LogitSelection {
 
 /// Opaque artifact-bound construction plan for one CPU execution session.
 #[derive(Debug)]
-pub struct Qwen35ExecutionPlan<'weights> {
-    weights: &'weights Qwen35Weights,
+pub struct Qwen35ExecutionPlan {
+    weights: Qwen35Weights,
     layout: Layout,
     max_step_tokens: usize,
     selection: Qwen35LogitSelection,
@@ -60,12 +60,12 @@ pub struct Qwen35ExecutionPlan<'weights> {
 /// state while borrowing a private paged-KV append transaction; both publish only
 /// after the whole call, including selected final logits, succeeds.
 #[derive(Debug)]
-pub struct Qwen35Execution<'weights> {
-    weights: &'weights Qwen35Weights,
+pub struct Qwen35Execution {
+    weights: Qwen35Weights,
     layout: Layout,
     max_step_tokens: usize,
     selection: Qwen35LogitSelection,
-    layers: Vec<LayerState<'weights>>,
+    layers: Vec<LayerState>,
     paged_kv_pool: Option<PagedKvPool>,
     position: usize,
 }
@@ -75,16 +75,13 @@ pub struct Qwen35Execution<'weights> {
     clippy::large_enum_variant,
     reason = "direct recurrent storage avoids an additional infallible per-layer heap allocation; the checked Vec allocation bounds every main block"
 )]
-enum LayerState<'weights> {
-    Recurrent(Qwen35RecurrentExecution<'weights>),
+enum LayerState {
+    Recurrent(Qwen35RecurrentExecution),
     Full(usize),
 }
 
-impl<'weights> Qwen35Execution<'weights> {
-    pub(crate) fn try_from_weights(
-        weights: &'weights Qwen35Weights,
-        max_context: usize,
-    ) -> Result<Self> {
+impl Qwen35Execution {
+    pub(crate) fn try_from_weights(weights: &Qwen35Weights, max_context: usize) -> Result<Self> {
         Qwen35ExecutionPlan::try_from_weights(
             weights,
             max_context,
@@ -95,9 +92,9 @@ impl<'weights> Qwen35Execution<'weights> {
     }
 }
 
-impl<'weights> Qwen35ExecutionPlan<'weights> {
+impl Qwen35ExecutionPlan {
     pub(crate) fn try_from_weights(
-        weights: &'weights Qwen35Weights,
+        weights: &Qwen35Weights,
         max_context: usize,
         max_step_tokens: usize,
         selection: Qwen35LogitSelection,
@@ -119,7 +116,7 @@ impl<'weights> Qwen35ExecutionPlan<'weights> {
             paged_kv_plan,
         )?;
         Ok(Self {
-            weights,
+            weights: weights.clone(),
             layout,
             max_step_tokens,
             selection,
@@ -134,7 +131,7 @@ impl<'weights> Qwen35ExecutionPlan<'weights> {
     ///
     /// Returns [`crate::Error`] if one plan-derived retained allocation or
     /// artifact-bound recurrent state cannot be constructed.
-    pub fn execution(self) -> Result<Qwen35Execution<'weights>> {
+    pub fn execution(self) -> Result<Qwen35Execution> {
         let Self {
             weights,
             layout,
@@ -191,7 +188,7 @@ impl<'weights> Qwen35ExecutionPlan<'weights> {
     }
 }
 
-impl<'weights> Qwen35Execution<'weights> {
+impl Qwen35Execution {
     /// Execute complete token ids and return token-major vocabulary logits.
     ///
     /// The session owns only state derived from its verified payload; callers
@@ -242,7 +239,7 @@ impl<'weights> Qwen35Execution<'weights> {
         Ok(logits)
     }
 
-    fn stage(&self) -> Result<StagedExecution<'weights>> {
+    fn stage(&self) -> Result<StagedExecution> {
         let mut layers = reserve("transaction main-block slots", self.layers.len())?;
         for layer in &self.layers {
             layers.push(match layer {
@@ -253,7 +250,7 @@ impl<'weights> Qwen35Execution<'weights> {
             });
         }
         Ok(StagedExecution {
-            weights: self.weights,
+            weights: self.weights.clone(),
             layout: self.layout,
             selection: self.selection,
             layers,
@@ -262,15 +259,15 @@ impl<'weights> Qwen35Execution<'weights> {
     }
 }
 
-struct StagedExecution<'weights> {
-    weights: &'weights Qwen35Weights,
+struct StagedExecution {
+    weights: Qwen35Weights,
     layout: Layout,
     selection: Qwen35LogitSelection,
-    layers: Vec<LayerState<'weights>>,
+    layers: Vec<LayerState>,
     position: usize,
 }
 
-impl StagedExecution<'_> {
+impl StagedExecution {
     fn step_staged(
         &mut self,
         token_ids: &[u32],
@@ -281,7 +278,7 @@ impl StagedExecution<'_> {
         for (token_index, token_id) in token_ids.iter().enumerate() {
             let mut hidden = self.embed(*token_id)?;
             for block in 0..self.layout.main_blocks {
-                let weights = self.weights;
+                let weights = &self.weights;
                 let layout = self.layout;
                 let position = self.position;
                 let layer = self.layers.get_mut(block).ok_or_else(|| {

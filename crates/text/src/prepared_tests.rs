@@ -124,6 +124,49 @@ fn prepared_report_binds_both_identities_and_exact_request_axes() -> TestResult<
 }
 
 #[test]
+fn prepared_request_retains_profile_after_pipeline_and_artifact_drop() -> TestResult<()> {
+    let (prepared, expected_tokenizer, expected_artifact) = {
+        let tokenizer_json = tokenizer_json();
+        let expected_tokenizer = tokenizer_identity(&tokenizer_json);
+        let config = fixture_config(&TOKENS, 3, true, true, CONTENT_TEMPLATE);
+        let fixture = build_qwen35_fixture(&config)?;
+        let (directory, artifact) = load_fixture(&fixture)?;
+        let expected_artifact = artifact.observation().inspection().digest;
+        let pipeline = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+        let messages = [TextMessage::new(TextRole::User, "hello")];
+        let prepared =
+            pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+        drop(pipeline);
+        drop(artifact);
+        drop(directory);
+        (prepared, expected_tokenizer, expected_artifact)
+    };
+
+    assert_eq!(prepared.rendered_prompt(), "hello");
+    assert_eq!(prepared.prompt_token_ids(), [1, 3, 2]);
+    assert_eq!(prepared.tokenizer_identity(), expected_tokenizer);
+    assert_eq!(
+        prepared.decoder_cpu_requirements().artifact_digest(),
+        expected_artifact
+    );
+    assert_eq!(prepared.context_tokens(), 4);
+    assert_eq!(prepared.max_output_tokens(), 1);
+    assert_eq!(
+        prepared
+            .verified_weights()
+            .execution_plan(4, 3, Qwen35LogitSelection::LastToken)?
+            .cpu_requirements()
+            .artifact_digest(),
+        expected_artifact,
+        "the prepared owner must retain its exact verified weights"
+    );
+    let generation = prepared.generate(&NeverCancelled)?;
+    assert_eq!(generation.token_ids(), [3]);
+    assert_eq!(generation.text(), "hello");
+    Ok(())
+}
+
+#[test]
 fn configured_ceiling_above_artifact_admits_only_requests_the_artifact_can_execute()
 -> TestResult<()> {
     let tokenizer_json = tokenizer_json();
