@@ -1498,8 +1498,9 @@ mod contract_tests {
     const DIGEST_B: &str =
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-    fn requested(bytes: u64) -> RequestedDeviceBytes {
-        RequestedDeviceBytes::new(std::num::NonZeroU64::new(bytes).unwrap())
+    fn requested(bytes: u64) -> Result<RequestedDeviceBytes, PlacementRefusal> {
+        let bytes = std::num::NonZeroU64::new(bytes).ok_or(PlacementRefusal::InvalidRequest)?;
+        Ok(RequestedDeviceBytes::new(bytes))
     }
 
     fn plan_input(devices: &str, artifacts: &str, workloads: &str) -> String {
@@ -1804,11 +1805,11 @@ mod contract_tests {
         let prepared = ledger.prepare(&request)?;
         let mut v1_leases = ledger.commit(prepared)?;
         assert!(matches!(
-            ledger.reserve_bytes("w7900", requested(5)),
+            ledger.reserve_bytes("w7900", requested(5)?),
             Err(DeviceByteReservationError::RequestedBytesExhausted { .. })
         ));
         let byte_lease = ledger
-            .reserve_bytes("w7900", requested(4))
+            .reserve_bytes("w7900", requested(4)?)
             .map_err(|_| PlacementRefusal::InvalidRequest)?;
         assert_eq!(byte_lease.device_id(), "w7900");
         assert_eq!(byte_lease.requested_bytes().get(), 4);
@@ -1837,10 +1838,10 @@ mod contract_tests {
         let request = PlanRequest::from_json(&input)?;
         let mut ledger = ReservationLedger::new(&request)?;
         let first = ledger
-            .reserve_bytes("w7900", requested(3))
+            .reserve_bytes("w7900", requested(3)?)
             .map_err(|_| PlacementRefusal::InvalidRequest)?;
         let second = ledger
-            .reserve_bytes("w7900", requested(4))
+            .reserve_bytes("w7900", requested(4)?)
             .map_err(|_| PlacementRefusal::InvalidRequest)?;
         drop(first);
         assert_eq!(ledger.dynamic_reserved.get("w7900"), Some(&7));
@@ -1864,7 +1865,7 @@ mod contract_tests {
         let mut first = ReservationLedger::new(&request)?;
         let mut second = ReservationLedger::new(&request)?;
         let lease = first
-            .reserve_bytes("w7900", requested(3))
+            .reserve_bytes("w7900", requested(3)?)
             .map_err(|_| PlacementRefusal::InvalidRequest)?;
         let failure = second
             .release_bytes(lease)
@@ -1888,7 +1889,7 @@ mod contract_tests {
                 device_id: "w7900".to_owned(),
                 reserved_bytes: 1,
             },
-            requested_bytes: requested(1),
+            requested_bytes: requested(1)?,
         };
         let failure = second
             .release_bytes(unknown)
@@ -1921,7 +1922,7 @@ mod contract_tests {
         let mut ledger = ReservationLedger::new(&request)?;
         let prepared = ledger.prepare(&request)?;
         let lease = ledger
-            .reserve_bytes("w7900", requested(1))
+            .reserve_bytes("w7900", requested(1)?)
             .map_err(|_| PlacementRefusal::InvalidRequest)?;
         ledger
             .release_bytes(lease)
@@ -1931,15 +1932,15 @@ mod contract_tests {
             Err(PlacementRefusal::StalePreparedPlan)
         ));
         assert!(matches!(
-            ledger.reserve_bytes("unknown", requested(1)),
+            ledger.reserve_bytes("unknown", requested(1)?),
             Err(DeviceByteReservationError::UnknownRequestedDevice { .. })
         ));
         assert!(matches!(
-            ledger.reserve_bytes("offline", requested(1)),
+            ledger.reserve_bytes("offline", requested(1)?),
             Err(DeviceByteReservationError::UnavailableRequestedDevice { .. })
         ));
         assert!(matches!(
-            ledger.reserve_bytes("wrong-isa", requested(1)),
+            ledger.reserve_bytes("wrong-isa", requested(1)?),
             Err(DeviceByteReservationError::UnsupportedRequestedDevice { .. })
         ));
         Ok(())
@@ -1960,14 +1961,14 @@ mod contract_tests {
         let request = PlanRequest::from_json(&input)?;
         let mut ledger = ReservationLedger::new(&request)?;
         assert!(matches!(
-            ledger.reserve_bytes("w7900", requested(4)),
+            ledger.reserve_bytes("w7900", requested(4)?),
             Err(DeviceByteReservationError::RequestedBytesExhausted { .. })
         ));
         assert!(ledger.dynamic_reserved.is_empty());
 
         ledger.dynamic_reserved.insert("w7900".to_owned(), u64::MAX);
         assert!(matches!(
-            ledger.reserve_bytes("w7900", requested(1)),
+            ledger.reserve_bytes("w7900", requested(1)?),
             Err(DeviceByteReservationError::RequestedByteArithmeticOverflow { .. })
         ));
         assert_eq!(ledger.dynamic_reserved.get("w7900"), Some(&u64::MAX));
