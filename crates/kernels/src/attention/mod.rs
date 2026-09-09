@@ -626,13 +626,6 @@ impl NativePageTokens {
     }
 }
 
-/// Checked native address layout for one all-query-head Q=1 decode call.
-///
-/// Keys and values are separate dense `f32` arrays with logical layout
-/// `[physical_page][in_page_token][kv_head][head_width]`. `page_table` has
-/// one `u32` physical-page index per logical page. The descriptor eagerly
-/// checks dense K/V and table allocation layouts plus ABI dimensions, but
-/// cannot inspect device table values or scalar contents.
 #[cfg(feature = "gpu")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NativePagedDecodeAbi {
@@ -644,6 +637,13 @@ struct NativePagedDecodeAbi {
     physical_pages: u32,
 }
 
+/// Checked native address layout for one all-query-head Q=1 decode call.
+///
+/// Keys and values are separate dense `f32` arrays with logical layout
+/// `[physical_page][in_page_token][kv_head][head_width]`. `page_table` has
+/// one `u32` physical-page index per logical page. The descriptor eagerly
+/// checks dense K/V and table allocation layouts plus ABI dimensions, but
+/// cannot inspect device table values or scalar contents.
 #[cfg(feature = "gpu")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NativePagedDecodePlan {
