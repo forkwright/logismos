@@ -164,7 +164,6 @@ impl Stream {
     /// destructor from this state: callers must first receive a
     /// [`QuiescentStream`], then destroy it after every buffer touched by the
     /// stream has been released.
-    #[must_use]
     pub fn begin_quiesce(self) -> StreamQuiesce {
         match self.into_release_owner(TeardownEntryId::Standalone) {
             Ok(owner) => map_stream_quiesce(attempt_stream_quiesce(owner)),
@@ -375,7 +374,6 @@ pub struct QuiescentStream {
 
 impl QuiescentStream {
     /// Explicitly destroy this already-quiescent stream.
-    #[must_use]
     pub fn destroy(self) -> StreamRelease {
         release_stream_owner(self.owner)
     }
@@ -395,7 +393,6 @@ impl PendingStreamQuiesce {
     }
 
     /// Retry the explicit quiescence transition.
-    #[must_use]
     pub fn retry(self) -> StreamQuiesce {
         map_stream_quiesce(attempt_stream_quiesce(self.pending.into_owner()))
     }
@@ -415,7 +412,6 @@ impl StreamSynchronizationUnconfirmed {
     }
 
     /// Deliberately issue another non-destructive synchronization attempt.
-    #[must_use]
     pub fn reconcile(self) -> StreamQuiesce {
         map_stream_reconciliation(attempt_stream_quiesce(self.pending.into_owner()))
     }
@@ -447,7 +443,6 @@ impl PendingStreamDestroy {
     }
 
     /// Retry the explicit stream destruction.
-    #[must_use]
     pub fn retry(self) -> StreamRelease {
         release_stream_owner(self.pending.into_owner())
     }

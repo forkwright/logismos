@@ -158,7 +158,6 @@ impl<T: BytePod> DeviceBuffer<T> {
     /// Callers that submitted work touching this buffer must establish stream
     /// quiescence first. [`crate::TeardownInventory`] encodes that order for a
     /// stream and all of its registered buffers.
-    #[must_use]
     pub fn begin_release(self) -> BufferRelease {
         self.into_teardown().begin_release()
     }
@@ -560,7 +559,6 @@ impl TeardownBuffer {
     }
 
     /// Attempt explicit standalone release of this allocation.
-    #[must_use]
     pub fn begin_release(self) -> BufferRelease {
         map_buffer_release(self.owner)
     }
@@ -602,7 +600,6 @@ impl PendingBufferTeardown {
     }
 
     /// Retry the previously unstarted release exactly once per call.
-    #[must_use]
     pub fn retry(self) -> BufferRelease {
         map_buffer_release(self.pending.into_owner())
     }

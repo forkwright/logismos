@@ -249,7 +249,7 @@ impl<R> ReleaseOwner<R> {
     ) -> ReleaseAttempt<R> {
         let mut owner = match self.prepare(phase, prepare) {
             Ok(owner) => owner,
-            Err(pending) => return ReleaseAttempt::Pending(pending),
+            Err(pending) => return ReleaseAttempt::Pending(*pending),
         };
         if let Err(source) = destroy(&mut owner.resource, &owner.metadata) {
             let error = TeardownError::Destructor {
@@ -271,9 +271,9 @@ impl<R> ReleaseOwner<R> {
         mut self,
         phase: TeardownPhase,
         operation: impl FnOnce(&mut R, &ResourceMetadata) -> Result<(), Error>,
-    ) -> core::result::Result<Self, PendingOwner<R>> {
+    ) -> core::result::Result<Self, Box<PendingOwner<R>>> {
         if let Err(source) = operation(&mut self.resource, &self.metadata) {
-            return Err(self.pending(phase, source));
+            return Err(Box::new(self.pending(phase, source)));
         }
         Ok(self)
     }
@@ -451,13 +451,11 @@ impl InventoryPushError {
     }
 
     /// Recover the rejected inert buffer for retention or another inventory.
-    #[must_use]
     pub fn into_buffer(self) -> TeardownBuffer {
         self.buffer
     }
 
     /// Explicitly release the rejected allocation as a standalone buffer.
-    #[must_use]
     pub fn begin_release(self) -> BufferRelease {
         self.buffer.begin_release()
     }
@@ -535,7 +533,6 @@ impl TeardownInventory {
     }
 
     /// Consume, quiesce, then explicitly release every retained resource.
-    #[must_use]
     pub fn begin_release(self) -> InventoryRelease {
         let Self {
             stream,
@@ -607,7 +604,6 @@ impl PendingInventory {
     }
 
     /// Retry only the transition known not to have reached its HIP call.
-    #[must_use]
     pub fn retry(self) -> InventoryRelease {
         let mut operations = HipInventoryOperations;
         map_coordinator_outcome(retry_pending(self.state, self.evidence, &mut operations))
@@ -640,7 +636,6 @@ impl InventorySynchronizationUnconfirmed {
     }
 
     /// Deliberately attempt to reconcile completion by synchronizing again.
-    #[must_use]
     pub fn reconcile(self) -> InventoryRelease {
         let mut operations = HipInventoryOperations;
         map_coordinator_outcome(reconcile_synchronization(
@@ -1152,9 +1147,8 @@ mod tests {
             [ReleaseStep::Success],
         );
         let outcome = begin_coordinator(stream, buffers, evidence, &mut operations);
-        let (state, evidence) = match outcome {
-            CoordinatorOutcome::Pending { state, evidence } => (state, evidence),
-            _ => return Err(io::Error::other("second buffer must remain pending").into()),
+        let CoordinatorOutcome::Pending { state, evidence } = outcome else {
+            return Err(io::Error::other("second buffer must remain pending").into());
         };
         assert_eq!(evidence.released().len(), 1);
         assert_eq!(
@@ -1163,11 +1157,8 @@ mod tests {
         );
 
         let outcome = retry_pending(state, evidence, &mut operations);
-        let evidence = match outcome {
-            CoordinatorOutcome::Released(evidence) => evidence,
-            _ => {
-                return Err(io::Error::other("retry must finish the retained suffix").into());
-            }
+        let CoordinatorOutcome::Released(evidence) = outcome else {
+            return Err(io::Error::other("retry must finish the retained suffix").into());
         };
         assert_eq!(evidence.released().len(), 3);
         assert_eq!(evidence.requested_bytes(), 32);
@@ -1189,17 +1180,13 @@ mod tests {
             [ReleaseStep::Success],
         );
         let outcome = begin_coordinator(stream, buffers, evidence, &mut operations);
-        let (stream, buffers, evidence) = match outcome {
-            CoordinatorOutcome::SynchronizationUnconfirmed {
-                stream,
-                buffers,
-                evidence,
-            } => (stream, buffers, evidence),
-            _ => {
-                return Err(
-                    io::Error::other("failed synchronization must be a distinct state").into(),
-                );
-            }
+        let CoordinatorOutcome::SynchronizationUnconfirmed {
+            stream,
+            buffers,
+            evidence,
+        } = outcome
+        else {
+            return Err(io::Error::other("failed synchronization must be a distinct state").into());
         };
         assert!(evidence.released().is_empty());
         assert_eq!(
@@ -1221,17 +1208,15 @@ mod tests {
             [ReleaseStep::Success],
         );
         let outcome = begin_coordinator(stream, buffers, evidence, &mut operations);
-        let (evidence, tombstone) = match outcome {
-            CoordinatorOutcome::Quarantined {
-                evidence,
-                tombstone,
-                ..
-            } => (evidence, tombstone),
-            _ => {
-                return Err(
-                    io::Error::other("destructor failure must quarantine the inventory").into(),
-                );
-            }
+        let CoordinatorOutcome::Quarantined {
+            evidence,
+            tombstone,
+            ..
+        } = outcome
+        else {
+            return Err(
+                io::Error::other("destructor failure must quarantine the inventory").into(),
+            );
         };
         assert!(evidence.released().is_empty());
         assert_eq!(evidence.requested_bytes(), 32);
@@ -1247,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_failure_never_invokes_destructor() -> TestResult {
+    fn preflight_failure_never_invokes_destructor() {
         let resource = owner(TeardownEntryId::Standalone, 16);
         let mut destructor_calls = 0;
         let outcome = resource.attempt(
@@ -1260,11 +1245,10 @@ mod tests {
         );
         assert!(matches!(outcome, ReleaseAttempt::Pending(_)));
         assert_eq!(destructor_calls, 0);
-        Ok(())
     }
 
     #[test]
-    fn acknowledged_release_drops_inert_rust_metadata_once() -> TestResult {
+    fn acknowledged_release_drops_inert_rust_metadata_once() {
         let drops = Arc::new(AtomicUsize::new(0));
         let owner = ReleaseOwner::new(
             DropTrackedHandle {
@@ -1275,7 +1259,6 @@ mod tests {
         let outcome = owner.attempt(TeardownPhase::Preflight, |_, _| Ok(()), |_, _| Ok(()));
         assert!(matches!(outcome, ReleaseAttempt::Released(_)));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        Ok(())
     }
 
     #[test]
@@ -1297,9 +1280,8 @@ mod tests {
             [ReleaseStep::Success],
         );
         let outcome = begin_coordinator(stream, buffers, evidence, &mut operations);
-        let (state, evidence) = match outcome {
-            CoordinatorOutcome::Pending { state, evidence } => (state, evidence),
-            _ => return Err(io::Error::other("preflight failure must remain retryable").into()),
+        let CoordinatorOutcome::Pending { state, evidence } = outcome else {
+            return Err(io::Error::other("preflight failure must remain retryable").into());
         };
         assert_eq!(operations.calls.join("|"), "stream-preflight");
         assert!(matches!(
@@ -1321,13 +1303,13 @@ mod tests {
             [],
         );
         let outcome = begin_coordinator(stream, buffers, evidence, &mut operations);
-        let (stream, buffers, evidence) = match outcome {
-            CoordinatorOutcome::SynchronizationUnconfirmed {
-                stream,
-                buffers,
-                evidence,
-            } => (stream, buffers, evidence),
-            _ => return Err(io::Error::other("initial sync failure must be unconfirmed").into()),
+        let CoordinatorOutcome::SynchronizationUnconfirmed {
+            stream,
+            buffers,
+            evidence,
+        } = outcome
+        else {
+            return Err(io::Error::other("initial sync failure must be unconfirmed").into());
         };
         assert!(matches!(
             reconcile_synchronization(stream, buffers, evidence, &mut operations),
