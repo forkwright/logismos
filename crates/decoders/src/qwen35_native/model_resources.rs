@@ -3,8 +3,8 @@
 use cache::NativePagedKvPool;
 use core::mem::ManuallyDrop;
 use hipcore::{
-    Device, DeviceBuffer, InventoryRelease, Stream, StreamCreationError, StreamCreationQuarantine,
-    TeardownBuffer, TeardownInventory,
+    Device, DeviceBuffer, InventoryRelease, Stream, StreamCreationError, TeardownBuffer,
+    TeardownInventory,
 };
 use snafu::ResultExt;
 use std::sync::Arc;
@@ -116,14 +116,14 @@ pub(super) struct NativeResidentTeardownParts {
 pub(super) enum NativeResidentTeardown {
     /// Creating a fresh owned teardown stream failed before HIP admission.
     Unadmitted(NativeResidentTeardownParts),
-    /// HIP returned a non-null teardown stream while reporting failure.
+    /// Stream creation failed without establishing that no handle was returned.
     ///
-    /// The indeterminate stream never enters ordinary teardown or the normal
-    /// inventory. The already-disarmed resident buffers remain retained with
-    /// its terminal creation quarantine.
+    /// The complete creation error never enters ordinary teardown or the
+    /// normal inventory. Retain unknown future error variants as conservatively
+    /// as today's non-null-on-error quarantine, with the disarmed buffers.
     CreationQuarantined {
         parts: NativeResidentTeardownParts,
-        quarantine: StreamCreationQuarantine,
+        error: StreamCreationError,
     },
     /// Checked accounting admitted a prefix and retained the remaining buffers.
     PartiallyAdmitted {
@@ -184,7 +184,6 @@ impl ModelSessionTeardown {
     pub(super) const fn state(&self) -> ModelSessionTeardownState {
         match self {
             Self::Unadmitted(_) => ModelSessionTeardownState::Unadmitted,
-            Self::CreationQuarantined { .. } => ModelSessionTeardownState::Quarantined,
             Self::PartiallyAdmitted { .. } => ModelSessionTeardownState::PartiallyAdmitted,
             Self::Releasing { release, .. } => match release {
                 InventoryRelease::Released(_) => ModelSessionTeardownState::Released,
@@ -251,6 +250,7 @@ impl NativeResidentTeardown {
     pub(super) const fn state(&self) -> ModelSessionTeardownState {
         match self {
             Self::Unadmitted(_) => ModelSessionTeardownState::Unadmitted,
+            Self::CreationQuarantined { .. } => ModelSessionTeardownState::Quarantined,
             Self::PartiallyAdmitted { .. } => ModelSessionTeardownState::PartiallyAdmitted,
             Self::Releasing(release) => match release {
                 InventoryRelease::Released(_) => ModelSessionTeardownState::Released,
@@ -340,13 +340,12 @@ impl NativeResidentTeardownParts {
             Err(StreamCreationError::NoHandle(_)) => {
                 return NativeResidentTeardown::Unadmitted(Self { device, buffers });
             }
-            Err(StreamCreationError::Quarantined(quarantine)) => {
+            Err(error) => {
                 return NativeResidentTeardown::CreationQuarantined {
                     parts: Self { device, buffers },
-                    quarantine,
+                    error,
                 };
             }
-            Err(_) => return NativeResidentTeardown::Unadmitted(Self { device, buffers }),
         };
         let mut inventory = match TeardownInventory::try_new(stream) {
             Ok(inventory) => inventory,
