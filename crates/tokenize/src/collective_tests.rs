@@ -6,7 +6,7 @@ use super::{Error, Result, Tokenizer};
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-fn tokenizer_json(tokens: &[&str], decoder: Value) -> TestResult<Vec<u8>> {
+fn tokenizer_json(tokens: &[&str], decoder: &Value) -> TestResult<Vec<u8>> {
     let mut vocabulary = Map::new();
     for (identifier, spelling) in tokens.iter().enumerate() {
         vocabulary.insert((*spelling).to_owned(), json!(identifier));
@@ -45,7 +45,7 @@ fn bounded_decode(
 
 fn assert_decoder(
     tokens: &[&str],
-    decoder: Value,
+    decoder: &Value,
     identifiers: &[u32],
     expected: &str,
 ) -> TestResult {
@@ -77,7 +77,7 @@ fn assert_decoder(
 fn null_decoder_uses_upstream_space_joining() -> TestResult {
     assert_decoder(
         &["[UNK]", "hello", "world"],
-        Value::Null,
+        &Value::Null,
         &[1, 2],
         "hello world",
     )
@@ -87,13 +87,13 @@ fn null_decoder_uses_upstream_space_joining() -> TestResult {
 fn bpe_preserves_suffix_and_empty_suffix_semantics() -> TestResult {
     assert_decoder(
         &["[UNK]", "hello</w>", "world</w>"],
-        json!({"type": "BPEDecoder", "suffix": "</w>"}),
+        &json!({"type": "BPEDecoder", "suffix": "</w>"}),
         &[1, 2],
         "hello world",
     )?;
     assert_decoder(
         &["[UNK]", "a", "b"],
-        json!({"type": "BPEDecoder", "suffix": ""}),
+        &json!({"type": "BPEDecoder", "suffix": ""}),
         &[1, 2],
         " a b",
     )
@@ -103,7 +103,7 @@ fn bpe_preserves_suffix_and_empty_suffix_semantics() -> TestResult {
 fn byte_level_decodes_split_utf8_only_as_one_sequence() -> TestResult {
     assert_decoder(
         &["[UNK]", "Ã", "©"],
-        json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}),
+        &json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}),
         &[1, 2],
         "é",
     )
@@ -113,13 +113,13 @@ fn byte_level_decodes_split_utf8_only_as_one_sequence() -> TestResult {
 fn wordpiece_preserves_prefix_and_cleanup_order() -> TestResult {
     assert_decoder(
         &["[UNK]", "hello", "##s", "!"],
-        json!({"type": "WordPiece", "prefix": "##", "cleanup": true}),
+        &json!({"type": "WordPiece", "prefix": "##", "cleanup": true}),
         &[1, 2, 3],
         "hellos!",
     )?;
     assert_decoder(
         &["[UNK]", "a", "b"],
-        json!({"type": "WordPiece", "prefix": "", "cleanup": false}),
+        &json!({"type": "WordPiece", "prefix": "", "cleanup": false}),
         &[1, 2],
         "ab",
     )
@@ -129,13 +129,13 @@ fn wordpiece_preserves_prefix_and_cleanup_order() -> TestResult {
 fn metaspace_preserves_prepend_scheme_semantics() -> TestResult {
     assert_decoder(
         &["[UNK]", "▁hello", "▁world"],
-        json!({"type": "Metaspace", "replacement": "▁", "prepend_scheme": "always", "split": true}),
+        &json!({"type": "Metaspace", "replacement": "▁", "prepend_scheme": "always", "split": true}),
         &[1, 2],
         "hello world",
     )?;
     assert_decoder(
         &["[UNK]", "▁hello", "▁world"],
-        json!({"type": "Metaspace", "replacement": "▁", "prepend_scheme": "never", "split": true}),
+        &json!({"type": "Metaspace", "replacement": "▁", "prepend_scheme": "never", "split": true}),
         &[1, 2],
         " hello world",
     )
@@ -145,13 +145,13 @@ fn metaspace_preserves_prepend_scheme_semantics() -> TestResult {
 fn ctc_preserves_dedup_pad_delimiter_and_empty_delimiter_order() -> TestResult {
     assert_decoder(
         &["[UNK]", "<pad>", "h", "|", "i"],
-        json!({"type": "CTC", "pad_token": "<pad>", "word_delimiter_token": "|", "cleanup": true}),
+        &json!({"type": "CTC", "pad_token": "<pad>", "word_delimiter_token": "|", "cleanup": true}),
         &[1, 1, 2, 2, 3, 3, 4],
         "h i",
     )?;
     assert_decoder(
         &["[UNK]", ""],
-        json!({"type": "CTC", "pad_token": "<pad>", "word_delimiter_token": "", "cleanup": true}),
+        &json!({"type": "CTC", "pad_token": "<pad>", "word_delimiter_token": "", "cleanup": true}),
         &[1],
         " ",
     )
@@ -161,31 +161,31 @@ fn ctc_preserves_dedup_pad_delimiter_and_empty_delimiter_order() -> TestResult {
 fn replace_preserves_literal_regex_empty_and_zero_width_semantics() -> TestResult {
     assert_decoder(
         &["[UNK]", "a_b"],
-        json!({"type": "Replace", "pattern": {"String": "_"}, "content": " "}),
+        &json!({"type": "Replace", "pattern": {"String": "_"}, "content": " "}),
         &[1],
         "a b",
     )?;
     assert_decoder(
         &["[UNK]", "é"],
-        json!({"type": "Replace", "pattern": {"String": ""}, "content": "."}),
+        &json!({"type": "Replace", "pattern": {"String": ""}, "content": "."}),
         &[1],
         ".é.",
     )?;
     assert_decoder(
         &["[UNK]", ""],
-        json!({"type": "Replace", "pattern": {"String": ""}, "content": "."}),
+        &json!({"type": "Replace", "pattern": {"String": ""}, "content": "."}),
         &[1],
         "",
     )?;
     assert_decoder(
         &["[UNK]", "a   b"],
-        json!({"type": "Replace", "pattern": {"Regex": "\\s+"}, "content": "_"}),
+        &json!({"type": "Replace", "pattern": {"Regex": "\\s+"}, "content": "_"}),
         &[1],
         "a_b",
     )?;
     assert_decoder(
         &["[UNK]", "ab"],
-        json!({"type": "Replace", "pattern": {"Regex": "(?=b)"}, "content": "_"}),
+        &json!({"type": "Replace", "pattern": {"Regex": "(?=b)"}, "content": "_"}),
         &[1],
         "a_b",
     )
@@ -195,13 +195,13 @@ fn replace_preserves_literal_regex_empty_and_zero_width_semantics() -> TestResul
 fn fuse_and_strip_preserve_token_boundaries_and_unicode() -> TestResult {
     assert_decoder(
         &["[UNK]", "hello", "world"],
-        json!({"type": "Fuse"}),
+        &json!({"type": "Fuse"}),
         &[1, 2],
         "helloworld",
     )?;
     assert_decoder(
         &["[UNK]", "üühelloüü"],
-        json!({"type": "Strip", "content": "ü", "start": 1, "stop": 2}),
+        &json!({"type": "Strip", "content": "ü", "start": 1, "stop": 2}),
         &[1],
         "ühello",
     )
@@ -211,13 +211,13 @@ fn fuse_and_strip_preserve_token_boundaries_and_unicode() -> TestResult {
 fn byte_fallback_preserves_valid_and_final_invalid_runs() -> TestResult {
     assert_decoder(
         &["[UNK]", "<0xC3>", "<0xA9>"],
-        json!({"type": "ByteFallback"}),
+        &json!({"type": "ByteFallback"}),
         &[1, 2],
         "é",
     )?;
     assert_decoder(
         &["[UNK]", "<0xE5>", "<0x8F>"],
-        json!({"type": "ByteFallback"}),
+        &json!({"type": "ByteFallback"}),
         &[1, 2],
         "��",
     )
@@ -238,7 +238,7 @@ fn nested_sequences_flatten_without_changing_stage_semantics() -> TestResult {
     });
     assert_decoder(
         &["[UNK]", "x_hi_x", "xthere_x"],
-        decoder,
+        &decoder,
         &[1, 2],
         "-hi-there-",
     )
@@ -253,7 +253,7 @@ fn expanding_then_shrinking_sequence_uses_scratch_not_output_headroom() -> TestR
             {"type": "Replace", "pattern": {"String": "xyz"}, "content": ""}
         ]
     });
-    let bytes = tokenizer_json(&["[UNK]", "a"], decoder)?;
+    let bytes = tokenizer_json(&["[UNK]", "a"], &decoder)?;
     let tokenizer = Tokenizer::from_bytes(&bytes)?;
     let plan = tokenizer.decode_storage_plan(1, 1)?;
 
@@ -265,14 +265,14 @@ fn expanding_then_shrinking_sequence_uses_scratch_not_output_headroom() -> TestR
         plan.requested_scratch_bytes() > plan.requested_retained_bytes(),
         "intermediate growth must be owned by scratch instead of output headroom"
     );
-    let (decoded, _) = bounded_decode(&tokenizer, &[1], 1, false)?;
+    let (decoded_output, _) = bounded_decode(&tokenizer, &[1], 1, false)?;
     assert_eq!(
-        decoded, "a",
+        decoded_output, "a",
         "late shrinking must succeed at the exact retained output cap"
     );
     assert_eq!(
         tokenizer.decode(&[1], false)?,
-        decoded,
+        decoded_output,
         "late shrinking must remain differential with pinned upstream"
     );
     Ok(())
@@ -352,7 +352,7 @@ fn sparse_high_ids_do_not_create_a_dense_max_id_table() -> TestResult {
 
 #[test]
 fn plan_arithmetic_overflow_is_rejected_before_acquisition() -> TestResult {
-    let bytes = tokenizer_json(&["[UNK]", "hello"], Value::Null)?;
+    let bytes = tokenizer_json(&["[UNK]", "hello"], &Value::Null)?;
     let tokenizer = Tokenizer::from_bytes(&bytes)?;
     let result = tokenizer.decode_storage_plan(usize::MAX, 1);
 
@@ -367,7 +367,7 @@ fn plan_arithmetic_overflow_is_rejected_before_acquisition() -> TestResult {
 fn persistent_decoder_containers_are_separate_from_request_storage() -> TestResult {
     let bytes = tokenizer_json(
         &["[UNK]", "a_b"],
-        json!({"type": "Replace", "pattern": {"String": "_"}, "content": " "}),
+        &json!({"type": "Replace", "pattern": {"String": "_"}, "content": " "}),
     )?;
     let tokenizer = Tokenizer::from_bytes(&bytes)?;
     let plan = tokenizer.decode_storage_plan(1, 3)?;
@@ -386,7 +386,7 @@ fn persistent_decoder_containers_are_separate_from_request_storage() -> TestResu
 
 #[test]
 fn impossible_storage_request_fails_fallibly() -> TestResult {
-    let bytes = tokenizer_json(&["[UNK]", "a"], Value::Null)?;
+    let bytes = tokenizer_json(&["[UNK]", "a"], &Value::Null)?;
     let tokenizer = Tokenizer::from_bytes(&bytes)?;
     let output_capacity = usize::MAX
         .checked_sub(size_of::<u32>())
@@ -402,7 +402,7 @@ fn impossible_storage_request_fails_fallibly() -> TestResult {
 
 #[test]
 fn decoded_byte_cap_reports_exact_length_before_publication() -> TestResult {
-    let bytes = tokenizer_json(&["[UNK]", "hello"], Value::Null)?;
+    let bytes = tokenizer_json(&["[UNK]", "hello"], &Value::Null)?;
     let tokenizer = Tokenizer::from_bytes(&bytes)?;
     let result = bounded_decode(&tokenizer, &[1], 4, false);
 
