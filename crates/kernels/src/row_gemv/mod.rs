@@ -79,6 +79,55 @@ unsafe extern "C" {
         width: i32,
         stream: *mut c_void,
     ) -> u32;
+    fn logismos_launch_f32_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
+    fn logismos_launch_q8_0_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
+    fn logismos_launch_q4_k_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
+    fn logismos_launch_q5_k_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
+    fn logismos_launch_q6_k_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
+    fn logismos_launch_iq4_nl_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
+    fn logismos_launch_iq4_xs_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
 }
 
 /// Validated serialized matrix/vector extents shared by CPU execution and HIP launch.
@@ -169,6 +218,85 @@ impl RowGemvShape {
 
     pub(crate) const fn matrix_bytes(self) -> usize {
         self.matrix_bytes
+    }
+}
+
+/// Checked selected-row lookup geometry derived from one serialized matrix shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RowDecodePlan {
+    shape: RowGemvShape,
+    row: usize,
+    row_offset: usize,
+    row_i32: i32,
+    width_i32: i32,
+}
+
+impl RowDecodePlan {
+    /// Select one stored row from an already-admitted serialized matrix shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::UnsupportedShape`] when `row` lies outside the
+    /// checked matrix or cannot cross the HIP ABI. The source shape remains
+    /// the sole owner of format, matrix extent, row bytes, and output width.
+    pub fn try_from_shape(shape: RowGemvShape, row: usize) -> Result<Self> {
+        if row >= shape.rows {
+            return unsupported_shape(format!(
+                "selected row {row} must be smaller than checked row count {}",
+                shape.rows
+            ));
+        }
+        let row_offset = row.checked_mul(shape.row_bytes).ok_or_else(|| {
+            UnsupportedShapeSnafu {
+                kernel: KERNEL,
+                msg: format!(
+                    "selected row offset overflows usize ({row} * {})",
+                    shape.row_bytes
+                ),
+            }
+            .build()
+        })?;
+        let row_end = row_offset.checked_add(shape.row_bytes).ok_or_else(|| {
+            UnsupportedShapeSnafu {
+                kernel: KERNEL,
+                msg: "selected row end overflows usize".to_owned(),
+            }
+            .build()
+        })?;
+        if row_end > shape.matrix_bytes {
+            return unsupported_shape("selected row exceeds the checked matrix extent");
+        }
+        Ok(Self {
+            shape,
+            row,
+            row_offset,
+            row_i32: i32::try_from(row).map_err(|_| abi_error("selected row", row))?,
+            width_i32: i32::try_from(shape.width).map_err(|_| abi_error("width", shape.width))?,
+        })
+    }
+
+    /// Return the sole source matrix-shape authority.
+    #[must_use]
+    pub const fn shape(self) -> RowGemvShape {
+        self.shape
+    }
+
+    /// Return the selected stored row index.
+    #[must_use]
+    pub const fn row(self) -> usize {
+        self.row
+    }
+
+    /// Return the checked serialized-byte offset of the selected row.
+    #[must_use]
+    pub const fn row_offset(self) -> usize {
+        self.row_offset
+    }
+
+    /// Return the exact f32 output extent.
+    #[must_use]
+    pub const fn output_elements(self) -> usize {
+        self.shape.width
     }
 }
 
@@ -287,6 +415,67 @@ pub unsafe fn launch_row_gemv_f32(
     }
 }
 
+#[cfg(feature = "gpu")]
+/// Decode one selected serialized row into a distinct dense f32 device buffer.
+///
+/// This is a direct token-to-logits lookup primitive, not a basis-vector GEMV:
+/// the checked plan's stored row selects the sole decoded output.
+///
+/// # Errors
+///
+/// Returns typed exact-span, layout, selected-row, CPU-only, stream, or HIP
+/// launch failures.
+///
+/// # Safety
+///
+/// `matrix` and `output` must identify live exact device spans on `stream`'s
+/// device through completion. The serialized matrix remains immutable and the
+/// output remains exclusively writable and disjoint from it. Every decoded
+/// scale, reconstructed value, and output must be finite and normal-or-zero;
+/// the device ABI has no numerical status channel.
+pub unsafe fn launch_row_decode_f32(
+    plan: RowDecodePlan,
+    matrix: *const u8,
+    matrix_bytes: usize,
+    output: *mut f32,
+    output_len: usize,
+    stream: &Stream,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = (plan, matrix, matrix_bytes, output, output_len, stream);
+        no_gpu_build_refusal()
+    }
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        validate_decode_buffers(plan, matrix, matrix_bytes, output, output_len)?;
+        stream.make_current()?;
+        // SAFETY: the checked plan and local span validation establish the
+        // private ABI; the caller upholds device ownership, lifetime, and
+        // normal-or-zero numerical-domain obligations through completion.
+        let code = unsafe {
+            launch_decode_format(
+                plan.shape.format,
+                matrix.cast::<c_void>(),
+                output.cast::<c_void>(),
+                plan.row_i32,
+                plan.width_i32,
+                stream.raw().cast::<c_void>(),
+            )?
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            LaunchSnafu {
+                kernel: KERNEL,
+                kind: hipcore::ErrorKind::from_raw(code),
+                code,
+            }
+            .fail()
+        }
+    }
+}
+
 #[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 unsafe fn launch_format(
     format: quant::RowFormat,
@@ -362,6 +551,45 @@ unsafe fn launch_format(
     }
 }
 
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
+unsafe fn launch_decode_format(
+    format: quant::RowFormat,
+    matrix: *const c_void,
+    output: *mut c_void,
+    row: i32,
+    width: i32,
+    stream: *mut c_void,
+) -> Result<u32> {
+    // SAFETY: caller selected the same checked RowFormat owner as GEMV and
+    // validated the exact matrix/output spans before this private ABI entry.
+    unsafe {
+        match format {
+            quant::RowFormat::F32 => Ok(logismos_launch_f32_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            quant::RowFormat::Q8_0 => Ok(logismos_launch_q8_0_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            quant::RowFormat::Q4K => Ok(logismos_launch_q4_k_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            quant::RowFormat::Q5K => Ok(logismos_launch_q5_k_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            quant::RowFormat::Q6K => Ok(logismos_launch_q6_k_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            quant::RowFormat::IQ4NL => Ok(logismos_launch_iq4_nl_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            quant::RowFormat::IQ4XS => Ok(logismos_launch_iq4_xs_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            _ => unsupported_shape(format!("native HIP row decode does not support {format}")),
+        }
+    }
+}
+
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 fn validate_device_buffers(
     shape: RowGemvShape,
@@ -397,6 +625,36 @@ fn validate_device_buffers(
     reject_overlapping_device_spans(KERNEL, output, activations)
 }
 
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn validate_decode_buffers(
+    plan: RowDecodePlan,
+    matrix: *const u8,
+    matrix_bytes: usize,
+    output: *mut f32,
+    output_len: usize,
+) -> Result<()> {
+    if matrix_bytes != plan.shape.matrix_bytes {
+        return unsupported_shape(format!(
+            "matrix byte length {matrix_bytes} must equal checked {}",
+            plan.shape.matrix_bytes
+        ));
+    }
+    if output_len != plan.shape.width {
+        return unsupported_shape(format!(
+            "output length {output_len} must equal checked {}",
+            plan.shape.width
+        ));
+    }
+    let matrix = checked_u8_device_span(KERNEL, matrix, plan.shape.matrix_bytes, "matrix")?;
+    let output = checked_f32_device_span(
+        KERNEL,
+        output.cast_const(),
+        plan.shape.width,
+        "decoded row output",
+    )?;
+    reject_overlapping_device_spans(KERNEL, output, matrix)
+}
+
 #[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
 fn no_gpu_build_refusal() -> Result<()> {
     NoGpuBuildSnafu { kernel: KERNEL }.fail()
@@ -414,7 +672,7 @@ pub(crate) fn reserve_output(rows: usize) -> Result<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{KERNEL, RowGemvShape};
+    use super::{KERNEL, RowDecodePlan, RowGemvShape};
     use crate::Error;
 
     #[test]
@@ -458,6 +716,73 @@ mod tests {
         assert_ne!(baseline, other_format);
         assert_ne!(baseline, other_width);
         assert_ne!(baseline, other_rows);
+        Ok(())
+    }
+
+    #[test]
+    fn row_decode_plan_derives_selected_row_extent_from_one_shape_owner()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let shape = RowGemvShape::new(quant::RowFormat::F32, 3, 3, 36, 3, 3)?;
+        let plan = RowDecodePlan::try_from_shape(shape, 2)?;
+        assert_eq!(plan.shape(), shape);
+        assert_eq!(plan.row(), 2);
+        assert_eq!(plan.row_offset(), 24);
+        assert_eq!(plan.output_elements(), 3);
+        assert!(
+            RowDecodePlan::try_from_shape(shape, 3).is_err(),
+            "a selected row beyond the checked matrix must be refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_row_fixtures_match_independent_f64_packed_oracles()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        for format in formats() {
+            let fixture = decode_fixture(format)?;
+            let shape = RowGemvShape::new(
+                format,
+                fixture.rows,
+                fixture.width,
+                fixture.matrix.len(),
+                fixture.width,
+                fixture.rows,
+            )?;
+            let plan = RowDecodePlan::try_from_shape(shape, fixture.selected_row)?;
+            let row =
+                &fixture.matrix[plan.row_offset()..plan.row_offset() + plan.shape().row_bytes()];
+            let expected = independent_decode(format, row, fixture.width)?;
+            let decoded = quant::row_decode_f32(format, row, fixture.width)?;
+
+            assert_decode_matches_f64(&decoded, &expected, &format.to_string());
+            assert_eq!(
+                expected.first().map(|value| value.to_bits()),
+                Some(fixture.known_first.to_bits()),
+                "{format} known first value"
+            );
+            assert_eq!(
+                expected.last().map(|value| value.to_bits()),
+                Some(fixture.known_last.to_bits()),
+                "{format} known tail value"
+            );
+            assert!(
+                decoded.iter().all(
+                    |value| value.is_normal() || value.classify() == std::num::FpCategory::Zero
+                ),
+                "{format} selected row must remain in the native numerical domain"
+            );
+            let preceding = quant::row_decode_f32(
+                format,
+                &fixture.matrix[..plan.shape().row_bytes()],
+                fixture.width,
+            )?;
+            assert!(
+                preceding
+                    .iter()
+                    .all(|value| value.classify() == std::num::FpCategory::Zero),
+                "{format} preceding row must discriminate the selected row"
+            );
+        }
         Ok(())
     }
 
@@ -636,6 +961,161 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+    #[test]
+    fn row_decode_validator_binds_exact_matrix_and_distinct_output()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let matrix = [0_u8; 24];
+        let mut output = [0.0_f32; 3];
+        let shape = RowGemvShape::new(quant::RowFormat::F32, 2, 3, matrix.len(), 3, 2)?;
+        let plan = RowDecodePlan::try_from_shape(shape, 1)?;
+        super::validate_decode_buffers(
+            plan,
+            matrix.as_ptr(),
+            matrix.len(),
+            output.as_mut_ptr(),
+            output.len(),
+        )?;
+        assert!(
+            super::validate_decode_buffers(
+                plan,
+                matrix.as_ptr(),
+                matrix.len() - 1,
+                output.as_mut_ptr(),
+                output.len(),
+            )
+            .is_err(),
+            "short serialized matrix must be refused"
+        );
+        assert!(
+            super::validate_decode_buffers(
+                plan,
+                matrix.as_ptr(),
+                matrix.len(),
+                output.as_mut_ptr(),
+                output.len() - 1,
+            )
+            .is_err(),
+            "short decoded output must be refused"
+        );
+        assert!(
+            super::validate_decode_buffers(
+                plan,
+                core::ptr::null(),
+                matrix.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+            .is_err(),
+            "null serialized matrix must be refused"
+        );
+        assert!(
+            super::validate_decode_buffers(
+                plan,
+                matrix.as_ptr(),
+                matrix.len(),
+                output.as_mut_ptr().wrapping_byte_add(1),
+                output.len(),
+            )
+            .is_err(),
+            "misaligned decoded output must be refused"
+        );
+        let mut aligned_matrix = [0.0_f32; 6];
+        assert!(
+            super::validate_decode_buffers(
+                plan,
+                aligned_matrix.as_ptr().cast::<u8>(),
+                matrix.len(),
+                aligned_matrix.as_mut_ptr(),
+                output.len(),
+            )
+            .is_err(),
+            "decoded output must not alias serialized matrix storage"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
+    fn reserved_device_decodes_selected_row_for_all_formats_and_preserves_tail()
+    -> core::result::Result<(), String> {
+        use hipcore::{Device, DeviceBuffer, Stream};
+
+        const SENTINEL: f32 = -1234.5;
+        const CANARY_VALUES: usize = 17;
+
+        let device = Device::new(0).map_err(|error| format!("open reserved device 0: {error}"))?;
+        let stream = Stream::new(&device).map_err(|error| format!("create stream: {error}"))?;
+        for format in formats() {
+            let fixture = decode_fixture(format).map_err(|error| error.to_string())?;
+            let shape = RowGemvShape::new(
+                format,
+                fixture.rows,
+                fixture.width,
+                fixture.matrix.len(),
+                fixture.width,
+                fixture.rows,
+            )
+            .map_err(|error| format!("validate {format} shape: {error}"))?;
+            let plan = RowDecodePlan::try_from_shape(shape, fixture.selected_row)
+                .map_err(|error| format!("select {format} row: {error}"))?;
+            let row =
+                &fixture.matrix[plan.row_offset()..plan.row_offset() + plan.shape().row_bytes()];
+            let expected = independent_decode(format, row, fixture.width)
+                .map_err(|error| format!("derive independent {format} result: {error}"))?;
+            let owner_decoded = quant::row_decode_f32(format, row, fixture.width)
+                .map_err(|error| format!("decode {format} with quant owner: {error}"))?;
+            assert_decode_matches_f64(&owner_decoded, &expected, &format.to_string());
+
+            let mut padded_matrix = Vec::with_capacity(fixture.matrix.len() + 1);
+            padded_matrix.push(0xa5);
+            padded_matrix.extend_from_slice(&fixture.matrix);
+            let matrix = DeviceBuffer::<u8>::from_host(&device, &padded_matrix)
+                .map_err(|error| format!("upload unaligned {format} matrix: {error}"))?;
+            let initialized_output = vec![SENTINEL; fixture.width + CANARY_VALUES];
+            let output = DeviceBuffer::<f32>::from_host(&device, &initialized_output)
+                .map_err(|error| format!("allocate {format} output and tail: {error}"))?;
+            // SAFETY: the one-byte offset deliberately exercises byte-unaligned
+            // little-endian weights. Both distinct allocations remain live;
+            // matrix stays immutable and output exclusive through synchronization.
+            unsafe {
+                super::launch_row_decode_f32(
+                    plan,
+                    matrix.as_device_ptr().wrapping_add(1),
+                    fixture.matrix.len(),
+                    output.as_device_ptr(),
+                    fixture.width,
+                    &stream,
+                )
+            }
+            .map_err(|error| format!("launch {format} selected-row decode: {error}"))?;
+            stream
+                .synchronize()
+                .map_err(|error| format!("synchronize {format} selected-row decode: {error}"))?;
+
+            let mut actual = vec![f32::NAN; output.len()];
+            output
+                .copy_to_host(&mut actual)
+                .map_err(|error| format!("read {format} decoded row: {error}"))?;
+            assert_decode_matches_f64(&actual[..fixture.width], &expected, &format.to_string());
+            if actual[fixture.width..]
+                .iter()
+                .any(|value| value.to_bits() != SENTINEL.to_bits())
+            {
+                return Err(format!("{format} launch modified the output canary tail"));
+            }
+            let mut matrix_after = vec![0_u8; matrix.len()];
+            matrix
+                .copy_to_host(&mut matrix_after)
+                .map_err(|error| format!("read {format} matrix: {error}"))?;
+            if matrix_after != padded_matrix {
+                return Err(format!("{format} launch modified immutable matrix bytes"));
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
     #[test]
     fn cpu_only_build_refuses_gpu_launch_without_a_device() {
@@ -643,5 +1123,328 @@ mod tests {
             super::no_gpu_build_refusal(),
             Err(Error::NoGpuBuild { .. })
         ));
+    }
+
+    fn formats() -> [quant::RowFormat; 7] {
+        [
+            quant::RowFormat::F32,
+            quant::RowFormat::Q8_0,
+            quant::RowFormat::Q4K,
+            quant::RowFormat::Q5K,
+            quant::RowFormat::Q6K,
+            quant::RowFormat::IQ4NL,
+            quant::RowFormat::IQ4XS,
+        ]
+    }
+
+    struct DecodeFixture {
+        rows: usize,
+        width: usize,
+        selected_row: usize,
+        matrix: Vec<u8>,
+        known_first: f64,
+        known_last: f64,
+    }
+
+    fn decode_fixture(
+        format: quant::RowFormat,
+    ) -> core::result::Result<DecodeFixture, Box<dyn std::error::Error>> {
+        let (width, selected, known_first, known_last) = match format {
+            quant::RowFormat::F32 => (263, known_f32_row(263), -3.5, 0.5),
+            quant::RowFormat::Q8_0 => (288, repeat_block(known_q8_block(), 9), -8.0, 7.5),
+            quant::RowFormat::Q4K => (512, repeat_block(known_q4_block(), 2), 0.5, 662.5),
+            quant::RowFormat::Q5K => (512, repeat_block(known_q5_block(), 2), 16.5, 1670.5),
+            quant::RowFormat::Q6K => (512, repeat_block(known_q6_block(), 2), -31.0, -27.0),
+            quant::RowFormat::IQ4NL => (288, repeat_block(known_iq4_nl_block(), 9), -63.5, 56.5),
+            quant::RowFormat::IQ4XS => (512, repeat_block(known_iq4_xs_block(), 2), -63.5, -1751.5),
+            _ => return Err("unknown executable row format".into()),
+        };
+        let row_bytes = quant::row_byte_len(format, width)?;
+        if selected.len() != row_bytes {
+            return Err(format!(
+                "independent {format} fixture has {} bytes, owner requires {row_bytes}",
+                selected.len()
+            )
+            .into());
+        }
+        let rows = 3;
+        let selected_row = 1;
+        let mut matrix = vec![0_u8; row_bytes];
+        matrix.extend(selected);
+        matrix.extend(vec![0_u8; row_bytes]);
+        Ok(DecodeFixture {
+            rows,
+            width,
+            selected_row,
+            matrix,
+            known_first,
+            known_last,
+        })
+    }
+
+    fn repeat_block(block: Vec<u8>, count: usize) -> Vec<u8> {
+        block.repeat(count)
+    }
+
+    fn known_f32_row(width: usize) -> Vec<u8> {
+        const VALUES: [f32; 5] = [-3.5, -1.25, 0.5, 2.0, 4.0];
+        (0..width)
+            .flat_map(|index| VALUES[index % VALUES.len()].to_le_bytes())
+            .collect()
+    }
+
+    fn known_q8_block() -> Vec<u8> {
+        const VALUES: [i8; 32] = [
+            -16, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4,
+            5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        ];
+        let mut block = 0x3800_u16.to_le_bytes().to_vec();
+        block.extend(VALUES.into_iter().flat_map(i8::to_le_bytes));
+        block
+    }
+
+    fn known_k_scales() -> [u8; 12] {
+        let scales = [1_u8, 2, 3, 4, 17, 34, 51, 63];
+        let minima = [5_u8, 6, 7, 8, 18, 35, 52, 61];
+        let mut packed = [0_u8; 12];
+        for group in 0..4 {
+            packed[group] = scales[group] | ((scales[group + 4] >> 4) << 6);
+            packed[group + 4] = minima[group] | ((minima[group + 4] >> 4) << 6);
+            packed[group + 8] = (scales[group + 4] & 0x0f) | ((minima[group + 4] & 0x0f) << 4);
+        }
+        packed
+    }
+
+    fn known_q4_block() -> Vec<u8> {
+        let mut block = vec![0_u8; 144];
+        block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        block[2..4].copy_from_slice(&0x3800_u16.to_le_bytes());
+        block[4..16].copy_from_slice(&known_k_scales());
+        block[16..].fill(0xb3);
+        block
+    }
+
+    fn known_q5_block() -> Vec<u8> {
+        let mut block = vec![0_u8; 176];
+        block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        block[2..4].copy_from_slice(&0x3800_u16.to_le_bytes());
+        block[4..16].copy_from_slice(&known_k_scales());
+        block[16..48].fill(0xa5);
+        block[48..].fill(0xb3);
+        block
+    }
+
+    fn known_q6_block() -> Vec<u8> {
+        let scales = [2_i8, -1, 3, -2, 4, -3, 5, -4, 6, -5, 7, -6, 8, -7, 9, -3];
+        let mut block = vec![0x21_u8; 128];
+        block.extend([0xe4_u8; 64]);
+        block.extend(scales.into_iter().flat_map(i8::to_le_bytes));
+        block.extend(0x3800_u16.to_le_bytes());
+        block
+    }
+
+    fn known_iq4_nl_block() -> Vec<u8> {
+        let mut block = 0x3800_u16.to_le_bytes().to_vec();
+        block.extend([0xf0_u8; 16]);
+        block
+    }
+
+    fn known_iq4_xs_block() -> Vec<u8> {
+        let raw_scales = [33_u8, 34, 35, 36, 49, 27, 63, 1];
+        let mut scale_high = 0_u16;
+        let mut scale_low = [0_u8; 4];
+        for (group, raw) in raw_scales.into_iter().enumerate() {
+            scale_low[group / 2] |= (raw & 0x0f) << ((group % 2) * 4);
+            scale_high |= u16::from(raw >> 4) << (group * 2);
+        }
+        let mut block = 0x3800_u16.to_le_bytes().to_vec();
+        block.extend(scale_high.to_le_bytes());
+        block.extend(scale_low);
+        block.extend([0xf0_u8; 128]);
+        block
+    }
+
+    fn independent_decode(
+        format: quant::RowFormat,
+        row: &[u8],
+        width: usize,
+    ) -> core::result::Result<Vec<f64>, Box<dyn std::error::Error>> {
+        (0..width)
+            .map(|index| independent_weight(format, row, index))
+            .collect()
+    }
+
+    fn independent_weight(
+        format: quant::RowFormat,
+        row: &[u8],
+        index: usize,
+    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+        match format {
+            quant::RowFormat::F32 => {
+                let offset = index * 4;
+                Ok(f64::from(f32::from_le_bytes(
+                    row[offset..offset + 4].try_into()?,
+                )))
+            }
+            quant::RowFormat::Q8_0 => {
+                let block = &row[index / 32 * 34..];
+                Ok(independent_f16(block)? * f64::from(i8::from_le_bytes([block[2 + index % 32]])))
+            }
+            quant::RowFormat::Q4K => independent_q4(row, index),
+            quant::RowFormat::Q5K => independent_q5(row, index),
+            quant::RowFormat::Q6K => independent_q6(row, index),
+            quant::RowFormat::IQ4NL => independent_iq4_nl(row, index),
+            quant::RowFormat::IQ4XS => independent_iq4_xs(row, index),
+            _ => Err("unknown executable row format".into()),
+        }
+    }
+
+    fn independent_k_scale_min(scales: &[u8], group: usize) -> (u8, u8) {
+        if group < 4 {
+            (scales[group] & 0x3f, scales[group + 4] & 0x3f)
+        } else {
+            (
+                (scales[group + 4] & 0x0f) | ((scales[group - 4] >> 6) << 4),
+                (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4),
+            )
+        }
+    }
+
+    fn independent_q4(
+        row: &[u8],
+        index: usize,
+    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+        let block = &row[index / 256 * 144..];
+        let group = index % 256 / 32;
+        let lane = index % 32;
+        let (scale, minimum) = independent_k_scale_min(&block[4..16], group);
+        let packed = block[16 + group / 2 * 32 + lane];
+        let quantized = if group.is_multiple_of(2) {
+            packed & 0x0f
+        } else {
+            packed >> 4
+        };
+        Ok(
+            independent_f16(block)? * f64::from(scale) * f64::from(quantized)
+                - independent_f16(&block[2..])? * f64::from(minimum),
+        )
+    }
+
+    fn independent_q5(
+        row: &[u8],
+        index: usize,
+    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+        let block = &row[index / 256 * 176..];
+        let group = index % 256 / 32;
+        let lane = index % 32;
+        let (scale, minimum) = independent_k_scale_min(&block[4..16], group);
+        let packed = block[48 + group / 2 * 32 + lane];
+        let fifth = if block[16 + lane] & (1 << group) == 0 {
+            0
+        } else {
+            16
+        };
+        let quantized = (if group.is_multiple_of(2) {
+            packed & 0x0f
+        } else {
+            packed >> 4
+        }) + fifth;
+        Ok(
+            independent_f16(block)? * f64::from(scale) * f64::from(quantized)
+                - independent_f16(&block[2..])? * f64::from(minimum),
+        )
+    }
+
+    fn independent_q6(
+        row: &[u8],
+        index: usize,
+    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+        let block = &row[index / 256 * 210..];
+        let local = index % 256;
+        let half = local / 128;
+        let quarter = local % 128 / 32;
+        let lane = local % 32;
+        let low = block[half * 64 + (quarter % 2) * 32 + lane];
+        let lower = if quarter < 2 { low & 0x0f } else { low >> 4 };
+        let upper = (block[128 + half * 32 + lane] >> (quarter * 2)) & 0x03;
+        let quantized = i16::from((upper << 4) | lower) - 32;
+        let scale = i8::from_le_bytes([block[192 + half * 8 + quarter * 2 + lane / 16]]);
+        Ok(independent_f16(&block[208..])? * f64::from(scale) * f64::from(quantized))
+    }
+
+    fn independent_iq4_nl(
+        row: &[u8],
+        index: usize,
+    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+        let block = &row[index / 32 * 18..];
+        let lane = index % 32;
+        let packed = block[2 + lane % 16];
+        let code = if lane < 16 {
+            packed & 0x0f
+        } else {
+            packed >> 4
+        };
+        Ok(independent_f16(block)? * f64::from(independent_iq4_value(code)))
+    }
+
+    fn independent_iq4_xs(
+        row: &[u8],
+        index: usize,
+    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+        let block = &row[index / 256 * 136..];
+        let local = index % 256;
+        let group = local / 32;
+        let lane = local % 32;
+        let low = if group.is_multiple_of(2) {
+            block[4 + group / 2] & 0x0f
+        } else {
+            block[4 + group / 2] >> 4
+        };
+        let high = u8::try_from((u16::from_le_bytes([block[2], block[3]]) >> (group * 2)) & 0x03)?;
+        let group_scale = i16::from(low | (high << 4)) - 32;
+        let packed = block[8 + group * 16 + lane % 16];
+        let code = if lane < 16 {
+            packed & 0x0f
+        } else {
+            packed >> 4
+        };
+        Ok(independent_f16(block)?
+            * f64::from(group_scale)
+            * f64::from(independent_iq4_value(code)))
+    }
+
+    fn independent_iq4_value(index: u8) -> i8 {
+        [
+            -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+        ][usize::from(index)]
+    }
+
+    fn independent_f16(bytes: &[u8]) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+        let bits = u16::from_le_bytes(bytes[..2].try_into()?);
+        let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+        let exponent = i32::from((bits >> 10) & 0x1f);
+        let fraction = u32::from(bits & 0x03ff);
+        match exponent {
+            0 => Ok(sign * f64::from(fraction) * 2_f64.powi(-24)),
+            31 => Err("synthetic fixture contains non-finite fp16".into()),
+            _ => Ok(sign * (1.0 + f64::from(fraction) / 1024.0) * 2_f64.powi(exponent - 15)),
+        }
+    }
+
+    fn assert_decode_matches_f64(actual: &[f32], expected: &[f64], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label} decoded length");
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                actual.is_finite() && expected.is_finite(),
+                "{label} value {index} must be finite: got {actual}, expected {expected}"
+            );
+            // WHY: every synthetic operand is dyadic and every expected result
+            // is exactly representable; this is not a global tolerance policy.
+            assert_eq!(
+                f64::from(*actual).to_bits(),
+                expected.to_bits(),
+                "{label} value {index}: got {actual}, expected {expected}"
+            );
+        }
     }
 }

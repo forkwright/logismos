@@ -1122,6 +1122,10 @@ fn add_recurrent_block(tensors: &mut Vec<FixtureTensor>, block_index: u64, feed_
 
 fn add_nextn_block(tensors: &mut Vec<FixtureTensor>, block_index: u64, feed_forward: u64) {
     add_full_attention_block(tensors, block_index, feed_forward);
+    add_nextn_extension(tensors, block_index);
+}
+
+fn add_nextn_extension(tensors: &mut Vec<FixtureTensor>, block_index: u64) {
     add_tensor(
         tensors,
         &block_tensor_name(block_index, NEXTN_EH_PROJ_ROLE),
@@ -1377,6 +1381,95 @@ pub(crate) fn canonical_hybrid_fixture_with_context_and_rotary(
         u32::try_from(context).map_err(|error| error.to_string())?,
     )?;
     Ok(fixture)
+}
+
+/// Preserve the canonical main model while varying only its optional auxiliary block.
+pub(crate) fn canonical_hybrid_fixture_with_nextn(
+    context: usize,
+    n_rot: Option<u64>,
+    auxiliary_value: f32,
+) -> std::result::Result<Fixture, String> {
+    if !auxiliary_value.is_normal() && auxiliary_value != 0.0 {
+        return Err("auxiliary witness values must be normal or zero".to_string());
+    }
+    let mut fixture = canonical_hybrid_fixture_with_context_and_rotary(context, n_rot)?;
+    let source_prefix = format!("blk.{}.", TEST_MAIN_BLOCKS - 1);
+    let auxiliary_prefix = format!("blk.{TEST_MAIN_BLOCKS}.");
+    let auxiliary = fixture
+        .tensors
+        .iter()
+        .filter_map(|tensor| {
+            tensor.name.strip_prefix(&source_prefix).map(|role| {
+                let mut cloned = tensor.clone();
+                cloned.name = format!("{auxiliary_prefix}{role}");
+                cloned
+            })
+        })
+        .collect::<Vec<_>>();
+    if auxiliary.is_empty() {
+        return Err("canonical auxiliary witness needs a full-attention source block".to_string());
+    }
+    fixture.tensors.extend(auxiliary);
+    add_nextn_extension(&mut fixture.tensors, TEST_MAIN_BLOCKS);
+    let auxiliary_parameters = fixture
+        .tensors
+        .iter()
+        .filter(|tensor| tensor.name.starts_with(&auxiliary_prefix))
+        .map(|tensor| {
+            let count = tensor
+                .dims
+                .iter()
+                .try_fold(1_u64, |count, dimension| count.checked_mul(*dimension))
+                .ok_or_else(|| "auxiliary parameter size overflowed".to_string())?;
+            let count = usize::try_from(count).map_err(|error| error.to_string())?;
+            Ok((tensor.name.clone(), count))
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?;
+    for (name, count) in auxiliary_parameters {
+        set_f32_values(&mut fixture, &name, vec![auxiliary_value; count])?;
+    }
+    set_u32(&mut fixture, BLOCK_COUNT_KEY, to_u32(TEST_MAIN_BLOCKS + 1)?)?;
+    set_u32(&mut fixture, NEXTN_PREDICT_LAYERS_KEY, 1)?;
+    Ok(fixture)
+}
+
+#[test]
+fn main_model_logits_exclude_optional_nextn_values() -> std::result::Result<(), String> {
+    let fixture = canonical_hybrid_fixture()?;
+    let tokens = [2, 0, 4, 1];
+    let expected = CanonicalHybridOracle::from_fixture(&fixture)?.step(&tokens)?;
+    let mut baseline_bits = None;
+    for auxiliary_value in [0.25, -0.75] {
+        let auxiliary =
+            canonical_hybrid_fixture_with_nextn(CANONICAL_CONTEXT, None, auxiliary_value)?;
+        let payload = verify_fixture(&auxiliary)?;
+        let weights =
+            Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+        let mut execution = weights
+            .execution(CANONICAL_CONTEXT)
+            .map_err(|error| error.to_string())?;
+        let mut actual = Vec::new();
+        for token in tokens {
+            actual.extend(
+                execution
+                    .step(&[token])
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        assert_f32_matches_f64(&actual, &expected, "main-only NextN continuation")?;
+        let bits = actual
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        if let Some(baseline) = &baseline_bits {
+            assert_eq!(
+                &bits, baseline,
+                "auxiliary-only changes must not alter main logits"
+            );
+        }
+        baseline_bits = Some(bits);
+    }
+    Ok(())
 }
 
 #[expect(

@@ -6,7 +6,9 @@ use snafu::ResultExt;
 use crate::error::{ArithmeticOverflowSnafu, NativePagedKvSnafu, NativeSessionStateSnafu};
 use crate::qwen35_native::plan::{DeviceByteDemand, DeviceFullAttentionPlan};
 use crate::qwen35_native::resources::DeviceResources;
-use crate::qwen35_native::{BeginError, CompletionError, ResourceOwner, ResourceState};
+use crate::qwen35_native::{
+    BeginError, CompletionError, CompletionResource, ResourceOwner, ResourceState,
+};
 use crate::{Qwen35Weights, Result};
 
 /// Checked device-allocation demand for one full-attention-block qualification session.
@@ -15,26 +17,14 @@ use crate::{Qwen35Weights, Result};
 /// throughput, capacity, or a device qualification result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen35NativeLayerDeviceDemand {
-    weights: usize,
-    scratch: usize,
-    input: usize,
-    output: usize,
-    controls: usize,
-    key_values: usize,
-    table: usize,
+    bytes: DeviceByteDemand,
     total: usize,
 }
 
 impl Qwen35NativeLayerDeviceDemand {
     fn from_bytes(bytes: DeviceByteDemand) -> Result<Self> {
         Ok(Self {
-            weights: bytes.weights,
-            scratch: bytes.scratch,
-            input: bytes.input,
-            output: bytes.output,
-            controls: bytes.controls,
-            key_values: bytes.key_values,
-            table: bytes.table,
+            bytes,
             total: bytes.total()?,
         })
     }
@@ -42,43 +32,43 @@ impl Qwen35NativeLayerDeviceDemand {
     /// Requested immutable weight bytes.
     #[must_use]
     pub const fn weight_bytes(self) -> usize {
-        self.weights
+        self.bytes.weights
     }
 
     /// Requested reusable scratch bytes.
     #[must_use]
     pub const fn scratch_bytes(self) -> usize {
-        self.scratch
+        self.bytes.scratch
     }
 
     /// Requested one-token input bytes.
     #[must_use]
     pub const fn input_bytes(self) -> usize {
-        self.input
+        self.bytes.input
     }
 
     /// Requested one-token output bytes.
     #[must_use]
     pub const fn output_bytes(self) -> usize {
-        self.output
+        self.bytes.output
     }
 
     /// Requested mRoPE-control bytes.
     #[must_use]
     pub const fn control_bytes(self) -> usize {
-        self.controls
+        self.bytes.controls
     }
 
     /// Requested separate native K/V backing bytes.
     #[must_use]
     pub const fn key_value_bytes(self) -> usize {
-        self.key_values
+        self.bytes.key_values
     }
 
     /// Requested native page-table bytes.
     #[must_use]
     pub const fn table_bytes(self) -> usize {
-        self.table
+        self.bytes.table
     }
 
     /// Checked total requested device bytes across this one owned session.
@@ -153,13 +143,28 @@ impl<'weights, 'artifact> Qwen35NativeLayerPlan<'weights, 'artifact> {
 /// Observable blocking-session state after completed or failed submissions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum Qwen35NativeLayerSessionState {
+pub enum Qwen35NativeSessionState {
     /// No work is submitted and the owned bundle may accept its next token.
     Ready,
     /// A submission reached a known-idle state but the session is permanently poisoned.
     PoisonedKnownIdle,
     /// Completion remains uncertain; the complete owned bundle is retained or forgotten.
     PoisonedCompletionUncertain,
+}
+
+/// Backwards-compatible state name for the single-layer qualification session.
+pub type Qwen35NativeLayerSessionState = Qwen35NativeSessionState;
+
+pub(super) fn session_state<Resource: CompletionResource>(
+    owner: &ResourceOwner<Resource>,
+) -> Qwen35NativeSessionState {
+    match owner.state() {
+        Some(ResourceState::Ready(_)) => Qwen35NativeSessionState::Ready,
+        Some(ResourceState::PoisonedIdle(_)) => Qwen35NativeSessionState::PoisonedKnownIdle,
+        Some(ResourceState::InFlight(_) | ResourceState::PoisonedUncertain(_)) | None => {
+            Qwen35NativeSessionState::PoisonedCompletionUncertain
+        }
+    }
 }
 
 /// One owned blocking native full-attention-block qualification session.
@@ -175,15 +180,7 @@ impl Qwen35NativeLayerSession {
     /// Return the session's externally observable completion state.
     #[must_use]
     pub fn state(&self) -> Qwen35NativeLayerSessionState {
-        match self.owner.state() {
-            Some(ResourceState::Ready(_)) => Qwen35NativeLayerSessionState::Ready,
-            Some(ResourceState::PoisonedIdle(_)) => {
-                Qwen35NativeLayerSessionState::PoisonedKnownIdle
-            }
-            Some(ResourceState::InFlight(_) | ResourceState::PoisonedUncertain(_)) | None => {
-                Qwen35NativeLayerSessionState::PoisonedCompletionUncertain
-            }
-        }
+        session_state(&self.owner)
     }
 
     /// Execute one token through exactly one admitted native full-attention block.
@@ -246,7 +243,7 @@ fn publish_completed_step(resources: &mut DeviceResources) -> Result<DeviceBuffe
     Ok(step.output)
 }
 
-fn begin_error(error: BeginError) -> crate::Error {
+pub(super) fn begin_error(error: BeginError) -> crate::Error {
     let rule = match error {
         BeginError::MissingResource => "native session lost its owned resource bundle",
         BeginError::NotReady => "native session is permanently poisoned after submission",
@@ -254,7 +251,7 @@ fn begin_error(error: BeginError) -> crate::Error {
     NativeSessionStateSnafu { rule }.build()
 }
 
-fn completion_error(error: CompletionError<crate::Error>) -> crate::Error {
+pub(super) fn completion_error(error: CompletionError<crate::Error>) -> crate::Error {
     match error {
         CompletionError::Commit { source, .. }
         | CompletionError::Synchronization { source, .. } => source,
