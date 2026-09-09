@@ -41,6 +41,17 @@
 //! automatically replace llama-server or retarget the fleet's `local` provider.
 #![deny(missing_docs)]
 
+#[cfg(feature = "gpu")]
+mod native_text;
+
+#[cfg(feature = "gpu")]
+pub use native_text::{
+    NativeTextDriverError, NativeTextGenerationFailure, NativeTextResident,
+    NativeTextResidentBuildFailure, NativeTextResidentClose, NativeTextResidentTeardown,
+    NativeTextUseClose, NativeTextUseConstructionCustody, NativeTextUsePlan,
+    NativeTextUsePlanFailure,
+};
+
 #[cfg(test)]
 const CRATE_NAME: &str = "hermeneus";
 

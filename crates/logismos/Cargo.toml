@@ -33,6 +33,7 @@ transformers = { path = "../transformers" }
 encoders = { path = "../encoders" }
 embed = { path = "../embed" }
 decoders = { path = "../decoders", features = ["gpu"] }
+hermeneus = { path = "../hermeneus", features = ["gpu"] }
 
 [dev-dependencies]
 # The Phase-2 integration test writes a synthetic safetensors fixture

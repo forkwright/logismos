@@ -36,6 +36,7 @@ pub use decode;
 pub use decoders;
 pub use embed;
 pub use encoders;
+pub use hermeneus;
 pub use loader;
 pub use logismos_core as core;
 pub use taxis;
