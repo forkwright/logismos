@@ -301,7 +301,7 @@ impl EmbeddingModel for StellaModel {
         check_token_limit(ids.len(), max_tokens)?;
         let mask = vec![1u8; ids.len()];
         self.encode_raw(&ids, &mask, dim)
-            .map_err(crate::map_compute_error)
+            .map_err(|error| crate::map_compute_error(&error))
     }
 }
 

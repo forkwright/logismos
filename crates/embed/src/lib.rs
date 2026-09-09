@@ -70,7 +70,7 @@ fn project_stella_head(
 }
 
 #[cfg(any(feature = "stella", test))]
-fn map_compute_error(error: Error) -> logismos_core::EmbeddingError {
+fn map_compute_error(error: &Error) -> logismos_core::EmbeddingError {
     logismos_core::ComputeSnafu {
         message: error.to_string(),
     }
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn tiny_stella_zero_head_maps_refusal_to_public_compute_error() {
         let result = project_stella_head(vec![3.0, 4.0], &[0.0, 0.0, 0.0, 0.0], &[0.0, 0.0], 2, 2)
-            .map_err(map_compute_error);
+            .map_err(|error| map_compute_error(&error));
         assert!(matches!(
             result,
             Err(EmbeddingError::Compute { ref message, .. })
