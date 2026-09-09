@@ -1201,7 +1201,7 @@ mod tests {
             vec![8.0, 80.0],
         ];
         let materialized = f64_materialized_oracle(&query, 0, &keys, &values)?;
-        let online = f64_online_oracle(&query, 0, &keys, &values)?;
+        let online = f64_online_oracle(&query, 0, &keys, &values);
         let plan = PagedDecodePlan::try_from_dimensions(keys.len(), 1, 1, query.len())?;
         let actual = paged_decode_cpu(
             plan,
@@ -1414,7 +1414,7 @@ mod tests {
         kv_head: usize,
         keys: &[Vec<f32>],
         values: &[Vec<f32>],
-    ) -> core::result::Result<Vec<f64>, Box<dyn std::error::Error>> {
+    ) -> Vec<f64> {
         let width = query.len();
         let scale = 1.0_f64 / (width as f64).sqrt();
         let head_start = kv_head * width;
@@ -1444,6 +1444,6 @@ mod tests {
         for result in &mut output {
             *result /= normalizer;
         }
-        Ok(output)
+        output
     }
 }
