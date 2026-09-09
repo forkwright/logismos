@@ -78,9 +78,7 @@ impl CacheLayout {
             }
             .build()
         })?;
-        let row_bytes = dtype
-            .checked_byte_count(row_elems)
-            .map_err(|source| crate::error::TaxisSnafu { source }.build())?;
+        let row_bytes = dtype.checked_byte_count(row_elems)?;
         let buffer_bytes = row_bytes.checked_mul(max_seq_len).ok_or_else(|| {
             FlatArithmeticSnafu {
                 operation: "per-layer buffer bytes",
@@ -300,11 +298,7 @@ impl FlatKvCache {
             }
             .build()
         })?;
-        let expected = self
-            .layout
-            .dtype
-            .checked_byte_count(expected_elements)
-            .map_err(|source| crate::error::TaxisSnafu { source }.build())?;
+        let expected = self.layout.dtype.checked_byte_count(expected_elements)?;
         if bytes.len() != expected {
             return ShapeMismatchSnafu {
                 msg: format!(
@@ -536,7 +530,7 @@ fn cpu_tensor_from_bytes(dtype: DType, bytes: &[u8], shape: Shape) -> Result<Ten
             .fail();
         }
     };
-    Tensor::from_cpu(storage, shape).map_err(|source| crate::error::TaxisSnafu { source }.build())
+    Tensor::from_cpu(storage, shape).map_err(crate::Error::from)
 }
 
 /// Reject a decoded-length mismatch at the serialized-byte boundary.

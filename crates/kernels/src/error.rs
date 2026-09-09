@@ -1,6 +1,6 @@
 //! `kernels` error surface.
 
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 
 #[cfg(feature = "gpu")]
 use crate::numerical_status::NativeNumericalStatusError;

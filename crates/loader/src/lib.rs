@@ -48,9 +48,6 @@
     clippy::elidable_lifetime_names
 )]
 
-#[cfg(feature = "tensor")]
-use snafu::ResultExt;
-
 pub mod error;
 pub mod gguf;
 pub mod mapping;
@@ -62,8 +59,7 @@ pub mod safetensors;
 pub use crate::error::{Error, Result};
 #[cfg(feature = "tensor")]
 use crate::error::{
-    MmapStaleSnafu, MsgSnafu, ShapeMismatchSnafu, TaxisSnafu, UnknownFormatSnafu,
-    UnsupportedDTypeSnafu,
+    MmapStaleSnafu, MsgSnafu, ShapeMismatchSnafu, UnknownFormatSnafu, UnsupportedDTypeSnafu,
 };
 pub use crate::mapping::NameMap;
 #[cfg(feature = "tensor")]
@@ -99,11 +95,8 @@ impl<'a> TensorView<'a> {
         use taxis::{CpuStorage, Shape, Tensor};
 
         let shape = Shape::new(&self.shape);
-        let elem_count = shape.checked_elem_count().context(TaxisSnafu)?;
-        let expected_bytes = self
-            .dtype
-            .checked_byte_count(elem_count)
-            .context(TaxisSnafu)?;
+        let elem_count = shape.checked_elem_count()?;
+        let expected_bytes = self.dtype.checked_byte_count(elem_count)?;
         if self.bytes.len() != expected_bytes {
             return ShapeMismatchSnafu {
                 name: self.name.to_string(),
@@ -131,7 +124,7 @@ impl<'a> TensorView<'a> {
             }
         };
 
-        Tensor::from_cpu(storage, shape).context(TaxisSnafu)
+        Tensor::from_cpu(storage, shape).map_err(Error::from)
     }
 }
 
