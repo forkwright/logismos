@@ -159,23 +159,23 @@ impl NativeResidentRequest {
 /// is explicitly discarded.
 #[derive(Debug, Clone, Copy)]
 pub struct NativeUseRequest {
-    mutable_device_bytes: RequestedDeviceBytes,
-    retained_device_bytes: Option<RequestedDeviceBytes>,
-    retained_host_bytes: Option<RequestedHostBytes>,
+    mutable_device: RequestedDeviceBytes,
+    retained_device: Option<RequestedDeviceBytes>,
+    retained_host: Option<RequestedHostBytes>,
 }
 
 impl NativeUseRequest {
     /// Construct requested mutable and retained-result accounting for one use.
     #[must_use]
     pub const fn new(
-        mutable_device_bytes: RequestedDeviceBytes,
-        retained_device_bytes: Option<RequestedDeviceBytes>,
-        retained_host_bytes: Option<RequestedHostBytes>,
+        mutable_device: RequestedDeviceBytes,
+        retained_device: Option<RequestedDeviceBytes>,
+        retained_host: Option<RequestedHostBytes>,
     ) -> Self {
         Self {
-            mutable_device_bytes,
-            retained_device_bytes,
-            retained_host_bytes,
+            mutable_device,
+            retained_device,
+            retained_host,
         }
     }
 }
@@ -790,7 +790,7 @@ impl Scheduler {
     /// the requested resident bytes cannot reserve against the shared ledger.
     pub fn admit_native_resident(
         &mut self,
-        request: NativeResidentRequest,
+        request: &NativeResidentRequest,
     ) -> Result<(AdmissionTicket, NativeLoadPermit), SchedulerError> {
         self.ensure_not_revoked()?;
         self.ensure_admission_capacity(1)?;
@@ -1295,9 +1295,9 @@ impl Scheduler {
             let leases = ledger
                 .reserve_bytes_batch(
                     &prepared.device_id,
-                    request.mutable_device_bytes,
+                    request.mutable_device,
                     request
-                        .retained_device_bytes
+                        .retained_device
                         .map(|bytes| (prepared.device_id.as_str(), bytes)),
                 )
                 .map_err(native_device_error)?;
@@ -1312,7 +1312,7 @@ impl Scheduler {
                 mutable_device,
                 retained_device,
                 retained_host: request
-                    .retained_host_bytes
+                    .retained_host
                     .map(|requested| HostResultLease { requested }),
             },
         );
@@ -1479,18 +1479,18 @@ impl Scheduler {
                 .ok_or(SchedulerError::UnknownUsePermit {
                     location: error_location(),
                 })?;
-        if let Some(device) = record.retained_device {
-            if let Err(failure) = self.ledger.release_bytes(device) {
-                let (reason, device) = failure.into_parts();
-                self.native_results.insert(
-                    result.value,
-                    NativeResultRecord {
-                        retained_device: Some(device),
-                        retained_host: record.retained_host,
-                    },
-                );
-                return Err(native_device_error(reason));
-            }
+        if let Some(device) = record.retained_device
+            && let Err(failure) = self.ledger.release_bytes(device)
+        {
+            let (reason, device) = failure.into_parts();
+            self.native_results.insert(
+                result.value,
+                NativeResultRecord {
+                    retained_device: Some(device),
+                    retained_host: record.retained_host,
+                },
+            );
+            return Err(native_device_error(reason));
         }
         self.host_result_reserved = next_host_reserved;
         Ok(())
@@ -1508,7 +1508,7 @@ impl Scheduler {
                 kind: "native use permit",
                 location: error_location(),
             })?;
-        let next_host_reserved = self.next_host_result_reservation(request.retained_host_bytes)?;
+        let next_host_reserved = self.next_host_result_reservation(request.retained_host)?;
         let admission =
             self.admissions
                 .get(&ticket.admission_id)
@@ -2072,7 +2072,7 @@ mod tests {
         resident_bytes: u64,
         resident: &str,
     ) -> Result<AdmissionTicket, SchedulerError> {
-        let (ticket, load) = scheduler.admit_native_resident(NativeResidentRequest::new(
+        let (ticket, load) = scheduler.admit_native_resident(&NativeResidentRequest::new(
             "w7900",
             requested_device_bytes(resident_bytes)?,
         ))?;
@@ -3037,7 +3037,7 @@ mod tests {
         let _legacy = one_ticket(&mut scheduler, &grant)?;
         let _native = native_loaded(&mut scheduler, 4, "native-main")?;
         assert!(matches!(
-            scheduler.admit_native_resident(NativeResidentRequest::new(
+            scheduler.admit_native_resident(&NativeResidentRequest::new(
                 "w7900",
                 requested_device_bytes(1)?,
             )),
@@ -3053,7 +3053,7 @@ mod tests {
         let grant = request("[]", 4)?;
         let mut first = Scheduler::new(&grant, SchedulerLimits::default())?;
         let mut second = Scheduler::new(&grant, SchedulerLimits::default())?;
-        let (ticket, load) = first.admit_native_resident(NativeResidentRequest::new(
+        let (ticket, load) = first.admit_native_resident(&NativeResidentRequest::new(
             "w7900",
             requested_device_bytes(4)?,
         ))?;
@@ -3071,7 +3071,7 @@ mod tests {
         ));
         assert!(matches!(first.poll_command()?, PollOutcome::Idle));
         assert!(matches!(
-            first.admit_native_resident(NativeResidentRequest::new(
+            first.admit_native_resident(&NativeResidentRequest::new(
                 "w7900",
                 requested_device_bytes(1)?,
             )),
