@@ -77,7 +77,6 @@ impl RecurrentWorkspacePlan {
 /// state buffers separately and owns their atomic publication.
 #[derive(Debug)]
 pub(super) struct DeviceRecurrentPlan {
-    pub(super) block: usize,
     pub(super) layout: ExecutionLayout,
     pub(super) matrices: RecurrentProjectionWeights,
     pub(super) parameters: RecurrentF32Parameters,
@@ -155,7 +154,6 @@ impl DeviceRecurrentPlan {
         )?;
 
         Ok(Self {
-            block,
             layout,
             matrices,
             parameters,

@@ -36,6 +36,7 @@ const SSM_OUT_ROLE: &str = "ssm_out.weight";
 ///
 /// This typed vocabulary keeps a native recurrent plan bound to the same role
 /// strings as the verified CPU recurrent owner.
+#[cfg(feature = "gpu")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RecurrentTensorRole {
     AttentionGate,
@@ -659,62 +660,72 @@ impl ExecutionLayout {
         Ok(())
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn hidden(self) -> usize {
         self.hidden
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn hidden_u64(self) -> u64 {
         self.hidden_u64
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn convolution_kernel(self) -> usize {
         self.conv_kernel
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn convolution_kernel_u64(self) -> u64 {
         self.conv_kernel_u64
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn key_dim(self) -> usize {
         self.key_dim
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn key_head_count(self) -> usize {
         self.key_head_count
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn value_dim(self) -> usize {
         self.value_dim
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn value_dim_u64(self) -> u64 {
         self.value_dim_u64
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn value_head_count(self) -> usize {
         self.value_head_count
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn value_head_count_u64(self) -> u64 {
         self.value_head_count_u64
     }
 
-    pub(crate) const fn key_width(self) -> usize {
-        self.key_width
-    }
-
+    #[cfg(feature = "gpu")]
     pub(crate) const fn convolution_width(self) -> usize {
         self.conv_width
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn convolution_width_u64(self) -> u64 {
         self.conv_width_u64
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn epsilon(self) -> f32 {
         self.epsilon
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn gdn_scale(self) -> f32 {
         self.gdn_scale
     }
@@ -1411,6 +1422,7 @@ fn block_tensor_name(block_index: u64, role: &str) -> String {
 
 /// Return the checked artifact tensor name for one recurrent role and main block.
 #[must_use]
+#[cfg(feature = "gpu")]
 pub(crate) fn recurrent_tensor_name(block_index: u64, role: RecurrentTensorRole) -> String {
     let role = match role {
         RecurrentTensorRole::AttentionGate => ATTN_GATE_ROLE,

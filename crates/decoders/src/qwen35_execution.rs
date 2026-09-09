@@ -959,14 +959,17 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
+    #[cfg(feature = "gpu")]
     pub(crate) const fn vocabulary(self) -> usize {
         self.vocabulary
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn main_block_count(self) -> usize {
         self.main_blocks
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) const fn hidden_dimension(self) -> u64 {
         self.hidden_u64
     }
@@ -1264,6 +1267,7 @@ impl Layout {
         (block + 1).is_multiple_of(self.full_interval)
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) fn is_admitted_full_block(self, block: usize) -> bool {
         block < self.main_blocks && self.is_full(block)
     }
