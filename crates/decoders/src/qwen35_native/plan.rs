@@ -74,7 +74,7 @@ pub(super) struct AttentionNormalizationWeights {
     pub(super) key: F32Parameter,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) struct DeviceByteDemand {
     pub(super) weights: usize,
     pub(super) scratch: usize,

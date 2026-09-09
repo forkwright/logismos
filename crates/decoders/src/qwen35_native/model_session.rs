@@ -15,40 +15,14 @@ use crate::{Qwen35Weights, Result};
 /// device-qualification result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen35NativeExecutionDeviceDemand {
-    weights: usize,
-    full_workspace: usize,
-    recurrent_workspace: usize,
-    finish_workspace: usize,
-    hidden_rows: usize,
-    final_normalized: usize,
-    logits: usize,
-    mrope_controls: usize,
-    key_values: usize,
-    page_table: usize,
-    recurrent_history_active: usize,
-    recurrent_history_staged: usize,
-    recurrent_state_active: usize,
-    recurrent_state_staged: usize,
+    bytes: ModelDeviceByteDemand,
     total: usize,
 }
 
 impl Qwen35NativeExecutionDeviceDemand {
     fn from_bytes(bytes: ModelDeviceByteDemand) -> Result<Self> {
         Ok(Self {
-            weights: bytes.weights,
-            full_workspace: bytes.full_workspace,
-            recurrent_workspace: bytes.recurrent_workspace,
-            finish_workspace: bytes.finish_workspace,
-            hidden_rows: bytes.hidden_rows,
-            final_normalized: bytes.final_normalized,
-            logits: bytes.logits,
-            mrope_controls: bytes.mrope_controls,
-            key_values: bytes.key_values,
-            page_table: bytes.page_table,
-            recurrent_history_active: bytes.recurrent_history_active,
-            recurrent_history_staged: bytes.recurrent_history_staged,
-            recurrent_state_active: bytes.recurrent_state_active,
-            recurrent_state_staged: bytes.recurrent_state_staged,
+            bytes,
             total: bytes.total()?,
         })
     }
@@ -56,85 +30,85 @@ impl Qwen35NativeExecutionDeviceDemand {
     /// Requested immutable embedding, layer, final-normalization, and output weight bytes.
     #[must_use]
     pub const fn weight_bytes(self) -> usize {
-        self.weights
+        self.bytes.weights
     }
 
     /// Requested reusable full-attention workspace bytes.
     #[must_use]
     pub const fn full_workspace_bytes(self) -> usize {
-        self.full_workspace
+        self.bytes.full_workspace
     }
 
     /// Requested reusable recurrent-block workspace bytes.
     #[must_use]
     pub const fn recurrent_workspace_bytes(self) -> usize {
-        self.recurrent_workspace
+        self.bytes.recurrent_workspace
     }
 
     /// Requested reusable shared layer-finish workspace bytes.
     #[must_use]
     pub const fn finish_workspace_bytes(self) -> usize {
-        self.finish_workspace
+        self.bytes.finish_workspace
     }
 
     /// Requested hidden ping-pong-row bytes.
     #[must_use]
     pub const fn hidden_row_bytes(self) -> usize {
-        self.hidden_rows
+        self.bytes.hidden_rows
     }
 
     /// Requested terminal normalized-hidden bytes.
     #[must_use]
     pub const fn final_normalized_bytes(self) -> usize {
-        self.final_normalized
+        self.bytes.final_normalized
     }
 
     /// Requested output-logit bytes.
     #[must_use]
     pub const fn logits_bytes(self) -> usize {
-        self.logits
+        self.bytes.logits
     }
 
     /// Requested shared text-mRoPE control-buffer bytes.
     #[must_use]
     pub const fn mrope_control_bytes(self) -> usize {
-        self.mrope_controls
+        self.bytes.mrope_controls
     }
 
     /// Requested native paged K/V backing bytes.
     #[must_use]
     pub const fn key_value_bytes(self) -> usize {
-        self.key_values
+        self.bytes.key_values
     }
 
     /// Requested native paged-K/V table bytes.
     #[must_use]
     pub const fn page_table_bytes(self) -> usize {
-        self.page_table
+        self.bytes.page_table
     }
 
     /// Requested active recurrent convolution-history bytes.
     #[must_use]
     pub const fn recurrent_history_active_bytes(self) -> usize {
-        self.recurrent_history_active
+        self.bytes.recurrent_history_active
     }
 
     /// Requested staged recurrent convolution-history bytes.
     #[must_use]
     pub const fn recurrent_history_staged_bytes(self) -> usize {
-        self.recurrent_history_staged
+        self.bytes.recurrent_history_staged
     }
 
     /// Requested active recurrent-state bytes.
     #[must_use]
     pub const fn recurrent_state_active_bytes(self) -> usize {
-        self.recurrent_state_active
+        self.bytes.recurrent_state_active
     }
 
     /// Requested staged recurrent-state bytes.
     #[must_use]
     pub const fn recurrent_state_staged_bytes(self) -> usize {
-        self.recurrent_state_staged
+        self.bytes.recurrent_state_staged
     }
 
     /// Checked total requested device bytes across this one owned session.

@@ -17,26 +17,14 @@ use crate::{Qwen35Weights, Result};
 /// throughput, capacity, or a device qualification result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen35NativeLayerDeviceDemand {
-    weights: usize,
-    scratch: usize,
-    input: usize,
-    output: usize,
-    controls: usize,
-    key_values: usize,
-    table: usize,
+    bytes: DeviceByteDemand,
     total: usize,
 }
 
 impl Qwen35NativeLayerDeviceDemand {
     fn from_bytes(bytes: DeviceByteDemand) -> Result<Self> {
         Ok(Self {
-            weights: bytes.weights,
-            scratch: bytes.scratch,
-            input: bytes.input,
-            output: bytes.output,
-            controls: bytes.controls,
-            key_values: bytes.key_values,
-            table: bytes.table,
+            bytes,
             total: bytes.total()?,
         })
     }
@@ -44,43 +32,43 @@ impl Qwen35NativeLayerDeviceDemand {
     /// Requested immutable weight bytes.
     #[must_use]
     pub const fn weight_bytes(self) -> usize {
-        self.weights
+        self.bytes.weights
     }
 
     /// Requested reusable scratch bytes.
     #[must_use]
     pub const fn scratch_bytes(self) -> usize {
-        self.scratch
+        self.bytes.scratch
     }
 
     /// Requested one-token input bytes.
     #[must_use]
     pub const fn input_bytes(self) -> usize {
-        self.input
+        self.bytes.input
     }
 
     /// Requested one-token output bytes.
     #[must_use]
     pub const fn output_bytes(self) -> usize {
-        self.output
+        self.bytes.output
     }
 
     /// Requested mRoPE-control bytes.
     #[must_use]
     pub const fn control_bytes(self) -> usize {
-        self.controls
+        self.bytes.controls
     }
 
     /// Requested separate native K/V backing bytes.
     #[must_use]
     pub const fn key_value_bytes(self) -> usize {
-        self.key_values
+        self.bytes.key_values
     }
 
     /// Requested native page-table bytes.
     #[must_use]
     pub const fn table_bytes(self) -> usize {
-        self.table
+        self.bytes.table
     }
 
     /// Checked total requested device bytes across this one owned session.
