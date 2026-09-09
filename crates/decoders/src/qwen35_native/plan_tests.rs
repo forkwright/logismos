@@ -48,7 +48,11 @@ fn verified_full_block_plan_accepts_each_explicit_native_page_size()
     let weights = Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
     let numerical_status = kernels::numerical_status::NativeNumericalStatus::byte_demand();
     for (page_tokens, key_values, base_total) in [
-        (kernels::attention::NativePageTokens::B8, 32_768, 76_640),
+        (
+            kernels::attention::NativePageTokens::B8,
+            32_768,
+            76_640_usize,
+        ),
         (kernels::attention::NativePageTokens::B16, 65_536, 109_408),
         (kernels::attention::NativePageTokens::B32, 131_072, 174_944),
     ] {
