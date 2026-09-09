@@ -1547,10 +1547,11 @@ mod tests {
         let g = [0.0_f32];
         let state = [0.0_f32];
         let mut output = [0.0_f32];
-        let grouped_plan = match MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 2, 4, 3, 2) {
-            Ok(plan) => plan,
-            Err(error) => panic!("test dimensions are valid: {error}"),
-        };
+        let grouped_plan =
+            match MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 2, 4, 3, 2) {
+                Ok(plan) => plan,
+                Err(error) => panic!("test dimensions are valid: {error}"),
+            };
         let grouped_q = vec![1.0_f32; grouped_plan.query_and_key_elements()];
         let grouped_k = vec![1.0_f32; grouped_plan.query_and_key_elements()];
         let grouped_v = vec![1.0_f32; grouped_plan.output_elements()];
