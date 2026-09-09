@@ -5,9 +5,41 @@
 //! explicit raw-input history permits callers to compose chunked evaluation
 //! without hidden mutable state.
 
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
+use std::ffi::c_void;
+
+#[cfg(feature = "gpu")]
+use hipcore::Stream;
 use snafu::{ResultExt, Snafu};
 
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+use crate::device_span::{checked_f32_device_span, reject_overlapping_f32_spans};
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
+use crate::error::LaunchSnafu;
+#[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
+use crate::error::NoGpuBuildSnafu;
+#[cfg(feature = "gpu")]
+use crate::error::Result;
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+use crate::error::UnsupportedShapeSnafu;
+
 const CAUSAL_CONVOLUTION: &str = "causal_conv_fwd";
+#[cfg(feature = "gpu")]
+const CAUSAL_CONV_STEP_KERNEL: &str = "causal_conv_step_f32";
+
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
+unsafe extern "C" {
+    fn logismos_launch_causal_conv_step_f32(
+        input_f32: *const c_void,
+        weights_f32: *const c_void,
+        history_in_f32: *const c_void,
+        history_out_f32: *mut c_void,
+        output_f32: *mut c_void,
+        channel_count: u32,
+        width: u32,
+        stream: *mut c_void,
+    ) -> u32;
+}
 
 /// Result alias for the bounded causal-convolution reference.
 pub type CausalConvResult<T> = core::result::Result<T, CausalConvError>;
@@ -19,6 +51,9 @@ pub type CausalConvResult<T> = core::result::Result<T, CausalConvError>;
 /// allocator capacity or resident memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CausalConvAllocationPlan {
+    token_count: usize,
+    channel_count: usize,
+    width: usize,
     output: usize,
     weights: usize,
     history: usize,
@@ -40,6 +75,9 @@ impl CausalConvAllocationPlan {
         validate_nonzero_dimension("width", width)?;
         let history_width = checked_subtract(width, 1, "width - 1")?;
         Ok(Self {
+            token_count,
+            channel_count,
+            width,
             output: checked_product(token_count, channel_count, "token_count * channel_count")?,
             weights: checked_product(channel_count, width, "channel_count * width")?,
             history: checked_product(channel_count, history_width, "channel_count * (width - 1)")?,
@@ -58,7 +96,27 @@ impl CausalConvAllocationPlan {
         self.history
     }
 
-    const fn weight_elements(self) -> usize {
+    /// Return the admitted token count.
+    #[must_use]
+    pub const fn token_count(self) -> usize {
+        self.token_count
+    }
+
+    /// Return the admitted channel count.
+    #[must_use]
+    pub const fn channel_count(self) -> usize {
+        self.channel_count
+    }
+
+    /// Return the admitted causal-filter width.
+    #[must_use]
+    pub const fn width(self) -> usize {
+        self.width
+    }
+
+    /// Return the exact requested channel-major weight capacity.
+    #[must_use]
+    pub const fn weight_elements(self) -> usize {
         self.weights
     }
 }
@@ -155,9 +213,6 @@ pub struct CausalConvInput<'a> {
     input: &'a [f32],
     weights: &'a [f32],
     history: &'a [f32],
-    token_count: usize,
-    channel_count: usize,
-    width: usize,
     allocations: CausalConvAllocationPlan,
 }
 
@@ -191,15 +246,12 @@ impl<'a> CausalConvInput<'a> {
             input,
             weights,
             history,
-            token_count,
-            channel_count,
-            width,
             allocations,
         })
     }
 
     fn history_width(&self) -> CausalConvResult<usize> {
-        checked_subtract(self.width, 1, "width - 1")
+        checked_subtract(self.allocations.width(), 1, "width - 1")
     }
 
     fn window_sample(&self, channel_index: usize, window_position: usize) -> CausalConvResult<f32> {
@@ -221,7 +273,7 @@ impl<'a> CausalConvInput<'a> {
         )?;
         let input_start = checked_product(
             token_index,
-            self.channel_count,
+            self.allocations.channel_count(),
             "token index * channel count",
         )?;
         let input_index = checked_add(input_start, channel_index, "input index")?;
@@ -229,7 +281,11 @@ impl<'a> CausalConvInput<'a> {
     }
 
     fn weight(&self, channel_index: usize, tap_index: usize) -> CausalConvResult<f32> {
-        let weight_start = checked_product(channel_index, self.width, "channel index * width")?;
+        let weight_start = checked_product(
+            channel_index,
+            self.allocations.width(),
+            "channel index * width",
+        )?;
         let weight_index = checked_add(weight_start, tap_index, "weight index")?;
         read_scalar(self.weights, weight_index, "weights", self.weights.len())
     }
@@ -272,19 +328,19 @@ pub fn causal_conv_fwd(input: &CausalConvInput<'_>) -> CausalConvResult<CausalCo
     let history_width = input.history_width()?;
     let mut output = reserve_f32("output", input.allocations.output_elements())?;
 
-    for token_index in 0..input.token_count {
-        for channel_index in 0..input.channel_count {
+    for token_index in 0..input.allocations.token_count() {
+        for channel_index in 0..input.allocations.channel_count() {
             let output_index = checked_add(
                 checked_product(
                     token_index,
-                    input.channel_count,
+                    input.allocations.channel_count(),
                     "token index * channel count",
                 )?,
                 channel_index,
                 "output index",
             )?;
             let mut accumulator = 0.0_f32;
-            for tap_index in 0..input.width {
+            for tap_index in 0..input.allocations.width() {
                 let window_position =
                     checked_add(token_index, tap_index, "token index + tap index")?;
                 let sample = input.window_sample(channel_index, window_position)?;
@@ -298,10 +354,10 @@ pub fn causal_conv_fwd(input: &CausalConvInput<'_>) -> CausalConvResult<CausalCo
     }
 
     let mut final_history = reserve_f32("final history", input.allocations.history_elements())?;
-    for channel_index in 0..input.channel_count {
+    for channel_index in 0..input.allocations.channel_count() {
         for history_index in 0..history_width {
             let window_position = checked_add(
-                input.token_count,
+                input.allocations.token_count(),
                 history_index,
                 "token count + history index",
             )?;
@@ -313,6 +369,247 @@ pub fn causal_conv_fwd(input: &CausalConvInput<'_>) -> CausalConvResult<CausalCo
         output,
         history: final_history,
     })
+}
+
+#[cfg(feature = "gpu")]
+/// Launch one staged dense-f32 causal-convolution decode step on `stream`.
+///
+/// `plan` is the sole owner of this operation's shape: the admitted native
+/// step has `T = 1`, input/output `[1, C]`, channel-major weights `[C, W]`,
+/// and immutable plus separately staged raw histories `[C, W - 1]`. Taps and
+/// history are oldest-to-newest. This operation applies no activation, bias,
+/// packing, model state, or decoder policy.
+///
+/// One GPU thread evaluates one channel, serializing tap products and
+/// additions in the same order as [`causal_conv_fwd`]. The source-scoped HIP
+/// flags disable fast math and contraction. `W = 1` has no history footprint:
+/// neither history pointer is accessed by the kernel.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedShape`] when `plan` is not a one-token
+/// dense-f32 step, a declared length differs from `plan`, a nonempty span is
+/// null, unaligned, unrepresentable, overlaps a writable result, or a launch
+/// dimension cannot cross the `u32` HIP ABI. A CPU-only build returns
+/// [`crate::Error::NoGpuBuild`] without initializing HIP. It propagates
+/// stream-current failures and reports a HIP submission failure as
+/// [`crate::Error::Launch`].
+///
+/// # Safety
+///
+/// Each nonempty pointer must designate a live allocation on `stream`'s
+/// device for the exact declared `f32` count through stream completion.
+/// `history_in_f32` remains immutable. `history_out_f32` and `output_f32`
+/// must not alias one another or any input, and each requires exclusive access
+/// through stream completion: no other GPU command or host alias may read or
+/// write either span. No producer may modify any input through stream
+/// completion.
+///
+/// Device contents are not inspectable at this boundary. Callers must ensure
+/// every input and intermediate is finite and either zero or normal `f32`; in
+/// particular every product, accumulation, output, and staged history value
+/// must remain finite. Subnormal-dependent behavior is not qualified. The
+/// kernel has no status channel and therefore cannot reproduce the CPU
+/// reference's non-finite-input or arithmetic refusals.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the five staged causal-convolution buffers and stream are the fixed native step ABI"
+)]
+pub unsafe fn launch_causal_conv_step_f32(
+    plan: CausalConvAllocationPlan,
+    input_f32: *const f32,
+    input_elements: usize,
+    weights_f32: *const f32,
+    weight_elements: usize,
+    history_in_f32: *const f32,
+    history_in_elements: usize,
+    history_out_f32: *mut f32,
+    history_out_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = (
+            plan,
+            input_f32,
+            input_elements,
+            weights_f32,
+            weight_elements,
+            history_in_f32,
+            history_in_elements,
+            history_out_f32,
+            history_out_elements,
+            output_f32,
+            output_elements,
+            stream,
+        );
+        no_gpu_causal_conv_step_refusal()
+    }
+
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        let abi = validate_causal_conv_step_launch(
+            plan,
+            input_f32,
+            input_elements,
+            weights_f32,
+            weight_elements,
+            history_in_f32,
+            history_in_elements,
+            history_out_f32,
+            history_out_elements,
+            output_f32,
+            output_elements,
+        )?;
+        stream.make_current()?;
+        // SAFETY: the caller upholds device ownership, lifetime, concurrent
+        // access, and numerical-domain obligations documented above; checked
+        // spans and the allocation-plan owner established exact extents,
+        // alignment, non-aliasing results, and ABI dimensions.
+        let code = unsafe {
+            logismos_launch_causal_conv_step_f32(
+                input_f32.cast::<c_void>(),
+                weights_f32.cast::<c_void>(),
+                history_in_f32.cast::<c_void>(),
+                history_out_f32.cast::<c_void>(),
+                output_f32.cast::<c_void>(),
+                abi.channel_count,
+                abi.width,
+                stream.raw().cast::<c_void>(),
+            )
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            LaunchSnafu {
+                kernel: CAUSAL_CONV_STEP_KERNEL,
+                kind: hipcore::ErrorKind::from_raw(code),
+                code,
+            }
+            .fail()
+        }
+    }
+}
+
+#[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
+fn no_gpu_causal_conv_step_refusal() -> Result<()> {
+    NoGpuBuildSnafu {
+        kernel: CAUSAL_CONV_STEP_KERNEL,
+    }
+    .fail()
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[derive(Clone, Copy)]
+struct CausalConvStepAbi {
+    channel_count: u32,
+    width: u32,
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validation receives the fixed raw staged causal-convolution ABI without constructing a second shape owner"
+)]
+fn validate_causal_conv_step_launch(
+    plan: CausalConvAllocationPlan,
+    input_f32: *const f32,
+    input_elements: usize,
+    weights_f32: *const f32,
+    weight_elements: usize,
+    history_in_f32: *const f32,
+    history_in_elements: usize,
+    history_out_f32: *mut f32,
+    history_out_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+) -> Result<CausalConvStepAbi> {
+    if plan.token_count() != 1 {
+        return unsupported_causal_conv_step_shape(format!(
+            "only dense-f32 T=1 decode steps are supported, got T={}",
+            plan.token_count()
+        ));
+    }
+    validate_causal_conv_step_length("input", input_elements, plan.output_elements())?;
+    validate_causal_conv_step_length("weights", weight_elements, plan.weight_elements())?;
+    validate_causal_conv_step_length("history_in", history_in_elements, plan.history_elements())?;
+    validate_causal_conv_step_length("history_out", history_out_elements, plan.history_elements())?;
+    validate_causal_conv_step_length("output", output_elements, plan.output_elements())?;
+
+    let inputs = [
+        checked_f32_device_span(CAUSAL_CONV_STEP_KERNEL, input_f32, input_elements, "input")?,
+        checked_f32_device_span(
+            CAUSAL_CONV_STEP_KERNEL,
+            weights_f32,
+            weight_elements,
+            "weights",
+        )?,
+        checked_f32_device_span(
+            CAUSAL_CONV_STEP_KERNEL,
+            history_in_f32,
+            history_in_elements,
+            "history_in",
+        )?,
+    ];
+    let history_out = checked_f32_device_span(
+        CAUSAL_CONV_STEP_KERNEL,
+        history_out_f32.cast_const(),
+        history_out_elements,
+        "history_out",
+    )?;
+    let output = checked_f32_device_span(
+        CAUSAL_CONV_STEP_KERNEL,
+        output_f32.cast_const(),
+        output_elements,
+        "output",
+    )?;
+    for input in inputs {
+        reject_overlapping_f32_spans(CAUSAL_CONV_STEP_KERNEL, history_out, input)?;
+        reject_overlapping_f32_spans(CAUSAL_CONV_STEP_KERNEL, output, input)?;
+    }
+    reject_overlapping_f32_spans(CAUSAL_CONV_STEP_KERNEL, history_out, output)?;
+
+    Ok(CausalConvStepAbi {
+        channel_count: causal_conv_step_u32("channel_count", plan.channel_count())?,
+        width: causal_conv_step_u32("width", plan.width())?,
+    })
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn validate_causal_conv_step_length(
+    name: &'static str,
+    actual: usize,
+    expected: usize,
+) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        unsupported_causal_conv_step_shape(format!(
+            "{name} length {actual} does not match allocation-plan extent {expected}"
+        ))
+    }
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn causal_conv_step_u32(name: &'static str, value: usize) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        UnsupportedShapeSnafu {
+            kernel: CAUSAL_CONV_STEP_KERNEL,
+            msg: format!("{name} {value} exceeds the HIP ABI u32 domain"),
+        }
+        .build()
+    })
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn unsupported_causal_conv_step_shape<T>(msg: String) -> Result<T> {
+    UnsupportedShapeSnafu {
+        kernel: CAUSAL_CONV_STEP_KERNEL,
+        msg,
+    }
+    .fail()
 }
 
 fn checked_product(left: usize, right: usize, dimensions: &'static str) -> CausalConvResult<usize> {
@@ -617,6 +914,438 @@ mod tests {
             first.output().get(..prefix_len),
             second.output().get(..prefix_len),
             "future samples must not affect the shared output prefix"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    struct ValidCausalConvStepBuffers {
+        input: Vec<f32>,
+        weights: Vec<f32>,
+        history_in: Vec<f32>,
+        history_out: Vec<f32>,
+        output: Vec<f32>,
+    }
+
+    #[cfg(feature = "gpu")]
+    impl ValidCausalConvStepBuffers {
+        fn from_plan(plan: CausalConvAllocationPlan) -> Self {
+            Self {
+                input: vec![1.0_f32; plan.output_elements()],
+                weights: vec![1.0_f32; plan.weight_elements()],
+                history_in: vec![0.0_f32; plan.history_elements()],
+                history_out: vec![0.0_f32; plan.history_elements()],
+                output: vec![0.0_f32; plan.output_elements()],
+            }
+        }
+
+        fn validate(&mut self, plan: CausalConvAllocationPlan) -> Result<CausalConvStepAbi> {
+            validate_causal_conv_step_launch(
+                plan,
+                self.input.as_ptr(),
+                self.input.len(),
+                self.weights.as_ptr(),
+                self.weights.len(),
+                self.history_in.as_ptr(),
+                self.history_in.len(),
+                self.history_out.as_mut_ptr(),
+                self.history_out.len(),
+                self.output.as_mut_ptr(),
+                self.output.len(),
+            )
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn staged_gpu_step_validates_exact_spans_and_refuses_one_invalidity()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let plan = CausalConvAllocationPlan::try_from_dimensions(1, 2, 3)?;
+        let mut buffers = ValidCausalConvStepBuffers::from_plan(plan);
+        let abi = buffers.validate(plan)?;
+        assert_eq!(
+            (abi.channel_count, abi.width),
+            (2, 3),
+            "the ABI must preserve allocation-owner dimensions"
+        );
+
+        let zero_token_plan = CausalConvAllocationPlan::try_from_dimensions(0, 2, 3)?;
+        let mut zero_token_buffers = ValidCausalConvStepBuffers::from_plan(zero_token_plan);
+        assert!(matches!(
+            zero_token_buffers.validate(zero_token_plan),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        let two_token_plan = CausalConvAllocationPlan::try_from_dimensions(2, 2, 3)?;
+        let mut two_token_buffers = ValidCausalConvStepBuffers::from_plan(two_token_plan);
+        assert!(matches!(
+            two_token_buffers.validate(two_token_plan),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+
+        buffers.input.clear();
+        assert!(matches!(
+            buffers.validate(plan),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        buffers.input.resize(plan.output_elements(), 1.0);
+        buffers.weights.clear();
+        assert!(matches!(
+            buffers.validate(plan),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        buffers.weights.resize(plan.weight_elements(), 1.0);
+        buffers.history_in.clear();
+        assert!(matches!(
+            buffers.validate(plan),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        buffers.history_in.resize(plan.history_elements(), 0.0);
+        buffers.history_out.clear();
+        assert!(matches!(
+            buffers.validate(plan),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        buffers.history_out.resize(plan.history_elements(), 0.0);
+        buffers.output.clear();
+        assert!(matches!(
+            buffers.validate(plan),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        buffers.output.resize(plan.output_elements(), 0.0);
+
+        let plan = CausalConvAllocationPlan::try_from_dimensions(1, 1, 2)?;
+        let mut aligned = ValidCausalConvStepBuffers::from_plan(plan);
+        let aligned_f32 = [0.0_f32; 2];
+        assert!(matches!(
+            validate_causal_conv_step_launch(
+                plan,
+                aligned_f32.as_ptr().wrapping_byte_add(1),
+                aligned.input.len(),
+                aligned.weights.as_ptr(),
+                aligned.weights.len(),
+                aligned.history_in.as_ptr(),
+                aligned.history_in.len(),
+                aligned.history_out.as_mut_ptr(),
+                aligned.history_out.len(),
+                aligned.output.as_mut_ptr(),
+                aligned.output.len(),
+            ),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        assert!(matches!(
+            validate_causal_conv_step_launch(
+                plan,
+                aligned.input.as_ptr(),
+                aligned.input.len(),
+                core::ptr::null(),
+                aligned.weights.len(),
+                aligned.history_in.as_ptr(),
+                aligned.history_in.len(),
+                aligned.history_out.as_mut_ptr(),
+                aligned.history_out.len(),
+                aligned.output.as_mut_ptr(),
+                aligned.output.len(),
+            ),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        assert!(matches!(
+            validate_causal_conv_step_launch(
+                plan,
+                aligned.input.as_ptr(),
+                aligned.input.len(),
+                aligned.weights.as_ptr(),
+                aligned.weights.len(),
+                aligned.history_in.as_ptr(),
+                aligned.history_in.len(),
+                aligned.output.as_mut_ptr(),
+                aligned.output.len(),
+                aligned.output.as_mut_ptr(),
+                aligned.output.len(),
+            ),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        assert!(matches!(
+            validate_causal_conv_step_launch(
+                plan,
+                aligned.input.as_ptr(),
+                aligned.input.len(),
+                aligned.weights.as_ptr(),
+                aligned.weights.len(),
+                aligned.history_in.as_ptr(),
+                aligned.history_in.len(),
+                aligned.history_out.as_mut_ptr(),
+                aligned.history_out.len(),
+                aligned.input.as_mut_ptr(),
+                aligned.input.len(),
+            ),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        assert!(matches!(
+            checked_f32_device_span(
+                CAUSAL_CONV_STEP_KERNEL,
+                core::ptr::NonNull::<f32>::dangling().as_ptr(),
+                usize::MAX,
+                "layout overflow",
+            ),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        let address_overflow = (usize::MAX - 3) as *const f32;
+        assert!(matches!(
+            checked_f32_device_span(
+                CAUSAL_CONV_STEP_KERNEL,
+                address_overflow,
+                1,
+                "address overflow"
+            ),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        if let Ok(abi_overflow) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(matches!(
+                causal_conv_step_u32("abi overflow", abi_overflow),
+                Err(crate::Error::UnsupportedShape { .. })
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn width_one_step_has_absent_null_history_spans()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let plan = CausalConvAllocationPlan::try_from_dimensions(1, 2, 1)?;
+        let mut buffers = ValidCausalConvStepBuffers::from_plan(plan);
+        validate_causal_conv_step_launch(
+            plan,
+            buffers.input.as_ptr(),
+            buffers.input.len(),
+            buffers.weights.as_ptr(),
+            buffers.weights.len(),
+            core::ptr::null(),
+            0,
+            core::ptr::null_mut(),
+            0,
+            buffers.output.as_mut_ptr(),
+            buffers.output.len(),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
+    #[test]
+    fn staged_gpu_step_cpu_only_witness_never_initializes_hip() {
+        assert!(matches!(
+            no_gpu_causal_conv_step_refusal(),
+            Err(crate::Error::NoGpuBuild { .. })
+        ));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
+    fn reserved_device_step_matches_oracle_continuation_and_width_one()
+    -> core::result::Result<(), String> {
+        use hipcore::{Device, DeviceBuffer, Stream};
+
+        let device = Device::new(0).map_err(|error| format!("open reserved device 0: {error}"))?;
+        let stream = Stream::new(&device).map_err(|error| format!("create stream: {error}"))?;
+        let weights_host = [0.5, -1.0, 0.25, 1.25, 0.75, -0.5, -0.25, 0.5, 1.0];
+        let initial_history = [-2.0, 0.5, 1.0, -1.5, 0.25, 2.0];
+        let first_input = [0.25, -1.0, 1.5];
+        let second_input = [0.75, -0.5, 2.0];
+        let plan = CausalConvAllocationPlan::try_from_dimensions(1, 3, 3)
+            .map_err(|error| format!("build one-token plan: {error}"))?;
+        let (first_output_oracle, first_history_oracle) =
+            oracle_causal_conv(&first_input, &weights_host, &initial_history, 1, 3, 3)
+                .map_err(|error| format!("first oracle: {error}"))?;
+        let first_history_expected: Vec<f32> = first_history_oracle
+            .iter()
+            .map(|value| *value as f32)
+            .collect();
+        let (second_output_oracle, second_history_oracle) = oracle_causal_conv(
+            &second_input,
+            &weights_host,
+            &first_history_expected,
+            1,
+            3,
+            3,
+        )
+        .map_err(|error| format!("continuation oracle: {error}"))?;
+
+        let input = DeviceBuffer::<f32>::from_host(&device, &first_input)
+            .map_err(|error| format!("upload first input: {error}"))?;
+        let weights = DeviceBuffer::<f32>::from_host(&device, &weights_host)
+            .map_err(|error| format!("upload weights: {error}"))?;
+        let history_in = DeviceBuffer::<f32>::from_host(&device, &initial_history)
+            .map_err(|error| format!("upload initial history: {error}"))?;
+        let history_out = DeviceBuffer::<f32>::alloc(&device, plan.history_elements())
+            .map_err(|error| format!("allocate staged history: {error}"))?;
+        let output = DeviceBuffer::<f32>::alloc(&device, plan.output_elements())
+            .map_err(|error| format!("allocate staged output: {error}"))?;
+        // SAFETY: these distinct device buffers have the exact plan extents;
+        // the test synchronizes before any host read or reuse.
+        unsafe {
+            launch_causal_conv_step_f32(
+                plan,
+                input.as_device_ptr(),
+                input.len(),
+                weights.as_device_ptr(),
+                weights.len(),
+                history_in.as_device_ptr(),
+                history_in.len(),
+                history_out.as_device_ptr(),
+                history_out.len(),
+                output.as_device_ptr(),
+                output.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch first causal-convolution step: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize first step: {error}"))?;
+        let mut first_output = vec![0.0_f32; output.len()];
+        output
+            .copy_to_host(&mut first_output)
+            .map_err(|error| format!("read first output: {error}"))?;
+        let mut first_history = vec![0.0_f32; history_out.len()];
+        history_out
+            .copy_to_host(&mut first_history)
+            .map_err(|error| format!("read first staged history: {error}"))?;
+        let mut preserved_first_input = vec![0.0_f32; input.len()];
+        input
+            .copy_to_host(&mut preserved_first_input)
+            .map_err(|error| format!("read immutable first input: {error}"))?;
+        let mut preserved_initial_history = vec![0.0_f32; history_in.len()];
+        history_in
+            .copy_to_host(&mut preserved_initial_history)
+            .map_err(|error| format!("read immutable initial history: {error}"))?;
+        let mut preserved_weights = vec![0.0_f32; weights.len()];
+        weights
+            .copy_to_host(&mut preserved_weights)
+            .map_err(|error| format!("read immutable weights: {error}"))?;
+        assert_close_f64(&first_output, &first_output_oracle, "device first output");
+        assert_close_f64(
+            &first_history,
+            &first_history_oracle,
+            "device first history",
+        );
+        assert_eq!(
+            preserved_first_input, first_input,
+            "device input must remain immutable"
+        );
+        assert_eq!(
+            preserved_initial_history, initial_history,
+            "device initial history must remain immutable"
+        );
+        assert_eq!(
+            preserved_weights, weights_host,
+            "device weights must remain immutable"
+        );
+
+        let second_input = DeviceBuffer::<f32>::from_host(&device, &second_input)
+            .map_err(|error| format!("upload continuation input: {error}"))?;
+        let second_history_out = DeviceBuffer::<f32>::alloc(&device, plan.history_elements())
+            .map_err(|error| format!("allocate continuation history: {error}"))?;
+        let second_output = DeviceBuffer::<f32>::alloc(&device, plan.output_elements())
+            .map_err(|error| format!("allocate continuation output: {error}"))?;
+        // SAFETY: the first staged history is immutable input to this distinct
+        // continuation result pair, with exact plan extents through completion.
+        unsafe {
+            launch_causal_conv_step_f32(
+                plan,
+                second_input.as_device_ptr(),
+                second_input.len(),
+                weights.as_device_ptr(),
+                weights.len(),
+                history_out.as_device_ptr(),
+                history_out.len(),
+                second_history_out.as_device_ptr(),
+                second_history_out.len(),
+                second_output.as_device_ptr(),
+                second_output.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch continuation causal-convolution step: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize continuation step: {error}"))?;
+        let mut actual_second_output = vec![0.0_f32; second_output.len()];
+        second_output
+            .copy_to_host(&mut actual_second_output)
+            .map_err(|error| format!("read continuation output: {error}"))?;
+        let mut actual_second_history = vec![0.0_f32; second_history_out.len()];
+        second_history_out
+            .copy_to_host(&mut actual_second_history)
+            .map_err(|error| format!("read continuation history: {error}"))?;
+        let mut preserved_first_history = vec![0.0_f32; history_out.len()];
+        history_out
+            .copy_to_host(&mut preserved_first_history)
+            .map_err(|error| format!("read immutable first staged history: {error}"))?;
+        assert_close_f64(
+            &actual_second_output,
+            &second_output_oracle,
+            "device continuation output",
+        );
+        assert_close_f64(
+            &actual_second_history,
+            &second_history_oracle,
+            "device continuation history",
+        );
+        assert_close_f64(
+            &preserved_first_history,
+            &first_history_oracle,
+            "device immutable first staged history",
+        );
+
+        let width_one_input = [2.0_f32, -3.0];
+        let width_one_weights = [4.0_f32, -0.5];
+        let width_one_plan = CausalConvAllocationPlan::try_from_dimensions(1, 2, 1)
+            .map_err(|error| format!("build width-one plan: {error}"))?;
+        let (width_one_output_oracle, width_one_history_oracle) =
+            oracle_causal_conv(&width_one_input, &width_one_weights, &[], 1, 2, 1)
+                .map_err(|error| format!("width-one oracle: {error}"))?;
+        let width_one_input = DeviceBuffer::<f32>::from_host(&device, &width_one_input)
+            .map_err(|error| format!("upload width-one input: {error}"))?;
+        let width_one_weights = DeviceBuffer::<f32>::from_host(&device, &width_one_weights)
+            .map_err(|error| format!("upload width-one weights: {error}"))?;
+        let width_one_output =
+            DeviceBuffer::<f32>::alloc(&device, width_one_plan.output_elements())
+                .map_err(|error| format!("allocate width-one output: {error}"))?;
+        // SAFETY: width one has no history footprint, so null history pointers
+        // carry zero lengths while the remaining distinct buffers match `plan`.
+        unsafe {
+            launch_causal_conv_step_f32(
+                width_one_plan,
+                width_one_input.as_device_ptr(),
+                width_one_input.len(),
+                width_one_weights.as_device_ptr(),
+                width_one_weights.len(),
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                0,
+                width_one_output.as_device_ptr(),
+                width_one_output.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch width-one causal-convolution step: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize width-one step: {error}"))?;
+        let mut actual_width_one_output = vec![0.0_f32; width_one_output.len()];
+        width_one_output
+            .copy_to_host(&mut actual_width_one_output)
+            .map_err(|error| format!("read width-one output: {error}"))?;
+        assert_close_f64(
+            &actual_width_one_output,
+            &width_one_output_oracle,
+            "device width-one output",
+        );
+        assert!(
+            width_one_history_oracle.is_empty(),
+            "width one must retain no history"
         );
         Ok(())
     }

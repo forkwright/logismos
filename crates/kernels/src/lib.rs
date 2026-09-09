@@ -43,6 +43,8 @@
 
 pub mod causal_conv;
 pub mod cpu_f32;
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+mod device_span;
 pub mod error;
 pub mod gdn;
 #[cfg(feature = "gpu")]

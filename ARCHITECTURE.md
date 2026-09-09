@@ -134,6 +134,15 @@ operands and intermediates; CPU subnormal witnesses do not qualify GPU denormal
 modes. This is a correctness-oriented primitive, not a
 whole-model GPU path, performance result or hardware qualification.
 
+The grouped-GDN and causal-convolution native decode steps reuse their CPU
+allocation plans as geometry owners. Their raw asynchronous launchers read
+immutable prior state/history and write distinct staged results; a private
+dense-f32 span owner checks extents and writable aliases for both. Empty
+convolution history has no memory footprint. Decoder transactions, persistent
+residency and grant handling remain above these operations. Their precise
+numerical domains and refusal rules live in the operation rustdoc; standalone
+kernels do not establish native hybrid-model execution or device qualification.
+
 `loader::gguf::VerifiedArtifact` owns one immutable serialized backing, admitted
 under an explicit byte limit and matched against a required SHA-256 expectation.
 Its metadata and tensor borrows come from those same bytes. This content binding
