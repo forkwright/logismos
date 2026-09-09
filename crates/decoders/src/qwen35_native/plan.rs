@@ -96,10 +96,20 @@ pub(crate) struct DeviceByteDemand {
 
 impl DeviceByteDemand {
     pub(crate) fn total(self) -> Result<usize> {
-        sum(&[self.weights, self.scratch, self.input, self.output, self.controls, self.key_values, self.table], "native device byte total")
+        sum(
+            &[
+                self.weights,
+                self.scratch,
+                self.input,
+                self.output,
+                self.controls,
+                self.key_values,
+                self.table,
+            ],
+            "native device byte total",
+        )
     }
 }
-
 impl DeviceFullAttentionPlan {
     pub(crate) fn from_weights(
         weights: &Qwen35Weights<'_>,
