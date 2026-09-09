@@ -32,6 +32,24 @@ const SSM_DT_ROLE: &str = "ssm_dt.bias";
 const SSM_NORM_ROLE: &str = "ssm_norm.weight";
 const SSM_OUT_ROLE: &str = "ssm_out.weight";
 
+/// One recurrent tensor role from the structural Qwen3.5 inventory.
+///
+/// This typed vocabulary keeps a native recurrent plan bound to the same role
+/// strings as the verified CPU recurrent owner.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RecurrentTensorRole {
+    AttentionGate,
+    AttentionNorm,
+    AttentionQkv,
+    SsmA,
+    SsmAlpha,
+    SsmBeta,
+    SsmConvolution,
+    SsmDt,
+    SsmNorm,
+    SsmOutput,
+}
+
 /// Stateful CPU execution for one digest-verified Qwen3.5 recurrent block.
 ///
 /// This is a narrow recurrent-attention trunk: it performs attention `RMSNorm`,
@@ -541,7 +559,7 @@ struct ArrangedRecurrence {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ExecutionLayout {
+pub(crate) struct ExecutionLayout {
     hidden: usize,
     hidden_u64: u64,
     conv_kernel: usize,
@@ -563,7 +581,7 @@ struct ExecutionLayout {
 }
 
 impl ExecutionLayout {
-    fn try_from_profile(layout: Qwen35RecurrentLayout, epsilon: f32) -> Result<Self> {
+    pub(crate) fn try_from_profile(layout: Qwen35RecurrentLayout, epsilon: f32) -> Result<Self> {
         let hidden = usize_dimension(layout.hidden, "recurrent hidden width")?;
         let conv_kernel = usize_dimension(layout.conv_kernel, "recurrent convolution kernel")?;
         let inner = usize_dimension(layout.inner, "recurrent inner width")?;
@@ -623,7 +641,7 @@ impl ExecutionLayout {
         })
     }
 
-    fn validate_recurrent_block(self, block_index: u64) -> Result<()> {
+    pub(crate) fn validate_recurrent_block(self, block_index: u64) -> Result<()> {
         if block_index >= self.main_block_count {
             return RecurrentLayerSnafu {
                 block_index,
@@ -639,6 +657,66 @@ impl ExecutionLayout {
             .fail();
         }
         Ok(())
+    }
+
+    pub(crate) const fn hidden(self) -> usize {
+        self.hidden
+    }
+
+    pub(crate) const fn hidden_u64(self) -> u64 {
+        self.hidden_u64
+    }
+
+    pub(crate) const fn convolution_kernel(self) -> usize {
+        self.conv_kernel
+    }
+
+    pub(crate) const fn convolution_kernel_u64(self) -> u64 {
+        self.conv_kernel_u64
+    }
+
+    pub(crate) const fn key_dim(self) -> usize {
+        self.key_dim
+    }
+
+    pub(crate) const fn key_head_count(self) -> usize {
+        self.key_head_count
+    }
+
+    pub(crate) const fn value_dim(self) -> usize {
+        self.value_dim
+    }
+
+    pub(crate) const fn value_dim_u64(self) -> u64 {
+        self.value_dim_u64
+    }
+
+    pub(crate) const fn value_head_count(self) -> usize {
+        self.value_head_count
+    }
+
+    pub(crate) const fn value_head_count_u64(self) -> u64 {
+        self.value_head_count_u64
+    }
+
+    pub(crate) const fn key_width(self) -> usize {
+        self.key_width
+    }
+
+    pub(crate) const fn convolution_width(self) -> usize {
+        self.conv_width
+    }
+
+    pub(crate) const fn convolution_width_u64(self) -> u64 {
+        self.conv_width_u64
+    }
+
+    pub(crate) const fn epsilon(self) -> f32 {
+        self.epsilon
+    }
+
+    pub(crate) const fn gdn_scale(self) -> f32 {
+        self.gdn_scale
     }
 }
 
@@ -1329,6 +1407,24 @@ fn usize_dimension(value: u64, context: &'static str) -> Result<usize> {
 
 fn block_tensor_name(block_index: u64, role: &str) -> String {
     format!("blk.{block_index}.{role}")
+}
+
+/// Return the checked artifact tensor name for one recurrent role and main block.
+#[must_use]
+pub(crate) fn recurrent_tensor_name(block_index: u64, role: RecurrentTensorRole) -> String {
+    let role = match role {
+        RecurrentTensorRole::AttentionGate => ATTN_GATE_ROLE,
+        RecurrentTensorRole::AttentionNorm => ATTN_NORM_ROLE,
+        RecurrentTensorRole::AttentionQkv => ATTN_QKV_ROLE,
+        RecurrentTensorRole::SsmA => SSM_A_ROLE,
+        RecurrentTensorRole::SsmAlpha => SSM_ALPHA_ROLE,
+        RecurrentTensorRole::SsmBeta => SSM_BETA_ROLE,
+        RecurrentTensorRole::SsmConvolution => SSM_CONV1D_ROLE,
+        RecurrentTensorRole::SsmDt => SSM_DT_ROLE,
+        RecurrentTensorRole::SsmNorm => SSM_NORM_ROLE,
+        RecurrentTensorRole::SsmOutput => SSM_OUT_ROLE,
+    };
+    block_tensor_name(block_index, role)
 }
 
 #[cfg(test)]
