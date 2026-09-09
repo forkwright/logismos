@@ -77,6 +77,7 @@ impl ModelDeviceByteDemand {
 #[derive(Debug)]
 pub(super) struct DeviceModelPlan {
     pub(super) layout: Layout,
+    pub(super) page_tokens: kernels::attention::NativePageTokens,
     pub(super) embedding: ProjectionWeight,
     pub(super) output: ProjectionWeight,
     pub(super) output_norm: F32Parameter,
@@ -150,6 +151,7 @@ impl DeviceModelPlan {
         let _ = bytes.total()?;
         Ok(Self {
             layout,
+            page_tokens,
             embedding,
             output,
             output_norm,

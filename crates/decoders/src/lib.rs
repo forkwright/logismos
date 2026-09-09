@@ -45,8 +45,9 @@ pub use crate::qwen35_execution::{Qwen35Execution, Qwen35ExecutionPlan, Qwen35Lo
 #[cfg(feature = "gpu")]
 pub use crate::qwen35_native::{
     Qwen35NativeExecutionDeviceDemand, Qwen35NativeExecutionModel, Qwen35NativeExecutionPlan,
-    Qwen35NativeExecutionSession, Qwen35NativeLayerDeviceDemand, Qwen35NativeLayerPlan,
-    Qwen35NativeLayerSession, Qwen35NativeLayerSessionState, Qwen35NativeSessionState,
+    Qwen35NativeExecutionSession, Qwen35NativeExecutionSessionPlan, Qwen35NativeLayerDeviceDemand,
+    Qwen35NativeLayerPlan, Qwen35NativeLayerSession, Qwen35NativeLayerSessionState,
+    Qwen35NativeSessionState,
 };
 pub use crate::qwen35_recurrent::Qwen35RecurrentExecution;
 pub use crate::qwen35_requirements::Qwen35CpuRequirements;

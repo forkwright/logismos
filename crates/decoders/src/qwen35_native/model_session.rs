@@ -135,20 +135,13 @@ impl Qwen35NativeExecutionDeviceDemand {
     }
 
     /// Requested mutable device bytes retained by each native session.
+    ///
+    /// Construction checked the complete sum before this demand escaped, so
+    /// this is the checked total less resident, one-token control, and returned
+    /// output extents rather than a second mutable-category ledger.
     #[must_use]
     pub const fn session_bytes(self) -> usize {
-        self.bytes.full_workspace
-            + self.bytes.recurrent_workspace
-            + self.bytes.finish_workspace
-            + self.bytes.hidden_rows
-            + self.bytes.final_normalized
-            + self.bytes.key_values
-            + self.bytes.page_table
-            + self.bytes.recurrent_history_active
-            + self.bytes.recurrent_history_staged
-            + self.bytes.recurrent_state_active
-            + self.bytes.recurrent_state_staged
-            + self.bytes.numerical_status
+        self.total - self.resident_bytes() - self.step_bytes() - self.output_bytes()
     }
 
     /// Requested one-token control-buffer bytes.
@@ -255,7 +248,29 @@ pub struct Qwen35NativeExecutionModel {
 }
 
 impl Qwen35NativeExecutionModel {
-    /// Allocate one fresh mutable session under this model's fixed context plan.
+    /// Derive one exact-context session plan under this resident model's ceiling.
+    ///
+    /// The opaque plan retains this exact resident model, including its verified
+    /// backing and device identity. It cannot select another artifact, device,
+    /// page geometry, or a context above the resident ceiling. Holding it is
+    /// ownership only, not an admission, physical-residency, or capacity grant;
+    /// a higher layer must still authorize the requested use.
+    ///
+    /// # Errors
+    ///
+    /// Refuses invalid context, a request above the resident ceiling, or a
+    /// descriptor that cannot bind the resident's immutable uploads.
+    pub fn plan_session(&self, max_context: usize) -> Result<Qwen35NativeExecutionSessionPlan> {
+        let plan = self.resources.plan_session(max_context)?;
+        let demand = Qwen35NativeExecutionDeviceDemand::from_bytes(plan.bytes)?;
+        Ok(Qwen35NativeExecutionSessionPlan {
+            model: Arc::clone(&self.resources),
+            plan,
+            demand,
+        })
+    }
+
+    /// Allocate one fresh mutable session at this model's profile ceiling.
     ///
     /// Each session owns a distinct stream, status word, cache, recurrent state,
     /// workspaces and pending token buffers. Its context bound is the exact bound
@@ -266,7 +281,39 @@ impl Qwen35NativeExecutionModel {
     /// Returns typed allocation or stream-creation failures without affecting
     /// the immutable resident uploads or another session.
     pub fn new_session(&self) -> Result<Qwen35NativeExecutionSession> {
-        let resources = ModelSessionResources::new(Arc::clone(&self.resources))?;
+        self.plan_session(self.resources.context_ceiling())?
+            .into_session()
+    }
+}
+
+/// Exact per-use session plan bound to one immutable resident native model.
+pub struct Qwen35NativeExecutionSessionPlan {
+    model: Arc<NativeResidentModelResources>,
+    plan: DeviceModelPlan,
+    demand: Qwen35NativeExecutionDeviceDemand,
+}
+
+impl Qwen35NativeExecutionSessionPlan {
+    /// Return the exact per-use context bound admitted by this plan.
+    #[must_use]
+    pub const fn max_context(&self) -> usize {
+        self.plan.layout.max_context()
+    }
+
+    /// Return this use's exact requested device extents.
+    #[must_use]
+    pub const fn device_demand(&self) -> Qwen35NativeExecutionDeviceDemand {
+        self.demand
+    }
+
+    /// Allocate the fresh mutable session bound by this exact plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed stream or allocation failures without changing the
+    /// resident uploads or another planned use.
+    pub fn into_session(self) -> Result<Qwen35NativeExecutionSession> {
+        let resources = ModelSessionResources::new(self.model, self.plan)?;
         Ok(Qwen35NativeExecutionSession {
             owner: ResourceOwner::new(resources),
         })

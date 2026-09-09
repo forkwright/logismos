@@ -132,7 +132,7 @@ fn reserved_device_native_main_model_matches_oracle_and_excludes_nextn()
 
 #[test]
 #[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
-fn reserved_device_resident_model_creates_independent_native_sessions()
+fn reserved_device_resident_model_creates_unequal_context_native_sessions()
 -> core::result::Result<(), String> {
     let fixture = canonical_hybrid_fixture_with_context_and_rotary(FIXTURE_CONTEXT, Some(64))?;
     let payload = verify_fixture(&fixture)?;
@@ -148,8 +148,16 @@ fn reserved_device_resident_model_creates_independent_native_sessions()
     // and the bounded normal-or-zero fixture. It proves API ownership only,
     // not hardware qualification or physical residency.
     let model = unsafe { plan.into_model(&device) }.map_err(|error| error.to_string())?;
-    let mut first = model.new_session().map_err(|error| error.to_string())?;
-    let mut second = model.new_session().map_err(|error| error.to_string())?;
+    let mut first = model
+        .plan_session(2)
+        .map_err(|error| error.to_string())?
+        .into_session()
+        .map_err(|error| error.to_string())?;
+    let mut second = model
+        .plan_session(4)
+        .map_err(|error| error.to_string())?
+        .into_session()
+        .map_err(|error| error.to_string())?;
     let mut first_oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
     let mut second_oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
 
@@ -164,7 +172,12 @@ fn reserved_device_resident_model_creates_independent_native_sessions()
             .map_err(|error| format!("read first native model output: {error}"))?;
         assert_f32_matches_f64(&actual, &expected, "first resident-model session")?;
     }
-    for token in [2_u32, 0] {
+    // SAFETY: the first exact-context plan has completed both admitted
+    // positions, so this preflight refusal must not submit new work.
+    if unsafe { first.step(4) }.is_ok() || first.state() != Qwen35NativeSessionState::Ready {
+        return Err("native first session must retain its exact two-token context".to_string());
+    }
+    for token in [2_u32, 0, 4] {
         let expected = second_oracle.step(&[token])?;
         // SAFETY: the second session's state starts at position zero and is
         // distinct from the first session despite sharing immutable uploads.
