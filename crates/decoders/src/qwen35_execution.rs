@@ -1,5 +1,7 @@
 //! Bounded CPU token-to-logits execution for a verified Qwen3.5 payload.
 
+use cache::{PagedKvGeometry, PagedKvPlan, PagedKvPool};
+use cache::paged::{PagedAppend, PagedLayerKv};
 use loader::gguf::{GgmlType, MetaValue, MetaValueType};
 use num_traits::ToPrimitive;
 use quant::f32_row::F32Row;
@@ -7,7 +9,8 @@ use snafu::ResultExt;
 
 use crate::error::{
     ArithmeticOverflowSnafu, ExecutionAllocationPlanSnafu, ExecutionAllocationSnafu,
-    ExecutionArithmeticSnafu, ExecutionContextSnafu, ExecutionCpuSnafu, ExecutionTokenSnafu,
+    ExecutionArithmeticSnafu, ExecutionContextSnafu, ExecutionCpuSnafu, ExecutionPagedKvSnafu,
+    ExecutionTokenSnafu,
     MetadataRelationSnafu, MetadataTypeSnafu, MissingMetadataSnafu, PayloadTensorSnafu,
     ProjectionBytesSnafu, ProjectionDtypeSnafu, ProjectionRowSnafu, RecurrentRmsNormSnafu,
     TensorShapeSnafu,
@@ -47,6 +50,7 @@ pub struct Qwen35ExecutionPlan<'weights, 'artifact> {
     layout: Layout,
     max_step_tokens: usize,
     selection: Qwen35LogitSelection,
+    paged_kv_plan: Option<PagedKvPlan>,
     requirements: Qwen35CpuRequirements,
 }
 
@@ -63,6 +67,7 @@ pub struct Qwen35Execution<'weights, 'artifact> {
     max_step_tokens: usize,
     selection: Qwen35LogitSelection,
     layers: Vec<LayerState<'weights, 'artifact>>,
+    paged_kv_pool: Option<PagedKvPool>,
     position: usize,
 }
 
@@ -73,7 +78,7 @@ pub struct Qwen35Execution<'weights, 'artifact> {
 )]
 enum LayerState<'weights, 'artifact> {
     Recurrent(Qwen35RecurrentExecution<'weights, 'artifact>),
-    Full(FullAttentionState),
+    Full(usize),
 }
 
 impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
@@ -106,13 +111,20 @@ impl<'weights, 'artifact> Qwen35ExecutionPlan<'weights, 'artifact> {
             }
             .fail();
         }
-        let requirements =
-            Qwen35CpuRequirements::try_from_plan(weights, layout, max_step_tokens, selection)?;
+        let paged_kv_plan = paged_kv_plan(layout)?;
+        let requirements = Qwen35CpuRequirements::try_from_plan(
+            weights,
+            layout,
+            max_step_tokens,
+            selection,
+            paged_kv_plan,
+        )?;
         Ok(Self {
             weights,
             layout,
             max_step_tokens,
             selection,
+            paged_kv_plan,
             requirements,
         })
     }
@@ -129,13 +141,21 @@ impl<'weights, 'artifact> Qwen35ExecutionPlan<'weights, 'artifact> {
             layout,
             max_step_tokens,
             selection,
+            paged_kv_plan,
             requirements: _,
         } = self;
         let block_count = layout.main_blocks;
         let mut layers = reserve("main-block execution slots", block_count)?;
+        let mut full_layer = 0;
         for block in 0..block_count {
             if layout.is_full(block) {
-                layers.push(LayerState::Full(FullAttentionState::new(&layout)?));
+                layers.push(LayerState::Full(full_layer));
+                full_layer = full_layer.checked_add(1).ok_or_else(|| {
+                    ArithmeticOverflowSnafu {
+                        context: "full-attention layer index",
+                    }
+                    .build()
+                })?;
             } else {
                 layers.push(LayerState::Recurrent(weights.recurrent_execution(
                     u64::try_from(block).map_err(|_| {
@@ -147,12 +167,17 @@ impl<'weights, 'artifact> Qwen35ExecutionPlan<'weights, 'artifact> {
                 )?));
             }
         }
+        let paged_kv_pool = paged_kv_plan
+            .map(PagedKvPool::new)
+            .transpose()
+            .context(ExecutionPagedKvSnafu)?;
         Ok(Qwen35Execution {
             weights,
             layout,
             max_step_tokens,
             selection,
             layers,
+            paged_kv_pool,
             position: 0,
         })
     }
@@ -167,7 +192,7 @@ impl<'weights, 'artifact> Qwen35ExecutionPlan<'weights, 'artifact> {
     }
 }
 
-impl Qwen35Execution<'_, '_> {
+impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
     /// Execute complete token ids and return token-major vocabulary logits.
     ///
     /// The session owns only state derived from its verified payload; callers
@@ -201,34 +226,54 @@ impl Qwen35Execution<'_, '_> {
             .fail();
         }
         let mut staged = self.stage()?;
-        let logits = staged.step_staged(token_ids)?;
-        *self = staged;
+        let mut append = self
+            .paged_kv_pool
+            .as_mut()
+            .map(|pool| pool.begin_append(token_ids.len()).context(ExecutionPagedKvSnafu))
+            .transpose()?;
+        let logits = staged.step_staged(token_ids, append.as_deref_mut())?;
+        if let Some(append) = append {
+            append.commit().context(ExecutionPagedKvSnafu)?;
+        }
+        self.layers = staged.layers;
+        self.position = staged.position;
         Ok(logits)
     }
 
-    fn stage(&self) -> Result<Self> {
+    fn stage(&self) -> Result<StagedExecution<'weights, 'artifact>> {
         let mut layers = reserve("transaction main-block slots", self.layers.len())?;
         for layer in &self.layers {
             layers.push(match layer {
                 LayerState::Recurrent(execution) => {
                     LayerState::Recurrent(execution.try_clone_for_transaction()?)
                 }
-                LayerState::Full(state) => {
-                    LayerState::Full(state.try_clone_for_transaction(&self.layout)?)
-                }
+                LayerState::Full(layer) => LayerState::Full(*layer),
             });
         }
-        Ok(Self {
+        Ok(StagedExecution {
             weights: self.weights,
             layout: self.layout,
-            max_step_tokens: self.max_step_tokens,
             selection: self.selection,
             layers,
             position: self.position,
         })
     }
+}
 
-    fn step_staged(&mut self, token_ids: &[u32]) -> Result<Vec<f32>> {
+struct StagedExecution<'weights, 'artifact> {
+    weights: &'weights Qwen35Weights<'artifact>,
+    layout: Layout,
+    selection: Qwen35LogitSelection,
+    layers: Vec<LayerState<'weights, 'artifact>>,
+    position: usize,
+}
+
+impl<'weights, 'artifact> StagedExecution<'weights, 'artifact> {
+    fn step_staged(
+        &mut self,
+        token_ids: &[u32],
+        mut append: Option<&mut PagedAppend<'_>>,
+    ) -> Result<Vec<f32>> {
         let total = returned_logits_elements(self.layout, token_ids.len(), self.selection)?;
         let mut logits = reserve("token logits", total)?;
         for (token_index, token_id) in token_ids.iter().enumerate() {
@@ -246,9 +291,22 @@ impl Qwen35Execution<'_, '_> {
                 })?;
                 let attention = match layer {
                     LayerState::Recurrent(execution) => execution.step(&hidden)?,
-                    LayerState::Full(state) => {
-                        full_attention(weights, layout, position, block, &hidden, state)?
-                    }
+                    LayerState::Full(full_layer) => full_attention(
+                        weights,
+                        layout,
+                        position,
+                        block,
+                        &hidden,
+                        append.as_deref_mut().ok_or_else(|| {
+                            ExecutionContextSnafu {
+                                requested: block,
+                                rule: "full-attention execution must own a paged KV transaction",
+                            }
+                            .build()
+                        })?,
+                        *full_layer,
+                        token_index,
+                    )?,
                 };
                 self.finish_layer(block, &mut hidden, &attention)?;
             }
@@ -390,6 +448,19 @@ impl Qwen35Execution<'_, '_> {
     }
 }
 
+fn paged_kv_plan(layout: Layout) -> Result<Option<PagedKvPlan>> {
+    if layout.full_layer_count() == 0 {
+        return Ok(None);
+    }
+    PagedKvPlan::select(PagedKvGeometry {
+        layers: layout.full_layer_count(),
+        row_width: layout.kv_width,
+        max_context: layout.max_context,
+    })
+    .map(Some)
+    .context(ExecutionPagedKvSnafu)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the pinned full-attention operation order is one bounded transactional unit"
@@ -400,9 +471,11 @@ fn full_attention(
     position: usize,
     block: usize,
     input: &[f32],
-    state: &mut FullAttentionState,
+    append: &mut PagedAppend<'_>,
+    full_layer: usize,
+    append_token: usize,
 ) -> Result<Vec<f32>> {
-    let attention_tokens = state.tokens.checked_add(1).ok_or_else(|| {
+    let attention_tokens = position.checked_add(append_token).and_then(|token| token.checked_add(1)).ok_or_else(|| {
         ArithmeticOverflowSnafu {
             context: "full-attention token count",
         }
@@ -512,7 +585,19 @@ fn full_attention(
     )?;
     apply_text_mrope(layout, position, &mut query)?;
     apply_text_mrope(layout, position, &mut key)?;
-    state.push(&key, &value, &layout)?;
+    append
+        .write_layer_row(full_layer, append_token, &key, &value)
+        .context(ExecutionPagedKvSnafu)?;
+    let kv = append
+        .layer_kv(full_layer)
+        .context(ExecutionPagedKvSnafu)?;
+    if kv.tokens() != attention_tokens {
+        return ExecutionContextSnafu {
+            requested: kv.tokens(),
+            rule: "paged KV transaction rows must match token-serial full-attention state",
+        }
+        .fail();
+    }
     let mut merged = reserve("full-attention merged output", allocations.merged_output)?;
     for head in 0..layout.heads {
         let kv_head = head / layout.gqa_group;
@@ -531,7 +616,7 @@ fn full_attention(
                 }
                 .build()
             })?;
-        let attended = state.attend(query, kv_head, &layout, allocations)?;
+        let attended = attend(&kv, query, kv_head, &layout, allocations)?;
         let gate_row = gate
             .get(query_start..query_start + layout.key)
             .ok_or_else(|| {
@@ -623,38 +708,6 @@ fn apply_text_mrope(layout: Layout, position: usize, values: &mut [f32]) -> Resu
         }
     }
     finite(values, "text MRoPE")
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FullAttentionStateAllocations {
-    keys: usize,
-    values: usize,
-}
-
-impl FullAttentionStateAllocations {
-    fn try_from_layout(layout: Layout) -> Result<Self> {
-        let cache_elements = layout
-            .max_context
-            .checked_mul(layout.kv_width)
-            .ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "full-attention KV capacity",
-                }
-                .build()
-            })?;
-        Ok(Self {
-            keys: cache_elements,
-            values: cache_elements,
-        })
-    }
-
-    fn total_elements(self) -> Result<usize> {
-        checked_add(
-            self.keys,
-            self.values,
-            "full-attention retained KV elements",
-        )
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -847,8 +900,8 @@ impl LmHeadWorkspaceAllocations {
     }
 }
 
-pub(crate) fn full_attention_retained_elements(layout: Layout) -> Result<usize> {
-    FullAttentionStateAllocations::try_from_layout(layout)?.total_elements()
+pub(crate) const fn full_attention_retained_elements(plan: PagedKvPlan) -> usize {
+    plan.requested_f32_elements()
 }
 
 pub(crate) fn full_attention_workspace_elements(
@@ -890,67 +943,16 @@ pub(crate) fn returned_logits_elements(
     })
 }
 
-#[derive(Debug)]
-struct FullAttentionState {
-    keys: Vec<f32>,
-    values: Vec<f32>,
-    tokens: usize,
-}
-
-impl FullAttentionState {
-    fn new(layout: &Layout) -> Result<Self> {
-        let allocations = FullAttentionStateAllocations::try_from_layout(*layout)?;
-        Ok(Self {
-            keys: reserve("KV keys", allocations.keys)?,
-            values: reserve("KV values", allocations.values)?,
-            tokens: 0,
-        })
-    }
-
-    fn push(&mut self, key: &[f32], value: &[f32], layout: &Layout) -> Result<()> {
-        if self.tokens >= layout.max_context {
-            return ExecutionContextSnafu {
-                requested: self.tokens + 1,
-                rule: "KV state must not exceed caller-bounded context",
-            }
-            .fail();
-        }
-        if key.len() != layout.kv_width || value.len() != layout.kv_width {
-            return ExecutionContextSnafu {
-                requested: key.len(),
-                rule: "full-attention KV projections must match artifact-derived width",
-            }
-            .fail();
-        }
-        self.keys.extend_from_slice(key);
-        self.values.extend_from_slice(value);
-        self.tokens += 1;
-        Ok(())
-    }
-
-    fn try_clone_for_transaction(&self, layout: &Layout) -> Result<Self> {
-        let allocations = FullAttentionStateAllocations::try_from_layout(*layout)?;
-        let mut keys = reserve("transaction KV keys", allocations.keys)?;
-        keys.extend_from_slice(&self.keys);
-        let mut values = reserve("transaction KV values", allocations.values)?;
-        values.extend_from_slice(&self.values);
-        Ok(Self {
-            keys,
-            values,
-            tokens: self.tokens,
-        })
-    }
-
-    fn attend(
-        &self,
-        query: &[f32],
-        kv_head: usize,
-        layout: &Layout,
-        allocations: FullAttentionWorkspaceAllocations,
-    ) -> Result<Vec<f32>> {
+fn attend(
+    kv: &PagedLayerKv<'_>,
+    query: &[f32],
+    kv_head: usize,
+    layout: &Layout,
+    allocations: FullAttentionWorkspaceAllocations,
+) -> Result<Vec<f32>> {
         ensure_execution_plan(
             "attention scores",
-            self.tokens,
+            kv.tokens(),
             allocations.attention_scores,
         )?;
         let mut scores = reserve("attention scores", allocations.attention_scores)?;
@@ -965,19 +967,19 @@ impl FullAttentionState {
             })?
             .sqrt()
             .recip();
-        for token in 0..self.tokens {
-            let start = token
-                .checked_mul(layout.kv_width)
-                .and_then(|offset| offset.checked_add(kv_head * layout.key))
+        for token in 0..kv.tokens() {
+            let head_start = kv_head
+                .checked_mul(layout.key)
                 .ok_or_else(|| {
                     ArithmeticOverflowSnafu {
-                        context: "KV key offset",
+                        context: "KV key head offset",
                     }
                     .build()
                 })?;
-            let key = self.keys.get(start..start + layout.key).ok_or_else(|| {
+            let row = kv.key_row(token).context(ExecutionPagedKvSnafu)?;
+            let key = row.get(head_start..head_start + layout.key).ok_or_else(|| {
                 ExecutionContextSnafu {
-                    requested: start,
+                    requested: head_start,
                     rule: "KV key range must fit retained state",
                 }
                 .build()
@@ -996,18 +998,18 @@ impl FullAttentionState {
         output.resize(allocations.attention_head_output, 0.0);
         for (token, score) in scores.iter().enumerate() {
             let probability = (*score - maximum).exp() / normalizer;
-            let start = token
-                .checked_mul(layout.kv_width)
-                .and_then(|offset| offset.checked_add(kv_head * layout.key))
+            let head_start = kv_head
+                .checked_mul(layout.key)
                 .ok_or_else(|| {
                     ArithmeticOverflowSnafu {
-                        context: "KV value offset",
+                        context: "KV value head offset",
                     }
                     .build()
                 })?;
-            let value = self.values.get(start..start + layout.key).ok_or_else(|| {
+            let row = kv.value_row(token).context(ExecutionPagedKvSnafu)?;
+            let value = row.get(head_start..head_start + layout.key).ok_or_else(|| {
                 ExecutionContextSnafu {
-                    requested: start,
+                    requested: head_start,
                     rule: "KV value range must fit retained state",
                 }
                 .build()
@@ -1018,7 +1020,6 @@ impl FullAttentionState {
             }
         }
         Ok(output)
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

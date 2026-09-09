@@ -11,6 +11,8 @@ publish = false
 workspace = true
 
 [dependencies]
+# Private bounded CPU KV backing for the Qwen3.5 execution owner.
+cache = { workspace = true, default-features = false }
 # Metadata-only observation keeps structural preflight independent of HIP/tensor decoding.
 loader = { path = "../loader", default-features = false }
 kernels = { workspace = true, default-features = false }
