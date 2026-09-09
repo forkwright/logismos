@@ -1102,7 +1102,9 @@ mod tests {
             logits: &mut [f32],
         ) -> Result<(), NativeTextDriverError> {
             self.final_output = Some(output);
-            logits[0] = output as f32;
+            logits[0] = f32::from(
+                u16::try_from(output).map_err(|_| NativeTextDriverError::EmptyTokenBatch)?,
+            );
             Ok(())
         }
     }
@@ -1256,7 +1258,7 @@ mod tests {
     #[test]
     fn retry_transition_invokes_only_pending_release() {
         let retries = Cell::new(0);
-        let retry = |_: ()| {
+        let retry = |()| {
             retries.set(retries.get() + 1);
             SyntheticRelease::Retried
         };
@@ -1315,7 +1317,7 @@ mod tests {
         assert_eq!(driver.stepped, [11, 12, 13]);
         assert_eq!(driver.released, [11, 12]);
         assert_eq!(driver.final_output, Some(13));
-        assert_eq!(logits, [13.0]);
+        assert_eq!(logits.map(f32::to_bits), [13.0_f32.to_bits()]);
     }
 
     #[test]
