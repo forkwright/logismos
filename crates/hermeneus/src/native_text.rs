@@ -1023,7 +1023,10 @@ mod tests {
     fn synthetic_pipeline(
         context_tokens: usize,
     ) -> Result<(tempfile::TempDir, TextPipeline), Box<dyn std::error::Error>> {
-        let fixture = build_qwen35_fixture(&Qwen35FixtureConfig::default())?;
+        let fixture = build_qwen35_fixture(&Qwen35FixtureConfig {
+            chat_template: "{{ messages[0].content }}".to_owned(),
+            ..Qwen35FixtureConfig::default()
+        })?;
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("synthetic.gguf");
         std::fs::write(&path, fixture.bytes)?;
