@@ -632,7 +632,12 @@ impl ReservationLedger {
         let reservations = prepared
             .placements
             .iter()
-            .map(|placement| (placement.device_id.as_str(), placement.total_estimated_bytes))
+            .map(|placement| {
+                (
+                    placement.device_id.as_str(),
+                    placement.total_estimated_bytes,
+                )
+            })
             .collect::<Vec<_>>();
         let commit = self
             .prepare_reservation(&reservations)
@@ -688,7 +693,10 @@ impl ReservationLedger {
     /// Returns the typed refusal and original lease without mutation when the
     /// lease belongs to another ledger or was not active in this ledger.
     pub fn release(&mut self, lease: ReservationLease) -> Result<(), Box<LeaseReleaseFailure>> {
-        let ReservationLease { lease: capability, placement } = lease;
+        let ReservationLease {
+            lease: capability,
+            placement,
+        } = lease;
         if capability.device_id != placement.device_id
             || capability.reserved_bytes != placement.total_estimated_bytes
         {
@@ -739,10 +747,7 @@ impl ReservationLedger {
         }
     }
 
-    fn require_reservable_device(
-        &self,
-        device_id: &str,
-    ) -> Result<(), DeviceByteReservationError> {
+    fn require_reservable_device(&self, device_id: &str) -> Result<(), DeviceByteReservationError> {
         let device = self
             .snapshot
             .devices
@@ -790,12 +795,15 @@ impl ReservationLedger {
                 })?;
         let mut candidate_reserved = self.dynamic_reserved.clone();
         for (device_id, bytes) in reservations {
-            let reserved = candidate_reserved.entry((*device_id).to_owned()).or_default();
-            *reserved = reserved.checked_add(*bytes).ok_or(
-                LeaseReservationError::ArithmeticOverflow {
-                    scope: "dynamic device reservation",
-                },
-            )?;
+            let reserved = candidate_reserved
+                .entry((*device_id).to_owned())
+                .or_default();
+            *reserved =
+                reserved
+                    .checked_add(*bytes)
+                    .ok_or(LeaseReservationError::ArithmeticOverflow {
+                        scope: "dynamic device reservation",
+                    })?;
         }
         remaining_after_reservations(&self.snapshot, &candidate_reserved)
             .map_err(LeaseReservationError::from)?;
@@ -825,11 +833,7 @@ impl ReservationLedger {
             .collect()
     }
 
-    fn apply_reservation(
-        &mut self,
-        commit: ReservationCommit,
-        reservations: &[(&str, u64)],
-    ) {
+    fn apply_reservation(&mut self, commit: ReservationCommit, reservations: &[(&str, u64)]) {
         for ((device_id, bytes), lease_id) in reservations
             .iter()
             .zip(commit.first_lease_id..commit.next_lease_id)
@@ -1849,8 +1853,8 @@ mod contract_tests {
     }
 
     #[test]
-    fn requested_byte_failures_preserve_capability_and_accounting()
-    -> Result<(), PlacementRefusal> {
+    fn requested_byte_failures_preserve_capability_and_accounting() -> Result<(), PlacementRefusal>
+    {
         let input = plan_input(
             r#"[{"id":"w7900","gfx_isa":"gfx1100","total_bytes":10,"reserved_bytes":0,"availability":"available"}]"#,
             "[]",
@@ -1961,9 +1965,7 @@ mod contract_tests {
         ));
         assert!(ledger.dynamic_reserved.is_empty());
 
-        ledger
-            .dynamic_reserved
-            .insert("w7900".to_owned(), u64::MAX);
+        ledger.dynamic_reserved.insert("w7900".to_owned(), u64::MAX);
         assert!(matches!(
             ledger.reserve_bytes("w7900", requested(1)),
             Err(DeviceByteReservationError::RequestedByteArithmeticOverflow { .. })
