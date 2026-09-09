@@ -96,7 +96,7 @@ impl NativeRecurrentWeights {
 
 impl NativeRecurrentWorkspace {
     /// Allocate the exact scratch spans named by the recurrent plan.
-    pub(super) fn new(plan: RecurrentWorkspacePlan, device: &Device) -> Result<Self> {
+    pub(super) fn new(plan: &RecurrentWorkspacePlan, device: &Device) -> Result<Self> {
         macro_rules! buffer {
             ($field:ident) => {
                 DeviceBuffer::alloc(device, plan.$field).context(NativeDeviceSnafu)?
@@ -173,6 +173,17 @@ impl DeferredRecurrent<'_> {
     /// on submission failure and publishes staged recurrent state only after
     /// model-wide completion is established.
     pub(super) unsafe fn submit(&self) -> Result<()> {
+        // SAFETY: submit's contract retains every checked projection span.
+        unsafe { self.submit_projections() }?;
+        // SAFETY: the staged convolution, activation, and Q/K spans remain live.
+        unsafe { self.submit_convolution_arrangement() }?;
+        // SAFETY: scalar controls and staged recurrence state remain live.
+        unsafe { self.submit_scalars_and_recurrence() }?;
+        // SAFETY: output, common finish, and all scratch spans remain live.
+        unsafe { self.submit_output_and_finish() }
+    }
+
+    unsafe fn submit_projections(&self) -> Result<()> {
         // SAFETY: submit's contract retains the exact input, norm, and output
         // spans, and the checked plan fixes their geometry.
         unsafe {
@@ -193,7 +204,7 @@ impl DeferredRecurrent<'_> {
                 self.stream,
             )
         }?;
-        // SAFETY: the gate projection has its own exact output span.
+        // SAFETY: each remaining projection has its own exact output span.
         unsafe {
             self.weights.gate.launch(
                 &self.workspace.normalized_hidden,
@@ -201,7 +212,7 @@ impl DeferredRecurrent<'_> {
                 self.stream,
             )
         }?;
-        // SAFETY: the alpha projection has its own exact output span.
+        // SAFETY: alpha and beta outputs are distinct exact workspace spans.
         unsafe {
             self.weights.alpha.launch(
                 &self.workspace.normalized_hidden,
@@ -209,14 +220,17 @@ impl DeferredRecurrent<'_> {
                 self.stream,
             )
         }?;
-        // SAFETY: the beta projection has its own exact output span.
+        // SAFETY: beta projection output remains distinct through completion.
         unsafe {
             self.weights.beta.launch(
                 &self.workspace.normalized_hidden,
                 &self.workspace.beta_projection,
                 self.stream,
             )
-        }?;
+        }
+    }
+
+    unsafe fn submit_convolution_arrangement(&self) -> Result<()> {
         // SAFETY: checked causal geometry and separate staged history preserve
         // the immutable committed state through completion.
         unsafe { self.submit_convolution() }?;
@@ -248,7 +262,10 @@ impl DeferredRecurrent<'_> {
                 self.stream,
             )
         }
-        .context(NativeKernelSnafu)?;
+        .context(NativeKernelSnafu)
+    }
+
+    unsafe fn submit_scalars_and_recurrence(&self) -> Result<()> {
         // SAFETY: all scalar inputs are immutable exact spans and both outputs
         // are distinct writable buffers owned by this workspace.
         unsafe {
@@ -272,7 +289,10 @@ impl DeferredRecurrent<'_> {
         .context(NativeKernelSnafu)?;
         // SAFETY: staged GDN state and output are distinct from committed state
         // and all prior-operation buffers; V is the plan-checked tail view.
-        unsafe { self.submit_recurrence() }?;
+        unsafe { self.submit_recurrence() }
+    }
+
+    unsafe fn submit_output_and_finish(&self) -> Result<()> {
         // SAFETY: each output head is an exact separate RMSNorm row.
         unsafe {
             launch_rms_norm(

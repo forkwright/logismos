@@ -61,6 +61,18 @@ pub(super) struct RecurrentWorkspacePlan {
     elements: usize,
 }
 
+/// Existing checked kernel plans that jointly define one recurrent workspace.
+struct RecurrentOperationPlans {
+    input_norm: kernels::decoder_ops::RmsNormF32Plan,
+    convolution: kernels::CausalConvAllocationPlan,
+    recurrence: kernels::MultiHeadRecurrentAllocationPlan,
+    convolution_silu: kernels::decoder_ops::ElementwiseF32Plan,
+    qk_l2: kernels::decoder_ops::RecurrentQkL2F32Plan,
+    scalars: kernels::decoder_ops::RecurrentScalarsF32Plan,
+    output_norm: kernels::decoder_ops::RmsNormF32Plan,
+    output_silu_product: kernels::decoder_ops::ElementwiseF32Plan,
+}
+
 impl RecurrentWorkspacePlan {
     /// Return the exact simultaneously allocated recurrent workspace extent.
     #[must_use]
@@ -296,7 +308,7 @@ impl RecurrentWorkspacePlan {
             kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(output_norm.elements())
                 .context(NativeKernelSnafu)?;
 
-        Self::from_operations(
+        Self::from_operations(RecurrentOperationPlans {
             input_norm,
             convolution,
             recurrence,
@@ -305,69 +317,26 @@ impl RecurrentWorkspacePlan {
             scalars,
             output_norm,
             output_silu_product,
-        )
+        })
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the checked kernel plans are the single native recurrent workspace contract"
-    )]
-    fn from_operations(
-        input_norm: kernels::decoder_ops::RmsNormF32Plan,
-        convolution: kernels::CausalConvAllocationPlan,
-        recurrence: kernels::MultiHeadRecurrentAllocationPlan,
-        convolution_silu: kernels::decoder_ops::ElementwiseF32Plan,
-        qk_l2: kernels::decoder_ops::RecurrentQkL2F32Plan,
-        scalars: kernels::decoder_ops::RecurrentScalarsF32Plan,
-        output_norm: kernels::decoder_ops::RmsNormF32Plan,
-        output_silu_product: kernels::decoder_ops::ElementwiseF32Plan,
-    ) -> Result<Self> {
-        if qk_l2.output_elements() != recurrence.query_and_key_elements()
-            || scalars.value_heads() != recurrence.scalar_elements()
-            || output_norm.elements() != recurrence.output_elements()
-        {
-            return NativeSessionStateSnafu {
-                rule: "native recurrent kernel plans must share the CPU-derived equal-head layout",
-            }
-            .fail();
-        }
-
-        let value_tail_offset = qk_l2.source_elements().checked_mul(2).ok_or_else(|| {
-            ArithmeticOverflowSnafu {
-                context: "native recurrent activated-convolution V offset",
-            }
-            .build()
-        })?;
-        let value_tail_end = value_tail_offset
-            .checked_add(recurrence.output_elements())
-            .ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "native recurrent activated-convolution V end",
-                }
-                .build()
-            })?;
-        if value_tail_end != convolution_silu.elements() {
-            return NativeSessionStateSnafu {
-                rule: "native recurrent V must be the exact activated-convolution tail",
-            }
-            .fail();
-        }
-
-        let normalized_hidden = input_norm.elements();
-        let qkv = convolution.output_elements();
-        let z = recurrence.output_elements();
-        let alpha = scalars.value_heads();
-        let beta_projection = scalars.value_heads();
-        let raw_convolution = convolution.output_elements();
-        let activated_convolution = convolution_silu.elements();
-        let tiled_query = qk_l2.output_elements();
-        let tiled_key = qk_l2.output_elements();
-        let beta = scalars.value_heads();
-        let log_decay = scalars.value_heads();
-        let recurrence_output = recurrence.output_elements();
-        let normalized_output = output_norm.elements();
-        let gated_output = output_silu_product.elements();
-        let projected_attention = input_norm.elements();
+    fn from_operations(operations: RecurrentOperationPlans) -> Result<Self> {
+        let (value_tail_offset, value_tail_elements) = validate_operations(&operations)?;
+        let normalized_hidden = operations.input_norm.elements();
+        let qkv = operations.convolution.output_elements();
+        let z = operations.recurrence.output_elements();
+        let alpha = operations.scalars.value_heads();
+        let beta_projection = operations.scalars.value_heads();
+        let raw_convolution = operations.convolution.output_elements();
+        let activated_convolution = operations.convolution_silu.elements();
+        let tiled_query = operations.qk_l2.output_elements();
+        let tiled_key = operations.qk_l2.output_elements();
+        let beta = operations.scalars.value_heads();
+        let log_decay = operations.scalars.value_heads();
+        let recurrence_output = operations.recurrence.output_elements();
+        let normalized_output = operations.output_norm.elements();
+        let gated_output = operations.output_silu_product.elements();
+        let projected_attention = operations.input_norm.elements();
         let elements = sum(
             &[
                 normalized_hidden,
@@ -390,12 +359,12 @@ impl RecurrentWorkspacePlan {
         )?;
 
         Ok(Self {
-            input_norm,
-            convolution_silu,
-            qk_l2,
-            scalars,
-            output_norm,
-            output_silu_product,
+            input_norm: operations.input_norm,
+            convolution_silu: operations.convolution_silu,
+            qk_l2: operations.qk_l2,
+            scalars: operations.scalars,
+            output_norm: operations.output_norm,
+            output_silu_product: operations.output_silu_product,
             normalized_hidden,
             qkv,
             z,
@@ -412,15 +381,53 @@ impl RecurrentWorkspacePlan {
             gated_output,
             projected_attention,
             value_tail_offset,
-            value_tail_elements: recurrence.output_elements(),
+            value_tail_elements,
             elements,
         })
     }
 }
 
+fn validate_operations(operations: &RecurrentOperationPlans) -> Result<(usize, usize)> {
+    if operations.qk_l2.output_elements() != operations.recurrence.query_and_key_elements()
+        || operations.scalars.value_heads() != operations.recurrence.scalar_elements()
+        || operations.output_norm.elements() != operations.recurrence.output_elements()
+    {
+        return NativeSessionStateSnafu {
+            rule: "native recurrent kernel plans must share the CPU-derived equal-head layout",
+        }
+        .fail();
+    }
+    let value_tail_offset = operations
+        .qk_l2
+        .source_elements()
+        .checked_mul(2)
+        .ok_or_else(|| {
+            ArithmeticOverflowSnafu {
+                context: "native recurrent activated-convolution V offset",
+            }
+            .build()
+        })?;
+    let value_tail_elements = operations.recurrence.output_elements();
+    let value_tail_end = value_tail_offset
+        .checked_add(value_tail_elements)
+        .ok_or_else(|| {
+            ArithmeticOverflowSnafu {
+                context: "native recurrent activated-convolution V end",
+            }
+            .build()
+        })?;
+    if value_tail_end != operations.convolution_silu.elements() {
+        return NativeSessionStateSnafu {
+            rule: "native recurrent V must be the exact activated-convolution tail",
+        }
+        .fail();
+    }
+    Ok((value_tail_offset, value_tail_elements))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DeviceRecurrentPlan, RecurrentWorkspacePlan, sum};
+    use super::{DeviceRecurrentPlan, RecurrentOperationPlans, RecurrentWorkspacePlan, sum};
     use crate::Qwen35Weights;
     use crate::qwen35::tests::{canonical_hybrid_fixture, verify_fixture};
 
@@ -500,7 +507,7 @@ mod tests {
             kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(output_norm.elements())
                 .map_err(|error| error.to_string())?;
 
-        let workspace = RecurrentWorkspacePlan::from_operations(
+        let workspace = RecurrentWorkspacePlan::from_operations(RecurrentOperationPlans {
             input_norm,
             convolution,
             recurrence,
@@ -509,7 +516,7 @@ mod tests {
             scalars,
             output_norm,
             output_silu_product,
-        )
+        })
         .map_err(|error| error.to_string())?;
 
         assert_eq!(workspace.tiled_query, 6);
