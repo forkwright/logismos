@@ -39,14 +39,18 @@ semantically respects that boundary.
 - `placement` and `sched` have no HIP/device-runtime dependency. `bin` consumes
   `placement` for `plan`, `loader` for `inspect`, and `text` for `prepare-text`
   without linking the device runtime.
-- `decoders` consumes `loader` without its tensor adapter and consumes `quant`
+- `decoders` defaults to consuming `loader` without its tensor adapter and `quant`
   for explicit CPU row projection, without linking HIP. Its recurrent-attention
   and full-attention paths use the standalone CPU `kernels` graph; full-attention history consumes
   `cache` with its legacy tensor-backed flat feature disabled. Structural profiles remain
   distinct from payload-bound execution. The lower-level `quant` crate owns
   executable block and row geometry; inspection and projection reuse that owner.
-- `cache::paged` owns private CPU KV allocation, borrowed row views and atomic
-  append transactions. It does not own model semantics, shared-prefix identity,
+  Opt-in `decoders/gpu` adds optional `hipcore`, `kernels/gpu` and `cache/gpu`
+  for the owned native one-block consumer; the GPU-capable facade selects it.
+  Default CPU consumers and package-isolated CPU checks do not select it.
+- `cache::paged` owns one logical KV ledger, CPU backing with borrowed row views
+  and atomic append transactions, and optional separate native K/V/table backing.
+  It does not own model semantics, shared-prefix identity,
   scheduling or host grants. Legacy flat tensor callers retain their default
   feature; their `KvCache` trait is not a shared-paging lifecycle contract.
 - `emulation` is a CPU test aid, not a production device backend.
@@ -167,8 +171,34 @@ score/softmax/value order. The unsafe asynchronous launcher requires valid
 device table entries, finite normal-or-zero arithmetic, buffer lifetimes and a
 nonaliasing staged output; it does not inspect device data or validate results.
 CPU arithmetic witnesses and compiled code objects do not qualify GPU numerical
-behavior. Device cache ownership, whole-model composition, admission and
-completion remain separate work.
+behavior. The native one-block decoder consumes this kernel and owns completion;
+whole-model composition, admission and hardware qualification remain separate work.
+
+`Qwen35NativeLayerPlan` borrows the exact verified weights it inspects and is
+consumed when uploading a native full-attention-block session. Its demand comes
+from seven serialized matrix allocations, four norm vectors, named workspace
+buffers, per-step input/output and rotary controls, and the native KV/table
+plans. These are requested device extents, not measured residency, allocator
+overhead, a grant, or an allowance for results retained by callers.
+
+The unsafe blocking session composes input RMSNorm, Q/gate/K/V projections,
+per-head Q/K RMSNorm, partial text mRoPE, staged paged attention, sigmoid gating,
+output projection/residual, post-attention norm and the full SwiGLU/residual
+path. CPU and native control preparation share the allocation-free per-pair
+mRoPE derivation. Original f32 kernels retain their explicit normal-or-zero
+arithmetic contract; a final output scan cannot establish that precondition.
+
+The native cache reuses the CPU's logical reservation/COW ledger but keeps
+separate layer-major K/V allocations and a device table mirror. A completed
+append parks its sole reservation inside the cache without publishing, ending
+the borrow so the complete session can synchronize. Only then may the cache
+publish and the session advance position and return its owned device output.
+The guard starts before the first kernel submission. Preflight refusal is
+retryable; any submitted failure poisons the session without publishing its
+logical state. Uncertain completion retains all resources, including immutable
+weights and input. Drop retries synchronization and forgets the entire bundle
+if completion remains uncertain. This is not device rollback, reset authority,
+multi-token atomicity, recurrence composition, or a safe serving API.
 
 `loader::gguf::VerifiedArtifact` owns one immutable serialized backing, admitted
 under an explicit byte limit and matched against a required SHA-256 expectation.
