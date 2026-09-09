@@ -644,7 +644,10 @@ fn compile_sources(
             ])
             .arg(out_dir);
         if src.file_name().is_some_and(|name| {
-            name == "row_gemv.hip" || name == "gdn_step.hip" || name == "causal_conv_step.hip"
+            name == "row_gemv.hip"
+                || name == "gdn_step.hip"
+                || name == "causal_conv_step.hip"
+                || name == "decoder_ops_f32.hip"
         }) {
             // WHY: these correctness baselines retain separately rounded f32
             // operations. Scope no-fast-math and no contraction to their
