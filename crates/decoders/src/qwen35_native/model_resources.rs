@@ -84,19 +84,26 @@ pub(super) struct ModelSessionResources {
 /// still reference resident weights. Dropping public teardown custody must
 /// therefore retain, rather than decrement the last resident `Arc` into the
 /// ordinary `DeviceBuffer` drop path.
-struct ResidentRetention {
-    resident: Option<Arc<NativeResidentModelResources>>,
+pub(super) struct ResidentRetention<T> {
+    resident: Option<Arc<T>>,
 }
 
-impl ResidentRetention {
-    const fn new(resident: Arc<NativeResidentModelResources>) -> Self {
+impl<T> ResidentRetention<T> {
+    const fn new(resident: Arc<T>) -> Self {
         Self {
             resident: Some(resident),
         }
     }
+
+    fn recover(mut self) -> Arc<T> {
+        match self.resident.take() {
+            Some(resident) => resident,
+            None => unreachable!("resident retention is recovered only once"),
+        }
+    }
 }
 
-impl Drop for ResidentRetention {
+impl<T> Drop for ResidentRetention<T> {
     fn drop(&mut self) {
         if let Some(resident) = self.resident.take() {
             // Explicit aggregate teardown has no physical-eviction authority
@@ -149,13 +156,13 @@ pub(super) enum ModelSessionTeardown {
     PartiallyAdmitted {
         inventory: TeardownInventory,
         buffers: Vec<TeardownBuffer>,
-        resident: ResidentRetention,
+        resident: ResidentRetention<NativeResidentModelResources>,
     },
     /// The HIP inventory owns the stream and all session buffers; its exact
     /// release outcome is retained with the resident owner.
     Releasing {
         release: InventoryRelease,
-        resident: ResidentRetention,
+        resident: ResidentRetention<NativeResidentModelResources>,
     },
 }
 
@@ -221,6 +228,20 @@ impl ModelSessionTeardown {
             other => other,
         }
     }
+
+    /// Recover the exact resident owner only after HIP acknowledged the whole
+    /// mutable-session inventory and its ordered stream.
+    pub(super) fn into_released_resident(
+        self,
+    ) -> core::result::Result<Arc<NativeResidentModelResources>, Self> {
+        match self {
+            Self::Releasing {
+                release: InventoryRelease::Released(_),
+                resident,
+            } => Ok(resident.recover()),
+            other => Err(other),
+        }
+    }
 }
 
 impl NativeResidentTeardown {
@@ -265,7 +286,7 @@ impl NativeResidentTeardown {
 pub(super) struct ModelSessionTeardownParts {
     stream: Stream,
     buffers: Vec<TeardownBuffer>,
-    resident: ResidentRetention,
+    resident: ResidentRetention<NativeResidentModelResources>,
 }
 
 impl ModelSessionTeardownParts {
@@ -987,6 +1008,8 @@ mod tests {
     use crate::qwen35::tests::{canonical_hybrid_fixture_with_context, verify_fixture};
     use crate::qwen35_native::model_plan::DeviceModelPlan;
     use crate::qwen35_native::model_step::ModelTokenPlan;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const RESIDENT_CONTEXT: usize = 16;
     const SESSION_CONTEXT: usize = 4;
@@ -1020,5 +1043,35 @@ mod tests {
             "a session plan cannot exceed the resident model's immutable ceiling"
         );
         Ok(())
+    }
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn abandoned_retention_never_drops_the_last_resident() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let resident = Arc::new(DropProbe(Arc::clone(&drops)));
+        let retention = super::ResidentRetention::new(Arc::clone(&resident));
+        drop(resident);
+        drop(retention);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn released_retention_recovers_the_exact_resident_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let resident = Arc::new(DropProbe(Arc::clone(&drops)));
+        let retention = super::ResidentRetention::new(Arc::clone(&resident));
+        drop(resident);
+        let recovered = retention.recover();
+        assert_eq!(Arc::strong_count(&recovered), 1);
+        drop(recovered);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

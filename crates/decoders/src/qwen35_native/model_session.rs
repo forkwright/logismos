@@ -452,6 +452,16 @@ impl Qwen35NativeExecutionSessionTeardown {
             inner: self.inner.reconcile_synchronization(),
         }
     }
+
+    /// Recover the exact resident model only after HIP acknowledged every
+    /// session buffer and its ordered stream. All other custody remains owned
+    /// by the returned teardown value without invoking HIP on drop.
+    pub fn into_released_model(self) -> core::result::Result<Qwen35NativeExecutionModel, Self> {
+        match self.inner.into_released_resident() {
+            Ok(resources) => Ok(Qwen35NativeExecutionModel { resources }),
+            Err(inner) => Err(Self { inner }),
+        }
+    }
 }
 
 fn teardown_state(state: ModelSessionTeardownState) -> Qwen35NativeExecutionSessionTeardownState {
