@@ -632,6 +632,129 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recurrent_qk_l2_validator_accepts_exact_spans_and_refuses_unsafe_bindings()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let plan = RecurrentQkL2F32Plan::try_from_dimensions(16, 2, 4, 3, 1e-5)?;
+        let convolved = [1.0_f32; 16];
+        let mut query = [0.0_f32; 12];
+        let mut key = [0.0_f32; 12];
+        validate_launch(
+            plan,
+            convolved.as_ptr(),
+            convolved.len(),
+            query.as_mut_ptr(),
+            query.len(),
+            key.as_mut_ptr(),
+            key.len(),
+        )?;
+        assert!(
+            validate_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len() - 1,
+                query.as_mut_ptr(),
+                query.len(),
+                key.as_mut_ptr(),
+                key.len(),
+            )
+            .is_err(),
+            "short convolved source span must be refused"
+        );
+        assert!(
+            validate_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len(),
+                query.as_mut_ptr(),
+                query.len() - 1,
+                key.as_mut_ptr(),
+                key.len(),
+            )
+            .is_err(),
+            "short Q output span must be refused"
+        );
+        assert!(
+            validate_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len(),
+                query.as_mut_ptr(),
+                query.len(),
+                key.as_mut_ptr(),
+                key.len() - 1,
+            )
+            .is_err(),
+            "short K output span must be refused"
+        );
+        assert!(
+            validate_launch(
+                plan,
+                core::ptr::null(),
+                convolved.len(),
+                query.as_mut_ptr(),
+                query.len(),
+                key.as_mut_ptr(),
+                key.len(),
+            )
+            .is_err(),
+            "null convolved source must be refused"
+        );
+        assert!(
+            validate_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len(),
+                query.as_mut_ptr().wrapping_byte_add(1),
+                query.len(),
+                key.as_mut_ptr(),
+                key.len(),
+            )
+            .is_err(),
+            "misaligned Q output must be refused"
+        );
+        assert!(
+            validate_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len(),
+                convolved.as_ptr().cast_mut(),
+                query.len(),
+                key.as_mut_ptr(),
+                key.len(),
+            )
+            .is_err(),
+            "Q output must not alias the convolved source"
+        );
+        assert!(
+            validate_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len(),
+                query.as_mut_ptr(),
+                query.len(),
+                convolved.as_ptr().cast_mut(),
+                key.len(),
+            )
+            .is_err(),
+            "K output must not alias the convolved source"
+        );
+        assert!(
+            validate_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len(),
+                query.as_mut_ptr(),
+                query.len(),
+                query.as_mut_ptr(),
+                key.len(),
+            )
+            .is_err(),
+            "Q and K outputs must not alias each other"
+        );
+        Ok(())
+    }
+
     #[cfg(logismos_no_gpu_kernels)]
     #[test]
     fn cpu_only_build_refuses_native_recurrent_launch() {
