@@ -1505,41 +1505,72 @@ mod tests {
     }
 
     #[cfg(feature = "gpu")]
-    #[test]
-    fn staged_gpu_step_refuses_unsupported_shape_alias_and_overflow() -> Result<()> {
-        let two_token_plan =
-            match MultiHeadRecurrentAllocationPlan::try_from_dimensions(2, 1, 1, 1, 1) {
-                Ok(plan) => plan,
-                Err(error) => panic!("test dimensions are valid: {error}"),
-            };
-        assert!(matches!(
+    struct ValidGdnStepBuffers {
+        q: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        beta: Vec<f32>,
+        g: Vec<f32>,
+        state_in: Vec<f32>,
+        state_out: Vec<f32>,
+        output: Vec<f32>,
+    }
+
+    #[cfg(feature = "gpu")]
+    impl ValidGdnStepBuffers {
+        fn from_plan(plan: MultiHeadRecurrentAllocationPlan) -> Self {
+            Self {
+                q: vec![1.0_f32; plan.query_and_key_elements()],
+                k: vec![1.0_f32; plan.query_and_key_elements()],
+                v: vec![1.0_f32; plan.output_elements()],
+                beta: vec![1.0_f32; plan.scalar_elements()],
+                g: vec![0.0_f32; plan.scalar_elements()],
+                state_in: vec![0.0_f32; plan.state_elements()],
+                state_out: vec![0.0_f32; plan.state_elements()],
+                output: vec![0.0_f32; plan.output_elements()],
+            }
+        }
+
+        fn validate(
+            &mut self,
+            plan: MultiHeadRecurrentAllocationPlan,
+            scale: f32,
+        ) -> Result<GdnStepAbi> {
             validate_gdn_step_launch(
-                two_token_plan,
-                core::ptr::null(),
-                0,
-                core::ptr::null(),
-                0,
-                core::ptr::null(),
-                0,
-                core::ptr::null(),
-                0,
-                core::ptr::null(),
-                0,
-                1.0,
-                core::ptr::null(),
-                0,
-                core::ptr::null_mut(),
-                0,
-                core::ptr::null_mut(),
-                0,
-            ),
+                plan,
+                self.q.as_ptr(),
+                self.q.len(),
+                self.k.as_ptr(),
+                self.k.len(),
+                self.v.as_ptr(),
+                self.v.len(),
+                self.beta.as_ptr(),
+                self.beta.len(),
+                self.g.as_ptr(),
+                self.g.len(),
+                scale,
+                self.state_in.as_ptr(),
+                self.state_in.len(),
+                self.state_out.as_mut_ptr(),
+                self.state_out.len(),
+                self.output.as_mut_ptr(),
+                self.output.len(),
+            )
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn staged_gpu_step_refuses_unsupported_shape_alias_and_overflow(
+    ) -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let two_token_plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(2, 1, 1, 1, 1)?;
+        let mut two_token_buffers = ValidGdnStepBuffers::from_plan(two_token_plan);
+        assert!(matches!(
+            two_token_buffers.validate(two_token_plan, 1.0),
             Err(crate::Error::UnsupportedShape { .. })
         ));
 
-        let plan = match MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 1, 1, 1, 1) {
-            Ok(plan) => plan,
-            Err(error) => panic!("test dimensions are valid: {error}"),
-        };
+        let plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 1, 1, 1, 1)?;
         let q = [1.0_f32];
         let k = [1.0_f32];
         let v = [1.0_f32];
@@ -1547,39 +1578,9 @@ mod tests {
         let g = [0.0_f32];
         let state = [0.0_f32];
         let mut output = [0.0_f32];
-        let grouped_plan =
-            match MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 2, 4, 3, 2) {
-                Ok(plan) => plan,
-                Err(error) => panic!("test dimensions are valid: {error}"),
-            };
-        let grouped_q = vec![1.0_f32; grouped_plan.query_and_key_elements()];
-        let grouped_k = vec![1.0_f32; grouped_plan.query_and_key_elements()];
-        let grouped_v = vec![1.0_f32; grouped_plan.output_elements()];
-        let grouped_beta = vec![1.0_f32; grouped_plan.scalar_elements()];
-        let grouped_g = vec![0.0_f32; grouped_plan.scalar_elements()];
-        let grouped_state_in = vec![0.0_f32; grouped_plan.state_elements()];
-        let mut grouped_state_out = vec![0.0_f32; grouped_plan.state_elements()];
-        let mut grouped_output = vec![0.0_f32; grouped_plan.output_elements()];
-        let abi = validate_gdn_step_launch(
-            grouped_plan,
-            grouped_q.as_ptr(),
-            grouped_q.len(),
-            grouped_k.as_ptr(),
-            grouped_k.len(),
-            grouped_v.as_ptr(),
-            grouped_v.len(),
-            grouped_beta.as_ptr(),
-            grouped_beta.len(),
-            grouped_g.as_ptr(),
-            grouped_g.len(),
-            1.0,
-            grouped_state_in.as_ptr(),
-            grouped_state_in.len(),
-            grouped_state_out.as_mut_ptr(),
-            grouped_state_out.len(),
-            grouped_output.as_mut_ptr(),
-            grouped_output.len(),
-        )?;
+        let grouped_plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 2, 4, 3, 2)?;
+        let mut grouped_buffers = ValidGdnStepBuffers::from_plan(grouped_plan);
+        let abi = grouped_buffers.validate(grouped_plan, 1.0)?;
         assert_eq!(
             (
                 abi.key_head_count,
@@ -1590,37 +1591,16 @@ mod tests {
             (2, 4, 3, 2),
             "the checked ABI must preserve the allocation owner's grouped geometry"
         );
-        let too_wide_plan = match MultiHeadRecurrentAllocationPlan::try_from_dimensions(
+        let too_wide_plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(
             1,
             1,
             1,
             1,
             MAX_GDN_VALUE_DIM + 1,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => panic!("test dimensions are valid: {error}"),
-        };
+        )?;
+        let mut too_wide_buffers = ValidGdnStepBuffers::from_plan(too_wide_plan);
         assert!(matches!(
-            validate_gdn_step_launch(
-                too_wide_plan,
-                core::ptr::null(),
-                0,
-                core::ptr::null(),
-                0,
-                core::ptr::null(),
-                0,
-                core::ptr::null(),
-                0,
-                core::ptr::null(),
-                0,
-                1.0,
-                core::ptr::null(),
-                0,
-                core::ptr::null_mut(),
-                0,
-                core::ptr::null_mut(),
-                0,
-            ),
+            too_wide_buffers.validate(too_wide_plan, 1.0),
             Err(crate::Error::UnsupportedShape { .. })
         ));
         for invalid_scale in [
@@ -1631,26 +1611,7 @@ mod tests {
             -f32::MIN_POSITIVE / 2.0,
         ] {
             assert!(matches!(
-                validate_gdn_step_launch(
-                    grouped_plan,
-                    grouped_q.as_ptr(),
-                    grouped_q.len(),
-                    grouped_k.as_ptr(),
-                    grouped_k.len(),
-                    grouped_v.as_ptr(),
-                    grouped_v.len(),
-                    grouped_beta.as_ptr(),
-                    grouped_beta.len(),
-                    grouped_g.as_ptr(),
-                    grouped_g.len(),
-                    invalid_scale,
-                    grouped_state_in.as_ptr(),
-                    grouped_state_in.len(),
-                    grouped_state_out.as_mut_ptr(),
-                    grouped_state_out.len(),
-                    grouped_output.as_mut_ptr(),
-                    grouped_output.len(),
-                ),
+                grouped_buffers.validate(grouped_plan, invalid_scale),
                 Err(crate::Error::UnsupportedShape { .. })
             ));
         }
@@ -1708,6 +1669,12 @@ mod tests {
             ),
             Err(crate::Error::UnsupportedShape { .. })
         ));
+        if let Ok(abi_overflow) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(matches!(
+                gdn_step_u32("abi overflow", abi_overflow),
+                Err(crate::Error::UnsupportedShape { .. })
+            ));
+        }
         Ok(())
     }
 
