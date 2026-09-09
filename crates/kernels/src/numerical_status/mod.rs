@@ -10,7 +10,7 @@ pub use codes::{
 #[cfg(feature = "gpu")]
 use hipcore::{Device, DeviceBuffer};
 #[cfg(feature = "gpu")]
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 #[cfg(feature = "gpu")]
 use crate::error::{NumericalStatusSnafu, Result};
@@ -119,25 +119,18 @@ impl NativeNumericalStatus {
     /// physical-device floating-point qualification.
     pub fn read_after_synchronization(&self) -> Result<()> {
         let mut raw = [0_u32];
-        self.bits.copy_to_host(&mut raw).map_err(|source| {
-            NumericalStatusSnafu {
-                source: NativeNumericalStatusError::Hip { source },
-            }
-            .build()
-        })?;
+        self.bits
+            .copy_to_host(&mut raw)
+            .map_err(|source| NativeNumericalStatusError::Hip { source })
+            .context(NumericalStatusSnafu)?;
         let Some(mask) = NativeNumericalStatusMask::from_bits(raw[0]) else {
-            return NumericalStatusSnafu {
-                source: NativeNumericalStatusError::UnknownBits { bits: raw[0] },
-            }
-            .fail();
+            return Err(NativeNumericalStatusError::UnknownBits { bits: raw[0] })
+                .context(NumericalStatusSnafu);
         };
         if mask.is_empty() {
             return Ok(());
         }
-        NumericalStatusSnafu {
-            source: NativeNumericalStatusError::Observed { mask },
-        }
-        .fail()
+        Err(NativeNumericalStatusError::Observed { mask }).context(NumericalStatusSnafu)
     }
 }
 

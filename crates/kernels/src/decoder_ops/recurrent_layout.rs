@@ -6,6 +6,7 @@
 //! staged GDN step. It deliberately does not arrange V: for `T = 1`, V's
 //! contiguous convolution tail already has the GDN row layout.
 
+#[cfg(not(logismos_no_gpu_kernels))]
 use core::ffi::c_void;
 
 use hipcore::Stream;
@@ -284,7 +285,10 @@ unsafe fn launch_recurrent_qk_l2_f32_with_status(
         )?;
         stream.make_current()?;
         let numerical_status = match status {
-            Some(status) => unsafe { status.as_device_ptr().cast::<c_void>() },
+            Some(status) => {
+                // SAFETY: the checked caller retains this nonaliasing status on the stream device.
+                unsafe { status.as_device_ptr().cast::<c_void>() }
+            }
             None => core::ptr::null_mut(),
         };
         // SAFETY: exact spans establish ABI extents; callers retain their
