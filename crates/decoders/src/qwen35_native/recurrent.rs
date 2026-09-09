@@ -76,7 +76,7 @@ pub(super) struct DeferredRecurrent<'resources> {
 impl NativeRecurrentWeights {
     /// Upload exactly the verified descriptors bound by `plan`.
     pub(super) fn upload(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         plan: &DeviceRecurrentPlan,
         device: &Device,
     ) -> Result<Self> {

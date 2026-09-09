@@ -134,13 +134,13 @@ impl Qwen35NativeExecutionDeviceDemand {
 /// output head; optional auxiliary `NextN` blocks are intentionally outside that
 /// baseline and are not a reason to reject an otherwise supported artifact.
 #[derive(Debug)]
-pub struct Qwen35NativeExecutionPlan<'weights, 'artifact> {
-    weights: &'weights Qwen35Weights<'artifact>,
+pub struct Qwen35NativeExecutionPlan<'weights> {
+    weights: &'weights Qwen35Weights,
     plan: DeviceModelPlan,
     demand: Qwen35NativeExecutionDeviceDemand,
 }
 
-impl<'weights, 'artifact> Qwen35NativeExecutionPlan<'weights, 'artifact> {
+impl<'weights> Qwen35NativeExecutionPlan<'weights> {
     /// Derive a checked native main-model plan from verified Qwen3.5 weights.
     ///
     /// This performs no device initialization, allocation, upload, or kernel
@@ -151,7 +151,7 @@ impl<'weights, 'artifact> Qwen35NativeExecutionPlan<'weights, 'artifact> {
     /// Refuses unsupported main-block metadata, matrix formats or geometry,
     /// invalid context or page geometry, and unrepresentable allocation extents.
     pub fn try_from_weights(
-        weights: &'weights Qwen35Weights<'artifact>,
+        weights: &'weights Qwen35Weights,
         max_context: usize,
         page_tokens: kernels::attention::NativePageTokens,
     ) -> Result<Self> {

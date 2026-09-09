@@ -78,7 +78,7 @@ pub(super) struct DeferredLayerFinish<'resources> {
 
 impl LayerFinishPlan {
     pub(super) fn from_weights(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         layout: Layout,
         block: usize,
     ) -> Result<Self> {
@@ -174,7 +174,7 @@ impl LayerFinishWorkspacePlan {
 
 impl LayerFinishWeights {
     pub(super) fn upload(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         plan: &LayerFinishPlan,
         device: &hipcore::Device,
     ) -> Result<Self> {

@@ -228,7 +228,7 @@ pub struct Generation {
 /// without gaining a mutable prompt or a second execution path.
 pub struct PreparedGeneration<'pipeline, 'artifact> {
     pipeline: &'pipeline TextPipeline<'artifact>,
-    plan: Qwen35ExecutionPlan<'pipeline, 'artifact>,
+    plan: Qwen35ExecutionPlan<'pipeline>,
     rendered_prompt: String,
     prompt_token_ids: Vec<u32>,
     max_output_tokens: usize,
@@ -391,7 +391,7 @@ struct SpecialTokenPolicy {
 
 /// Artifact-bound text pipeline.
 pub struct TextPipeline<'artifact> {
-    weights: Qwen35Weights<'artifact>,
+    weights: Qwen35Weights,
     tokenizer: VerifiedTokenizer,
     template: BoundedTemplate<'artifact>,
     special_tokens: SpecialTokenPolicy,

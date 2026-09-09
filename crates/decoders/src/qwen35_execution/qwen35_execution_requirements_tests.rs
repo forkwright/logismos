@@ -360,8 +360,8 @@ fn report_component_sum(
 }
 
 fn assert_same_execution_state(
-    left_execution: &Qwen35Execution<'_, '_>,
-    right_execution: &Qwen35Execution<'_, '_>,
+    left_execution: &Qwen35Execution<'_>,
+    right_execution: &Qwen35Execution<'_>,
 ) -> std::result::Result<(), String> {
     assert_eq!(left_execution.position, right_execution.position);
     assert_eq!(left_execution.layers.len(), right_execution.layers.len());

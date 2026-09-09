@@ -291,6 +291,37 @@ fn verified_artifact_borrows_checked_f32_payload_from_its_immutable_backing() ->
 }
 
 #[test]
+fn verified_artifact_clone_retains_the_verified_backing_after_original_drop() -> Result<()> {
+    let dir = tempdir_for_test();
+    let path = dir.join("verified-clone.gguf");
+    let bytes = fixture_bytes();
+    let identity = ArtifactDigest::Sha256(digest_for_bytes(&bytes));
+    std::fs::write(&path, &bytes)?;
+
+    let artifact = VerifiedArtifact::load(
+        &path,
+        digest_for_bytes(&bytes),
+        fixture_backing_limit(&bytes)?,
+    )?;
+    let retained = artifact.clone();
+    drop(artifact);
+    std::fs::write(&path, b"replaced after verified load")?;
+
+    let tensor = retained.tensor("one")?;
+    assert_eq!(
+        tensor.bytes(),
+        [0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64],
+        "a clone must retain the exact verified bytes rather than rereading its source path"
+    );
+    assert_eq!(
+        retained.observation().inspection().digest,
+        identity,
+        "a clone must retain the identity derived from those exact bytes"
+    );
+    Ok(())
+}
+
+#[test]
 fn verified_artifact_borrows_checked_q8_payload_without_copying_a_model() -> Result<()> {
     let dir = tempdir_for_test();
     let path = dir.join("verified-q8.gguf");

@@ -60,7 +60,7 @@ pub(super) struct ModelDeviceResources {
 
 impl ModelDeviceResources {
     pub(super) fn new(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         plan: DeviceModelPlan,
         device: &Device,
     ) -> Result<Self> {
@@ -367,7 +367,7 @@ impl CompletionResource for ModelDeviceResources {
 }
 
 fn upload_layers(
-    weights: &Qwen35Weights<'_>,
+    weights: &Qwen35Weights,
     plan: &DeviceModelPlan,
     device: &Device,
 ) -> Result<Vec<NativeModelLayer>> {

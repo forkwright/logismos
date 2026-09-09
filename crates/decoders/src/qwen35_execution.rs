@@ -44,8 +44,8 @@ pub enum Qwen35LogitSelection {
 
 /// Opaque artifact-bound construction plan for one CPU execution session.
 #[derive(Debug)]
-pub struct Qwen35ExecutionPlan<'weights, 'artifact> {
-    weights: &'weights Qwen35Weights<'artifact>,
+pub struct Qwen35ExecutionPlan<'weights> {
+    weights: &'weights Qwen35Weights,
     layout: Layout,
     max_step_tokens: usize,
     selection: Qwen35LogitSelection,
@@ -60,12 +60,12 @@ pub struct Qwen35ExecutionPlan<'weights, 'artifact> {
 /// state while borrowing a private paged-KV append transaction; both publish only
 /// after the whole call, including selected final logits, succeeds.
 #[derive(Debug)]
-pub struct Qwen35Execution<'weights, 'artifact> {
-    weights: &'weights Qwen35Weights<'artifact>,
+pub struct Qwen35Execution<'weights> {
+    weights: &'weights Qwen35Weights,
     layout: Layout,
     max_step_tokens: usize,
     selection: Qwen35LogitSelection,
-    layers: Vec<LayerState<'weights, 'artifact>>,
+    layers: Vec<LayerState<'weights>>,
     paged_kv_pool: Option<PagedKvPool>,
     position: usize,
 }
@@ -75,14 +75,14 @@ pub struct Qwen35Execution<'weights, 'artifact> {
     clippy::large_enum_variant,
     reason = "direct recurrent storage avoids an additional infallible per-layer heap allocation; the checked Vec allocation bounds every main block"
 )]
-enum LayerState<'weights, 'artifact> {
-    Recurrent(Qwen35RecurrentExecution<'weights, 'artifact>),
+enum LayerState<'weights> {
+    Recurrent(Qwen35RecurrentExecution<'weights>),
     Full(usize),
 }
 
-impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
+impl<'weights> Qwen35Execution<'weights> {
     pub(crate) fn try_from_weights(
-        weights: &'weights Qwen35Weights<'artifact>,
+        weights: &'weights Qwen35Weights,
         max_context: usize,
     ) -> Result<Self> {
         Qwen35ExecutionPlan::try_from_weights(
@@ -95,9 +95,9 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
     }
 }
 
-impl<'weights, 'artifact> Qwen35ExecutionPlan<'weights, 'artifact> {
+impl<'weights> Qwen35ExecutionPlan<'weights> {
     pub(crate) fn try_from_weights(
-        weights: &'weights Qwen35Weights<'artifact>,
+        weights: &'weights Qwen35Weights,
         max_context: usize,
         max_step_tokens: usize,
         selection: Qwen35LogitSelection,
@@ -134,7 +134,7 @@ impl<'weights, 'artifact> Qwen35ExecutionPlan<'weights, 'artifact> {
     ///
     /// Returns [`crate::Error`] if one plan-derived retained allocation or
     /// artifact-bound recurrent state cannot be constructed.
-    pub fn execution(self) -> Result<Qwen35Execution<'weights, 'artifact>> {
+    pub fn execution(self) -> Result<Qwen35Execution<'weights>> {
         let Self {
             weights,
             layout,
@@ -191,7 +191,7 @@ impl<'weights, 'artifact> Qwen35ExecutionPlan<'weights, 'artifact> {
     }
 }
 
-impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
+impl<'weights> Qwen35Execution<'weights> {
     /// Execute complete token ids and return token-major vocabulary logits.
     ///
     /// The session owns only state derived from its verified payload; callers
@@ -242,7 +242,7 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
         Ok(logits)
     }
 
-    fn stage(&self) -> Result<StagedExecution<'weights, 'artifact>> {
+    fn stage(&self) -> Result<StagedExecution<'weights>> {
         let mut layers = reserve("transaction main-block slots", self.layers.len())?;
         for layer in &self.layers {
             layers.push(match layer {
@@ -262,15 +262,15 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
     }
 }
 
-struct StagedExecution<'weights, 'artifact> {
-    weights: &'weights Qwen35Weights<'artifact>,
+struct StagedExecution<'weights> {
+    weights: &'weights Qwen35Weights,
     layout: Layout,
     selection: Qwen35LogitSelection,
-    layers: Vec<LayerState<'weights, 'artifact>>,
+    layers: Vec<LayerState<'weights>>,
     position: usize,
 }
 
-impl StagedExecution<'_, '_> {
+impl StagedExecution<'_> {
     fn step_staged(
         &mut self,
         token_ids: &[u32],
@@ -478,7 +478,7 @@ struct FullAttentionStep {
     reason = "the pinned full-attention operation order is one bounded transactional unit"
 )]
 fn full_attention(
-    weights: &Qwen35Weights<'_>,
+    weights: &Qwen35Weights,
     layout: Layout,
     step: FullAttentionStep,
     input: &[f32],
@@ -1001,7 +1001,7 @@ impl Layout {
         clippy::too_many_lines,
         reason = "execution-only metadata is admitted at one artifact-bound boundary"
     )]
-    pub(crate) fn from_metadata(weights: &Qwen35Weights<'_>, max_context: usize) -> Result<Self> {
+    pub(crate) fn from_metadata(weights: &Qwen35Weights, max_context: usize) -> Result<Self> {
         if max_context == 0 {
             return ExecutionContextSnafu {
                 requested: max_context,
@@ -1277,7 +1277,7 @@ impl Layout {
 }
 
 pub(crate) fn read_f32(
-    weights: &Qwen35Weights<'_>,
+    weights: &Qwen35Weights,
     name: &str,
     expected_dims: &[u64],
     planned_values: usize,
@@ -1482,7 +1482,7 @@ fn f32_tensor_elements(dimensions: &[u64]) -> Result<usize> {
 }
 
 fn project_checked(
-    weights: &Qwen35Weights<'_>,
+    weights: &Qwen35Weights,
     name: &str,
     input: &[f32],
     planned_values: usize,

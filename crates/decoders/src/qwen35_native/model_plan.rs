@@ -103,7 +103,7 @@ struct ModelBlockPlans {
 
 impl DeviceModelPlan {
     pub(super) fn from_weights(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         max_context: usize,
         page_tokens: kernels::attention::NativePageTokens,
     ) -> Result<Self> {
@@ -166,7 +166,7 @@ impl DeviceModelPlan {
 
 impl ModelBlockPlans {
     fn from_weights(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         layout: Layout,
         page_tokens: kernels::attention::NativePageTokens,
         weights_bytes: usize,
@@ -194,7 +194,7 @@ impl ModelBlockPlans {
 
     fn push_full(
         &mut self,
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         layout: Layout,
         block: usize,
         page_tokens: kernels::attention::NativePageTokens,
@@ -228,7 +228,7 @@ impl ModelBlockPlans {
 
     fn push_recurrent(
         &mut self,
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         layout: Layout,
         block: usize,
     ) -> Result<()> {

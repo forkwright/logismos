@@ -36,7 +36,7 @@ pub struct Qwen35CpuRequirements {
 
 impl Qwen35CpuRequirements {
     pub(crate) fn try_from_plan(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         layout: Layout,
         max_step_tokens: usize,
         selection: Qwen35LogitSelection,

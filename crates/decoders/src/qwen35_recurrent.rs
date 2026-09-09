@@ -58,8 +58,8 @@ pub(crate) enum RecurrentTensorRole {
 /// delta recurrence, gated `RMSNorm`, and output projection. It does not execute
 /// residuals, FFN, dense attention, `NextN`, tokenization, logits, or a model.
 #[derive(Debug)]
-pub struct Qwen35RecurrentExecution<'weights, 'artifact> {
-    weights: &'weights Qwen35Weights<'artifact>,
+pub struct Qwen35RecurrentExecution<'weights> {
+    weights: &'weights Qwen35Weights,
     block_index: u64,
     layout: ExecutionLayout,
     attention_norm: Vec<f32>,
@@ -125,7 +125,7 @@ impl RecurrentRetainedAllocations {
     }
 }
 
-impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
+impl<'weights> Qwen35RecurrentExecution<'weights> {
     pub(crate) fn retained_elements(layout: Qwen35RecurrentLayout, epsilon: f32) -> Result<usize> {
         let layout = ExecutionLayout::try_from_profile(layout, epsilon)?;
         RecurrentRetainedAllocations::try_from_layout(layout)?.total_elements()
@@ -140,7 +140,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         Ok(RecurrentStepAllocations::try_from_layout(layout, token_count)?.workspace_elements())
     }
     pub(crate) fn try_from_weights(
-        weights: &'weights Qwen35Weights<'artifact>,
+        weights: &'weights Qwen35Weights,
         block_index: u64,
     ) -> Result<Self> {
         let epsilon = recurrent_layernorm_rms_epsilon(weights.payload().observation().metadata())?;
@@ -1021,7 +1021,7 @@ impl RecurrentStepAllocations {
 }
 
 fn read_f32_tensor(
-    weights: &Qwen35Weights<'_>,
+    weights: &Qwen35Weights,
     name: &str,
     expected_dims: &[u64],
     planned_values: usize,
@@ -1304,7 +1304,7 @@ fn softplus(value: f32) -> f32 {
     reason = "the checked token matrix shape and its owner plan are one projection contract"
 )]
 fn project_tokens(
-    weights: &Qwen35Weights<'_>,
+    weights: &Qwen35Weights,
     name: &str,
     values: &[f32],
     token_count: usize,

@@ -58,7 +58,7 @@ pub(super) struct FullAttentionStep<'buffers> {
 
 impl DeviceResources {
     pub(super) fn new(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         plan: DeviceFullAttentionPlan,
         device: &Device,
     ) -> Result<Self> {
