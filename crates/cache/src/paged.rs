@@ -1147,8 +1147,8 @@ impl NativePagedAppend<'_> {
     ///
     /// # Safety
     ///
-    /// `keys` and `values` must contain finite normal-or-zero rows and remain
-    /// live and immutable through stream completion. Their device must match
+    /// `keys` and `values` must remain live and immutable through stream
+    /// completion. Their device must match
     /// this pool and `stream`, which must be the ordered pool-device stream passed to
     /// [`NativePagedKvPool::begin_append`]. The caller owns completion and
     /// must poison its whole session if submission completion becomes uncertain.
@@ -1292,9 +1292,12 @@ impl NativePagedLayerKv<'_> {
     ///
     /// # Safety
     ///
-    /// `query` must contain finite normal-or-zero values and remain live and
-    /// immutable through completion. `output` must remain exclusively owned
-    /// through completion; both buffers must be on this pool's device.
+    /// `query` must remain live and immutable through completion. `output`
+    /// must remain live and exclusively owned through completion; both buffers
+    /// must be on this pool's device. The query, staged K/V and every arithmetic
+    /// intermediate must satisfy the attention launcher's finite normal-or-zero
+    /// numerical domain. Buffer ownership and device checks do not prove that
+    /// numerical precondition.
     /// `stream` must be this pool's device stream and exactly the ordered
     /// stream passed to begin/row submission for this transaction.
     ///
