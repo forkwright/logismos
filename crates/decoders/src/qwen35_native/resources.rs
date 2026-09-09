@@ -61,7 +61,7 @@ impl DeviceResources {
         let stream = Stream::new(device).context(NativeDeviceSnafu)?;
         let owned_weights = NativeWeights::upload(weights, &plan, device)?;
         let kv = NativePagedKvPool::new(plan.kv, device).context(NativePagedKvSnafu)?;
-        let workspace = NativeWorkspace::new(plan.workspace, device)?;
+        let workspace = NativeWorkspace::new(&plan.workspace, device)?;
         Ok(Self {
             plan,
             weights: owned_weights,
@@ -142,7 +142,7 @@ impl DeviceResources {
     }
 }
 impl NativeWorkspace {
-    fn new(plan: WorkspacePlan, device: &Device) -> Result<Self> {
+    fn new(plan: &WorkspacePlan, device: &Device) -> Result<Self> {
         macro_rules! buffer {
             ($field:ident) => {
                 DeviceBuffer::alloc(device, plan.$field).context(NativeDeviceSnafu)?

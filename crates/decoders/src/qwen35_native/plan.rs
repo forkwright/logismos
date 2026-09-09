@@ -16,7 +16,7 @@ use crate::{Qwen35Weights, Result};
 pub(crate) struct DeviceFullAttentionPlan {
     pub(crate) layout: Layout,
     pub(crate) matrices: ProjectionWeights,
-    pub(crate) scalars: ScalarWeights,
+    pub(crate) norms: NormalizationWeights,
     pub(crate) workspace: WorkspacePlan,
     pub(crate) kv: NativePagedKvPlan,
     pub(crate) bytes: DeviceByteDemand,
@@ -76,11 +76,11 @@ pub(crate) struct ScalarWeight {
 }
 
 #[derive(Debug)]
-pub(crate) struct ScalarWeights {
-    pub(crate) input_norm: ScalarWeight,
-    pub(crate) query_norm: ScalarWeight,
-    pub(crate) key_norm: ScalarWeight,
-    pub(crate) post_attention_norm: ScalarWeight,
+pub(crate) struct NormalizationWeights {
+    pub(crate) input: ScalarWeight,
+    pub(crate) query: ScalarWeight,
+    pub(crate) key: ScalarWeight,
+    pub(crate) post_attention: ScalarWeight,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,7 +125,7 @@ impl DeviceFullAttentionPlan {
             .fail();
         }
         let matrices = ProjectionWeights::from_weights(weights, block)?;
-        let scalars = ScalarWeights::from_weights(weights, layout, block)?;
+        let norms = NormalizationWeights::from_weights(weights, layout, block)?;
         let workspace = WorkspacePlan::from_layout(layout)?;
         let kv = NativePagedKvPlan::try_from_geometry(
             PagedKvGeometry {
@@ -153,10 +153,7 @@ impl DeviceFullAttentionPlan {
         .context(ExecutionPagedDecodePlanSnafu)?;
         let f32_bytes = size_of::<f32>();
         let bytes = DeviceByteDemand {
-            weights: sum(
-                &[matrices.bytes()?, scalars.bytes()?],
-                "native weight bytes",
-            )?,
+            weights: sum(&[matrices.bytes()?, norms.bytes()?], "native weight bytes")?,
             scratch: elements_bytes(workspace.elements()?, f32_bytes, "native scratch bytes")?,
             input: elements_bytes(layout.hidden, f32_bytes, "native input bytes")?,
             output: elements_bytes(layout.hidden, f32_bytes, "native output bytes")?,
@@ -187,7 +184,7 @@ impl DeviceFullAttentionPlan {
         Ok(Self {
             layout,
             matrices,
-            scalars,
+            norms,
             workspace,
             kv,
             bytes,
@@ -224,17 +221,17 @@ impl ProjectionWeights {
     }
 }
 
-impl ScalarWeights {
+impl NormalizationWeights {
     fn from_weights(weights: &Qwen35Weights<'_>, layout: Layout, block: usize) -> Result<Self> {
         Ok(Self {
-            input_norm: scalar(
+            input: scalar(
                 weights,
                 block_name(block, "attn_norm.weight"),
                 layout.hidden,
             )?,
-            query_norm: scalar(weights, block_name(block, "attn_q_norm.weight"), layout.key)?,
-            key_norm: scalar(weights, block_name(block, "attn_k_norm.weight"), layout.key)?,
-            post_attention_norm: scalar(
+            query: scalar(weights, block_name(block, "attn_q_norm.weight"), layout.key)?,
+            key: scalar(weights, block_name(block, "attn_k_norm.weight"), layout.key)?,
+            post_attention: scalar(
                 weights,
                 block_name(block, "post_attention_norm.weight"),
                 layout.hidden,
@@ -244,10 +241,10 @@ impl ScalarWeights {
 
     fn bytes(&self) -> Result<usize> {
         let widths = [
-            self.input_norm.elements,
-            self.query_norm.elements,
-            self.key_norm.elements,
-            self.post_attention_norm.elements,
+            self.input.elements,
+            self.query.elements,
+            self.key.elements,
+            self.post_attention.elements,
         ];
         elements_bytes(
             sum(&widths, "native scalar weight elements")?,

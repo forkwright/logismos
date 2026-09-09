@@ -1,10 +1,10 @@
-//! Shared Qwen3.5 text MRoPE coefficient derivation.
+//! Shared Qwen3.5 text `MRoPE` coefficient derivation.
 
 use crate::Result;
 use crate::error::{ArithmeticOverflowSnafu, ExecutionArithmeticSnafu};
 use num_traits::ToPrimitive;
 
-/// Validated text MRoPE parameters reused by CPU and native execution.
+/// Validated text `MRoPE` parameters reused by CPU and native execution.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TextMrope {
     rotary_width: usize,
@@ -95,6 +95,8 @@ pub(crate) fn text_mrope_coefficient(
 
 #[cfg(test)]
 mod tests {
+    use num_traits::ToPrimitive;
+
     use super::{TextMrope, text_mrope_coefficient};
 
     const POSITION: usize = 3;
@@ -103,14 +105,22 @@ mod tests {
 
     #[test]
     fn coefficients_match_independent_text_position_angles() -> std::result::Result<(), String> {
-        let position = POSITION as f64;
+        let position = POSITION
+            .to_f64()
+            .ok_or_else(|| "test position must fit f64".to_string())?;
         let expected = [position, position / ROPE_BASE.sqrt()];
         for (index, angle) in expected.into_iter().enumerate() {
             let (actual_cosine, actual_sine) =
                 text_mrope_coefficient(TextMrope::new(4, ROPE_BASE, [1, 1, 0, 0]), POSITION, index)
                     .map_err(|error| error.to_string())?;
-            let expected_cosine = angle.cos() as f32;
-            let expected_sine = angle.sin() as f32;
+            let expected_cosine = angle
+                .cos()
+                .to_f32()
+                .ok_or_else(|| "independent cosine must fit f32".to_string())?;
+            let expected_sine = angle
+                .sin()
+                .to_f32()
+                .ok_or_else(|| "independent sine must fit f32".to_string())?;
             assert!(
                 (actual_cosine - expected_cosine).abs() <= COEFFICIENT_EPSILON,
                 "cosine coefficient must derive from the independent text-position angle"

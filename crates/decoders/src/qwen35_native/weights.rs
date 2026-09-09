@@ -42,10 +42,10 @@ impl NativeWeights {
             ffn_gate: matrix(weights, &plan.matrices.ffn_gate, device)?,
             ffn_up: matrix(weights, &plan.matrices.ffn_up, device)?,
             ffn_down: matrix(weights, &plan.matrices.ffn_down, device)?,
-            input_norm: scalar(weights, &plan.scalars.input_norm, device)?,
-            query_norm: scalar(weights, &plan.scalars.query_norm, device)?,
-            key_norm: scalar(weights, &plan.scalars.key_norm, device)?,
-            post_attention_norm: scalar(weights, &plan.scalars.post_attention_norm, device)?,
+            input_norm: scalar(weights, &plan.norms.input, device)?,
+            query_norm: scalar(weights, &plan.norms.query, device)?,
+            key_norm: scalar(weights, &plan.norms.key, device)?,
+            post_attention_norm: scalar(weights, &plan.norms.post_attention, device)?,
         })
     }
 }
