@@ -287,6 +287,13 @@ mod tests {
     const TOLERANCE: f32 = 1e-3;
     const TAIL_VALUE_HEADS: usize = 263;
 
+    struct ScalarFixture {
+        alpha: Vec<f32>,
+        dt: Vec<f32>,
+        a: Vec<f32>,
+        beta_projection: Vec<f32>,
+    }
+
     #[test]
     fn native_order_tracks_independent_f64_oracle_and_input_mutations()
     -> core::result::Result<(), Box<dyn std::error::Error>> {
@@ -387,12 +394,21 @@ mod tests {
     #[test]
     fn native_order_reference_preserves_tail_head_order()
     -> core::result::Result<(), Box<dyn std::error::Error>> {
-        let (alpha, dt, a, beta_projection) = tail_fixture()?;
+        let fixture = tail_fixture()?;
         let plan = RecurrentScalarsF32Plan::try_from_value_heads(TAIL_VALUE_HEADS)?;
-        let (beta, log_decay) =
-            recurrent_scalars_native_order_reference(plan, &alpha, &dt, &a, &beta_projection)?;
-        let (expected_beta, expected_log_decay) =
-            recurrent_scalars_f64_oracle(&alpha, &dt, &a, &beta_projection);
+        let (beta, log_decay) = recurrent_scalars_native_order_reference(
+            plan,
+            &fixture.alpha,
+            &fixture.dt,
+            &fixture.a,
+            &fixture.beta_projection,
+        )?;
+        let (expected_beta, expected_log_decay) = recurrent_scalars_f64_oracle(
+            &fixture.alpha,
+            &fixture.dt,
+            &fixture.a,
+            &fixture.beta_projection,
+        );
         assert_close_f64(&beta, &expected_beta, "tail recurrent beta");
         assert_close_f64(&log_decay, &expected_log_decay, "tail recurrent log decay");
         assert!(
@@ -480,20 +496,24 @@ mod tests {
 
         const OUTPUT_SENTINEL: f32 = -1_234.5;
 
-        let (alpha, dt, a, beta_projection) = tail_fixture()?;
+        let fixture = tail_fixture()?;
         let plan = RecurrentScalarsF32Plan::try_from_value_heads(TAIL_VALUE_HEADS)
             .map_err(|error| format!("plan recurrent scalars: {error}"))?;
-        let (expected_beta, expected_log_decay) =
-            recurrent_scalars_f64_oracle(&alpha, &dt, &a, &beta_projection);
+        let (expected_beta, expected_log_decay) = recurrent_scalars_f64_oracle(
+            &fixture.alpha,
+            &fixture.dt,
+            &fixture.a,
+            &fixture.beta_projection,
+        );
         let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
         let stream = Stream::new(&device).map_err(|error| format!("create stream: {error}"))?;
-        let alpha_device = DeviceBuffer::from_host(&device, &alpha)
+        let alpha_device = DeviceBuffer::from_host(&device, &fixture.alpha)
             .map_err(|error| format!("upload alpha: {error}"))?;
-        let dt_device =
-            DeviceBuffer::from_host(&device, &dt).map_err(|error| format!("upload dt: {error}"))?;
-        let a_device =
-            DeviceBuffer::from_host(&device, &a).map_err(|error| format!("upload A: {error}"))?;
-        let beta_projection_device = DeviceBuffer::from_host(&device, &beta_projection)
+        let dt_device = DeviceBuffer::from_host(&device, &fixture.dt)
+            .map_err(|error| format!("upload dt: {error}"))?;
+        let a_device = DeviceBuffer::from_host(&device, &fixture.a)
+            .map_err(|error| format!("upload A: {error}"))?;
+        let beta_projection_device = DeviceBuffer::from_host(&device, &fixture.beta_projection)
             .map_err(|error| format!("upload beta projection: {error}"))?;
         let sentinel = vec![OUTPUT_SENTINEL; TAIL_VALUE_HEADS];
         let beta_device = DeviceBuffer::from_host(&device, &sentinel)
@@ -551,7 +571,7 @@ mod tests {
         Ok(())
     }
 
-    fn tail_fixture() -> core::result::Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String> {
+    fn tail_fixture() -> core::result::Result<ScalarFixture, String> {
         let lane_values = (0..TAIL_VALUE_HEADS)
             .map(|index| {
                 u16::try_from(index)
@@ -559,18 +579,18 @@ mod tests {
                     .map_err(|error| format!("convert fixture lane {index}: {error}"))
             })
             .collect::<core::result::Result<Vec<_>, _>>()?;
-        Ok((
-            lane_values.iter().map(|lane| lane * 0.031 - 4.0).collect(),
-            lane_values
+        Ok(ScalarFixture {
+            alpha: lane_values.iter().map(|lane| lane * 0.031 - 4.0).collect(),
+            dt: lane_values
                 .iter()
                 .map(|lane| (lane % 11.0) * 0.07 - 0.35)
                 .collect(),
-            lane_values
+            a: lane_values
                 .iter()
                 .map(|lane| (lane % 7.0) * 0.2 - 0.6)
                 .collect(),
-            lane_values.iter().map(|lane| lane * 0.043 - 5.5).collect(),
-        ))
+            beta_projection: lane_values.iter().map(|lane| lane * 0.043 - 5.5).collect(),
+        })
     }
 
     fn recurrent_scalars_f64_oracle(
