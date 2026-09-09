@@ -116,13 +116,25 @@ impl<T: BytePod> DeviceBuffer<T> {
     /// stream and all of its registered buffers.
     #[must_use]
     pub fn begin_release(self) -> BufferRelease<T> {
-        map_buffer_release(self.into_release_owner())
+        map_buffer_release(self.into_release_owner(crate::teardown::TeardownEntryId::standalone()))
     }
 
-    pub(crate) fn into_release_owner(self) -> ReleaseOwner<Self> {
-        let metadata =
-            ResourceMetadata::new(ResourceKind::Buffer, self.byte_len(), self.device.clone());
-        ReleaseOwner::new(self, metadata)
+    pub(crate) fn into_release_owner(
+        self,
+        entry: crate::teardown::TeardownEntryId,
+    ) -> ReleaseOwner<Self> {
+        let metadata = ResourceMetadata::new(
+            ResourceKind::Buffer,
+            self.byte_len(),
+            self.device.clone(),
+            entry,
+        );
+        ReleaseOwner::new(self, metadata, Self::dispose_after_release)
+    }
+
+    fn dispose_after_release(buffer: Self) {
+        let Self { device, .. } = buffer;
+        drop(device);
     }
 
     /// Number of `T` elements.

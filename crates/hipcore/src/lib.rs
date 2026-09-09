@@ -59,7 +59,7 @@ pub use crate::stream::{
     StreamRelease, StreamTeardownQuarantine,
 };
 pub use crate::teardown::{
-    InventoryQuarantine, InventoryReceipt, InventoryRelease, PendingInventory, ReleaseReceipt,
-    ResourceKind, ResourceMetadata, TeardownError, TeardownInventory, TeardownPhase,
-    TeardownTombstone,
+    InventoryQuarantine, InventoryReceipt, InventoryRelease, NonOwnedInventory, PendingInventory,
+    ReleaseReceipt, ResourceKind, ResourceMetadata, TeardownEntryId, TeardownError,
+    TeardownInventory, TeardownPhase, TeardownTombstone,
 };

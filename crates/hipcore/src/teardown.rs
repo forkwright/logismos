@@ -5,7 +5,7 @@ use core::mem::ManuallyDrop;
 use snafu::Snafu;
 
 use crate::device::Device;
-use crate::error::Error;
+use crate::error::{Error, InternalSnafu};
 use crate::memory::{DeviceBuffer, attempt_buffer_release};
 use crate::pod::BytePod;
 use crate::stream::{Stream, StreamQuiesce, attempt_stream_release, quiesce_stream_owner};
@@ -37,14 +37,21 @@ pub struct ResourceMetadata {
     kind: ResourceKind,
     requested_bytes: usize,
     device: Device,
+    entry: TeardownEntryId,
 }
 
 impl ResourceMetadata {
-    pub(crate) fn new(kind: ResourceKind, requested_bytes: usize, device: Device) -> Self {
+    pub(crate) fn new(
+        kind: ResourceKind,
+        requested_bytes: usize,
+        device: Device,
+        entry: TeardownEntryId,
+    ) -> Self {
         Self {
             kind,
             requested_bytes,
             device,
+            entry,
         }
     }
 
@@ -64,6 +71,32 @@ impl ResourceMetadata {
     #[must_use]
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Stable entry identity within the teardown owner that captured it.
+    #[must_use]
+    pub const fn entry(&self) -> TeardownEntryId {
+        self.entry
+    }
+}
+
+/// Stable local identity of an entry captured for explicit teardown.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct TeardownEntryId(usize);
+
+impl TeardownEntryId {
+    pub(crate) const fn standalone() -> Self {
+        Self(0)
+    }
+
+    pub(crate) const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    /// Zero-based position assigned when the teardown owner captured this entry.
+    #[must_use]
+    pub const fn position(self) -> usize {
+        self.0
     }
 }
 
@@ -178,13 +211,15 @@ impl TeardownTombstone {
 pub(crate) struct ReleaseOwner<R> {
     resource: ManuallyDrop<R>,
     metadata: ResourceMetadata,
+    dispose_after_ack: fn(R),
 }
 
 impl<R> ReleaseOwner<R> {
-    pub(crate) fn new(resource: R, metadata: ResourceMetadata) -> Self {
+    pub(crate) fn new(resource: R, metadata: ResourceMetadata, dispose_after_ack: fn(R)) -> Self {
         Self {
             resource: ManuallyDrop::new(resource),
             metadata,
+            dispose_after_ack,
         }
     }
 
@@ -213,6 +248,8 @@ impl<R> ReleaseOwner<R> {
                 tombstone: TeardownTombstone::new(error),
             };
         }
+        let resource = ManuallyDrop::into_inner(owner.resource);
+        (owner.dispose_after_ack)(resource);
         ReleaseAttempt::Released(ReleaseReceipt::new(owner.metadata))
     }
 
@@ -286,9 +323,25 @@ impl<T: BytePod> TeardownInventory<T> {
         let TeardownInventory { stream, buffers } = self;
         let buffers = buffers
             .into_iter()
-            .map(DeviceBuffer::into_release_owner)
+            .enumerate()
+            .map(|(entry, buffer)| buffer.into_release_owner(TeardownEntryId::new(entry)))
             .collect();
-        match quiesce_stream_owner(stream.into_release_owner()) {
+        if !stream.owns_explicit_handle() {
+            return InventoryRelease::NotOwned(NonOwnedInventory { _buffers: buffers });
+        }
+        let stream = stream.into_release_owner(TeardownEntryId::new(usize::MAX));
+        if let Err(error) = inventory_extent(&stream, &buffers) {
+            return InventoryRelease::Pending(PendingInventory {
+                state: PendingInventoryState::Admission {
+                    stream: stream.pending(TeardownPhase::Preflight, error),
+                    buffers,
+                },
+            });
+        }
+        match quiesce_stream_owner(stream) {
+            StreamQuiesce::NotOwned => {
+                InventoryRelease::NotOwned(NonOwnedInventory { _buffers: buffers })
+            }
             StreamQuiesce::Quiescent(stream) => {
                 resume_buffers(stream.owner, None, buffers, Vec::new())
             }
@@ -319,6 +372,8 @@ impl InventoryReceipt {
 /// Explicit inventory teardown outcome.
 #[non_exhaustive]
 pub enum InventoryRelease<T: BytePod> {
+    /// The inventory was given the non-owned NULL stream; no destroy acknowledgement exists.
+    NotOwned(NonOwnedInventory<T>),
     /// Every buffer and the quiescent stream acknowledged destruction.
     Released(InventoryReceipt),
     /// No uncertain resource is released automatically; retry is explicit.
@@ -332,7 +387,16 @@ pub struct PendingInventory<T: BytePod> {
     state: PendingInventoryState<T>,
 }
 
+/// Opaque retained buffers from an inventory rejected for a non-owned stream.
+pub struct NonOwnedInventory<T: BytePod> {
+    _buffers: Vec<ReleaseOwner<DeviceBuffer<T>>>,
+}
+
 enum PendingInventoryState<T: BytePod> {
+    Admission {
+        stream: PendingOwner<Stream>,
+        buffers: Vec<ReleaseOwner<DeviceBuffer<T>>>,
+    },
     Synchronizing {
         stream: PendingOwner<Stream>,
         buffers: Vec<ReleaseOwner<DeviceBuffer<T>>>,
@@ -354,8 +418,36 @@ impl<T: BytePod> PendingInventory<T> {
     #[must_use]
     pub fn retry(self) -> InventoryRelease<T> {
         match self.state {
+            PendingInventoryState::Admission { stream, buffers } => {
+                let stream = stream.into_owner();
+                if let Err(error) = inventory_extent(&stream, &buffers) {
+                    return InventoryRelease::Pending(Self {
+                        state: PendingInventoryState::Admission {
+                            stream: stream.pending(TeardownPhase::Preflight, error),
+                            buffers,
+                        },
+                    });
+                }
+                match quiesce_stream_owner(stream) {
+                    StreamQuiesce::NotOwned => {
+                        InventoryRelease::NotOwned(NonOwnedInventory { _buffers: buffers })
+                    }
+                    StreamQuiesce::Quiescent(stream) => {
+                        resume_buffers(stream.owner, None, buffers, Vec::new())
+                    }
+                    StreamQuiesce::Pending(stream) => InventoryRelease::Pending(Self {
+                        state: PendingInventoryState::Synchronizing {
+                            stream: stream.pending,
+                            buffers,
+                        },
+                    }),
+                }
+            }
             PendingInventoryState::Synchronizing { stream, buffers } => {
                 match quiesce_stream_owner(stream.into_owner()) {
+                    StreamQuiesce::NotOwned => {
+                        InventoryRelease::NotOwned(NonOwnedInventory { _buffers: buffers })
+                    }
                     StreamQuiesce::Quiescent(stream) => {
                         resume_buffers(stream.owner, None, buffers, Vec::new())
                     }
@@ -378,6 +470,22 @@ impl<T: BytePod> PendingInventory<T> {
             }
         }
     }
+}
+
+fn inventory_extent<T: BytePod>(
+    stream: &ReleaseOwner<Stream>,
+    buffers: &[ReleaseOwner<DeviceBuffer<T>>],
+) -> core::result::Result<usize, Error> {
+    buffers
+        .iter()
+        .try_fold(stream.requested_bytes(), |extent, buffer| {
+            extent.checked_add(buffer.requested_bytes()).ok_or_else(|| {
+                InternalSnafu {
+                    message: "teardown inventory requested-byte extent overflow".to_string(),
+                }
+                .build()
+            })
+        })
 }
 
 /// Opaque conservative charge after a partial inventory destructor failure.
@@ -528,6 +636,11 @@ impl<R> ReleaseOwner<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
     use crate::device::Device;
     use crate::error::Error;
@@ -535,12 +648,28 @@ mod tests {
     fn owner(value: u8) -> ReleaseOwner<u8> {
         ReleaseOwner::new(
             value,
-            ResourceMetadata::new(ResourceKind::Buffer, 16, Device::for_test(0)),
+            ResourceMetadata::new(
+                ResourceKind::Buffer,
+                16,
+                Device::for_test(0),
+                TeardownEntryId::standalone(),
+            ),
+            |_| {},
         )
     }
 
     fn failure() -> Error {
         Error::runtime(1, "synthetic teardown")
+    }
+
+    struct RustMetadata {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for RustMetadata {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[test]
@@ -561,6 +690,26 @@ mod tests {
         assert!(matches!(outcome, ReleaseAttempt::Released(_)));
         assert_eq!(prepares, 1);
         assert_eq!(destructors, 1);
+    }
+
+    #[test]
+    fn acknowledged_release_disposes_rust_metadata_without_repeating_destructor() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = ReleaseOwner::new(
+            RustMetadata {
+                drops: Arc::clone(&drops),
+            },
+            ResourceMetadata::new(
+                ResourceKind::Buffer,
+                16,
+                Device::for_test(0),
+                TeardownEntryId::standalone(),
+            ),
+            |_| {},
+        );
+        let outcome = owner.attempt(TeardownPhase::Preflight, |_| Ok(()), |_| Ok(()));
+        assert!(matches!(outcome, ReleaseAttempt::Released(_)));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -110,7 +110,12 @@ impl Stream {
     /// stream has been released.
     #[must_use]
     pub fn begin_quiesce(self) -> StreamQuiesce {
-        quiesce_stream_owner(self.into_release_owner())
+        if !self.owns_handle || self.handle.is_null() {
+            return StreamQuiesce::NotOwned;
+        }
+        quiesce_stream_owner(
+            self.into_release_owner(crate::teardown::TeardownEntryId::standalone()),
+        )
     }
 
     /// Queue `event` on this stream.
@@ -130,15 +135,29 @@ impl Stream {
         )
     }
 
-    pub(crate) fn into_release_owner(self) -> ReleaseOwner<Self> {
-        let metadata = ResourceMetadata::new(ResourceKind::Stream, 0, self.device.clone());
-        ReleaseOwner::new(self, metadata)
+    pub(crate) fn into_release_owner(
+        self,
+        entry: crate::teardown::TeardownEntryId,
+    ) -> ReleaseOwner<Self> {
+        let metadata = ResourceMetadata::new(ResourceKind::Stream, 0, self.device.clone(), entry);
+        ReleaseOwner::new(self, metadata, Self::dispose_after_release)
+    }
+
+    fn dispose_after_release(stream: Self) {
+        let Self { device, .. } = stream;
+        drop(device);
+    }
+
+    pub(crate) const fn owns_explicit_handle(&self) -> bool {
+        self.owns_handle && !self.handle.is_null()
     }
 }
 
 /// Outcome of consuming a stream for explicit synchronization.
 #[non_exhaustive]
 pub enum StreamQuiesce {
+    /// This is the non-owned NULL stream, so no destroy acknowledgement exists.
+    NotOwned,
     /// Synchronization proved that submitted stream work completed.
     Quiescent(QuiescentStream),
     /// Preflight or synchronization failed without invoking a destructor.
