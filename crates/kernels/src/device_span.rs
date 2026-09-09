@@ -82,10 +82,16 @@ mod tests {
     -> core::result::Result<(), Box<dyn std::error::Error>> {
         let values = [0.0_f32; 2];
         let present = checked_f32_device_span(KERNEL, values.as_ptr(), values.len(), "present")?;
-        let absent = checked_f32_device_span(KERNEL, core::ptr::null(), 0, "absent")?;
+        let absent = checked_f32_device_span(
+            KERNEL,
+            values.as_ptr().wrapping_add(1),
+            0,
+            "absent inside present",
+        )?;
 
         assert!(absent.is_none(), "zero elements must have no device footprint");
         reject_overlapping_f32_spans(KERNEL, absent, present)?;
+        reject_overlapping_f32_spans(KERNEL, present, absent)?;
         Ok(())
     }
 }

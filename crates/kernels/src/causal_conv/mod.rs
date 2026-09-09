@@ -982,14 +982,39 @@ mod tests {
             buffers.validate(plan),
             Err(crate::Error::UnsupportedShape { .. })
         ));
+        buffers.input.resize(plan.output_elements(), 1.0);
+        buffers.weights.clear();
+        assert!(matches!(
+            buffers.validate(plan),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        buffers.weights.resize(plan.weight_elements(), 1.0);
+        buffers.history_in.clear();
+        assert!(matches!(
+            buffers.validate(plan),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        buffers.history_in.resize(plan.history_elements(), 0.0);
+        buffers.history_out.clear();
+        assert!(matches!(
+            buffers.validate(plan),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        buffers.history_out.resize(plan.history_elements(), 0.0);
+        buffers.output.clear();
+        assert!(matches!(
+            buffers.validate(plan),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        buffers.output.resize(plan.output_elements(), 0.0);
 
         let plan = CausalConvAllocationPlan::try_from_dimensions(1, 1, 2)?;
         let mut aligned = ValidCausalConvStepBuffers::from_plan(plan);
-        let misaligned = [0_u8; core::mem::size_of::<f32>() + 1];
+        let aligned_f32 = [0.0_f32; 2];
         assert!(matches!(
             validate_causal_conv_step_launch(
                 plan,
-                misaligned.as_ptr().wrapping_add(1).cast::<f32>(),
+                aligned_f32.as_ptr().cast::<u8>().wrapping_add(1).cast::<f32>(),
                 aligned.input.len(),
                 aligned.weights.as_ptr(),
                 aligned.weights.len(),
@@ -1107,12 +1132,13 @@ mod tests {
     #[cfg(feature = "gpu")]
     #[test]
     #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
-    fn reserved_device_step_matches_oracle_and_continuation() -> core::result::Result<(), String> {
+    fn reserved_device_step_matches_oracle_continuation_and_width_one()
+    -> core::result::Result<(), String> {
         use hipcore::{Device, DeviceBuffer, Stream};
 
         let device = Device::new(0).map_err(|error| format!("open reserved device 0: {error}"))?;
         let stream = Stream::new(&device).map_err(|error| format!("create stream: {error}"))?;
-        let weights = [0.5, -1.0, 0.25, 1.25, 0.75, -0.5, -0.25, 0.5, 1.0];
+        let weights_host = [0.5, -1.0, 0.25, 1.25, 0.75, -0.5, -0.25, 0.5, 1.0];
         let initial_history = [-2.0, 0.5, 1.0, -1.5, 0.25, 2.0];
         let first_input = [0.25, -1.0, 1.5];
         let second_input = [0.75, -0.5, 2.0];
@@ -1120,7 +1146,7 @@ mod tests {
             .map_err(|error| format!("build one-token plan: {error}"))?;
         let (first_output_oracle, first_history_oracle) = oracle_causal_conv(
             &first_input,
-            &weights,
+            &weights_host,
             &initial_history,
             1,
             3,
@@ -1133,7 +1159,7 @@ mod tests {
             .collect();
         let (second_output_oracle, second_history_oracle) = oracle_causal_conv(
             &second_input,
-            &weights,
+            &weights_host,
             &first_history_expected,
             1,
             3,
@@ -1143,7 +1169,7 @@ mod tests {
 
         let input = DeviceBuffer::<f32>::from_host(&device, &first_input)
             .map_err(|error| format!("upload first input: {error}"))?;
-        let weights = DeviceBuffer::<f32>::from_host(&device, &weights)
+        let weights = DeviceBuffer::<f32>::from_host(&device, &weights_host)
             .map_err(|error| format!("upload weights: {error}"))?;
         let history_in = DeviceBuffer::<f32>::from_host(&device, &initial_history)
             .map_err(|error| format!("upload initial history: {error}"))?;
@@ -1185,9 +1211,22 @@ mod tests {
         input
             .copy_to_host(&mut preserved_first_input)
             .map_err(|error| format!("read immutable first input: {error}"))?;
+        let mut preserved_initial_history = vec![0.0_f32; history_in.len()];
+        history_in
+            .copy_to_host(&mut preserved_initial_history)
+            .map_err(|error| format!("read immutable initial history: {error}"))?;
+        let mut preserved_weights = vec![0.0_f32; weights.len()];
+        weights
+            .copy_to_host(&mut preserved_weights)
+            .map_err(|error| format!("read immutable weights: {error}"))?;
         assert_close_f64(&first_output, &first_output_oracle, "device first output");
         assert_close_f64(&first_history, &first_history_oracle, "device first history");
         assert_eq!(preserved_first_input, first_input, "device input must remain immutable");
+        assert_eq!(
+            preserved_initial_history, initial_history,
+            "device initial history must remain immutable"
+        );
+        assert_eq!(preserved_weights, weights_host, "device weights must remain immutable");
 
         let second_input = DeviceBuffer::<f32>::from_host(&device, &second_input)
             .map_err(|error| format!("upload continuation input: {error}"))?;
@@ -1225,6 +1264,10 @@ mod tests {
         second_history_out
             .copy_to_host(&mut actual_second_history)
             .map_err(|error| format!("read continuation history: {error}"))?;
+        let mut preserved_first_history = vec![0.0_f32; history_out.len()];
+        history_out
+            .copy_to_host(&mut preserved_first_history)
+            .map_err(|error| format!("read immutable first staged history: {error}"))?;
         assert_close_f64(
             &actual_second_output,
             &second_output_oracle,
@@ -1234,6 +1277,66 @@ mod tests {
             &actual_second_history,
             &second_history_oracle,
             "device continuation history",
+        );
+        assert_close_f64(
+            &preserved_first_history,
+            &first_history_oracle,
+            "device immutable first staged history",
+        );
+
+        let width_one_input = [2.0_f32, -3.0];
+        let width_one_weights = [4.0_f32, -0.5];
+        let width_one_plan = CausalConvAllocationPlan::try_from_dimensions(1, 2, 1)
+            .map_err(|error| format!("build width-one plan: {error}"))?;
+        let (width_one_output_oracle, width_one_history_oracle) = oracle_causal_conv(
+            &width_one_input,
+            &width_one_weights,
+            &[],
+            1,
+            2,
+            1,
+        )
+        .map_err(|error| format!("width-one oracle: {error}"))?;
+        let width_one_input = DeviceBuffer::<f32>::from_host(&device, &width_one_input)
+            .map_err(|error| format!("upload width-one input: {error}"))?;
+        let width_one_weights = DeviceBuffer::<f32>::from_host(&device, &width_one_weights)
+            .map_err(|error| format!("upload width-one weights: {error}"))?;
+        let width_one_output = DeviceBuffer::<f32>::alloc(&device, width_one_plan.output_elements())
+            .map_err(|error| format!("allocate width-one output: {error}"))?;
+        // SAFETY: width one has no history footprint, so null history pointers
+        // carry zero lengths while the remaining distinct buffers match `plan`.
+        unsafe {
+            launch_causal_conv_step_f32(
+                width_one_plan,
+                width_one_input.as_device_ptr(),
+                width_one_input.len(),
+                width_one_weights.as_device_ptr(),
+                width_one_weights.len(),
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                0,
+                width_one_output.as_device_ptr(),
+                width_one_output.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch width-one causal-convolution step: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize width-one step: {error}"))?;
+        let mut actual_width_one_output = vec![0.0_f32; width_one_output.len()];
+        width_one_output
+            .copy_to_host(&mut actual_width_one_output)
+            .map_err(|error| format!("read width-one output: {error}"))?;
+        assert_close_f64(
+            &actual_width_one_output,
+            &width_one_output_oracle,
+            "device width-one output",
+        );
+        assert!(
+            width_one_history_oracle.is_empty(),
+            "width one must retain no history"
         );
         Ok(())
     }

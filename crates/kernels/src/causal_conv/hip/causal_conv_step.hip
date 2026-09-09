@@ -22,7 +22,9 @@ extern "C" __global__ void logismos_causal_conv_step_f32_kernel(
     std::uint32_t channel_count,
     std::uint32_t width)
 {
-    const auto channel = static_cast<std::uint32_t>(blockIdx.x);
+    const auto channel = static_cast<std::uint64_t>(blockIdx.x)
+        * static_cast<std::uint64_t>(blockDim.x)
+        + static_cast<std::uint64_t>(threadIdx.x);
     if (channel >= channel_count) {
         return;
     }
