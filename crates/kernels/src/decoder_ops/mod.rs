@@ -5,6 +5,7 @@ use std::ffi::c_void;
 
 use hipcore::Stream;
 use num_traits::ToPrimitive;
+#[cfg(test)]
 use snafu::ResultExt;
 
 #[cfg(any(test, not(logismos_no_gpu_kernels)))]
@@ -21,6 +22,7 @@ const SPLIT_Q_GATE_KERNEL: &str = "decoder_split_q_gate_f32";
 const SIGMOID_MUL_KERNEL: &str = "decoder_sigmoid_mul_f32";
 const SILU_MUL_KERNEL: &str = "decoder_silu_mul_f32";
 const RESIDUAL_ADD_KERNEL: &str = "decoder_residual_add_f32";
+#[cfg(test)]
 const WAVE_SIZE: usize = 32;
 const ELEMENTWISE_THREADS: usize = 256;
 
@@ -338,11 +340,13 @@ impl ElementwiseF32Plan {
 ///
 /// # Safety
 ///
-/// Every nonempty pointer must identify a live, correctly aligned allocation
-/// on `stream`'s device through completion. `output_f32` must not alias either
-/// input and is exclusively writable through completion. Inputs and every
-/// reduction/output intermediate must be finite and normal-or-zero; this ABI
-/// has no device status channel for checked numerical refusals.
+/// Every pointer must identify a correctly aligned allocation on `stream`'s
+/// device for its exact declared extent and remain live through stream
+/// completion. Both inputs must remain immutable, and `output_f32` must remain
+/// exclusively writable, through completion. `output_f32` must not alias
+/// either input. Inputs and every reduction/output intermediate must be finite
+/// and normal-or-zero; this ABI has no device status channel for checked
+/// numerical refusals.
 pub unsafe fn launch_rms_norm_f32(
     plan: RmsNormF32Plan,
     input_f32: *const f32,
@@ -405,9 +409,12 @@ pub unsafe fn launch_rms_norm_f32(
 ///
 /// # Safety
 ///
-/// `values_f32` must be exclusively writable through completion and must not
-/// alias either coefficient span. All values, coefficients, products, and
-/// rotated results must be finite and normal-or-zero on `stream`'s device.
+/// Every pointer must identify a correctly aligned allocation on `stream`'s
+/// device for its exact declared extent and remain live through stream
+/// completion. Both coefficient spans must remain immutable, and `values_f32`
+/// must remain exclusively writable, through completion. `values_f32` must
+/// not alias either coefficient span. All values, coefficients, products, and
+/// rotated results must be finite and normal-or-zero.
 pub unsafe fn launch_rotary_half_split_f32_in_place(
     plan: RotaryHalfSplitF32Plan,
     values_f32: *mut f32,
@@ -469,9 +476,12 @@ pub unsafe fn launch_rotary_half_split_f32_in_place(
 ///
 /// # Safety
 ///
-/// The source is immutable through completion. Both outputs are exclusive and
-/// may not alias each other or the source. Every device operand is finite and
-/// normal-or-zero through this copy-only operation.
+/// Every pointer must identify a correctly aligned allocation on `stream`'s
+/// device for its exact declared extent and remain live through stream
+/// completion. The source must remain immutable, and both outputs must remain
+/// exclusively writable, through completion. The outputs may not alias each
+/// other or the source. Every operand must be finite and normal-or-zero through
+/// this copy-only operation.
 pub unsafe fn launch_split_q_gate_f32(
     plan: SplitQGateF32Plan,
     q_gate_f32: *const f32,
@@ -531,9 +541,12 @@ pub unsafe fn launch_split_q_gate_f32(
 ///
 /// # Safety
 ///
-/// Inputs remain immutable and output remains exclusively writable through
-/// completion. Output must not alias either input. Inputs and all sigmoid and
-/// product intermediates must be finite and normal-or-zero.
+/// Every pointer must identify a correctly aligned allocation on `stream`'s
+/// device for its exact declared extent and remain live through stream
+/// completion. Inputs must remain immutable, and output must remain
+/// exclusively writable, through completion. Output must not alias either
+/// input. Inputs and all sigmoid and product intermediates must be finite and
+/// normal-or-zero.
 pub unsafe fn sigmoid_mul(
     plan: ElementwiseF32Plan,
     value_f32: *const f32,
@@ -569,9 +582,12 @@ pub unsafe fn sigmoid_mul(
 ///
 /// # Safety
 ///
-/// Inputs remain immutable and output remains exclusively writable through
-/// completion. Output must not alias either input. Inputs and all exponential,
-/// activation, and product intermediates must be finite and normal-or-zero.
+/// Every pointer must identify a correctly aligned allocation on `stream`'s
+/// device for its exact declared extent and remain live through stream
+/// completion. Inputs must remain immutable, and output must remain
+/// exclusively writable, through completion. Output must not alias either
+/// input. Inputs and all exponential, activation, and product intermediates
+/// must be finite and normal-or-zero.
 pub unsafe fn silu_mul(
     plan: ElementwiseF32Plan,
     gate_f32: *const f32,
@@ -607,9 +623,11 @@ pub unsafe fn silu_mul(
 ///
 /// # Safety
 ///
-/// Inputs remain immutable and output remains exclusively writable through
-/// completion. Output must not alias either input. Inputs and every sum must
-/// be finite and normal-or-zero.
+/// Every pointer must identify a correctly aligned allocation on `stream`'s
+/// device for its exact declared extent and remain live through stream
+/// completion. Inputs must remain immutable, and output must remain
+/// exclusively writable, through completion. Output must not alias either
+/// input. Inputs and every sum must be finite and normal-or-zero.
 pub unsafe fn residual_add(
     plan: ElementwiseF32Plan,
     left_f32: *const f32,
@@ -924,6 +942,7 @@ fn validate_grid(kernel: &'static str, work_items: usize, threads: usize) -> Res
     abi_u32(kernel, "native launch-grid blocks", blocks).map(|_| ())
 }
 
+#[cfg(any(test, not(logismos_no_gpu_kernels)))]
 fn validate_length(
     kernel: &'static str,
     name: &'static str,
@@ -944,6 +963,7 @@ fn unsupported_shape<T>(kernel: &'static str, msg: String) -> Result<T> {
     UnsupportedShapeSnafu { kernel, msg }.fail()
 }
 
+#[cfg(test)]
 fn reserve_native_reference(operation: &'static str, elements: usize) -> Result<Vec<f32>> {
     let mut output = Vec::new();
     output
@@ -955,6 +975,7 @@ fn reserve_native_reference(operation: &'static str, elements: usize) -> Result<
     Ok(output)
 }
 
+#[cfg(test)]
 fn validate_reference_length(
     operation: &'static str,
     name: &'static str,
@@ -964,6 +985,7 @@ fn validate_reference_length(
     validate_length(operation, name, actual, expected)
 }
 
+#[cfg(test)]
 fn rms_norm_native_order_reference(
     plan: RmsNormF32Plan,
     input: &[f32],
@@ -1056,6 +1078,7 @@ fn rms_norm_native_order_reference(
     Ok(output)
 }
 
+#[cfg(test)]
 fn rotary_half_split_native_order_reference(
     plan: RotaryHalfSplitF32Plan,
     values: &[f32],
@@ -1125,6 +1148,7 @@ fn rotary_half_split_native_order_reference(
     Ok(output)
 }
 
+#[cfg(test)]
 fn split_q_gate_native_order_reference(
     plan: SplitQGateF32Plan,
     source: &[f32],
@@ -1158,6 +1182,7 @@ fn split_q_gate_native_order_reference(
     Ok((query, gate))
 }
 
+#[cfg(test)]
 fn sigmoid_mul_native_order_reference(
     plan: ElementwiseF32Plan,
     value: &[f32],
@@ -1168,6 +1193,7 @@ fn sigmoid_mul_native_order_reference(
     })
 }
 
+#[cfg(test)]
 fn silu_mul_native_order_reference(
     plan: ElementwiseF32Plan,
     gate: &[f32],
@@ -1178,6 +1204,7 @@ fn silu_mul_native_order_reference(
     })
 }
 
+#[cfg(test)]
 fn residual_add_native_order_reference(
     plan: ElementwiseF32Plan,
     left: &[f32],
@@ -1188,6 +1215,7 @@ fn residual_add_native_order_reference(
     })
 }
 
+#[cfg(test)]
 fn elementwise_native_order_reference(
     plan: ElementwiseF32Plan,
     left: &[f32],
@@ -1280,16 +1308,132 @@ mod tests {
         let plan = ElementwiseF32Plan::try_from_elements(query.len())?;
         let sigmoid = sigmoid_mul_native_order_reference(plan, &query, &gate)?;
         let silu = silu_mul_native_order_reference(plan, &gate, &query)?;
+        let sigmoid_expected = query
+            .iter()
+            .zip(&gate)
+            .map(|(value, gate)| f64::from(*value) * (1.0 / (1.0 + (-f64::from(*gate)).exp())))
+            .collect::<Vec<_>>();
+        assert_close_f64(
+            &sigmoid,
+            &sigmoid_expected,
+            "independent sigmoid multiplication",
+        );
+        let silu_expected = gate
+            .iter()
+            .zip(&query)
+            .map(|(gate, up)| {
+                let gate = f64::from(*gate);
+                (gate / (1.0 + (-gate).exp())) * f64::from(*up)
+            })
+            .collect::<Vec<_>>();
+        assert_close_f64(&silu, &silu_expected, "independent SiLU multiplication");
         let residual = residual_add_native_order_reference(plan, &sigmoid, &silu)?;
-        for (index, got) in residual.iter().enumerate() {
-            let q = f64::from(*query.get(index).ok_or("query index")?);
-            let g = f64::from(*gate.get(index).ok_or("gate index")?);
-            let expected = q * (1.0 / (1.0 + (-g).exp())) + (g / (1.0 + (-g).exp())) * q;
-            assert!(
-                (f64::from(*got) - expected).abs() <= f64::from(TOLERANCE),
-                "index {index}: got {got}, expected {expected}"
-            );
-        }
+        let residual_expected = sigmoid
+            .iter()
+            .zip(&silu)
+            .map(|(left, right)| f64::from(*left) + f64::from(*right))
+            .collect::<Vec<_>>();
+        assert_close_f64(
+            &residual,
+            &residual_expected,
+            "independent residual addition",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rms_validator_accepts_exact_spans_and_refuses_short_input()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let rms_plan = RmsNormF32Plan::try_from_dimensions(1, 3, 1e-5)?;
+        let rms_input = [1.0_f32, 2.0, 3.0];
+        let rms_weight = [1.0_f32, 1.0, 1.0];
+        let mut rms_output = [0.0_f32; 3];
+        validate_rms_launch(
+            rms_plan,
+            rms_input.as_ptr(),
+            rms_input.len(),
+            rms_weight.as_ptr(),
+            rms_weight.len(),
+            rms_output.as_mut_ptr(),
+            rms_output.len(),
+        )?;
+        assert!(
+            validate_rms_launch(
+                rms_plan,
+                rms_input.as_ptr(),
+                rms_input.len() - 1,
+                rms_weight.as_ptr(),
+                rms_weight.len(),
+                rms_output.as_mut_ptr(),
+                rms_output.len(),
+            )
+            .is_err(),
+            "short RMSNorm input must be refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotary_validator_accepts_exact_spans_and_refuses_short_sine()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let rotary_plan = RotaryHalfSplitF32Plan::try_from_dimensions(1, 5, 4)?;
+        let mut rotary_values = [1.0_f32, 2.0, 3.0, 4.0, 5.0];
+        let rotary_cosine = [1.0_f32, 1.0];
+        let rotary_sine = [0.0_f32, 0.0];
+        validate_rotary_launch(
+            rotary_plan,
+            rotary_values.as_mut_ptr(),
+            rotary_values.len(),
+            rotary_cosine.as_ptr(),
+            rotary_cosine.len(),
+            rotary_sine.as_ptr(),
+            rotary_sine.len(),
+        )?;
+        assert!(
+            validate_rotary_launch(
+                rotary_plan,
+                rotary_values.as_mut_ptr(),
+                rotary_values.len(),
+                rotary_cosine.as_ptr(),
+                rotary_cosine.len(),
+                rotary_sine.as_ptr(),
+                rotary_sine.len() - 1,
+            )
+            .is_err(),
+            "short rotary sine span must be refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn split_validator_accepts_exact_spans_and_refuses_short_gate()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let split_plan = SplitQGateF32Plan::try_from_dimensions(2, 3)?;
+        let split_source = [0.0_f32; 12];
+        let mut split_query = [0.0_f32; 6];
+        let mut split_gate = [0.0_f32; 6];
+        validate_split_launch(
+            split_plan,
+            split_source.as_ptr(),
+            split_source.len(),
+            split_query.as_mut_ptr(),
+            split_query.len(),
+            split_gate.as_mut_ptr(),
+            split_gate.len(),
+        )?;
+        assert!(
+            validate_split_launch(
+                split_plan,
+                split_source.as_ptr(),
+                split_source.len(),
+                split_query.as_mut_ptr(),
+                split_query.len(),
+                split_gate.as_mut_ptr(),
+                split_gate.len() - 1,
+            )
+            .is_err(),
+            "short gate output must be refused"
+        );
         Ok(())
     }
 
@@ -1412,19 +1556,23 @@ mod tests {
     fn reserved_device_decoder_ops_match_native_references() -> core::result::Result<(), String> {
         use hipcore::{Device, DeviceBuffer};
 
+        const OUTPUT_SENTINEL: f32 = -1_234.5;
+
         let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
         let stream = Stream::new(&device).map_err(|error| format!("create stream: {error}"))?;
 
-        let rms_plan = RmsNormF32Plan::try_from_dimensions(1, 3, 1e-5)
+        let rms_plan = RmsNormF32Plan::try_from_dimensions(1, 37, 1e-5)
             .map_err(|error| format!("plan RMSNorm: {error}"))?;
-        let rms_input_host = [1.0_f32, -2.0, 3.0];
-        let rms_weight_host = [0.5_f32, 1.5, -1.0];
+        let mut rms_input_host = [1.0_f32; 37];
+        rms_input_host[32] = 3.0;
+        let rms_weight_host = [1.0_f32; 37];
+        let rms_output_host = [OUTPUT_SENTINEL; 37];
         let rms_input = DeviceBuffer::from_host(&device, &rms_input_host)
             .map_err(|error| format!("upload RMSNorm input: {error}"))?;
         let rms_weight = DeviceBuffer::from_host(&device, &rms_weight_host)
             .map_err(|error| format!("upload RMSNorm weight: {error}"))?;
-        let rms_output = DeviceBuffer::alloc(&device, rms_plan.elements())
-            .map_err(|error| format!("allocate RMSNorm output: {error}"))?;
+        let rms_output = DeviceBuffer::from_host(&device, &rms_output_host)
+            .map_err(|error| format!("initialize RMSNorm output: {error}"))?;
         // SAFETY: distinct buffers satisfy the exact plan spans and remain live through synchronization.
         unsafe {
             launch_rms_norm_f32(
@@ -1486,15 +1634,18 @@ mod tests {
         .map_err(|error| format!("rotary reference: {error}"))?;
         assert_close_f32(&rotary_actual, &rotary_expected, "device rotary");
 
-        let split_plan = SplitQGateF32Plan::try_from_dimensions(1, 3)
+        let split_plan = SplitQGateF32Plan::try_from_dimensions(2, 3)
             .map_err(|error| format!("plan split: {error}"))?;
-        let split_source_host = [1.0_f32, 2.0, 3.0, -2.0, 0.0, 2.0];
+        let split_source_host = [
+            1.0_f32, 2.0, 3.0, -2.0, 0.0, 2.0, 10.0, 20.0, 30.0, 3.0, -1.0, 0.5,
+        ];
+        let split_output_host = [OUTPUT_SENTINEL; 6];
         let split_source = DeviceBuffer::from_host(&device, &split_source_host)
             .map_err(|error| format!("upload split source: {error}"))?;
-        let split_query = DeviceBuffer::alloc(&device, split_plan.output_elements())
-            .map_err(|error| format!("allocate split query: {error}"))?;
-        let split_gate = DeviceBuffer::alloc(&device, split_plan.output_elements())
-            .map_err(|error| format!("allocate split gate: {error}"))?;
+        let split_query = DeviceBuffer::from_host(&device, &split_output_host)
+            .map_err(|error| format!("initialize split query: {error}"))?;
+        let split_gate = DeviceBuffer::from_host(&device, &split_output_host)
+            .map_err(|error| format!("initialize split gate: {error}"))?;
         // SAFETY: source is immutable and the two outputs are distinct exact plan spans.
         unsafe {
             launch_split_q_gate_f32(
@@ -1528,8 +1679,9 @@ mod tests {
 
         let elementwise = ElementwiseF32Plan::try_from_elements(query_expected.len())
             .map_err(|error| format!("plan elementwise: {error}"))?;
-        let elementwise_output = DeviceBuffer::alloc(&device, elementwise.elements())
-            .map_err(|error| format!("allocate elementwise output: {error}"))?;
+        let elementwise_output_host = [OUTPUT_SENTINEL; 6];
+        let sigmoid_output = DeviceBuffer::from_host(&device, &elementwise_output_host)
+            .map_err(|error| format!("initialize sigmoid output: {error}"))?;
         // SAFETY: all source/output buffers are distinct exact plan spans.
         unsafe {
             sigmoid_mul(
@@ -1538,8 +1690,8 @@ mod tests {
                 split_query.len(),
                 split_gate.as_device_ptr(),
                 split_gate.len(),
-                elementwise_output.as_device_ptr(),
-                elementwise_output.len(),
+                sigmoid_output.as_device_ptr(),
+                sigmoid_output.len(),
                 &stream,
             )
         }
@@ -1547,7 +1699,7 @@ mod tests {
         stream
             .synchronize()
             .map_err(|error| format!("synchronize sigmoid multiplication: {error}"))?;
-        let sigmoid_actual = read_device(&elementwise_output)?;
+        let sigmoid_actual = read_device(&sigmoid_output)?;
         let sigmoid_expected =
             sigmoid_mul_native_order_reference(elementwise, &query_expected, &gate_expected)
                 .map_err(|error| format!("sigmoid reference: {error}"))?;
@@ -1556,6 +1708,8 @@ mod tests {
             &sigmoid_expected,
             "device sigmoid multiplication",
         );
+        let silu_output = DeviceBuffer::from_host(&device, &elementwise_output_host)
+            .map_err(|error| format!("initialize SiLU output: {error}"))?;
         // SAFETY: inputs remain immutable and output remains an exclusive exact plan span.
         unsafe {
             silu_mul(
@@ -1564,8 +1718,8 @@ mod tests {
                 split_gate.len(),
                 split_query.as_device_ptr(),
                 split_query.len(),
-                elementwise_output.as_device_ptr(),
-                elementwise_output.len(),
+                silu_output.as_device_ptr(),
+                silu_output.len(),
                 &stream,
             )
         }
@@ -1573,11 +1727,13 @@ mod tests {
         stream
             .synchronize()
             .map_err(|error| format!("synchronize SiLU multiplication: {error}"))?;
-        let silu_actual = read_device(&elementwise_output)?;
+        let silu_actual = read_device(&silu_output)?;
         let silu_expected =
             silu_mul_native_order_reference(elementwise, &gate_expected, &query_expected)
                 .map_err(|error| format!("SiLU reference: {error}"))?;
         assert_close_f32(&silu_actual, &silu_expected, "device SiLU multiplication");
+        let residual_output = DeviceBuffer::from_host(&device, &elementwise_output_host)
+            .map_err(|error| format!("initialize residual output: {error}"))?;
         // SAFETY: both input buffers and the output buffer remain distinct through completion.
         unsafe {
             residual_add(
@@ -1586,8 +1742,8 @@ mod tests {
                 split_query.len(),
                 split_gate.as_device_ptr(),
                 split_gate.len(),
-                elementwise_output.as_device_ptr(),
-                elementwise_output.len(),
+                residual_output.as_device_ptr(),
+                residual_output.len(),
                 &stream,
             )
         }
@@ -1595,7 +1751,7 @@ mod tests {
         stream
             .synchronize()
             .map_err(|error| format!("synchronize residual addition: {error}"))?;
-        let residual_actual = read_device(&elementwise_output)?;
+        let residual_actual = read_device(&residual_output)?;
         let residual_expected =
             residual_add_native_order_reference(elementwise, &query_expected, &gate_expected)
                 .map_err(|error| format!("residual reference: {error}"))?;
@@ -1651,6 +1807,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(logismos_no_gpu_kernels))]
     fn assert_close_f32(actual: &[f32], expected: &[f32], operation: &str) {
         assert_eq!(
             actual.len(),
@@ -1665,6 +1822,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(logismos_no_gpu_kernels))]
     fn read_device(buffer: &hipcore::DeviceBuffer<f32>) -> core::result::Result<Vec<f32>, String> {
         let mut host = vec![0.0_f32; buffer.len()];
         buffer
