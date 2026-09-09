@@ -45,9 +45,9 @@ fn verified_full_block_plan_accepts_each_explicit_native_page_size()
     let artifact = verify_fixture(&canonical_hybrid_fixture()?)?;
     let weights = Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
     for (page_tokens, key_values, total) in [
-        (kernels::attention::NativePageTokens::B8, 32_768, 76_384),
-        (kernels::attention::NativePageTokens::B16, 65_536, 109_152),
-        (kernels::attention::NativePageTokens::B32, 131_072, 174_688),
+        (kernels::attention::NativePageTokens::B8, 32_768, 76_640),
+        (kernels::attention::NativePageTokens::B16, 65_536, 109_408),
+        (kernels::attention::NativePageTokens::B32, 131_072, 174_944),
     ] {
         let plan = DeviceFullAttentionPlan::from_weights(&weights, 3, 4, page_tokens)
             .map_err(|error| error.to_string())?;
@@ -58,7 +58,9 @@ fn verified_full_block_plan_accepts_each_explicit_native_page_size()
         );
         assert_eq!(plan.bytes.input, 12, "one hidden f32 input row");
         assert_eq!(plan.bytes.output, 12, "one hidden f32 output row");
-        assert_eq!(plan.bytes.controls, 256, "64 rotary f32 controls");
+        // WHY: absent dimension_count defaults to D=128 in this fixture:
+        // 64 pairs each require one f32 cosine and one f32 sine.
+        assert_eq!(plan.bytes.controls, 512, "128 rotary f32 controls");
         assert_eq!(
             plan.bytes.table, 4,
             "four-token context uses one table entry"
