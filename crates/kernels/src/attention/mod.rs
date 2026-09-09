@@ -295,6 +295,18 @@ pub enum PagedDecodeError {
         location: snafu::Location,
     },
 
+    /// A checked native descriptor dimension cannot cross the u32 HIP ABI.
+    #[snafu(display("{PAGED_DECODE}: native {dimension} {value} exceeds the HIP ABI u32 domain"))]
+    NativeAbiOutOfRange {
+        /// Native descriptor dimension that failed conversion.
+        dimension: &'static str,
+        /// Rejected native descriptor dimension value.
+        value: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// A requested query head was outside the admitted query-head range.
     #[snafu(display("{PAGED_DECODE}: query head {query_head} is outside 0..{query_heads}"))]
     QueryHeadOutOfRange {
@@ -622,6 +634,17 @@ impl NativePageTokens {
 /// checks dense K/V and table allocation layouts plus ABI dimensions, but
 /// cannot inspect device table values or scalar contents.
 #[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativePagedDecodeAbi {
+    visible_tokens: u32,
+    query_heads: u32,
+    kv_heads: u32,
+    head_width: u32,
+    page_tokens: u32,
+    physical_pages: u32,
+}
+
+#[cfg(feature = "gpu")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NativePagedDecodePlan {
     logical: PagedDecodePlan,
@@ -631,6 +654,7 @@ pub struct NativePagedDecodePlan {
     query_elements: usize,
     key_value_elements: usize,
     output_elements: usize,
+    abi: NativePagedDecodeAbi,
 }
 
 #[cfg(feature = "gpu")]
@@ -641,7 +665,8 @@ impl NativePagedDecodePlan {
     ///
     /// Returns [`PagedDecodeError`] when the requested native page size is not
     /// B8/B16/B32, physical-page count is zero, a native extent overflows, or
-    /// a dense K/V or table allocation layout is unrepresentable.
+    /// a dense K/V or table allocation layout or any u32 ABI dimension is
+    /// unrepresentable.
     pub fn try_from_paged_decode(
         logical: PagedDecodePlan,
         page_tokens: usize,
@@ -649,6 +674,14 @@ impl NativePagedDecodePlan {
     ) -> PagedDecodeResult<Self> {
         let page_tokens = NativePageTokens::try_from_tokens(page_tokens)?;
         validate_nonzero_dimension("physical_pages", physical_pages)?;
+        let abi = NativePagedDecodeAbi {
+            visible_tokens: native_abi_u32("visible_tokens", logical.visible_tokens)?,
+            kv_heads: native_abi_u32("kv_heads", logical.kv_heads)?,
+            query_heads: native_abi_u32("query_heads", logical.query_heads)?,
+            head_width: native_abi_u32("head_width", logical.head_width)?,
+            page_tokens: native_abi_u32("page_tokens", page_tokens.get())?,
+            physical_pages: native_abi_u32("physical_pages", physical_pages)?,
+        };
         let logical_pages = logical
             .visible_tokens
             .checked_sub(1)
@@ -681,6 +714,7 @@ impl NativePagedDecodePlan {
             query_elements,
             key_value_elements,
             output_elements: query_elements,
+            abi,
         })
     }
 
@@ -749,9 +783,10 @@ impl NativePagedDecodePlan {
 ///
 /// Returns [`crate::Error::UnsupportedShape`] when a supplied extent differs
 /// from the descriptor, a nonempty span is null, unaligned, unrepresentable,
-/// aliases the writable output, or a dimension cannot cross the `u32` ABI. A
-/// CPU-only build returns [`crate::Error::NoGpuBuild`] without initializing
-/// HIP. HIP stream-current and submission failures are propagated.
+/// or aliases the writable output. Descriptor construction already rejects
+/// dimensions outside the `u32` ABI. A CPU-only build returns
+/// [`crate::Error::NoGpuBuild`] without initializing HIP. HIP stream-current
+/// and submission failures are propagated.
 ///
 /// # Safety
 ///
@@ -858,17 +893,6 @@ fn no_gpu_paged_decode_refusal() -> KernelResult<()> {
 }
 
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
-#[derive(Debug, Clone, Copy)]
-struct PagedDecodeAbi {
-    visible_tokens: u32,
-    query_heads: u32,
-    kv_heads: u32,
-    head_width: u32,
-    page_tokens: u32,
-    physical_pages: u32,
-}
-
-#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 #[expect(
     clippy::too_many_arguments,
     reason = "validation receives the fixed raw Q=1 paged-attention ABI without a second geometry owner"
@@ -885,7 +909,7 @@ fn validate_paged_decode_launch(
     page_table_entries: usize,
     output_f32: *mut f32,
     output_elements: usize,
-) -> KernelResult<PagedDecodeAbi> {
+) -> KernelResult<NativePagedDecodeAbi> {
     validate_native_length("query", query_elements, plan.query_elements)?;
     validate_native_length("keys", key_elements, plan.key_value_elements)?;
     validate_native_length("values", value_elements, plan.key_value_elements)?;
@@ -912,14 +936,7 @@ fn validate_paged_decode_launch(
         reject_overlapping_device_spans(PAGED_DECODE_KERNEL, output, input)?;
     }
 
-    Ok(PagedDecodeAbi {
-        visible_tokens: native_u32("visible_tokens", plan.logical.visible_tokens)?,
-        query_heads: native_u32("query_heads", plan.logical.query_heads)?,
-        kv_heads: native_u32("kv_heads", plan.logical.kv_heads)?,
-        head_width: native_u32("head_width", plan.logical.head_width)?,
-        page_tokens: native_u32("page_tokens", plan.page_tokens.get())?,
-        physical_pages: native_u32("physical_pages", plan.physical_pages)?,
-    })
+    Ok(plan.abi)
 }
 
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
@@ -937,15 +954,9 @@ fn validate_native_length(name: &'static str, actual: usize, expected: usize) ->
     }
 }
 
-#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
-fn native_u32(name: &'static str, value: usize) -> KernelResult<u32> {
-    u32::try_from(value).map_err(|_| {
-        UnsupportedShapeSnafu {
-            kernel: PAGED_DECODE_KERNEL,
-            msg: format!("{name} {value} exceeds the HIP ABI u32 domain"),
-        }
-        .build()
-    })
+#[cfg(feature = "gpu")]
+fn native_abi_u32(dimension: &'static str, value: usize) -> PagedDecodeResult<u32> {
+    u32::try_from(value).map_err(|_| NativeAbiOutOfRangeSnafu { dimension, value }.build())
 }
 
 fn checked_product(
@@ -1264,19 +1275,76 @@ mod tests {
             NativePagedDecodePlan::try_from_paged_decode(logical, 12, 1),
             Err(PagedDecodeError::NativePageTokensUnsupported { .. })
         ));
-        let native_layout_overflow =
-            isize::MAX as usize / (core::mem::size_of::<f32>() * NativePageTokens::B8.get()) + 1;
-        let small_logical = PagedDecodePlan::try_from_dimensions(1, 1, 1, 1)?;
+        let largest_abi_page_count = usize::try_from(u32::MAX)?;
+        let native_layout_width = isize::MAX as usize
+            / core::mem::size_of::<f32>()
+            / NativePageTokens::B8.get()
+            / largest_abi_page_count
+            + 1;
+        let native_layout_logical =
+            PagedDecodePlan::try_from_dimensions(1, 1, 1, native_layout_width)?;
         assert!(matches!(
             NativePagedDecodePlan::try_from_paged_decode(
-                small_logical,
+                native_layout_logical,
                 NativePageTokens::B8.get(),
-                native_layout_overflow,
+                largest_abi_page_count,
             ),
             Err(PagedDecodeError::AllocationLayout {
                 allocation: "native keys",
                 ..
             })
+        ));
+        let beyond_u32 = usize::try_from(u32::MAX)?
+            .checked_add(1)
+            .ok_or("host usize cannot represent the u32 ABI boundary")?;
+        let visible_beyond_abi = PagedDecodePlan::try_from_dimensions(beyond_u32, 1, 1, 1)?;
+        assert!(matches!(
+            NativePagedDecodePlan::try_from_paged_decode(visible_beyond_abi, 8, 1),
+            Err(PagedDecodeError::NativeAbiOutOfRange {
+                dimension: "visible_tokens",
+                value,
+                ..
+            }) if value == beyond_u32
+        ));
+        let query_heads_beyond_abi = PagedDecodePlan::try_from_dimensions(1, beyond_u32, 1, 1)?;
+        assert!(matches!(
+            NativePagedDecodePlan::try_from_paged_decode(query_heads_beyond_abi, 8, 1),
+            Err(PagedDecodeError::NativeAbiOutOfRange {
+                dimension: "query_heads",
+                value,
+                ..
+            }) if value == beyond_u32
+        ));
+        let kv_heads_beyond_abi =
+            PagedDecodePlan::try_from_dimensions(1, beyond_u32, beyond_u32, 1)?;
+        assert!(matches!(
+            NativePagedDecodePlan::try_from_paged_decode(kv_heads_beyond_abi, 8, 1),
+            Err(PagedDecodeError::NativeAbiOutOfRange {
+                dimension: "kv_heads",
+                value,
+                ..
+            }) if value == beyond_u32
+        ));
+        let width_beyond_abi = PagedDecodePlan::try_from_dimensions(1, 1, 1, beyond_u32)?;
+        assert!(matches!(
+            NativePagedDecodePlan::try_from_paged_decode(width_beyond_abi, 8, 1),
+            Err(PagedDecodeError::NativeAbiOutOfRange {
+                dimension: "head_width",
+                value,
+                ..
+            }) if value == beyond_u32
+        ));
+        assert!(matches!(
+            NativePagedDecodePlan::try_from_paged_decode(
+                PagedDecodePlan::try_from_dimensions(1, 1, 1, 1)?,
+                8,
+                beyond_u32,
+            ),
+            Err(PagedDecodeError::NativeAbiOutOfRange {
+                dimension: "physical_pages",
+                value,
+                ..
+            }) if value == beyond_u32
         ));
 
         let query = 0x1000_usize as *const f32;
