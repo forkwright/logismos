@@ -115,7 +115,7 @@ pub(super) struct NativeResidentTeardownParts {
 #[must_use = "resident teardown retains live native ownership"]
 pub(super) enum NativeResidentTeardown {
     /// Creating a fresh owned teardown stream failed before HIP admission.
-    Unadmitted(_NativeResidentTeardownParts),
+    Unadmitted { _parts: NativeResidentTeardownParts },
     /// Stream creation failed without establishing that no handle was returned.
     ///
     /// The complete creation error never enters ordinary teardown or the
@@ -143,7 +143,7 @@ pub(super) enum NativeResidentTeardown {
 #[must_use = "native session teardown retains live native ownership"]
 pub(super) enum ModelSessionTeardown {
     /// The supplied stream was not an owned HIP stream; no buffer was admitted.
-    Unadmitted(_ModelSessionTeardownParts),
+    Unadmitted { _parts: ModelSessionTeardownParts },
     /// Some buffers were admitted and a checked accounting refusal retained the rest.
     ///
     /// This is deliberately opaque to the caller: both the admitted inventory
@@ -183,7 +183,7 @@ impl ModelSessionTeardown {
     /// Classify the exact ownership retained by this teardown result.
     pub(super) const fn state(&self) -> ModelSessionTeardownState {
         match self {
-            Self::Unadmitted(_) => ModelSessionTeardownState::Unadmitted,
+            Self::Unadmitted { .. } => ModelSessionTeardownState::Unadmitted,
             Self::PartiallyAdmitted { .. } => ModelSessionTeardownState::PartiallyAdmitted,
             Self::Releasing { release, .. } => match release {
                 InventoryRelease::Released(_) => ModelSessionTeardownState::Released,
@@ -249,7 +249,7 @@ impl NativeResidentTeardown {
     /// Classify the exact ownership retained by this resident teardown result.
     pub(super) const fn state(&self) -> ModelSessionTeardownState {
         match self {
-            Self::Unadmitted(_) => ModelSessionTeardownState::Unadmitted,
+            Self::Unadmitted { .. } => ModelSessionTeardownState::Unadmitted,
             Self::CreationQuarantined { .. } => ModelSessionTeardownState::Quarantined,
             Self::PartiallyAdmitted { .. } => ModelSessionTeardownState::PartiallyAdmitted,
             Self::Releasing(release) => match release {
@@ -302,11 +302,13 @@ impl ModelSessionTeardownParts {
         let mut inventory = match TeardownInventory::try_new(stream) {
             Ok(inventory) => inventory,
             Err(stream) => {
-                return ModelSessionTeardown::Unadmitted(Self {
-                    stream: stream.into_stream(),
-                    buffers,
-                    resident,
-                });
+                return ModelSessionTeardown::Unadmitted {
+                    _parts: Self {
+                        stream: stream.into_stream(),
+                        buffers,
+                        resident,
+                    },
+                };
             }
         };
         while let Some(buffer) = buffers.pop() {
@@ -338,7 +340,9 @@ impl NativeResidentTeardownParts {
         let stream = match Stream::new_tracked(&device) {
             Ok(stream) => stream,
             Err(StreamCreationError::NoHandle(_)) => {
-                return NativeResidentTeardown::Unadmitted(Self { device, buffers });
+                return NativeResidentTeardown::Unadmitted {
+                    _parts: Self { device, buffers },
+                };
             }
             Err(error) => {
                 return NativeResidentTeardown::CreationQuarantined {
@@ -351,7 +355,9 @@ impl NativeResidentTeardownParts {
             Ok(inventory) => inventory,
             Err(stream) => {
                 drop(stream);
-                return NativeResidentTeardown::Unadmitted(Self { device, buffers });
+                return NativeResidentTeardown::Unadmitted {
+                    _parts: Self { device, buffers },
+                };
             }
         };
         while let Some(buffer) = buffers.pop() {
