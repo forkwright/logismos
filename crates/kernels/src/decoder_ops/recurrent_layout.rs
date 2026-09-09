@@ -764,7 +764,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(logismos_no_gpu_kernels))]
     #[test]
     #[ignore = "requires an operator-reserved HIP device; source tests do not qualify hardware"]
     fn reserved_device_recurrent_qk_l2_matches_native_and_independent_references()
@@ -884,7 +883,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(logismos_no_gpu_kernels))]
     fn assert_close_f32(actual: &[f32], expected: &[f32], operation: &str) {
         assert_eq!(
             actual.len(),
@@ -907,7 +905,6 @@ mod tests {
         .build()
     }
 
-    #[cfg(not(logismos_no_gpu_kernels))]
     fn read_device(buffer: &hipcore::DeviceBuffer<f32>) -> core::result::Result<Vec<f32>, String> {
         let mut host = vec![0.0_f32; buffer.len()];
         buffer

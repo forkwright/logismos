@@ -487,7 +487,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(logismos_no_gpu_kernels))]
     #[test]
     #[ignore = "requires an operator-reserved gfx1100 device; source tests do not qualify hardware"]
     fn reserved_gfx1100_recurrent_scalars_match_independent_f64_oracle_with_tail()
