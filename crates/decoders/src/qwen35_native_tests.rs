@@ -1,16 +1,21 @@
-//! Reserved-device whole-block witness for the unsafe native Qwen3.5 session.
+//! Reserved-device witnesses for unsafe native Qwen3.5 execution.
 
 use hipcore::{Device, DeviceBuffer};
 
 use crate::qwen35::tests::{
-    CanonicalHybridOracle, assert_f32_matches_f64,
-    canonical_hybrid_fixture_with_context_and_rotary, verify_fixture,
+    CanonicalHybridOracle, Fixture, assert_f32_matches_f64,
+    canonical_hybrid_fixture_with_context_and_rotary, canonical_hybrid_fixture_with_nextn,
+    verify_fixture,
 };
-use crate::{Qwen35NativeLayerPlan, Qwen35NativeLayerSessionState, Qwen35Weights};
+use crate::{
+    Qwen35NativeExecutionPlan, Qwen35NativeLayerPlan, Qwen35NativeLayerSessionState,
+    Qwen35NativeSessionState, Qwen35Weights,
+};
 
 const FULL_ATTENTION_BLOCK: usize = 3;
 const FIXTURE_CONTEXT: usize = 16;
 const WITNESS_STEPS: usize = 9;
+const MODEL_WITNESS_TOKENS: [u32; 9] = [2, 0, 4, 1, 3, 2, 4, 0, 1];
 
 /// Build deterministic, varied full-block rows without leaving the native f32 domain.
 ///
@@ -73,6 +78,69 @@ fn reserved_device_native_full_block_matches_independent_oracle() -> core::resul
                 "native full-block session was not ready after completed step {position}"
             ));
         }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
+fn reserved_device_native_main_model_matches_oracle_and_excludes_nextn()
+-> core::result::Result<(), String> {
+    let baseline = canonical_hybrid_fixture_with_context_and_rotary(FIXTURE_CONTEXT, Some(64))?;
+    native_main_model_witness(&baseline, &baseline)?;
+    for auxiliary_value in [0.25, -0.75] {
+        let auxiliary =
+            canonical_hybrid_fixture_with_nextn(FIXTURE_CONTEXT, Some(64), auxiliary_value)?;
+        native_main_model_witness(&auxiliary, &baseline)?;
+    }
+    Ok(())
+}
+
+fn native_main_model_witness(
+    fixture: &Fixture,
+    baseline: &Fixture,
+) -> core::result::Result<(), String> {
+    let payload = verify_fixture(fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    // WHY: expected values always come from the independent no-auxiliary model,
+    // even when the native plan binds an artifact carrying a NextN extension.
+    let mut oracle = CanonicalHybridOracle::from_fixture(baseline)?;
+    let plan = Qwen35NativeExecutionPlan::try_from_weights(
+        &weights,
+        MODEL_WITNESS_TOKENS.len(),
+        kernels::attention::NativePageTokens::B8,
+    )
+    .map_err(|error| error.to_string())?;
+    let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
+    // SAFETY: this helper is reached only by the ignored operator-reserved
+    // gfx1100 witness. The canonical main weights and short continuation are
+    // bounded normal-or-zero fixture operands, not a production domain scan.
+    let mut session = unsafe { plan.into_session(&device) }.map_err(|error| error.to_string())?;
+
+    // SAFETY: this vocabulary refusal submits no work; all retained fixture
+    // allocations satisfy the same reserved-device lifetime preconditions.
+    if unsafe { session.step(u32::MAX) }.is_ok()
+        || session.state() != Qwen35NativeSessionState::Ready
+    {
+        return Err("native invalid token must refuse without poisoning preflight".to_string());
+    }
+    for token in MODEL_WITNESS_TOKENS {
+        let expected = oracle.step(&[token])?;
+        // SAFETY: the admitted token and owned main-model fixture satisfy the
+        // explicitly bounded normal-or-zero operands/intermediates contract.
+        let output = unsafe { session.step(token) }.map_err(|error| error.to_string())?;
+        let mut actual = vec![0.0_f32; expected.len()];
+        output
+            .copy_to_host(&mut actual)
+            .map_err(|error| error.to_string())?;
+        assert_f32_matches_f64(&actual, &expected, "native main-model continuation")?;
+        if session.state() != Qwen35NativeSessionState::Ready {
+            return Err("native main model must be ready after completed token".to_string());
+        }
+    }
+    // SAFETY: context preflight is exhausted and cannot submit another token.
+    if unsafe { session.step(0) }.is_ok() || session.state() != Qwen35NativeSessionState::Ready {
+        return Err("native exhausted context must refuse without a new submission".to_string());
     }
     Ok(())
 }
