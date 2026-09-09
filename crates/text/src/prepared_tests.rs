@@ -3,7 +3,6 @@ use std::collections::VecDeque;
 
 use decoders::Qwen35LogitSelection;
 use sha2::{Digest, Sha256};
-use snafu::IntoError;
 use test_fixtures::build_qwen35_fixture;
 use tokenize::{TokenizerDigest, TokenizerIdentity};
 
