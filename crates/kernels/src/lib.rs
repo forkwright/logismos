@@ -52,6 +52,7 @@ pub mod error;
 pub mod gdn;
 #[cfg(feature = "gpu")]
 pub mod matmul;
+pub mod numerical_status;
 #[cfg(feature = "gpu")]
 pub mod paged_kv;
 #[cfg(feature = "gpu")]

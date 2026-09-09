@@ -2,6 +2,9 @@
 
 use snafu::Snafu;
 
+#[cfg(feature = "gpu")]
+use crate::numerical_status::NativeNumericalStatusError;
+
 /// Result alias.
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -48,6 +51,17 @@ pub enum Error {
     Taxis {
         /// Source tensor error.
         source: taxis::Error,
+    },
+
+    #[cfg(feature = "gpu")]
+    /// Checked native arithmetic reported an invalid numerical-domain value.
+    #[snafu(display("native numerical status failure: {source}"))]
+    NumericalStatus {
+        /// Typed native numerical-status failure.
+        source: NativeNumericalStatusError,
+        /// Source code location where the status was read.
+        #[snafu(implicit)]
+        location: snafu::Location,
     },
 
     /// Propagated checked serialized-row format failure.

@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 // kanon:ignore RUST/no-direct-process-command -- a build script runs before the workspace is built, so no project process wrapper is linkable here
 use std::process::Command;
 
+#[path = "src/numerical_status/codes.rs"]
+mod numerical_status_codes;
+
 const HIP_BUILD_MODE_ENV: &str = "LOGISMOS_HIP_BUILD";
 const HIP_BUILD_REQUIRED: &str = "required";
 const HIP_BUILD_CPU_ONLY: &str = "cpu-only";
@@ -93,6 +96,7 @@ fn main() -> Result<(), String> {
     }
 
     write_row_format_header(&out_dir)?;
+    write_numerical_status_header(&out_dir)?;
     compile_sources(&hipcc, &out_dir, &hip_sources, &cpp_sources)?;
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
@@ -110,6 +114,12 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
     let header = render_row_format_header(&derived);
     std::fs::write(out_dir.join("row_format.h"), header)
         .map_err(|error| format!("write generated serialized-row format header: {error}"))
+}
+
+fn write_numerical_status_header(out_dir: &Path) -> Result<(), String> {
+    let header = render_numerical_status_header();
+    std::fs::write(out_dir.join("numerical_status_bits.h"), header)
+        .map_err(|error| format!("write generated numerical-status header: {error}"))
 }
 
 struct RowFormatDerived {
@@ -496,6 +506,20 @@ fn render_row_format_header(derived: &RowFormatDerived) -> String {
     )
 }
 
+fn render_numerical_status_header() -> String {
+    use numerical_status_codes::NativeNumericalStatusCategory;
+
+    format!(
+        "#pragma once\n\n#include <cstddef>\n#include <cstdint>\n\ninline constexpr std::size_t LOGISMOS_NUMERICAL_STATUS_BYTES = {bytes};\ninline constexpr std::uint32_t LOGISMOS_NUMERICAL_STATUS_INPUT_SUBNORMAL = {input_subnormal}U;\ninline constexpr std::uint32_t LOGISMOS_NUMERICAL_STATUS_INPUT_NONFINITE = {input_nonfinite}U;\ninline constexpr std::uint32_t LOGISMOS_NUMERICAL_STATUS_ARITHMETIC_SUBNORMAL = {arithmetic_subnormal}U;\ninline constexpr std::uint32_t LOGISMOS_NUMERICAL_STATUS_ARITHMETIC_NONFINITE = {arithmetic_nonfinite}U;\ninline constexpr std::uint32_t LOGISMOS_NUMERICAL_STATUS_KNOWN_BITS = {known_bits}U;\n",
+        bytes = numerical_status_codes::NATIVE_NUMERICAL_STATUS_BYTES,
+        input_subnormal = NativeNumericalStatusCategory::InputSubnormal.bit(),
+        input_nonfinite = NativeNumericalStatusCategory::InputNonFinite.bit(),
+        arithmetic_subnormal = NativeNumericalStatusCategory::ArithmeticSubnormal.bit(),
+        arithmetic_nonfinite = NativeNumericalStatusCategory::ArithmeticNonFinite.bit(),
+        known_bits = numerical_status_codes::NATIVE_NUMERICAL_STATUS_KNOWN_BITS,
+    )
+}
+
 fn render_header_prefix() -> String {
     format!(
         "#pragma once\n\n#include <cstddef>\n#include <cstdint>\n\ninline constexpr std::size_t LOGISMOS_F32_VALUE_BYTES = {f32_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUES_PER_BLOCK = {values_per_block};\ninline constexpr std::size_t LOGISMOS_Q8_0_SCALE_BYTES = {scale_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUE_BYTES = {value_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_BLOCK_BYTES = {block_bytes};\ninline constexpr std::size_t LOGISMOS_K_GROUP_VALUES = {k_group};\n",
@@ -642,7 +666,8 @@ fn compile_sources(
                 "-mno-wavefrontsize64",
                 "-I",
             ])
-            .arg(out_dir);
+            .arg(out_dir)
+            .args(["-I", "src/numerical_status/hip"]);
         if src.file_name().is_some_and(|name| {
             name == "row_gemv.hip"
                 || name == "gdn_step.hip"
@@ -650,11 +675,16 @@ fn compile_sources(
                 || name == "decoder_ops_f32.hip"
                 || name == "recurrent_layout_f32.hip"
                 || name == "recurrent_scalars_f32.hip"
+                || name == "paged_decode_q1.hip"
         }) {
             // WHY: these correctness baselines retain separately rounded f32
             // operations. Scope no-fast-math and no contraction to their
             // sources rather than changing the rest of the HIP archive.
-            command.args(["-fno-fast-math", "-ffp-contract=off"]);
+            command.args([
+                "-fno-fast-math",
+                "-ffp-contract=off",
+                "-fno-gpu-flush-denormals-to-zero",
+            ]);
         }
         // kanon:ignore RUST/no-direct-process-command -- invoking hipcc is the build script's purpose
         let status = match command.arg("-c").arg(src).arg("-o").arg(&obj).status() {
