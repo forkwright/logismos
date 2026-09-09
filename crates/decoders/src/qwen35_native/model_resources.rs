@@ -2,7 +2,10 @@
 
 use cache::NativePagedKvPool;
 use core::mem::ManuallyDrop;
-use hipcore::{Device, DeviceBuffer, InventoryRelease, Stream, TeardownBuffer, TeardownInventory};
+use hipcore::{
+    Device, DeviceBuffer, InventoryRelease, Stream, StreamCreationError, StreamCreationQuarantine,
+    TeardownBuffer, TeardownInventory,
+};
 use snafu::ResultExt;
 use std::sync::Arc;
 
@@ -113,6 +116,15 @@ pub(super) struct NativeResidentTeardownParts {
 pub(super) enum NativeResidentTeardown {
     /// Creating a fresh owned teardown stream failed before HIP admission.
     Unadmitted(NativeResidentTeardownParts),
+    /// HIP returned a non-null teardown stream while reporting failure.
+    ///
+    /// The indeterminate stream never enters ordinary teardown or the normal
+    /// inventory. The already-disarmed resident buffers remain retained with
+    /// its terminal creation quarantine.
+    CreationQuarantined {
+        parts: NativeResidentTeardownParts,
+        quarantine: StreamCreationQuarantine,
+    },
     /// Checked accounting admitted a prefix and retained the remaining buffers.
     PartiallyAdmitted {
         inventory: TeardownInventory,
@@ -172,6 +184,7 @@ impl ModelSessionTeardown {
     pub(super) const fn state(&self) -> ModelSessionTeardownState {
         match self {
             Self::Unadmitted(_) => ModelSessionTeardownState::Unadmitted,
+            Self::CreationQuarantined { .. } => ModelSessionTeardownState::Quarantined,
             Self::PartiallyAdmitted { .. } => ModelSessionTeardownState::PartiallyAdmitted,
             Self::Releasing { release, .. } => match release {
                 InventoryRelease::Released(_) => ModelSessionTeardownState::Released,
@@ -322,8 +335,17 @@ impl NativeResidentTeardownParts {
             device,
             mut buffers,
         } = self;
-        let stream = match Stream::new(&device) {
+        let stream = match Stream::new_tracked(&device) {
             Ok(stream) => stream,
+            Err(StreamCreationError::NoHandle(_)) => {
+                return NativeResidentTeardown::Unadmitted(Self { device, buffers });
+            }
+            Err(StreamCreationError::Quarantined(quarantine)) => {
+                return NativeResidentTeardown::CreationQuarantined {
+                    parts: Self { device, buffers },
+                    quarantine,
+                };
+            }
             Err(_) => return NativeResidentTeardown::Unadmitted(Self { device, buffers }),
         };
         let mut inventory = match TeardownInventory::try_new(stream) {
