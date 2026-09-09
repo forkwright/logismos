@@ -3,9 +3,13 @@
 #[cfg(feature = "gpu")]
 mod dispatch;
 #[cfg(feature = "gpu")]
+mod finish;
+#[cfg(feature = "gpu")]
 mod plan;
 #[cfg(all(test, feature = "gpu"))]
 mod plan_tests;
+#[cfg(feature = "gpu")]
+mod recurrent_plan;
 #[cfg(feature = "gpu")]
 mod resources;
 #[cfg(feature = "gpu")]
