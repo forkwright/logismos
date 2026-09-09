@@ -47,6 +47,10 @@ KV, recurrent state or position; uncertain completion retains the entire
 session bundle and its shared model reference. Requested demand separates
 resident uploads, per-session state, token controls and returned logits;
 arbitrarily retained outputs and qualified runtime overhead remain separate.
+Explicit close preserves mixed-resource custody through pending or uncertain
+teardown; only acknowledged session release permits recovery of its model
+reference. This is not yet aggregate construction-failure or service-accounting
+integration, and ordinary `Drop` remains no release receipt.
 The status checks explicit operations, not hidden math-library temporaries, and
 still requires a qualified denorm-preserving compiler/math/device profile.
 The `logismos` facade selects this surface; direct CPU consumers keep it off.
