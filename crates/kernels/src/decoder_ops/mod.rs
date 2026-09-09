@@ -477,7 +477,10 @@ unsafe fn launch_rms_norm_f32_with_status(
         )?;
         stream.make_current()?;
         let numerical_status = match status {
-            Some(status) => unsafe { status.as_device_ptr().cast::<c_void>() },
+            Some(status) => {
+                // SAFETY: checked callers retain status through stream synchronization.
+                unsafe { status.as_device_ptr().cast::<c_void>() }
+            }
             None => core::ptr::null_mut(),
         };
         // SAFETY: exact spans establish ABI extents; callers retain their
@@ -617,7 +620,10 @@ unsafe fn launch_rotary_half_split_f32_with_status(
         )?;
         stream.make_current()?;
         let numerical_status = match status {
-            Some(status) => unsafe { status.as_device_ptr().cast::<c_void>() },
+            Some(status) => {
+                // SAFETY: checked callers retain status through stream synchronization.
+                unsafe { status.as_device_ptr().cast::<c_void>() }
+            }
             None => core::ptr::null_mut(),
         };
         // SAFETY: exact spans establish ABI extents; callers retain their
@@ -756,7 +762,10 @@ unsafe fn launch_split_q_gate_f32_with_status(
         )?;
         stream.make_current()?;
         let numerical_status = match status {
-            Some(status) => unsafe { status.as_device_ptr().cast::<c_void>() },
+            Some(status) => {
+                // SAFETY: checked callers retain status through stream synchronization.
+                unsafe { status.as_device_ptr().cast::<c_void>() }
+            }
             None => core::ptr::null_mut(),
         };
         // SAFETY: exact spans establish ABI extents; callers retain their
@@ -957,7 +966,10 @@ unsafe fn launch_silu_with_status(
         )?;
         stream.make_current()?;
         let numerical_status = match status {
-            Some(status) => unsafe { status.as_device_ptr().cast::<c_void>() },
+            Some(status) => {
+                // SAFETY: checked callers retain status through stream synchronization.
+                unsafe { status.as_device_ptr().cast::<c_void>() }
+            }
             None => core::ptr::null_mut(),
         };
         // SAFETY: exact spans establish ABI extents; callers retain their
@@ -1922,7 +1934,8 @@ mod tests {
             "RMSNorm must expose an overflowing square before reduction"
         );
         assert_eq!(
-            rms_output[1], 0.0,
+            rms_output[1].to_bits(),
+            0.0_f32.to_bits(),
             "a finite zero output must not hide the earlier overflowing square"
         );
 
@@ -1930,7 +1943,8 @@ mod tests {
         let hidden_square = subnormal * subnormal;
         let variance = hidden_square + 1e-5_f32;
         assert_eq!(
-            hidden_square, 0.0,
+            hidden_square.to_bits(),
+            0.0_f32.to_bits(),
             "the f32 square underflows before epsilon"
         );
         assert!(
@@ -1944,9 +1958,10 @@ mod tests {
             (-(-f32::MAX)).exp().is_infinite(),
             "SiLU exponent overflows first"
         );
+        assert_eq!(silu.len(), 1, "SiLU fixture must produce one output");
         assert_eq!(
-            silu,
-            vec![-0.0],
+            silu[0].to_bits(),
+            (-0.0_f32).to_bits(),
             "SiLU can subsequently produce finite signed zero"
         );
         Ok(())

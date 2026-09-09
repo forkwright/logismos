@@ -142,16 +142,17 @@ mod tests {
     };
 
     #[test]
-    fn mask_accepts_combined_typed_categories() {
+    fn mask_accepts_combined_typed_categories()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
         let bits = NativeNumericalStatusCategory::InputSubnormal.bit()
             | NativeNumericalStatusCategory::ArithmeticNonFinite.bit();
-        let Some(mask) = NativeNumericalStatusMask::from_bits(bits) else {
-            panic!("known combined numerical-status bits must construct a typed mask");
-        };
+        let mask = NativeNumericalStatusMask::from_bits(bits)
+            .ok_or("known combined numerical-status bits must construct a typed mask")?;
 
         assert!(mask.contains(NativeNumericalStatusCategory::InputSubnormal));
         assert!(mask.contains(NativeNumericalStatusCategory::ArithmeticNonFinite));
         assert!(!mask.contains(NativeNumericalStatusCategory::InputNonFinite));
+        Ok(())
     }
 
     #[test]

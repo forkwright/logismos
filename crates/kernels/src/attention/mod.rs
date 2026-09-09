@@ -1089,15 +1089,16 @@ mod tests {
     use crate::numerical_status::{NativeNumericalStatusCategory, NativeNumericalStatusMask};
 
     #[test]
-    fn checked_native_first_token_maximum_sentinel_is_not_an_operand_failure() {
+    fn checked_native_first_token_maximum_sentinel_is_not_an_operand_failure()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
         let score = 1.0_f32;
         let maximum = f32::NEG_INFINITY.max(score);
         let bits = arithmetic_status_bits(maximum);
-        let Some(mask) = NativeNumericalStatusMask::from_bits(bits) else {
-            panic!("independent normal sentinel witness must use known status bits");
-        };
+        let mask = NativeNumericalStatusMask::from_bits(bits)
+            .ok_or("independent normal sentinel witness must use known status bits")?;
 
         assert!(mask.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -1130,7 +1131,8 @@ mod tests {
     }
 
     #[test]
-    fn checked_native_status_keeps_a_hidden_subnormal_product_sticky() {
+    fn checked_native_status_keeps_a_hidden_subnormal_product_sticky()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
         let left = 1.0e-20_f32;
         let right = 1.0e-20_f32;
         assert!(left.is_normal());
@@ -1142,11 +1144,11 @@ mod tests {
         assert!(restored.is_normal());
 
         let bits = arithmetic_status_bits(product) | arithmetic_status_bits(restored);
-        let Some(mask) = NativeNumericalStatusMask::from_bits(bits) else {
-            panic!("independent hidden-intermediate witness must use known status bits");
-        };
+        let mask = NativeNumericalStatusMask::from_bits(bits)
+            .ok_or("independent hidden-intermediate witness must use known status bits")?;
 
         assert!(mask.contains(NativeNumericalStatusCategory::ArithmeticSubnormal));
+        Ok(())
     }
 
     fn arithmetic_status_bits(value: f32) -> u32 {

@@ -710,7 +710,7 @@ fn reserved_device_q1_paged_attention_rejects_hidden_subnormal_product()
         }) => {
             assert!(mask.contains(
                 crate::numerical_status::NativeNumericalStatusCategory::ArithmeticSubnormal
-            ))
+            ));
         }
         Err(error) => return Err(format!("unexpected native status failure: {error}").into()),
         Ok(()) => {

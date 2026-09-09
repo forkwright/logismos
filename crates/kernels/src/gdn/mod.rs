@@ -2433,10 +2433,6 @@ mod tests {
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the independent oracle mirrors the fixed recurrence contract without sharing production validation helpers"
-    )]
     #[cfg(feature = "gpu")]
     fn gdn_native_status_bits(
         status: &crate::numerical_status::NativeNumericalStatus,
