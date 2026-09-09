@@ -290,7 +290,7 @@ impl ModelSessionTeardownParts {
             Ok(inventory) => inventory,
             Err(stream) => {
                 return ModelSessionTeardown::Unadmitted(Self {
-                    stream: recover_non_owned_stream(stream),
+                    stream: stream.into_stream(),
                     buffers,
                     resident,
                 });
