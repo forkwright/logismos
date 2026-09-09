@@ -383,6 +383,72 @@ pub unsafe fn launch_rms_norm_f32(
     output_elements: usize,
     stream: &Stream,
 ) -> Result<()> {
+    // SAFETY: this raw boundary retains its documented caller-owned numerical
+    // and device-lifetime obligations while selecting no sticky status word.
+    unsafe {
+        launch_rms_norm_f32_with_status(
+            plan,
+            input_f32,
+            input_elements,
+            weight_f32,
+            weight_elements,
+            output_f32,
+            output_elements,
+            stream,
+            None,
+        )
+    }
+}
+
+/// Launch f32 RMSNorm while recording explicit numerical-domain failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through same-stream completion on the same
+/// device as every supplied buffer and must be read only after successful
+/// synchronization. Checked classification replaces the raw path's explicit
+/// finite normal-or-zero operand/intermediate obligation; it still requires
+/// the qualified compiler, denorm, math-library, and device profile.
+pub unsafe fn launch_rms_norm_f32_checked(
+    plan: RmsNormF32Plan,
+    input_f32: *const f32,
+    input_elements: usize,
+    weight_f32: *const f32,
+    weight_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: the checked boundary retains raw pointer/device ownership
+    // obligations and retains status through same-stream synchronization.
+    unsafe {
+        launch_rms_norm_f32_with_status(
+            plan,
+            input_f32,
+            input_elements,
+            weight_f32,
+            weight_elements,
+            output_f32,
+            output_elements,
+            stream,
+            Some(status),
+        )
+    }
+}
+
+unsafe fn launch_rms_norm_f32_with_status(
+    plan: RmsNormF32Plan,
+    input_f32: *const f32,
+    input_elements: usize,
+    weight_f32: *const f32,
+    weight_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: Option<&NativeNumericalStatus>,
+) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (
@@ -394,6 +460,7 @@ pub unsafe fn launch_rms_norm_f32(
             output_f32,
             output_elements,
             stream,
+            status,
         );
         no_gpu_refusal(RMS_NORM_KERNEL)
     }
@@ -409,72 +476,12 @@ pub unsafe fn launch_rms_norm_f32(
             output_elements,
         )?;
         stream.make_current()?;
-        // SAFETY: the caller's ownership and finite-domain contract plus the
-        // checked plan/spans establish the private ABI's preconditions.
-        let code = unsafe {
-            logismos_launch_decoder_rms_norm_f32(
-                input_f32.cast::<c_void>(),
-                weight_f32.cast::<c_void>(),
-                output_f32.cast::<c_void>(),
-                plan.rows_u32,
-                plan.width_u32,
-                plan.epsilon,
-                core::ptr::null_mut(),
-                stream.raw().cast::<c_void>(),
-            )
+        let numerical_status = match status {
+            Some(status) => unsafe { status.as_device_ptr().cast::<c_void>() },
+            None => core::ptr::null_mut(),
         };
-        launch_result(RMS_NORM_KERNEL, code)
-    }
-}
-
-/// Launch f32 RMSNorm while recording explicit numerical-domain failures.
-///
-/// # Safety
-///
-/// The raw launcher's pointer, lifetime, ownership, and stream requirements
-/// apply. `status` must remain live through stream completion and belong to
-/// the same device as every supplied buffer.
-pub unsafe fn launch_rms_norm_f32_checked(
-    plan: RmsNormF32Plan,
-    input_f32: *const f32,
-    input_elements: usize,
-    weight_f32: *const f32,
-    weight_elements: usize,
-    output_f32: *mut f32,
-    output_elements: usize,
-    stream: &Stream,
-    status: &NativeNumericalStatus,
-) -> Result<()> {
-    #[cfg(logismos_no_gpu_kernels)]
-    {
-        let _ = status;
-        // SAFETY: this forwards the unchanged raw arguments solely to retain its typed CPU refusal.
-        unsafe {
-            launch_rms_norm_f32(
-                plan,
-                input_f32,
-                input_elements,
-                weight_f32,
-                weight_elements,
-                output_f32,
-                output_elements,
-                stream,
-            )
-        }
-    }
-    #[cfg(not(logismos_no_gpu_kernels))]
-    {
-        validate_rms_launch(
-            plan,
-            input_f32,
-            input_elements,
-            weight_f32,
-            weight_elements,
-            output_f32,
-            output_elements,
-        )?;
-        stream.make_current()?;
-        // SAFETY: checked spans and the caller's status lifetime contract establish this private ABI.
+        // SAFETY: exact spans establish ABI extents; callers retain their
+        // device/lifetime contract and checked callers retain status through sync.
         let code = unsafe {
             logismos_launch_decoder_rms_norm_f32(
                 input_f32.cast::<c_void>(),
@@ -483,7 +490,7 @@ pub unsafe fn launch_rms_norm_f32_checked(
                 plan.rows_u32,
                 plan.width_u32,
                 plan.epsilon,
-                status.as_device_ptr().cast::<c_void>(),
+                numerical_status,
                 stream.raw().cast::<c_void>(),
             )
         };
@@ -516,6 +523,72 @@ pub unsafe fn launch_rotary_half_split_f32_in_place(
     sin_elements: usize,
     stream: &Stream,
 ) -> Result<()> {
+    // SAFETY: this raw boundary retains its documented caller-owned numerical
+    // and device-lifetime obligations while selecting no sticky status word.
+    unsafe {
+        launch_rotary_half_split_f32_with_status(
+            plan,
+            values_f32,
+            value_elements,
+            cos_f32,
+            cos_elements,
+            sin_f32,
+            sin_elements,
+            stream,
+            None,
+        )
+    }
+}
+
+/// Launch in-place half-split rotary embedding while recording explicit numerical failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through same-stream completion on the same
+/// device and must be read only after successful synchronization. Checked
+/// classification replaces the raw path's explicit finite normal-or-zero
+/// operand/intermediate obligation; it still requires the qualified compiler,
+/// denorm, math-library, and device profile.
+pub unsafe fn launch_rotary_half_split_f32_in_place_checked(
+    plan: RotaryHalfSplitF32Plan,
+    values_f32: *mut f32,
+    value_elements: usize,
+    cos_f32: *const f32,
+    cos_elements: usize,
+    sin_f32: *const f32,
+    sin_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: the checked boundary retains raw pointer/device ownership
+    // obligations and retains status through same-stream synchronization.
+    unsafe {
+        launch_rotary_half_split_f32_with_status(
+            plan,
+            values_f32,
+            value_elements,
+            cos_f32,
+            cos_elements,
+            sin_f32,
+            sin_elements,
+            stream,
+            Some(status),
+        )
+    }
+}
+
+unsafe fn launch_rotary_half_split_f32_with_status(
+    plan: RotaryHalfSplitF32Plan,
+    values_f32: *mut f32,
+    value_elements: usize,
+    cos_f32: *const f32,
+    cos_elements: usize,
+    sin_f32: *const f32,
+    sin_elements: usize,
+    stream: &Stream,
+    status: Option<&NativeNumericalStatus>,
+) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (
@@ -527,6 +600,7 @@ pub unsafe fn launch_rotary_half_split_f32_in_place(
             sin_f32,
             sin_elements,
             stream,
+            status,
         );
         no_gpu_refusal(ROTARY_KERNEL)
     }
@@ -542,71 +616,12 @@ pub unsafe fn launch_rotary_half_split_f32_in_place(
             sin_elements,
         )?;
         stream.make_current()?;
-        // SAFETY: validated spans and the caller's device/numerical contract
-        // establish the private ABI's preconditions.
-        let code = unsafe {
-            logismos_launch_decoder_rotary_half_split_f32(
-                values_f32.cast::<c_void>(),
-                cos_f32.cast::<c_void>(),
-                sin_f32.cast::<c_void>(),
-                plan.heads_u32,
-                plan.width_u32,
-                plan.rotary_width_u32,
-                core::ptr::null_mut(),
-                stream.raw().cast::<c_void>(),
-            )
+        let numerical_status = match status {
+            Some(status) => unsafe { status.as_device_ptr().cast::<c_void>() },
+            None => core::ptr::null_mut(),
         };
-        launch_result(ROTARY_KERNEL, code)
-    }
-}
-
-/// Launch in-place half-split rotary embedding while recording explicit numerical failures.
-///
-/// # Safety
-///
-/// The raw launcher's pointer, lifetime, ownership, and stream requirements
-/// apply. `status` must remain live through stream completion on the same device.
-pub unsafe fn launch_rotary_half_split_f32_in_place_checked(
-    plan: RotaryHalfSplitF32Plan,
-    values_f32: *mut f32,
-    value_elements: usize,
-    cos_f32: *const f32,
-    cos_elements: usize,
-    sin_f32: *const f32,
-    sin_elements: usize,
-    stream: &Stream,
-    status: &NativeNumericalStatus,
-) -> Result<()> {
-    #[cfg(logismos_no_gpu_kernels)]
-    {
-        let _ = status;
-        // SAFETY: this forwards the unchanged raw arguments solely to retain its typed CPU refusal.
-        unsafe {
-            launch_rotary_half_split_f32_in_place(
-                plan,
-                values_f32,
-                value_elements,
-                cos_f32,
-                cos_elements,
-                sin_f32,
-                sin_elements,
-                stream,
-            )
-        }
-    }
-    #[cfg(not(logismos_no_gpu_kernels))]
-    {
-        validate_rotary_launch(
-            plan,
-            values_f32,
-            value_elements,
-            cos_f32,
-            cos_elements,
-            sin_f32,
-            sin_elements,
-        )?;
-        stream.make_current()?;
-        // SAFETY: validated spans and the caller's status lifetime contract establish this private ABI.
+        // SAFETY: exact spans establish ABI extents; callers retain their
+        // device/lifetime contract and checked callers retain status through sync.
         let code = unsafe {
             logismos_launch_decoder_rotary_half_split_f32(
                 values_f32.cast::<c_void>(),
@@ -615,7 +630,7 @@ pub unsafe fn launch_rotary_half_split_f32_in_place_checked(
                 plan.heads_u32,
                 plan.width_u32,
                 plan.rotary_width_u32,
-                status.as_device_ptr().cast::<c_void>(),
+                numerical_status,
                 stream.raw().cast::<c_void>(),
             )
         };
@@ -647,6 +662,72 @@ pub unsafe fn launch_split_q_gate_f32(
     gate_elements: usize,
     stream: &Stream,
 ) -> Result<()> {
+    // SAFETY: this raw boundary retains its documented caller-owned numerical
+    // and device-lifetime obligations while selecting no sticky status word.
+    unsafe {
+        launch_split_q_gate_f32_with_status(
+            plan,
+            q_gate_f32,
+            q_gate_elements,
+            query_f32,
+            query_elements,
+            gate_f32,
+            gate_elements,
+            stream,
+            None,
+        )
+    }
+}
+
+/// Launch Q/gate splitting while recording explicit input-domain failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through same-stream completion on the same
+/// device and must be read only after successful synchronization. Checked
+/// classification replaces the raw path's explicit finite normal-or-zero
+/// operand obligation; it still requires the qualified compiler, denorm,
+/// math-library, and device profile.
+pub unsafe fn launch_split_q_gate_f32_checked(
+    plan: SplitQGateF32Plan,
+    q_gate_f32: *const f32,
+    q_gate_elements: usize,
+    query_f32: *mut f32,
+    query_elements: usize,
+    gate_f32: *mut f32,
+    gate_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: the checked boundary retains raw pointer/device ownership
+    // obligations and retains status through same-stream synchronization.
+    unsafe {
+        launch_split_q_gate_f32_with_status(
+            plan,
+            q_gate_f32,
+            q_gate_elements,
+            query_f32,
+            query_elements,
+            gate_f32,
+            gate_elements,
+            stream,
+            Some(status),
+        )
+    }
+}
+
+unsafe fn launch_split_q_gate_f32_with_status(
+    plan: SplitQGateF32Plan,
+    q_gate_f32: *const f32,
+    q_gate_elements: usize,
+    query_f32: *mut f32,
+    query_elements: usize,
+    gate_f32: *mut f32,
+    gate_elements: usize,
+    stream: &Stream,
+    status: Option<&NativeNumericalStatus>,
+) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (
@@ -658,6 +739,7 @@ pub unsafe fn launch_split_q_gate_f32(
             gate_f32,
             gate_elements,
             stream,
+            status,
         );
         no_gpu_refusal(SPLIT_Q_GATE_KERNEL)
     }
@@ -673,69 +755,12 @@ pub unsafe fn launch_split_q_gate_f32(
             gate_elements,
         )?;
         stream.make_current()?;
-        // SAFETY: validated spans and the caller's ownership contract establish the ABI.
-        let code = unsafe {
-            logismos_launch_decoder_split_q_gate_f32(
-                q_gate_f32.cast::<c_void>(),
-                query_f32.cast::<c_void>(),
-                gate_f32.cast::<c_void>(),
-                plan.heads_u32,
-                plan.key_width_u32,
-                core::ptr::null_mut(),
-                stream.raw().cast::<c_void>(),
-            )
+        let numerical_status = match status {
+            Some(status) => unsafe { status.as_device_ptr().cast::<c_void>() },
+            None => core::ptr::null_mut(),
         };
-        launch_result(SPLIT_Q_GATE_KERNEL, code)
-    }
-}
-
-/// Launch Q/gate splitting while recording explicit input-domain failures.
-///
-/// # Safety
-///
-/// The raw launcher's pointer, lifetime, ownership, and stream requirements
-/// apply. `status` must remain live through stream completion on the same device.
-pub unsafe fn launch_split_q_gate_f32_checked(
-    plan: SplitQGateF32Plan,
-    q_gate_f32: *const f32,
-    q_gate_elements: usize,
-    query_f32: *mut f32,
-    query_elements: usize,
-    gate_f32: *mut f32,
-    gate_elements: usize,
-    stream: &Stream,
-    status: &NativeNumericalStatus,
-) -> Result<()> {
-    #[cfg(logismos_no_gpu_kernels)]
-    {
-        let _ = status;
-        // SAFETY: this forwards the unchanged raw arguments solely to retain its typed CPU refusal.
-        unsafe {
-            launch_split_q_gate_f32(
-                plan,
-                q_gate_f32,
-                q_gate_elements,
-                query_f32,
-                query_elements,
-                gate_f32,
-                gate_elements,
-                stream,
-            )
-        }
-    }
-    #[cfg(not(logismos_no_gpu_kernels))]
-    {
-        validate_split_launch(
-            plan,
-            q_gate_f32,
-            q_gate_elements,
-            query_f32,
-            query_elements,
-            gate_f32,
-            gate_elements,
-        )?;
-        stream.make_current()?;
-        // SAFETY: validated spans and the caller's status lifetime contract establish this private ABI.
+        // SAFETY: exact spans establish ABI extents; callers retain their
+        // device/lifetime contract and checked callers retain status through sync.
         let code = unsafe {
             logismos_launch_decoder_split_q_gate_f32(
                 q_gate_f32.cast::<c_void>(),
@@ -743,7 +768,7 @@ pub unsafe fn launch_split_q_gate_f32_checked(
                 gate_f32.cast::<c_void>(),
                 plan.heads_u32,
                 plan.key_width_u32,
-                status.as_device_ptr().cast::<c_void>(),
+                numerical_status,
                 stream.raw().cast::<c_void>(),
             )
         };
@@ -1728,6 +1753,24 @@ mod tests {
         let expected = rms_f64_oracle(&input, &weight, plan.width(), f64::from(plan.epsilon()))?;
         assert_close_f64(&actual, &expected, "wave32 RMSNorm");
         Ok(())
+    }
+
+    #[test]
+    fn rms_only_lane_zero_forms_the_checked_denominator() {
+        let lane_zero_partial = 1.0_f32;
+        let inactive_lane_partial = f32::MIN_POSITIVE;
+        let width = 32.0_f32;
+        let epsilon = 1.0e-5_f32;
+
+        let lane_zero_inverse = (lane_zero_partial / width + epsilon).sqrt().recip();
+        let spurious_inactive_mean = inactive_lane_partial / width;
+
+        assert!(lane_zero_inverse.is_normal());
+        assert!(spurious_inactive_mean.is_subnormal());
+        assert!(
+            (spurious_inactive_mean + epsilon).is_normal(),
+            "the old all-lane denominator arithmetic could set a sticky subnormal bit even though the selected denominator is normal"
+        );
     }
 
     #[test]

@@ -37,10 +37,13 @@ __global__ void decoder_rms_norm_f32_kernel(
     partial = logismos_status_add(partial, __shfl_down(partial, 4, kWaveSize), numerical_status);
     partial = logismos_status_add(partial, __shfl_down(partial, 2, kWaveSize), numerical_status);
     partial = logismos_status_add(partial, __shfl_down(partial, 1, kWaveSize), numerical_status);
-    logismos_status_input(epsilon, numerical_status);
-    const float mean = logismos_status_div(partial, static_cast<float>(width), numerical_status);
-    const float variance = logismos_status_add(mean, epsilon, numerical_status);
-    float inverse = lane == 0 ? logismos_status_rsqrt(variance, numerical_status) : 0.0f;
+    float inverse = 0.0f;
+    if (lane == 0) {
+        logismos_status_input(epsilon, numerical_status);
+        const float mean = logismos_status_div(partial, static_cast<float>(width), numerical_status);
+        const float variance = logismos_status_add(mean, epsilon, numerical_status);
+        inverse = logismos_status_rsqrt(variance, numerical_status);
+    }
     inverse = __shfl(inverse, 0, kWaveSize);
     for (size_t column = lane; column < static_cast<size_t>(width); column += kWaveSize) {
         const float value = input[row_offset + column];
