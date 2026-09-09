@@ -83,6 +83,13 @@ __global__ void decoder_sigmoid_mul_f32_kernel(const float* value, const float* 
     output[index] = value[index] * sigmoid;
 }
 
+__global__ void decoder_silu_f32_kernel(const float* input, float* output, const unsigned int elements) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<size_t>(elements)) return;
+    const float value = input[index];
+    output[index] = value / (1.0f + expf(-value));
+}
+
 __global__ void decoder_silu_mul_f32_kernel(const float* gate, const float* up, float* output, const unsigned int elements) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<size_t>(elements)) return;
@@ -120,6 +127,11 @@ extern "C" hipError_t logismos_launch_decoder_split_q_gate_f32(const void* sourc
 
 extern "C" hipError_t logismos_launch_decoder_sigmoid_mul_f32(const void* value, const void* gate, void* output, unsigned int elements, hipStream_t stream) {
     decoder_sigmoid_mul_f32_kernel<<<dim3(blocks_for(elements)), dim3(kElementwiseThreads), 0, stream>>>(reinterpret_cast<const float*>(value), reinterpret_cast<const float*>(gate), reinterpret_cast<float*>(output), elements);
+    return hipGetLastError();
+}
+
+extern "C" hipError_t logismos_launch_decoder_silu_f32(const void* input, void* output, unsigned int elements, hipStream_t stream) {
+    decoder_silu_f32_kernel<<<dim3(blocks_for(elements)), dim3(kElementwiseThreads), 0, stream>>>(reinterpret_cast<const float*>(input), reinterpret_cast<float*>(output), elements);
     return hipGetLastError();
 }
 
