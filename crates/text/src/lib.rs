@@ -28,6 +28,8 @@
 
 pub mod error;
 
+use std::fmt::{Display, Formatter};
+use std::mem::{size_of, take};
 use std::sync::Arc;
 
 use decoders::{Qwen35CpuRequirements, Qwen35ExecutionPlan, Qwen35LogitSelection, Qwen35Weights};
@@ -40,8 +42,9 @@ use tokenize::{DecodeStoragePlan, TokenizerByteLimit, TokenizerIdentity, Verifie
 use crate::error::{
     AllocationSnafu, CancelledSnafu, DecodeSnafu, DecoderSnafu, EmptyPromptSnafu,
     InvalidConfigurationSnafu, LimitExceededSnafu, LogitShapeSnafu, MetadataSnafu,
-    RenderedUtf8Snafu, SpecialTokenPolicySnafu, TemplateRendererSnafu, TemplateSnafu,
-    TokenizerSnafu, VocabularyLengthMismatchSnafu, VocabularyMismatchSnafu,
+    RecycledLogitsExtentOverflowSnafu, RecycledLogitsStorageMismatchSnafu, RenderedUtf8Snafu,
+    SpecialTokenPolicySnafu, TemplateRendererSnafu, TemplateSnafu, TokenizerSnafu,
+    VocabularyLengthMismatchSnafu, VocabularyMismatchSnafu,
 };
 
 pub use crate::error::{Error, Result};
@@ -240,7 +243,146 @@ pub struct PreparedGeneration {
     rendered_prompt: String,
     prompt_token_ids: Vec<u32>,
     max_output_tokens: usize,
+    recycled_logits_plan: RecycledLogitsPlan,
     output_storage_plan: DecodeStoragePlan,
+}
+
+/// Checked logical extent for one caller-recycled vocabulary row.
+///
+/// The values come from the exact verified tokenizer bound to a
+/// [`PreparedGeneration`]. They describe requested owned `f32` storage only;
+/// they are not allocation, residency, admission, or host-memory authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecycledLogitsPlan {
+    vocabulary_width: usize,
+    requested_bytes: usize,
+}
+
+impl RecycledLogitsPlan {
+    fn new(vocabulary_width: usize) -> Result<Self> {
+        let requested_bytes = vocabulary_width
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| RecycledLogitsExtentOverflowSnafu { vocabulary_width }.build())?;
+        Ok(Self {
+            vocabulary_width,
+            requested_bytes,
+        })
+    }
+
+    /// Return the exact verified tokenizer vocabulary width.
+    #[must_use]
+    pub const fn vocabulary_width(self) -> usize {
+        self.vocabulary_width
+    }
+
+    /// Return the checked requested byte extent of the logical `f32` row.
+    #[must_use]
+    pub const fn requested_bytes(self) -> usize {
+        self.requested_bytes
+    }
+
+    /// Verify that opaque storage was acquired for this vocabulary width.
+    ///
+    /// WHY: an execution owner can refuse substituted storage before it creates
+    /// a backend session, while the generation entry applies the same check.
+    /// This validates logical shape only and grants no allocation or host authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RecycledLogitsStorageMismatch`] when `storage` came
+    /// from a plan with a different exact tokenizer vocabulary width.
+    pub fn validate_storage(&self, storage: &RecycledLogitsStorage) -> Result<()> {
+        if storage.row.len() != self.vocabulary_width {
+            return RecycledLogitsStorageMismatchSnafu {
+                actual: storage.row.len(),
+                expected: self.vocabulary_width,
+            }
+            .fail();
+        }
+        Ok(())
+    }
+
+    /// Fallibly acquire the exact mutable row consumed by recycled generation.
+    ///
+    /// The allocation is caller-owned until passed to
+    /// [`PreparedGeneration::generate_with_recycled_driver`]. Its requested
+    /// extent does not account for allocator metadata or prove host admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Allocation`] if the standard allocator refuses the row.
+    pub fn acquire(self) -> Result<RecycledLogitsStorage> {
+        let mut row = Vec::new();
+        row.try_reserve_exact(self.vocabulary_width)
+            .context(AllocationSnafu {
+                target: "recycled logits row",
+            })?;
+        row.resize(self.vocabulary_width, 0.0);
+        Ok(RecycledLogitsStorage { row })
+    }
+}
+
+/// Opaque caller-preacquired storage for one recycled vocabulary row.
+///
+/// Values can be obtained only from [`RecycledLogitsPlan::acquire`] and can be
+/// consumed only by [`PreparedGeneration::generate_with_recycled_driver`].
+/// The owner is request scratch, not admission or host-residency authority.
+pub struct RecycledLogitsStorage {
+    row: Vec<f32>,
+}
+
+/// Failure from recycled generation without erasing caller-owned driver custody.
+///
+/// WHY: native adapters may need to return non-cloneable resource-release
+/// evidence with their failure. Keeping the driver error generic preserves that
+/// ownership while pipeline failures retain the established [`Error`] type.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RecycledGenerationError<DriverError> {
+    /// The HIP-free text pipeline refused or failed the request.
+    Pipeline {
+        /// Original typed text pipeline failure.
+        source: Error,
+    },
+    /// The caller-owned generation driver failed and retained its exact error.
+    Driver {
+        /// Original driver error, moved without boxing or cloning.
+        source: DriverError,
+    },
+}
+
+impl<DriverError> Display for RecycledGenerationError<DriverError>
+where
+    DriverError: std::error::Error,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pipeline { source } => {
+                write!(
+                    formatter,
+                    "recycled text generation pipeline failed: {source}"
+                )
+            }
+            Self::Driver { source } => {
+                write!(
+                    formatter,
+                    "recycled text generation driver failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl<DriverError> std::error::Error for RecycledGenerationError<DriverError>
+where
+    DriverError: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pipeline { source } => Some(source),
+            Self::Driver { source } => Some(source),
+        }
+    }
 }
 
 /// Per-request token execution consumed by the bounded greedy driver.
@@ -263,6 +405,108 @@ pub trait GenerationDriver {
     /// loop. Implementations must preserve their typed source rather than
     /// replacing a backend failure with text.
     fn step(&mut self, token_ids: &[u32], cancellation: &dyn Cancellation) -> Result<Vec<f32>>;
+}
+
+/// Per-request token execution that fills one caller-recycled vocabulary row.
+///
+/// The first call receives the complete nonempty prepared prompt. Each later
+/// call receives exactly one previously selected non-stop token ID. The driver
+/// must overwrite the entire supplied row with last-token logits and may use
+/// the cancellation source between internal prompt-token operations.
+///
+/// Implementors must bind private execution to the exact
+/// [`PreparedGeneration`] inspected before its consuming generation entry.
+/// This port is not service authority, GPU-residency proof, release
+/// acknowledgement, or native-backend qualification.
+pub trait RecycledGenerationDriver {
+    /// Exact error returned by the caller-owned driver.
+    type Error: std::error::Error;
+
+    /// Execute one nonempty batch into the exact verified vocabulary row.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed pipeline error used by the shared generation
+    /// loop. Implementations must preserve typed backend sources and leave no
+    /// externally published response on failure.
+    fn step_into(
+        &mut self,
+        token_ids: &[u32],
+        logits: &mut [f32],
+        cancellation: &dyn Cancellation,
+    ) -> std::result::Result<(), Self::Error>;
+}
+
+trait GenerationLogits {
+    type Error: std::error::Error;
+
+    fn step(
+        &mut self,
+        token_ids: &[u32],
+        cancellation: &dyn Cancellation,
+    ) -> std::result::Result<&[f32], Self::Error>;
+}
+
+struct LegacyGenerationLogits<'driver> {
+    driver: &'driver mut dyn GenerationDriver,
+    row: Vec<f32>,
+}
+
+impl<'driver> LegacyGenerationLogits<'driver> {
+    fn new(driver: &'driver mut dyn GenerationDriver) -> Self {
+        Self {
+            driver,
+            row: Vec::new(),
+        }
+    }
+}
+
+impl GenerationLogits for LegacyGenerationLogits<'_> {
+    type Error = Error;
+
+    fn step(
+        &mut self,
+        token_ids: &[u32],
+        cancellation: &dyn Cancellation,
+    ) -> std::result::Result<&[f32], Self::Error> {
+        drop(take(&mut self.row));
+        self.row = self.driver.step(token_ids, cancellation)?;
+        Ok(&self.row)
+    }
+}
+
+struct RecycledGenerationLogits<'driver, Driver>
+where
+    Driver: RecycledGenerationDriver + ?Sized,
+{
+    driver: &'driver mut Driver,
+    storage: RecycledLogitsStorage,
+}
+
+impl<'driver, Driver> RecycledGenerationLogits<'driver, Driver>
+where
+    Driver: RecycledGenerationDriver + ?Sized,
+{
+    fn new(driver: &'driver mut Driver, storage: RecycledLogitsStorage) -> Self {
+        Self { driver, storage }
+    }
+}
+
+impl<Driver> GenerationLogits for RecycledGenerationLogits<'_, Driver>
+where
+    Driver: RecycledGenerationDriver + ?Sized,
+{
+    type Error = Driver::Error;
+
+    fn step(
+        &mut self,
+        token_ids: &[u32],
+        cancellation: &dyn Cancellation,
+    ) -> std::result::Result<&[f32], Self::Error> {
+        self.driver
+            .step_into(token_ids, &mut self.storage.row, cancellation)?;
+        Ok(&self.storage.row)
+    }
 }
 
 /// Explicit CPU implementation of the shared generation-driver port.
@@ -321,6 +565,24 @@ impl PreparedGeneration {
         self.max_output_tokens
     }
 
+    /// Return the checked plan for one caller-recycled vocabulary row.
+    ///
+    /// WHY: an adapter can acquire its exact request scratch before consuming
+    /// the preparation without receiving allocation or host-admission authority.
+    #[must_use]
+    pub const fn recycled_logits_plan(&self) -> RecycledLogitsPlan {
+        self.recycled_logits_plan
+    }
+
+    /// Return the tokenizer-owned collective output storage plan.
+    ///
+    /// WHY: adapters account from the authoritative plan instead of mirroring
+    /// its retained-output and scratch formulas. The plan is not host admission.
+    #[must_use]
+    pub const fn output_storage_plan(&self) -> DecodeStoragePlan {
+        self.output_storage_plan
+    }
+
     /// Borrow the exact verified weights retained by this preparation.
     ///
     /// WHY: a native qualification adapter must derive its own artifact-bound
@@ -359,6 +621,7 @@ impl PreparedGeneration {
             rendered_prompt,
             prompt_token_ids,
             max_output_tokens,
+            recycled_logits_plan: _,
             output_storage_plan,
         } = self;
         drop(rendered_prompt);
@@ -371,9 +634,10 @@ impl PreparedGeneration {
             &prompt_token_ids,
             max_output_tokens,
             output_storage_plan,
-            &mut driver,
+            LegacyGenerationLogits::new(&mut driver),
             cancellation,
         )
+        .map_err(flatten_legacy_generation_error)
     }
 
     /// Generate through one caller-owned execution adapter.
@@ -410,6 +674,7 @@ impl PreparedGeneration {
             rendered_prompt,
             prompt_token_ids,
             max_output_tokens,
+            recycled_logits_plan: _,
             output_storage_plan,
         } = self;
         drop(rendered_prompt);
@@ -419,60 +684,146 @@ impl PreparedGeneration {
             &prompt_token_ids,
             max_output_tokens,
             output_storage_plan,
-            driver,
+            LegacyGenerationLogits::new(driver),
+            cancellation,
+        )
+        .map_err(flatten_legacy_generation_error)
+    }
+
+    /// Generate through a caller-owned adapter and one preacquired logits row.
+    ///
+    /// The adapter receives the same prompt, continuation, and cancellation
+    /// boundaries as [`Self::generate_with_driver`], but fills the supplied row
+    /// in place on every step. This consumes both the preparation and storage.
+    /// The row is released before collective output decoding begins.
+    ///
+    /// The caller must derive `logits_storage` from
+    /// [`Self::recycled_logits_plan`] and bind the driver to this preparation's
+    /// exact weights and context. Neither plan nor storage grants execution,
+    /// service, residency, or native-backend authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecycledGenerationError::Pipeline`] for cancellation, storage,
+    /// sampling, tokenizer, allocation, or output-limit failures. Returns
+    /// [`RecycledGenerationError::Driver`] with the original driver error moved
+    /// intact when the caller-owned adapter fails. No partial response is
+    /// published on failure.
+    pub fn generate_with_recycled_driver<Driver>(
+        self,
+        driver: &mut Driver,
+        logits_storage: RecycledLogitsStorage,
+        cancellation: &dyn Cancellation,
+    ) -> std::result::Result<Generation, RecycledGenerationError<Driver::Error>>
+    where
+        Driver: RecycledGenerationDriver + ?Sized,
+    {
+        let Self {
+            pipeline,
+            plan: _,
+            rendered_prompt,
+            prompt_token_ids,
+            max_output_tokens,
+            recycled_logits_plan,
+            output_storage_plan,
+        } = self;
+        drop(rendered_prompt);
+        check_cancelled(cancellation, "decoder session construction")
+            .map_err(recycled_pipeline_error)?;
+        recycled_logits_plan
+            .validate_storage(&logits_storage)
+            .map_err(recycled_pipeline_error)?;
+        let logits = RecycledGenerationLogits::new(driver, logits_storage);
+        run_generation(
+            &pipeline,
+            &prompt_token_ids,
+            max_output_tokens,
+            output_storage_plan,
+            logits,
             cancellation,
         )
     }
 }
 
-fn run_generation(
+fn run_generation<Logits>(
     pipeline: &TextPipeline,
     prompt_token_ids: &[u32],
     max_output_tokens: usize,
     output_storage_plan: DecodeStoragePlan,
-    driver: &mut dyn GenerationDriver,
+    mut logits: Logits,
     cancellation: &dyn Cancellation,
-) -> Result<Generation> {
+) -> std::result::Result<Generation, RecycledGenerationError<Logits::Error>>
+where
+    Logits: GenerationLogits,
+{
     let mut output_storage = output_storage_plan
         .acquire()
-        .map_err(map_collective_decode_error)?;
-    check_cancelled(cancellation, "prompt decoder step")?;
-    let mut logits = driver.step(prompt_token_ids, cancellation)?;
+        .map_err(map_collective_decode_error)
+        .map_err(recycled_pipeline_error)?;
+    check_cancelled(cancellation, "prompt decoder step").map_err(recycled_pipeline_error)?;
+    let vocabulary = pipeline.profile.tokenizer.tokenizer().vocab_size();
+    let mut next = select_next(&mut logits, prompt_token_ids, vocabulary, cancellation)?;
     let finish_reason = loop {
-        check_cancelled(cancellation, "greedy selection")?;
-        let next =
-            greedy_last_logits(&logits, pipeline.profile.tokenizer.tokenizer().vocab_size())?;
         if pipeline.profile.special_tokens.stop_ids.contains(&next) {
             break FinishReason::EndOfSequence;
         }
         output_storage
             .push_token_id(next)
-            .map_err(map_collective_decode_error)?;
+            .map_err(map_collective_decode_error)
+            .map_err(recycled_pipeline_error)?;
         if output_storage.token_ids().len() == max_output_tokens {
             break FinishReason::Length;
         }
-        check_cancelled(cancellation, "next decoder step")?;
-        // Selection is complete; do not retain the old vocabulary row while
-        // the decoder allocates the next step's workspace and output.
-        drop(logits);
-        logits = driver.step(&[next], cancellation)?;
+        check_cancelled(cancellation, "next decoder step").map_err(recycled_pipeline_error)?;
+        next = select_next(&mut logits, &[next], vocabulary, cancellation)?;
     };
-    // The final vocabulary row is no longer needed once selection completes;
-    // release it before using the already acquired collective-decode buffers.
+    // WHY: collective decoding must not overlap either port's owned logits row.
     drop(logits);
-    check_cancelled(cancellation, "collective output decoding")?;
+    check_cancelled(cancellation, "collective output decoding").map_err(recycled_pipeline_error)?;
     let (text, token_ids) = pipeline
         .profile
         .tokenizer
         .tokenizer()
         .decode_with_storage(output_storage, false)
-        .map_err(map_collective_decode_error)?;
-    check_cancelled(cancellation, "publishing completed response")?;
+        .map_err(map_collective_decode_error)
+        .map_err(recycled_pipeline_error)?;
+    check_cancelled(cancellation, "publishing completed response")
+        .map_err(recycled_pipeline_error)?;
     Ok(Generation {
         text,
         token_ids,
         finish_reason,
     })
+}
+
+fn select_next<Logits>(
+    logits: &mut Logits,
+    token_ids: &[u32],
+    vocabulary: usize,
+    cancellation: &dyn Cancellation,
+) -> std::result::Result<u32, RecycledGenerationError<Logits::Error>>
+where
+    Logits: GenerationLogits,
+{
+    let row = logits
+        .step(token_ids, cancellation)
+        .map_err(|source| RecycledGenerationError::Driver { source })?;
+    check_cancelled(cancellation, "greedy selection").map_err(recycled_pipeline_error)?;
+    greedy_last_logits(row, vocabulary).map_err(recycled_pipeline_error)
+}
+
+fn recycled_pipeline_error<DriverError>(source: Error) -> RecycledGenerationError<DriverError>
+where
+    DriverError: std::error::Error,
+{
+    RecycledGenerationError::Pipeline { source }
+}
+
+fn flatten_legacy_generation_error(error: RecycledGenerationError<Error>) -> Error {
+    match error {
+        RecycledGenerationError::Pipeline { source }
+        | RecycledGenerationError::Driver { source } => source,
+    }
 }
 
 impl Generation {
@@ -519,6 +870,31 @@ struct SpecialTokenPolicy {
     add_bos: bool,
     add_eos: bool,
     stop_ids: Vec<u32>,
+}
+
+/// Borrowed artifact-bound execution inputs retained by one text pipeline.
+///
+/// WHY: an execution owner can construct its backend once from the pipeline's
+/// exact weights and configured context ceiling without exposing backend,
+/// device, residency, or service authority through `text`.
+#[derive(Clone, Copy)]
+pub struct ExecutionProfile<'profile> {
+    weights: &'profile Qwen35Weights,
+    context_ceiling: usize,
+}
+
+impl<'profile> ExecutionProfile<'profile> {
+    /// Borrow the exact verified weights retained by the pipeline.
+    #[must_use]
+    pub const fn weights(&self) -> &'profile Qwen35Weights {
+        self.weights
+    }
+
+    /// Return the pipeline's configured prompt-plus-output context ceiling.
+    #[must_use]
+    pub const fn context_ceiling(self) -> usize {
+        self.context_ceiling
+    }
 }
 
 /// Artifact-bound text pipeline.
@@ -579,6 +955,18 @@ impl TextPipeline {
                 limits,
             }),
         })
+    }
+
+    /// Borrow the exact retained weights and configured execution ceiling.
+    ///
+    /// WHY: a separate execution owner must bind itself to this pipeline's
+    /// immutable profile without `text` acquiring native or device authority.
+    #[must_use]
+    pub fn execution_profile(&self) -> ExecutionProfile<'_> {
+        ExecutionProfile {
+            weights: &self.profile.weights,
+            context_ceiling: self.profile.limits.context_tokens,
+        }
     }
 
     /// Return whether this pipeline retains the profile that prepared a request.
@@ -670,12 +1058,15 @@ impl TextPipeline {
             .tokenizer()
             .decode_storage_plan(request.max_output_tokens, self.profile.limits.output_bytes)
             .context(TokenizerSnafu)?;
+        let recycled_logits_plan =
+            RecycledLogitsPlan::new(self.profile.tokenizer.tokenizer().vocab_size())?;
         Ok(PreparedGeneration {
             pipeline: self.clone(),
             plan,
             rendered_prompt: rendered,
             prompt_token_ids: prompt,
             max_output_tokens: request.max_output_tokens,
+            recycled_logits_plan,
             output_storage_plan,
         })
     }

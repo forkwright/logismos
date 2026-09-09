@@ -1,6 +1,8 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::fmt::{Display, Formatter};
 use std::mem::size_of;
+use std::rc::Rc;
 
 use decoders::Qwen35LogitSelection;
 use sha2::{Digest, Sha256};
@@ -8,8 +10,9 @@ use test_fixtures::build_qwen35_fixture;
 use tokenize::{TokenizerDigest, TokenizerIdentity};
 
 use super::{
-    Cancellation, Error, FinishReason, GenerationDriver, GenerationRequest, NeverCancelled,
-    TextMessage, TextRole,
+    Cancellation, Error, FinishReason, GenerationDriver, GenerationLogits, GenerationRequest,
+    LegacyGenerationLogits, NeverCancelled, PreparedGeneration, RecycledGenerationDriver,
+    RecycledGenerationError, RecycledLogitsPlan, RecycledLogitsStorage, TextMessage, TextRole,
 };
 use crate::error::{CancelledSnafu, InvalidConfigurationSnafu};
 use crate::tests::{
@@ -64,6 +67,18 @@ fn text_error<T>(result: super::Result<T>) -> TestResult<Error> {
     match result {
         Err(error) => Ok(error),
         Ok(_) => Err(std::io::Error::other("text operation unexpectedly succeeded").into()),
+    }
+}
+
+fn recycled_error<T, DriverError>(
+    result: std::result::Result<T, RecycledGenerationError<DriverError>>,
+) -> TestResult<RecycledGenerationError<DriverError>>
+where
+    DriverError: std::error::Error,
+{
+    match result {
+        Err(error) => Ok(error),
+        Ok(_) => Err(std::io::Error::other("recycled generation unexpectedly succeeded").into()),
     }
 }
 
@@ -131,6 +146,106 @@ impl GenerationDriver for FakeDriver {
     }
 }
 
+struct FakeRecycledDriver {
+    steps: VecDeque<FakeStep>,
+    calls: Vec<Vec<u32>>,
+    row_pointers: Vec<*const f32>,
+    checks_each_prompt_token: bool,
+}
+
+impl FakeRecycledDriver {
+    fn with_steps(steps: impl IntoIterator<Item = FakeStep>) -> Self {
+        Self {
+            steps: steps.into_iter().collect(),
+            calls: Vec::new(),
+            row_pointers: Vec::new(),
+            checks_each_prompt_token: false,
+        }
+    }
+
+    fn with_prompt_token_checks(steps: impl IntoIterator<Item = FakeStep>) -> Self {
+        Self {
+            checks_each_prompt_token: true,
+            ..Self::with_steps(steps)
+        }
+    }
+}
+
+impl RecycledGenerationDriver for FakeRecycledDriver {
+    type Error = Error;
+
+    fn step_into(
+        &mut self,
+        token_ids: &[u32],
+        logits: &mut [f32],
+        cancellation: &dyn Cancellation,
+    ) -> super::Result<()> {
+        self.calls.push(token_ids.to_vec());
+        self.row_pointers.push(logits.as_ptr());
+        if self.checks_each_prompt_token {
+            for _ in token_ids {
+                if cancellation.is_cancelled() {
+                    return CancelledSnafu {
+                        boundary: "fake recycled native prefill token",
+                    }
+                    .fail();
+                }
+            }
+        }
+        match self.steps.pop_front() {
+            Some(FakeStep::Logits(row)) if row.len() == logits.len() => {
+                logits.copy_from_slice(&row);
+                Ok(())
+            }
+            Some(FakeStep::Logits(_)) => InvalidConfigurationSnafu {
+                rule: "fake recycled driver row has the wrong width",
+            }
+            .fail(),
+            Some(FakeStep::Failure) => InvalidConfigurationSnafu {
+                rule: "fake recycled generation driver failed",
+            }
+            .fail(),
+            None => InvalidConfigurationSnafu {
+                rule: "fake recycled generation driver has no programmed step",
+            }
+            .fail(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CustodyDriverError {
+    custody: Rc<usize>,
+}
+
+impl Display for CustodyDriverError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("fake driver retained resource custody")
+    }
+}
+
+impl std::error::Error for CustodyDriverError {}
+
+struct CustodyFailureDriver {
+    failure: Option<CustodyDriverError>,
+}
+
+impl RecycledGenerationDriver for CustodyFailureDriver {
+    type Error = CustodyDriverError;
+
+    fn step_into(
+        &mut self,
+        _token_ids: &[u32],
+        _logits: &mut [f32],
+        _cancellation: &dyn Cancellation,
+    ) -> std::result::Result<(), Self::Error> {
+        match self.failure.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
 struct CancelOnCheck {
     check: Cell<usize>,
     cancel_at: usize,
@@ -163,6 +278,10 @@ fn logits_for(token_id: usize) -> Vec<f32> {
     logits
 }
 
+fn acquire_logits(prepared: &PreparedGeneration) -> super::Result<RecycledLogitsStorage> {
+    prepared.recycled_logits_plan().acquire()
+}
+
 #[test]
 fn shared_driver_receives_prompt_then_selected_decode_ids_and_retains_output() -> TestResult<()> {
     let tokenizer_json = tokenizer_json();
@@ -192,6 +311,138 @@ fn shared_driver_receives_prompt_then_selected_decode_ids_and_retains_output() -
         generation.token_ids.capacity() >= 2,
         "the returned IDs must be the pre-acquired retained ID owner"
     );
+    Ok(())
+}
+
+#[test]
+fn legacy_adapter_borrows_the_driver_vec_without_a_second_row() -> TestResult<()> {
+    struct PointerDriver<'pointer> {
+        returned_pointer: &'pointer Cell<*const f32>,
+    }
+
+    impl GenerationDriver for PointerDriver<'_> {
+        fn step(
+            &mut self,
+            _token_ids: &[u32],
+            _cancellation: &dyn Cancellation,
+        ) -> super::Result<Vec<f32>> {
+            let row = logits_for(3);
+            self.returned_pointer.set(row.as_ptr());
+            Ok(row)
+        }
+    }
+
+    let returned_pointer = Cell::new(std::ptr::null());
+    let mut driver = PointerDriver {
+        returned_pointer: &returned_pointer,
+    };
+    let mut adapter = LegacyGenerationLogits::new(&mut driver);
+    let row = adapter.step(&[3], &NeverCancelled)?;
+
+    assert_eq!(
+        row.as_ptr(),
+        returned_pointer.get(),
+        "the loop must borrow the exact Vec allocation returned by the legacy driver"
+    );
+    Ok(())
+}
+
+#[test]
+fn recycled_driver_preserves_output_and_reuses_one_row_across_steps() -> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let pipeline = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+    let messages = [TextMessage::new(TextRole::User, "assistant")];
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 2, false), &NeverCancelled)?;
+    let logits_storage = acquire_logits(&prepared)?;
+    let mut driver = FakeRecycledDriver::with_steps([
+        FakeStep::Logits(logits_for(3)),
+        FakeStep::Logits(logits_for(4)),
+    ]);
+
+    let generation =
+        prepared.generate_with_recycled_driver(&mut driver, logits_storage, &NeverCancelled)?;
+
+    assert_eq!(
+        driver.calls,
+        [vec![4], vec![3]],
+        "the recycled port must receive the prompt followed by one selected continuation ID"
+    );
+    assert_eq!(
+        driver.row_pointers.len(),
+        2,
+        "the two generation steps must each receive the acquired row"
+    );
+    assert!(
+        driver
+            .row_pointers
+            .windows(2)
+            .all(|pair| pair.first() == pair.get(1)),
+        "every recycled step must receive the same allocation identity"
+    );
+    assert_eq!(
+        generation.token_ids(),
+        [3, 4],
+        "the recycled port must retain both independently expected token IDs"
+    );
+    assert_eq!(
+        generation.finish_reason(),
+        FinishReason::Length,
+        "the recycled port must preserve length completion"
+    );
+    assert_eq!(
+        generation.text(),
+        "hello assistant",
+        "the recycled port must preserve collective output decoding"
+    );
+    Ok(())
+}
+
+#[test]
+fn recycled_driver_error_moves_non_send_custody_without_losing_identity() -> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let pipeline = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+    let messages = [TextMessage::new(TextRole::User, "hello")];
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+    let logits_storage = acquire_logits(&prepared)?;
+    let custody = Rc::new(41usize);
+    let custody_identity = Rc::as_ptr(&custody);
+    let mut driver = CustodyFailureDriver {
+        failure: Some(CustodyDriverError { custody }),
+    };
+
+    let error = recycled_error(prepared.generate_with_recycled_driver(
+        &mut driver,
+        logits_storage,
+        &NeverCancelled,
+    ))?;
+
+    match error {
+        RecycledGenerationError::Driver { source } => {
+            assert_eq!(
+                Rc::as_ptr(&source.custody),
+                custody_identity,
+                "the driver failure must retain the exact non-Send custody allocation"
+            );
+            assert_eq!(
+                *source.custody, 41,
+                "the driver failure must preserve its owned custody value"
+            );
+        }
+        RecycledGenerationError::Pipeline { source } => {
+            return Err(std::io::Error::other(format!(
+                "driver custody was flattened into a pipeline error: {source}"
+            ))
+            .into());
+        }
+    }
     Ok(())
 }
 
@@ -231,6 +482,148 @@ fn output_storage_is_acquired_before_the_first_driver_step() -> TestResult<()> {
 }
 
 #[test]
+fn recycled_port_acquires_output_storage_before_the_first_driver_step() -> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let mut limits = test_limits(tokenizer_json.len())?;
+    limits.output_bytes = usize::MAX
+        .checked_sub(size_of::<u32>())
+        .ok_or_else(|| std::io::Error::other("usize cannot hold one token ID"))?;
+    let pipeline = pipeline_result(&artifact, &tokenizer_json, limits)?;
+    let messages = [TextMessage::new(TextRole::User, "hello")];
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+    let logits_storage = acquire_logits(&prepared)?;
+    let mut driver = FakeRecycledDriver::with_steps([FakeStep::Logits(logits_for(3))]);
+
+    let error = recycled_error(prepared.generate_with_recycled_driver(
+        &mut driver,
+        logits_storage,
+        &NeverCancelled,
+    ))?;
+
+    assert!(
+        matches!(
+            error,
+            RecycledGenerationError::Pipeline {
+                source: Error::Allocation {
+                    target: "decoded output bytes",
+                    ..
+                }
+            }
+        ),
+        "the recycled port must preserve output pre-acquisition failure"
+    );
+    assert!(
+        driver.calls.is_empty(),
+        "no recycled driver step may begin before collective storage acquisition"
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_driver_wrong_shape_remains_a_typed_pipeline_error() -> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let pipeline = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+    let messages = [TextMessage::new(TextRole::User, "hello")];
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+    let mut driver = FakeDriver::with_steps([FakeStep::Logits(vec![0.0; TOKENS.len() - 1])]);
+
+    let error = text_error(prepared.generate_with_driver(&mut driver, &NeverCancelled))?;
+
+    assert!(
+        matches!(
+            error,
+            Error::LogitShape {
+                actual,
+                expected,
+                ..
+            } if actual == TOKENS.len() - 1 && expected == TOKENS.len()
+        ),
+        "the unchanged legacy port must reject a returned row with the wrong width"
+    );
+    assert_eq!(
+        driver.calls,
+        [vec![3]],
+        "shape refusal must occur after exactly one legacy driver invocation"
+    );
+    Ok(())
+}
+
+#[test]
+fn recycled_storage_width_mismatch_refuses_before_driver_invocation() -> TestResult<()> {
+    const WIDE_TOKENS: [&str; 6] = ["[UNK]", "<bos>", "<eos>", "hello", "assistant", "extra"];
+
+    let tokenizer_json = tokenizer_json();
+    let wide_tokenizer_json =
+        tokenizer_json.replace("\"assistant\":4}", "\"assistant\":4,\"extra\":5}");
+    let wide_config = fixture_config(&WIDE_TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let wide_fixture = build_qwen35_fixture(&wide_config)?;
+    let (_wide_directory, wide_artifact) = load_fixture(&wide_fixture)?;
+    let wide_pipeline = pipeline_with_tokenizer(&wide_artifact, &wide_tokenizer_json)?;
+    let messages = [TextMessage::new(TextRole::User, "hello")];
+    let wide_prepared =
+        wide_pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+    let mismatched_storage = acquire_logits(&wide_prepared)?;
+
+    let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let pipeline = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+    let mut driver = FakeRecycledDriver::with_steps([]);
+
+    let validation = text_error(
+        prepared
+            .recycled_logits_plan()
+            .validate_storage(&mismatched_storage),
+    )?;
+    assert!(
+        matches!(
+            validation,
+            Error::RecycledLogitsStorageMismatch {
+                actual: 6,
+                expected: 5,
+                ..
+            }
+        ),
+        "the public plan check must reject substituted storage before session construction"
+    );
+
+    let error = recycled_error(prepared.generate_with_recycled_driver(
+        &mut driver,
+        mismatched_storage,
+        &NeverCancelled,
+    ))?;
+
+    assert!(
+        matches!(
+            error,
+            RecycledGenerationError::Pipeline {
+                source: Error::RecycledLogitsStorageMismatch {
+                    actual: 6,
+                    expected: 5,
+                    ..
+                }
+            }
+        ),
+        "storage from another vocabulary width must remain a typed pipeline refusal"
+    );
+    assert!(
+        driver.calls.is_empty(),
+        "storage mismatch must be rejected before invoking the recycled driver"
+    );
+    Ok(())
+}
+
+#[test]
 fn prepared_storage_plan_separates_retained_and_scratch_extents() -> TestResult<()> {
     let tokenizer_json = tokenizer_json();
     let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
@@ -250,13 +643,53 @@ fn prepared_storage_plan_separates_retained_and_scratch_extents() -> TestResult<
         .ok_or_else(|| std::io::Error::other("retained byte count overflowed"))?;
 
     assert_eq!(
-        prepared.output_storage_plan.requested_retained_bytes(),
+        prepared.output_storage_plan().requested_retained_bytes(),
         retained_bytes,
         "retained accounting must contain only the moved output and ID owners"
     );
     assert!(
-        prepared.output_storage_plan.requested_scratch_bytes() > 0,
+        prepared.output_storage_plan().requested_scratch_bytes() > 0,
         "transform arenas and indexes must remain separately scratch-owned"
+    );
+    assert_eq!(
+        prepared.recycled_logits_plan().vocabulary_width(),
+        TOKENS.len(),
+        "the recycled row width must come from the exact verified tokenizer"
+    );
+    assert_eq!(
+        prepared.recycled_logits_plan().requested_bytes(),
+        TOKENS.len() * size_of::<f32>(),
+        "recycled row accounting must expose the checked logical f32 extent"
+    );
+    Ok(())
+}
+
+#[test]
+fn recycled_logits_plan_checks_extent_and_reports_allocation_refusal() -> TestResult<()> {
+    let overflow = text_error(RecycledLogitsPlan::new(usize::MAX))?;
+    assert!(
+        matches!(
+            overflow,
+            Error::RecycledLogitsExtentOverflow {
+                vocabulary_width: usize::MAX,
+                ..
+            }
+        ),
+        "an unrepresentable f32 extent must fail while deriving the plan"
+    );
+
+    let largest_representable_width = usize::MAX / size_of::<f32>();
+    let plan = RecycledLogitsPlan::new(largest_representable_width)?;
+    let allocation = text_error(plan.acquire())?;
+    assert!(
+        matches!(
+            allocation,
+            Error::Allocation {
+                target: "recycled logits row",
+                ..
+            }
+        ),
+        "an allocator refusal must remain a typed fallible acquisition error"
     );
     Ok(())
 }
@@ -328,6 +761,51 @@ fn driver_can_observe_cancellation_between_native_prefill_tokens() -> TestResult
 }
 
 #[test]
+fn recycled_driver_observes_the_same_internal_prefill_cancellation() -> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, true, true, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let pipeline = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+    let messages = [TextMessage::new(TextRole::User, "hello")];
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+    let logits_storage = acquire_logits(&prepared)?;
+    let cancellation = CancelOnCheck::new(4);
+    let mut driver = FakeRecycledDriver::with_prompt_token_checks([]);
+
+    let error = recycled_error(prepared.generate_with_recycled_driver(
+        &mut driver,
+        logits_storage,
+        &cancellation,
+    ))?;
+
+    assert!(
+        matches!(
+            error,
+            RecycledGenerationError::Driver {
+                source: Error::Cancelled {
+                    boundary: "fake recycled native prefill token",
+                    ..
+                }
+            }
+        ),
+        "internal recycled-driver cancellation must retain its driver error boundary"
+    );
+    assert_eq!(
+        driver.calls,
+        [vec![1, 3, 2]],
+        "the recycled driver must receive the exact prepared prompt"
+    );
+    assert_eq!(
+        cancellation.checks(),
+        4,
+        "the recycled port must preserve the legacy cancellation observation order"
+    );
+    Ok(())
+}
+
+#[test]
 fn driver_failure_after_a_selected_token_returns_no_output() -> TestResult<()> {
     let tokenizer_json = tokenizer_json();
     let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
@@ -367,12 +845,23 @@ fn preparation_profile_owner_accepts_clones_and_refuses_an_equal_independent_pro
     let independent = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
     let messages = [TextMessage::new(TextRole::User, "hello")];
     let prepared = first.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+    let execution_profile = first.execution_profile();
+    let expected_context_ceiling = test_limits(tokenizer_json.len())?.context_tokens;
 
     assert!(clone.owns_preparation(&prepared));
     assert!(first.owns_preparation(&prepared));
     assert!(
         !independent.owns_preparation(&prepared),
         "equal tokenizer/artifact bytes must not substitute for the retained profile owner"
+    );
+    assert!(
+        std::ptr::eq(execution_profile.weights(), prepared.verified_weights()),
+        "the generic execution profile must borrow the preparation's exact retained weights"
+    );
+    assert_eq!(
+        execution_profile.context_ceiling(),
+        expected_context_ceiling,
+        "the execution profile must expose the configured context ceiling"
     );
     drop(first);
     assert!(

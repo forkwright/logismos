@@ -128,6 +128,30 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// The exact vocabulary row could not be represented as a byte extent.
+    #[snafu(display(
+        "text recycled logits extent overflowed for vocabulary width {vocabulary_width}"
+    ))]
+    RecycledLogitsExtentOverflow {
+        /// Exact verified tokenizer vocabulary width.
+        vocabulary_width: usize,
+        /// Source code location where the overflow was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Caller-acquired logits storage belongs to a different vocabulary width.
+    #[snafu(display("text recycled logits storage has width {actual}, expected {expected}"))]
+    RecycledLogitsStorageMismatch {
+        /// Acquired logits row width.
+        actual: usize,
+        /// Required exact verified tokenizer vocabulary width.
+        expected: usize,
+        /// Source code location where the mismatch was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// Rendered bytes violated the UTF-8 invariant required by a text template.
     #[snafu(display("text template emitted invalid UTF-8: {source}"))]
     RenderedUtf8 {
