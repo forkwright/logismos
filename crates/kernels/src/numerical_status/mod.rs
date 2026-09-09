@@ -86,6 +86,63 @@ pub struct NativeNumericalStatus {
     bits: DeviceBuffer<u32>,
 }
 
+/// Caller-owned native-status storage with validated geometry and device identity.
+///
+/// This carrier does not claim that its status word has been initialized. A
+/// construction transaction must explicitly initialize the retained owner
+/// before it becomes a [`NativeNumericalStatus`].
+#[cfg(feature = "gpu")]
+pub struct NativeNumericalStatusBuffer {
+    bits: DeviceBuffer<u32>,
+}
+
+#[cfg(feature = "gpu")]
+impl NativeNumericalStatusBuffer {
+    /// Consume this carrier and return its original typed device-buffer owner.
+    #[must_use]
+    pub fn into_buffer(self) -> DeviceBuffer<u32> {
+        self.bits
+    }
+}
+
+/// Reason a caller-owned numerical-status buffer could not become a status owner.
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeNumericalStatusBufferErrorKind {
+    /// The buffer belongs to a different process-visible HIP device.
+    DeviceMismatch,
+    /// The buffer does not contain exactly one native-status word.
+    LengthMismatch,
+}
+
+/// Rejected caller-owned numerical-status buffer retaining its original owner.
+#[cfg(feature = "gpu")]
+pub struct NativeNumericalStatusBufferError {
+    kind: NativeNumericalStatusBufferErrorKind,
+    buffer: DeviceBuffer<u32>,
+}
+
+#[cfg(feature = "gpu")]
+impl NativeNumericalStatusBufferError {
+    /// Return the ownership-preserving rejection category.
+    #[must_use]
+    pub const fn kind(&self) -> NativeNumericalStatusBufferErrorKind {
+        self.kind
+    }
+
+    /// Consume this rejection and recover its original typed buffer owner.
+    #[must_use]
+    pub fn into_buffer(self) -> DeviceBuffer<u32> {
+        self.buffer
+    }
+
+    /// Consume this rejection and recover its category and original buffer.
+    #[must_use]
+    pub fn into_parts(self) -> (NativeNumericalStatusBufferErrorKind, DeviceBuffer<u32>) {
+        (self.kind, self.buffer)
+    }
+}
+
 #[cfg(feature = "gpu")]
 impl NativeNumericalStatus {
     /// Allocate one initialized sticky native-status word on `device`.
@@ -93,6 +150,40 @@ impl NativeNumericalStatus {
         Ok(Self {
             bits: DeviceBuffer::from_host(device, &[0])?,
         })
+    }
+
+    /// Validate one caller-owned raw status buffer without initializing it.
+    ///
+    /// This performs no allocation or device write. A rejected buffer remains
+    /// owned by [`NativeNumericalStatusBufferError`] for explicit construction
+    /// teardown; its device contents and completion state are not interpreted.
+    pub fn try_bind_buffer(
+        device: &Device,
+        bits: DeviceBuffer<u32>,
+    ) -> core::result::Result<NativeNumericalStatusBuffer, NativeNumericalStatusBufferError> {
+        if bits.len() != 1 {
+            return Err(NativeNumericalStatusBufferError {
+                kind: NativeNumericalStatusBufferErrorKind::LengthMismatch,
+                buffer: bits,
+            });
+        }
+        if bits.device().ordinal() != device.ordinal() {
+            return Err(NativeNumericalStatusBufferError {
+                kind: NativeNumericalStatusBufferErrorKind::DeviceMismatch,
+                buffer: bits,
+            });
+        }
+        Ok(NativeNumericalStatusBuffer { bits })
+    }
+
+    /// Consume this status and return its original typed device-buffer owner.
+    ///
+    /// This performs no synchronization, HIP release, or eviction
+    /// acknowledgement. A caller handling submitted work must retain the
+    /// returned owner in a quiescing teardown path before it can drop.
+    #[must_use]
+    pub fn into_buffer(self) -> DeviceBuffer<u32> {
+        self.bits
     }
 
     /// Return the exact device allocation demand for one sticky status word.
@@ -140,6 +231,18 @@ mod tests {
         NATIVE_NUMERICAL_STATUS_KNOWN_BITS, NativeNumericalStatusCategory,
         NativeNumericalStatusMask,
     };
+
+    #[cfg(feature = "gpu")]
+    use super::NativeNumericalStatus;
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn native_status_demand_is_one_u32_without_opening_a_device() {
+        assert_eq!(
+            NativeNumericalStatus::byte_demand(),
+            core::mem::size_of::<u32>()
+        );
+    }
 
     #[test]
     fn mask_accepts_combined_typed_categories()

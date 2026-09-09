@@ -92,13 +92,13 @@ impl Qwen35NativeLayerDeviceDemand {
 /// The plan borrows the exact verified weights used during upload, preventing a
 /// same-shape but different artifact from being substituted at session creation.
 #[derive(Debug)]
-pub struct Qwen35NativeLayerPlan<'weights, 'artifact> {
-    weights: &'weights Qwen35Weights<'artifact>,
+pub struct Qwen35NativeLayerPlan<'weights> {
+    weights: &'weights Qwen35Weights,
     plan: DeviceFullAttentionPlan,
     demand: Qwen35NativeLayerDeviceDemand,
 }
 
-impl<'weights, 'artifact> Qwen35NativeLayerPlan<'weights, 'artifact> {
+impl<'weights> Qwen35NativeLayerPlan<'weights> {
     /// Derive a checked native one-block plan from verified Qwen3.5 weights.
     ///
     /// This performs no device initialization, allocation, upload, or kernel
@@ -109,7 +109,7 @@ impl<'weights, 'artifact> Qwen35NativeLayerPlan<'weights, 'artifact> {
     /// Refuses unsupported block roles, metadata, matrix formats or geometry,
     /// out-of-range context, and unrepresentable allocation extents.
     pub fn try_from_weights(
-        weights: &'weights Qwen35Weights<'artifact>,
+        weights: &'weights Qwen35Weights,
         block: usize,
         max_context: usize,
         page_tokens: kernels::attention::NativePageTokens,

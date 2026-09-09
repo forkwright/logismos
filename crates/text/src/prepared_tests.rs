@@ -1,11 +1,16 @@
 use std::cell::Cell;
+use std::collections::VecDeque;
 
 use decoders::Qwen35LogitSelection;
 use sha2::{Digest, Sha256};
 use test_fixtures::build_qwen35_fixture;
 use tokenize::{TokenizerDigest, TokenizerIdentity};
 
-use super::{Cancellation, Error, GenerationRequest, NeverCancelled, TextMessage, TextRole};
+use super::{
+    Cancellation, Error, FinishReason, GenerationDriver, GenerationRequest, NeverCancelled,
+    TextMessage, TextRole,
+};
+use crate::error::{CancelledSnafu, InvalidConfigurationSnafu};
 use crate::tests::{
     TestResult, fixture_config, load_fixture, mutated_artifact, pipeline_result,
     pipeline_with_tokenizer, set_f32_row, test_limits, tokenizer_json, verified_artifact,
@@ -66,6 +71,206 @@ fn tokenizer_identity(tokenizer_json: &str) -> TokenizerIdentity {
     TokenizerIdentity::new(tokenizer_json.len(), digest)
 }
 
+enum FakeStep {
+    Logits(Vec<f32>),
+    Failure,
+}
+
+struct FakeDriver {
+    steps: VecDeque<FakeStep>,
+    calls: Vec<Vec<u32>>,
+    checks_each_prompt_token: bool,
+}
+
+impl FakeDriver {
+    fn with_steps(steps: impl IntoIterator<Item = FakeStep>) -> Self {
+        Self {
+            steps: steps.into_iter().collect(),
+            calls: Vec::new(),
+            checks_each_prompt_token: false,
+        }
+    }
+
+    fn with_prompt_token_checks(steps: impl IntoIterator<Item = FakeStep>) -> Self {
+        Self {
+            checks_each_prompt_token: true,
+            ..Self::with_steps(steps)
+        }
+    }
+}
+
+impl GenerationDriver for FakeDriver {
+    fn step(
+        &mut self,
+        token_ids: &[u32],
+        cancellation: &dyn Cancellation,
+    ) -> super::Result<Vec<f32>> {
+        self.calls.push(token_ids.to_vec());
+        if self.checks_each_prompt_token {
+            for _ in token_ids {
+                if cancellation.is_cancelled() {
+                    return CancelledSnafu {
+                        boundary: "fake native prefill token",
+                    }
+                    .fail();
+                }
+            }
+        }
+        match self.steps.pop_front() {
+            Some(FakeStep::Logits(logits)) => Ok(logits),
+            Some(FakeStep::Failure) => InvalidConfigurationSnafu {
+                rule: "fake generation driver failed",
+            }
+            .fail(),
+            None => InvalidConfigurationSnafu {
+                rule: "fake generation driver has no programmed step",
+            }
+            .fail(),
+        }
+    }
+}
+
+struct CancelOnCheck {
+    check: Cell<usize>,
+    cancel_at: usize,
+}
+
+impl CancelOnCheck {
+    fn new(cancel_at: usize) -> Self {
+        Self {
+            check: Cell::new(0),
+            cancel_at,
+        }
+    }
+
+    fn checks(&self) -> usize {
+        self.check.get()
+    }
+}
+
+impl Cancellation for CancelOnCheck {
+    fn is_cancelled(&self) -> bool {
+        let check = self.check.get() + 1;
+        self.check.set(check);
+        check >= self.cancel_at
+    }
+}
+
+fn logits_for(token_id: usize) -> Vec<f32> {
+    let mut logits = vec![0.0; TOKENS.len()];
+    logits[token_id] = 1.0;
+    logits
+}
+
+#[test]
+fn shared_driver_receives_prompt_then_selected_decode_ids_and_retains_output() -> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let pipeline = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+    let messages = [TextMessage::new(TextRole::User, "assistant")];
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 2, false), &NeverCancelled)?;
+    let mut driver = FakeDriver::with_steps([
+        FakeStep::Logits(logits_for(3)),
+        FakeStep::Logits(logits_for(4)),
+    ]);
+
+    let generation = prepared.generate_with_driver(&mut driver, &NeverCancelled)?;
+
+    assert_eq!(driver.calls, [vec![4], vec![3]]);
+    assert_eq!(generation.token_ids(), [3, 4]);
+    assert_eq!(generation.finish_reason(), FinishReason::Length);
+    assert_eq!(generation.text(), "hello assistant");
+    Ok(())
+}
+
+#[test]
+fn driver_can_observe_cancellation_between_native_prefill_tokens() -> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, true, true, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let pipeline = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+    let messages = [TextMessage::new(TextRole::User, "hello")];
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+    let cancellation = CancelOnCheck::new(4);
+    let mut driver = FakeDriver::with_prompt_token_checks([]);
+
+    let error = text_error(prepared.generate_with_driver(&mut driver, &cancellation))?;
+
+    assert!(
+        matches!(
+            error,
+            Error::Cancelled {
+                boundary: "fake native prefill token",
+                ..
+            }
+        ),
+        "a per-token adapter cancellation must remain a typed pipeline cancellation"
+    );
+    assert_eq!(driver.calls, [vec![1, 3, 2]]);
+    assert_eq!(cancellation.checks(), 4);
+    Ok(())
+}
+
+#[test]
+fn driver_failure_after_a_selected_token_returns_no_output() -> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let pipeline = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+    let messages = [TextMessage::new(TextRole::User, "hello")];
+    let prepared =
+        pipeline.prepare(GenerationRequest::new(&messages, 2, false), &NeverCancelled)?;
+    let mut driver = FakeDriver::with_steps([FakeStep::Logits(logits_for(3)), FakeStep::Failure]);
+
+    let error = text_error(prepared.generate_with_driver(&mut driver, &NeverCancelled))?;
+
+    assert!(
+        matches!(
+            error,
+            Error::InvalidConfiguration {
+                rule: "fake generation driver failed",
+                ..
+            }
+        ),
+        "the exact typed backend error must be returned without an output value"
+    );
+    assert_eq!(driver.calls, [vec![3], vec![3]]);
+    Ok(())
+}
+
+#[test]
+fn preparation_profile_owner_accepts_clones_and_refuses_an_equal_independent_profile()
+-> TestResult<()> {
+    let tokenizer_json = tokenizer_json();
+    let config = fixture_config(&TOKENS, 3, false, false, CONTENT_TEMPLATE);
+    let fixture = build_qwen35_fixture(&config)?;
+    let (_directory, artifact) = load_fixture(&fixture)?;
+    let first = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+    let clone = first.clone();
+    let independent = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+    let messages = [TextMessage::new(TextRole::User, "hello")];
+    let prepared = first.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+
+    assert!(clone.owns_preparation(&prepared));
+    assert!(first.owns_preparation(&prepared));
+    assert!(
+        !independent.owns_preparation(&prepared),
+        "equal tokenizer/artifact bytes must not substitute for the retained profile owner"
+    );
+    drop(first);
+    assert!(
+        clone.owns_preparation(&prepared),
+        "a clone must retain the same profile after the original wrapper drops"
+    );
+    Ok(())
+}
+
 #[test]
 fn distinct_preparations_bind_exact_renderings_and_final_prompt_ids() -> TestResult<()> {
     let tokenizer_json = tokenizer_json();
@@ -120,6 +325,49 @@ fn prepared_report_binds_both_identities_and_exact_request_axes() -> TestResult<
         requirements.max_context(),
         prompt_tokens + prepared.max_output_tokens()
     );
+    Ok(())
+}
+
+#[test]
+fn prepared_request_retains_profile_after_pipeline_and_artifact_drop() -> TestResult<()> {
+    let (prepared, expected_tokenizer, expected_artifact) = {
+        let tokenizer_json = tokenizer_json();
+        let expected_tokenizer = tokenizer_identity(&tokenizer_json);
+        let config = fixture_config(&TOKENS, 3, true, true, CONTENT_TEMPLATE);
+        let fixture = build_qwen35_fixture(&config)?;
+        let (directory, artifact) = load_fixture(&fixture)?;
+        let expected_artifact = artifact.observation().inspection().digest;
+        let pipeline = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
+        let messages = [TextMessage::new(TextRole::User, "hello")];
+        let prepared =
+            pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)?;
+        drop(pipeline);
+        drop(artifact);
+        drop(directory);
+        (prepared, expected_tokenizer, expected_artifact)
+    };
+
+    assert_eq!(prepared.rendered_prompt(), "hello");
+    assert_eq!(prepared.prompt_token_ids(), [1, 3, 2]);
+    assert_eq!(prepared.tokenizer_identity(), expected_tokenizer);
+    assert_eq!(
+        prepared.decoder_cpu_requirements().artifact_digest(),
+        expected_artifact
+    );
+    assert_eq!(prepared.context_tokens(), 4);
+    assert_eq!(prepared.max_output_tokens(), 1);
+    assert_eq!(
+        prepared
+            .verified_weights()
+            .execution_plan(4, 3, Qwen35LogitSelection::LastToken)?
+            .cpu_requirements()
+            .artifact_digest(),
+        expected_artifact,
+        "the prepared owner must retain its exact verified weights"
+    );
+    let generation = prepared.generate(&NeverCancelled)?;
+    assert_eq!(generation.token_ids(), [3]);
+    assert_eq!(generation.text(), "hello");
     Ok(())
 }
 

@@ -7,11 +7,14 @@
 //! living in a separate crate because both protocols are the same
 //! role at different transports.
 //!
-//! Phase 0 scaffold. No functional code yet.
+//! Protocol scaffold. No functional service or published wire contract yet.
+//! The private service adapter belongs here: it will bind the existing text,
+//! decoder, placement and scheduler owners without moving HIP into the pure
+//! request/planning crates or creating a second resource ledger.
 //!
 //! ## Responsibility
 //!
-//! HTTP surface (phase 7):
+//! Planned HTTP surface (not an advertised capability):
 //! - `/v1/chat/completions` (+ SSE streaming)
 //! - `/v1/completions`, `/v1/embeddings`
 //! - `/v1/rerank` (non-standard but matches BGE/Cohere convention)
@@ -19,7 +22,7 @@
 //! - `/v1/audio/transcriptions` (phase 8), `/v1/audio/speech` (phase 9)
 //! - `/v1/images/generations` (phase 11)
 //!
-//! MCP surface (phase 7):
+//! Planned MCP surface (not an advertised capability):
 //! - `inference.complete`, `inference.embed`, `inference.rerank`,
 //!   `inference.models` over stdio + SSE
 //!
@@ -27,10 +30,15 @@
 //! - Request shaping + response normalisation across model families
 //! - Admission control delegation to `sched`
 //! - Grammar delegation to `decode`
-//! - SLO target: P50 first-token ≤300 ms, P95 ≤1 s, ≥8 concurrent
+//! - Dispatch-time validation of the exact request, resident and current grant
+//! - Shared residency, independent per-use state and retained-result ownership
+//! - Explicit release acknowledgement; cancellation alone does not free a lease
 //!
-//! Lands in Phase 7 (fleet cutover milestone). Replaces llama-server
-//! as the dispatch fleet's `local` provider backend.
+//! Aletheia retains workload/session intent and privacy policy. Host grants,
+//! modes and external service lifecycle remain host-owned. Serving, measured
+//! capacity/quality/performance, consumer conformance and any intentional
+//! provider transition have separate gates; implementing this crate does not
+//! automatically replace llama-server or retarget the fleet's `local` provider.
 #![deny(missing_docs)]
 
 #[cfg(test)]

@@ -126,7 +126,7 @@ pub(super) fn native_decode_plan(
 
 impl DeviceFullAttentionPlan {
     pub(super) fn from_weights(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         block: usize,
         max_context: usize,
         page_tokens: kernels::attention::NativePageTokens,
@@ -136,7 +136,7 @@ impl DeviceFullAttentionPlan {
     }
 
     pub(super) fn from_layout(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         layout: Layout,
         block: usize,
         page_tokens: kernels::attention::NativePageTokens,
@@ -216,7 +216,7 @@ impl DeviceFullAttentionPlan {
 }
 
 impl AttentionProjectionWeights {
-    fn from_weights(weights: &Qwen35Weights<'_>, block: usize) -> Result<Self> {
+    fn from_weights(weights: &Qwen35Weights, block: usize) -> Result<Self> {
         Ok(Self {
             q_gate: projection(weights, block_name(block, "attn_q.weight"))?,
             key: projection(weights, block_name(block, "attn_k.weight"))?,
@@ -239,7 +239,7 @@ impl AttentionProjectionWeights {
 }
 
 impl AttentionNormalizationWeights {
-    fn from_weights(weights: &Qwen35Weights<'_>, layout: Layout, block: usize) -> Result<Self> {
+    fn from_weights(weights: &Qwen35Weights, layout: Layout, block: usize) -> Result<Self> {
         Ok(Self {
             input: f32_parameter(
                 weights,
@@ -272,7 +272,7 @@ impl AttentionNormalizationWeights {
     }
 }
 
-pub(super) fn projection(weights: &Qwen35Weights<'_>, name: String) -> Result<ProjectionWeight> {
+pub(super) fn projection(weights: &Qwen35Weights, name: String) -> Result<ProjectionWeight> {
     let matrix = weights.checked_matrix(&name)?;
     let shape = matrix.native_shape().context(NativeKernelSnafu)?;
     Ok(ProjectionWeight {
@@ -287,7 +287,7 @@ pub(super) fn dimension(elements: usize, context: &'static str) -> Result<u64> {
 }
 
 pub(super) fn f32_parameter(
-    weights: &Qwen35Weights<'_>,
+    weights: &Qwen35Weights,
     name: String,
     dimensions: Vec<u64>,
     elements: usize,

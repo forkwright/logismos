@@ -15,8 +15,9 @@ use crate::qwen35_recurrent::Qwen35RecurrentExecution;
 
 /// One payload-verified Qwen3.5 structural profile with a narrow CPU projection.
 ///
-/// The only construction path borrows a [`VerifiedArtifact`], then repeats the
-/// observation-only Qwen3.5 structural validation over its exact observation.
+/// The only construction path borrows a [`VerifiedArtifact`], then retains a
+/// cheap shared clone and repeats the observation-only Qwen3.5 structural
+/// validation over its exact observation.
 /// It accepts no external report as authority and exposes no constructor from
 /// [`loader::gguf::ObservedArtifact`]. A successful binding establishes only
 /// verified payload ownership and the structural profile; execution-only
@@ -33,14 +34,14 @@ use crate::qwen35_recurrent::Qwen35RecurrentExecution;
 ///     let _ = Qwen35Weights::try_from_verified(observed);
 /// }
 /// ```
-#[derive(Debug)]
-pub struct Qwen35Weights<'artifact> {
-    payload: &'artifact VerifiedArtifact,
+#[derive(Clone, Debug)]
+pub struct Qwen35Weights {
+    payload: VerifiedArtifact,
     recurrent_layout: Qwen35RecurrentLayout,
     execution_dimensions: Qwen35ExecutionDimensions,
 }
 
-impl<'artifact> Qwen35Weights<'artifact> {
+impl Qwen35Weights {
     pub(crate) const fn projection_output_elements(output_width: usize) -> usize {
         CheckedMatrix::projection_output_elements(output_width)
     }
@@ -55,10 +56,10 @@ impl<'artifact> Qwen35Weights<'artifact> {
     ///
     /// Returns [`crate::Error`] when the verified payload's retained
     /// observation does not meet the narrow Qwen3.5 structural contract.
-    pub fn try_from_verified(payload: &'artifact VerifiedArtifact) -> Result<Self> {
+    pub fn try_from_verified(payload: &VerifiedArtifact) -> Result<Self> {
         let profile = Qwen35StructuralProfile::try_from_observed(payload.observation())?;
         Ok(Self {
-            payload,
+            payload: payload.clone(),
             recurrent_layout: profile.recurrent_layout(),
             execution_dimensions: profile.execution_dimensions(),
         })
@@ -68,8 +69,8 @@ impl<'artifact> Qwen35Weights<'artifact> {
         self.recurrent_layout
     }
 
-    pub(crate) const fn payload(&self) -> &'artifact VerifiedArtifact {
-        self.payload
+    pub(crate) const fn payload(&self) -> &VerifiedArtifact {
+        &self.payload
     }
 
     pub(crate) const fn execution_dimensions(&self) -> Qwen35ExecutionDimensions {
@@ -101,7 +102,7 @@ impl<'artifact> Qwen35Weights<'artifact> {
     }
 
     fn matrix(&self, name: &str) -> Result<CheckedMatrix<'_>> {
-        CheckedMatrix::from_payload(self.payload, name)
+        CheckedMatrix::from_payload(&self.payload, name)
     }
 
     #[cfg(feature = "gpu")]
@@ -119,10 +120,7 @@ impl<'artifact> Qwen35Weights<'artifact> {
     ///
     /// Returns [`crate::Error`] when the selected block is not recurrent or
     /// when its execution-only finite parameters cannot be admitted.
-    pub fn recurrent_execution(
-        &self,
-        block_index: u64,
-    ) -> Result<Qwen35RecurrentExecution<'_, 'artifact>> {
+    pub fn recurrent_execution(&self, block_index: u64) -> Result<Qwen35RecurrentExecution> {
         Qwen35RecurrentExecution::try_from_weights(self, block_index)
     }
 
@@ -135,7 +133,7 @@ impl<'artifact> Qwen35Weights<'artifact> {
     ///
     /// Returns [`crate::Error`] when execution-only Qwen3.5 metadata is
     /// incomplete, unsupported, or the requested context is out of range.
-    pub fn execution(&self, max_context: usize) -> Result<Qwen35Execution<'_, 'artifact>> {
+    pub fn execution(&self, max_context: usize) -> Result<Qwen35Execution> {
         Qwen35Execution::try_from_weights(self, max_context)
     }
 
@@ -150,7 +148,7 @@ impl<'artifact> Qwen35Weights<'artifact> {
         max_context: usize,
         max_step_tokens: usize,
         selection: Qwen35LogitSelection,
-    ) -> Result<Qwen35ExecutionPlan<'_, 'artifact>> {
+    ) -> Result<Qwen35ExecutionPlan> {
         Qwen35ExecutionPlan::try_from_weights(self, max_context, max_step_tokens, selection)
     }
 }

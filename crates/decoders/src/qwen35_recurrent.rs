@@ -58,8 +58,8 @@ pub(crate) enum RecurrentTensorRole {
 /// delta recurrence, gated `RMSNorm`, and output projection. It does not execute
 /// residuals, FFN, dense attention, `NextN`, tokenization, logits, or a model.
 #[derive(Debug)]
-pub struct Qwen35RecurrentExecution<'weights, 'artifact> {
-    weights: &'weights Qwen35Weights<'artifact>,
+pub struct Qwen35RecurrentExecution {
+    weights: Qwen35Weights,
     block_index: u64,
     layout: ExecutionLayout,
     attention_norm: Vec<f32>,
@@ -125,7 +125,7 @@ impl RecurrentRetainedAllocations {
     }
 }
 
-impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
+impl Qwen35RecurrentExecution {
     pub(crate) fn retained_elements(layout: Qwen35RecurrentLayout, epsilon: f32) -> Result<usize> {
         let layout = ExecutionLayout::try_from_profile(layout, epsilon)?;
         RecurrentRetainedAllocations::try_from_layout(layout)?.total_elements()
@@ -139,10 +139,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         let layout = ExecutionLayout::try_from_profile(layout, epsilon)?;
         Ok(RecurrentStepAllocations::try_from_layout(layout, token_count)?.workspace_elements())
     }
-    pub(crate) fn try_from_weights(
-        weights: &'weights Qwen35Weights<'artifact>,
-        block_index: u64,
-    ) -> Result<Self> {
+    pub(crate) fn try_from_weights(weights: &Qwen35Weights, block_index: u64) -> Result<Self> {
         let epsilon = recurrent_layernorm_rms_epsilon(weights.payload().observation().metadata())?;
         let layout = ExecutionLayout::try_from_profile(weights.recurrent_layout(), epsilon)?;
         layout.validate_recurrent_block(block_index)?;
@@ -182,7 +179,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         let recurrent_state = zeroed_f32("GDN state", allocations.recurrent_state)?;
 
         Ok(Self {
-            weights,
+            weights: weights.clone(),
             block_index,
             layout,
             attention_norm,
@@ -222,7 +219,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
     pub(crate) fn try_clone_for_transaction(&self) -> Result<Self> {
         let allocations = RecurrentRetainedAllocations::try_from_layout(self.layout)?;
         Ok(Self {
-            weights: self.weights,
+            weights: self.weights.clone(),
             block_index: self.block_index,
             layout: self.layout,
             attention_norm: clone_f32(
@@ -293,7 +290,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
         allocations: &RecurrentStepAllocations,
     ) -> Result<ProjectedInputs> {
         let qkv = project_tokens(
-            self.weights,
+            &self.weights,
             &block_tensor_name(self.block_index, ATTN_QKV_ROLE),
             normalized,
             token_count,
@@ -302,7 +299,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             allocations.qkv_projection,
         )?;
         let z = project_tokens(
-            self.weights,
+            &self.weights,
             &block_tensor_name(self.block_index, ATTN_GATE_ROLE),
             normalized,
             token_count,
@@ -311,7 +308,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             allocations.gate_projection,
         )?;
         let alpha = project_tokens(
-            self.weights,
+            &self.weights,
             &block_tensor_name(self.block_index, SSM_ALPHA_ROLE),
             normalized,
             token_count,
@@ -320,7 +317,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             allocations.alpha_projection,
         )?;
         let beta_projection = project_tokens(
-            self.weights,
+            &self.weights,
             &block_tensor_name(self.block_index, SSM_BETA_ROLE),
             normalized,
             token_count,
@@ -519,7 +516,7 @@ impl<'weights, 'artifact> Qwen35RecurrentExecution<'weights, 'artifact> {
             kernels::cpu_f32::try_hadamard(&normalized_output, &gate).context(RecurrentCpuSnafu)?;
         ensure_finite(&gated_output, "recurrent output gate", 0)?;
         project_tokens(
-            self.weights,
+            &self.weights,
             &block_tensor_name(self.block_index, SSM_OUT_ROLE),
             &gated_output,
             token_count,
@@ -1021,7 +1018,7 @@ impl RecurrentStepAllocations {
 }
 
 fn read_f32_tensor(
-    weights: &Qwen35Weights<'_>,
+    weights: &Qwen35Weights,
     name: &str,
     expected_dims: &[u64],
     planned_values: usize,
@@ -1304,7 +1301,7 @@ fn softplus(value: f32) -> f32 {
     reason = "the checked token matrix shape and its owner plan are one projection contract"
 )]
 fn project_tokens(
-    weights: &Qwen35Weights<'_>,
+    weights: &Qwen35Weights,
     name: &str,
     values: &[f32],
     token_count: usize,

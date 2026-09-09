@@ -6,10 +6,15 @@
 //! template, and one explicitly receipt-verified `tokenizer.json`. It accepts
 //! only text messages, renders through a capability-free MiniJinja environment,
 //! then executes greedy CPU generation in a fresh session for each request.
+//! [`PreparedGeneration`] also exposes a HIP-free per-request driver port so a
+//! separate private adapter can reuse the same bounded greedy loop without
+//! making this crate a native execution or service authority.
 //!
-//! A failed pipeline call returns neither a session nor partial generated text.
-//! Its private execution is dropped, but a completed underlying decoder step is
-//! not rolled back before that drop.
+//! A failed CPU pipeline call returns neither a session nor partial generated
+//! text. Its private execution is dropped, but a completed underlying decoder
+//! step is not rolled back before that drop. A caller-owned
+//! [`GenerationDriver`] remains with its caller on success, cancellation, or
+//! error; this port does not acknowledge adapter-resource release.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -22,6 +27,8 @@
 )]
 
 pub mod error;
+
+use std::sync::Arc;
 
 use decoders::{Qwen35CpuRequirements, Qwen35ExecutionPlan, Qwen35LogitSelection, Qwen35Weights};
 use loader::gguf::{MetaValue, VerifiedArtifact};
@@ -226,15 +233,52 @@ pub struct Generation {
 ///
 /// WHY: qualification callers must inspect the exact artifact-bound request
 /// without gaining a mutable prompt or a second execution path.
-pub struct PreparedGeneration<'pipeline, 'artifact> {
-    pipeline: &'pipeline TextPipeline<'artifact>,
-    plan: Qwen35ExecutionPlan<'pipeline, 'artifact>,
+pub struct PreparedGeneration {
+    pipeline: TextPipeline,
+    plan: Qwen35ExecutionPlan,
     rendered_prompt: String,
     prompt_token_ids: Vec<u32>,
     max_output_tokens: usize,
 }
 
-impl PreparedGeneration<'_, '_> {
+/// Per-request token execution consumed by the bounded greedy driver.
+///
+/// The first call receives the complete, nonempty prepared prompt. Each later
+/// call receives exactly one previously selected non-stop token ID. A driver
+/// returns the last-token vocabulary row for its supplied IDs, and may use the
+/// cancellation source between internal prompt-token operations.
+///
+/// Implementors are responsible for binding their private execution to the
+/// exact [`PreparedGeneration`] weights and context inspected before this port
+/// consumes the preparation. This port is not service authority, GPU-residency
+/// proof, a release acknowledgement, or a qualification for a native backend.
+pub trait GenerationDriver {
+    /// Execute one nonempty batch of prepared token IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed pipeline error used by the shared generation
+    /// loop. Implementations must preserve their typed source rather than
+    /// replacing a backend failure with text.
+    fn step(&mut self, token_ids: &[u32], cancellation: &dyn Cancellation) -> Result<Vec<f32>>;
+}
+
+/// Explicit CPU implementation of the shared generation-driver port.
+///
+/// The shared loop observes cancellation before each whole CPU decoder step.
+/// Unlike a native prefill adapter, this implementation intentionally passes
+/// the complete prompt to the established batched CPU execution contract.
+struct CpuGenerationDriver {
+    execution: decoders::Qwen35Execution,
+}
+
+impl GenerationDriver for CpuGenerationDriver {
+    fn step(&mut self, token_ids: &[u32], _cancellation: &dyn Cancellation) -> Result<Vec<f32>> {
+        self.execution.step(token_ids).context(DecoderSnafu)
+    }
+}
+
+impl PreparedGeneration {
     /// Borrow the exact template rendering bound to this prepared request.
     ///
     /// WHY: qualification evidence must be the rendering that will be decoded.
@@ -255,8 +299,8 @@ impl PreparedGeneration<'_, '_> {
     ///
     /// WHY: prompt IDs only have meaning with their verified tokenizer bytes.
     #[must_use]
-    pub const fn tokenizer_identity(&self) -> TokenizerIdentity {
-        self.pipeline.tokenizer.identity()
+    pub fn tokenizer_identity(&self) -> TokenizerIdentity {
+        self.pipeline.profile.tokenizer.identity()
     }
 
     /// Return the request-specific decoder-owned logical CPU requirements.
@@ -275,7 +319,25 @@ impl PreparedGeneration<'_, '_> {
         self.max_output_tokens
     }
 
-    /// Construct one decoder session and generate from this exact prepared prompt.
+    /// Borrow the exact verified weights retained by this preparation.
+    ///
+    /// WHY: a native qualification adapter must derive its own artifact-bound
+    /// plan from this prepared request rather than accept substitutable weights.
+    #[must_use]
+    pub fn verified_weights(&self) -> &Qwen35Weights {
+        &self.pipeline.profile.weights
+    }
+
+    /// Return the exact prompt-plus-output context admitted for this request.
+    ///
+    /// WHY: a native qualification adapter must use this request's admitted
+    /// context, not the pipeline's broader configured ceiling.
+    #[must_use]
+    pub const fn context_tokens(&self) -> usize {
+        self.plan.cpu_requirements().max_context()
+    }
+
+    /// Construct one CPU decoder session and generate from this exact prepared prompt.
     ///
     /// This consumes the prepared request so callers cannot alter or reuse its
     /// prompt IDs with another pipeline or execution plan. A cancellation or
@@ -298,49 +360,118 @@ impl PreparedGeneration<'_, '_> {
         } = self;
         drop(rendered_prompt);
         check_cancelled(cancellation, "decoder session construction")?;
-        let mut execution = plan.execution().context(DecoderSnafu)?;
-        check_cancelled(cancellation, "prompt decoder step")?;
-        let mut logits = execution.step(&prompt_token_ids).context(DecoderSnafu)?;
-        let mut generated = Vec::new();
-        generated
-            .try_reserve_exact(max_output_tokens)
-            .context(AllocationSnafu {
-                target: "generated token IDs",
-            })?;
-        let finish_reason = loop {
-            check_cancelled(cancellation, "greedy selection")?;
-            let next = greedy_last_logits(&logits, pipeline.tokenizer.tokenizer().vocab_size())?;
-            if pipeline.special_tokens.stop_ids.contains(&next) {
-                break FinishReason::EndOfSequence;
-            }
-            generated.push(next);
-            if generated.len() == max_output_tokens {
-                break FinishReason::Length;
-            }
-            check_cancelled(cancellation, "next decoder step")?;
-            // Selection is complete; do not retain the old vocabulary row while
-            // the decoder allocates the next step's workspace and output.
-            drop(logits);
-            logits = execution.step(&[next]).context(DecoderSnafu)?;
+        let mut driver = CpuGenerationDriver {
+            execution: plan.execution().context(DecoderSnafu)?,
         };
-        check_cancelled(cancellation, "collective output decoding")?;
-        let text = pipeline
-            .tokenizer
-            .tokenizer()
-            .decode(&generated, false)
-            .context(TokenizerSnafu)?;
-        check_limit(
-            "decoded output bytes",
-            text.len(),
-            pipeline.limits.output_bytes,
-        )?;
-        check_cancelled(cancellation, "publishing completed response")?;
-        Ok(Generation {
-            text,
-            token_ids: generated,
-            finish_reason,
-        })
+        run_generation(
+            &pipeline,
+            &prompt_token_ids,
+            max_output_tokens,
+            &mut driver,
+            cancellation,
+        )
     }
+
+    /// Generate through one caller-owned execution adapter.
+    ///
+    /// The adapter is called once with the exact complete prepared prompt and
+    /// then once per selected generated token. This consumes the preparation,
+    /// so the immutable prompt, profile, plan, and output cap cannot be reused
+    /// with another driver. An adapter that internally pre-fills token by token
+    /// receives the cancellation source for those boundaries.
+    ///
+    /// This method checks cancellation at the legacy `decoder session
+    /// construction` boundary before invoking the driver. Because the driver
+    /// is caller-owned and already constructed, that check is not evidence that
+    /// an adapter allocation or submission was prevented; private adapters must
+    /// validate their own grant and cancellation before construction.
+    ///
+    /// The caller must construct the adapter from [`Self::verified_weights`]
+    /// and [`Self::context_tokens`] of this same preparation before consuming
+    /// it. The port deliberately does not claim safe native inference, service
+    /// authority, artifact quality, or GPU qualification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed adapter, cancellation, sampling, tokenizer, allocation,
+    /// or output-limit error. No partial response is published on failure.
+    pub fn generate_with_driver(
+        self,
+        driver: &mut dyn GenerationDriver,
+        cancellation: &dyn Cancellation,
+    ) -> Result<Generation> {
+        let Self {
+            pipeline,
+            plan: _,
+            rendered_prompt,
+            prompt_token_ids,
+            max_output_tokens,
+        } = self;
+        drop(rendered_prompt);
+        check_cancelled(cancellation, "decoder session construction")?;
+        run_generation(
+            &pipeline,
+            &prompt_token_ids,
+            max_output_tokens,
+            driver,
+            cancellation,
+        )
+    }
+}
+
+fn run_generation(
+    pipeline: &TextPipeline,
+    prompt_token_ids: &[u32],
+    max_output_tokens: usize,
+    driver: &mut dyn GenerationDriver,
+    cancellation: &dyn Cancellation,
+) -> Result<Generation> {
+    check_cancelled(cancellation, "prompt decoder step")?;
+    let mut logits = driver.step(prompt_token_ids, cancellation)?;
+    let mut generated = Vec::new();
+    generated
+        .try_reserve_exact(max_output_tokens)
+        .context(AllocationSnafu {
+            target: "generated token IDs",
+        })?;
+    let finish_reason = loop {
+        check_cancelled(cancellation, "greedy selection")?;
+        let next =
+            greedy_last_logits(&logits, pipeline.profile.tokenizer.tokenizer().vocab_size())?;
+        if pipeline.profile.special_tokens.stop_ids.contains(&next) {
+            break FinishReason::EndOfSequence;
+        }
+        generated.push(next);
+        if generated.len() == max_output_tokens {
+            break FinishReason::Length;
+        }
+        check_cancelled(cancellation, "next decoder step")?;
+        // Selection is complete; do not retain the old vocabulary row while
+        // the decoder allocates the next step's workspace and output.
+        drop(logits);
+        logits = driver.step(&[next], cancellation)?;
+    };
+    // The final vocabulary row is no longer needed once selection completes;
+    // release it before collective tokenizer output allocation and decoding.
+    drop(logits);
+    check_cancelled(cancellation, "collective output decoding")?;
+    let text = pipeline
+        .profile
+        .tokenizer
+        .tokenizer()
+        .decode(&generated, false)
+        .context(TokenizerSnafu)?;
+    check_limit(
+        "decoded output bytes",
+        text.len(),
+        pipeline.profile.limits.output_bytes,
+    )?;
+    check_cancelled(cancellation, "publishing completed response")?;
+    Ok(Generation {
+        text,
+        token_ids: generated,
+        finish_reason,
+    })
 }
 
 impl Generation {
@@ -390,21 +521,27 @@ struct SpecialTokenPolicy {
 }
 
 /// Artifact-bound text pipeline.
-pub struct TextPipeline<'artifact> {
-    weights: Qwen35Weights<'artifact>,
+#[derive(Clone)]
+pub struct TextPipeline {
+    profile: Arc<TextProfile>,
+}
+
+struct TextProfile {
+    weights: Qwen35Weights,
     tokenizer: VerifiedTokenizer,
-    template: BoundedTemplate<'artifact>,
+    template_source: String,
+    template_limits: TemplateLimits,
     special_tokens: SpecialTokenPolicy,
     limits: PipelineLimits,
 }
 
-impl<'artifact> TextPipeline<'artifact> {
+impl TextPipeline {
     /// Verify one tokenizer companion and bind it to one verified GGUF artifact.
     ///
     /// The GGUF is the sole source of template, vocabulary, special IDs, and
     /// add-special policy. This constructor performs no sibling-file discovery.
     pub fn new(
-        artifact: &'artifact VerifiedArtifact,
+        artifact: &VerifiedArtifact,
         companion: TokenizerCompanion<'_>,
         limits: PipelineLimits,
     ) -> Result<Self> {
@@ -422,19 +559,39 @@ impl<'artifact> TextPipeline<'artifact> {
         let template = metadata_string(metadata, CHAT_TEMPLATE_KEY)?;
         check_limit("template bytes", template.len(), limits.template_bytes)?;
         let special_tokens = verify_vocabulary(metadata, &tokenizer)?;
-        let template =
-            BoundedTemplate::new(template, template_limits).map_err(map_template_error)?;
+        let mut template_source = String::new();
+        template_source
+            .try_reserve_exact(template.len())
+            .context(AllocationSnafu {
+                target: "artifact chat template source",
+            })?;
+        template_source.push_str(template);
+        BoundedTemplate::new(&template_source, template_limits).map_err(map_template_error)?;
         let weights = Qwen35Weights::try_from_verified(artifact).context(DecoderSnafu)?;
         Ok(Self {
-            weights,
-            tokenizer,
-            template,
-            special_tokens,
-            limits,
+            profile: Arc::new(TextProfile {
+                weights,
+                tokenizer,
+                template_source,
+                template_limits,
+                special_tokens,
+                limits,
+            }),
         })
     }
 
-    /// Prepare and generate greedily in one fresh private decoder session.
+    /// Return whether this pipeline retains the profile that prepared a request.
+    ///
+    /// Clones share one in-process profile owner. Independently constructed
+    /// pipelines conservatively return false even if their artifacts and
+    /// tokenizer bytes compare equal. This is not an authenticity check, host
+    /// grant, or proof of device residency.
+    #[must_use]
+    pub fn owns_preparation(&self, prepared: &PreparedGeneration) -> bool {
+        Arc::ptr_eq(&self.profile, &prepared.pipeline.profile)
+    }
+
+    /// Prepare and generate greedily in one fresh private CPU decoder session.
     ///
     /// A cancellation or later failure returns no partial text. Any completed
     /// decoder `step` remains committed only inside the private session that is
@@ -474,7 +631,7 @@ impl<'artifact> TextPipeline<'artifact> {
         &self,
         request: GenerationRequest<'_>,
         cancellation: &dyn Cancellation,
-    ) -> Result<PreparedGeneration<'_, 'artifact>> {
+    ) -> Result<PreparedGeneration> {
         check_cancelled(cancellation, "template rendering")?;
         self.validate_request(&request)?;
         let rendered = self.render(&request)?;
@@ -495,9 +652,10 @@ impl<'artifact> TextPipeline<'artifact> {
         check_limit(
             "prompt plus output tokens",
             requested_context,
-            self.limits.context_tokens,
+            self.profile.limits.context_tokens,
         )?;
         let plan = self
+            .profile
             .weights
             .execution_plan(
                 requested_context,
@@ -506,7 +664,7 @@ impl<'artifact> TextPipeline<'artifact> {
             )
             .context(DecoderSnafu)?;
         Ok(PreparedGeneration {
-            pipeline: self,
+            pipeline: self.clone(),
             plan,
             rendered_prompt: rendered,
             prompt_token_ids: prompt,
@@ -515,7 +673,11 @@ impl<'artifact> TextPipeline<'artifact> {
     }
 
     fn validate_request(&self, request: &GenerationRequest<'_>) -> Result<()> {
-        check_limit("messages", request.messages.len(), self.limits.messages)?;
+        check_limit(
+            "messages",
+            request.messages.len(),
+            self.profile.limits.messages,
+        )?;
         if request.messages.is_empty() {
             return InvalidConfigurationSnafu {
                 rule: "generation request must contain at least one text message",
@@ -535,7 +697,7 @@ impl<'artifact> TextPipeline<'artifact> {
         check_limit(
             "requested output tokens",
             request.max_output_tokens,
-            self.limits.output_tokens,
+            self.profile.limits.output_tokens,
         )?;
         if request.max_output_tokens == 0 {
             return InvalidConfigurationSnafu {
@@ -554,7 +716,7 @@ impl<'artifact> TextPipeline<'artifact> {
             check_limit(
                 "message bytes",
                 message.content.len(),
-                self.limits.message_bytes,
+                self.profile.limits.message_bytes,
             )?;
             total_bytes = total_bytes
                 .checked_add(message.content.len())
@@ -568,12 +730,15 @@ impl<'artifact> TextPipeline<'artifact> {
         check_limit(
             "request prompt bytes",
             total_bytes,
-            self.limits.prompt_bytes,
+            self.profile.limits.prompt_bytes,
         )
     }
 
     fn render(&self, request: &GenerationRequest<'_>) -> Result<String> {
-        self.template
+        let template =
+            BoundedTemplate::new(&self.profile.template_source, self.profile.template_limits)
+                .map_err(map_template_error)?;
+        template
             .render(RenderContext {
                 messages: request.messages,
                 add_generation_prompt: true,
@@ -585,6 +750,7 @@ impl<'artifact> TextPipeline<'artifact> {
 
     fn encode_prompt(&self, rendered: &str) -> Result<Vec<u32>> {
         let mut prompt = self
+            .profile
             .tokenizer
             .tokenizer()
             .encode(rendered, false)
@@ -592,8 +758,8 @@ impl<'artifact> TextPipeline<'artifact> {
         prompt.try_reserve(2).context(AllocationSnafu {
             target: "prompt special-token prefix/suffix",
         })?;
-        if self.special_tokens.add_bos {
-            let bos_id = self.special_tokens.bos_id.ok_or_else(|| {
+        if self.profile.special_tokens.add_bos {
+            let bos_id = self.profile.special_tokens.bos_id.ok_or_else(|| {
                 SpecialTokenPolicySnafu {
                     rule: "add_bos requires a declared BOS token ID",
                 }
@@ -601,8 +767,8 @@ impl<'artifact> TextPipeline<'artifact> {
             })?;
             prompt.insert(0, bos_id);
         }
-        if self.special_tokens.add_eos {
-            prompt.push(self.special_tokens.eos_id);
+        if self.profile.special_tokens.add_eos {
+            prompt.push(self.profile.special_tokens.eos_id);
         }
         Ok(prompt)
     }
@@ -1110,24 +1276,24 @@ mod tests {
         load_fixture(&fixture)
     }
 
-    fn pipeline_for(artifact: &VerifiedArtifact) -> TestResult<TextPipeline<'_>> {
+    fn pipeline_for(artifact: &VerifiedArtifact) -> TestResult<TextPipeline> {
         let tokenizer_json = tokenizer_json();
         pipeline_with_tokenizer(artifact, &tokenizer_json)
     }
 
-    pub(super) fn pipeline_with_tokenizer<'artifact>(
-        artifact: &'artifact VerifiedArtifact,
+    pub(super) fn pipeline_with_tokenizer(
+        artifact: &VerifiedArtifact,
         tokenizer_json: &str,
-    ) -> TestResult<TextPipeline<'artifact>> {
+    ) -> TestResult<TextPipeline> {
         let limits = test_limits(tokenizer_json.len())?;
         Ok(pipeline_result(artifact, tokenizer_json, limits)?)
     }
 
-    pub(super) fn pipeline_result<'artifact>(
-        artifact: &'artifact VerifiedArtifact,
+    pub(super) fn pipeline_result(
+        artifact: &VerifiedArtifact,
         tokenizer_json: &str,
         limits: PipelineLimits,
-    ) -> Result<TextPipeline<'artifact>> {
+    ) -> Result<TextPipeline> {
         let digest = TokenizerDigest::from_bytes(Sha256::digest(tokenizer_json.as_bytes()).into());
         TextPipeline::new(
             artifact,
@@ -1139,11 +1305,23 @@ mod tests {
         )
     }
 
-    fn prompt_ids(pipeline: &TextPipeline<'_>, messages: &[TextMessage]) -> TestResult<Vec<u32>> {
+    fn prompt_ids(pipeline: &TextPipeline, messages: &[TextMessage]) -> TestResult<Vec<u32>> {
         let request = GenerationRequest::new(messages, 1, false);
         pipeline.validate_request(&request)?;
         let rendered = pipeline.render(&request)?;
         Ok(pipeline.encode_prompt(&rendered)?)
+    }
+
+    #[test]
+    fn pipeline_clone_shares_one_immutable_profile() -> TestResult<()> {
+        let (_directory, artifact) = verified_artifact(3, true, false)?;
+        let pipeline = pipeline_for(&artifact)?;
+        let clone = pipeline.clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&pipeline.profile, &clone.profile),
+            "pipeline clones must retain one immutable verified profile"
+        );
+        Ok(())
     }
 
     fn text_error<T>(result: Result<T>) -> TestResult<Error> {
@@ -1674,7 +1852,7 @@ mod tests {
             set_f32_row(raw, "output.weight", 5, &[0.0, 1.0, 0.0])
         })?;
         let pipeline = pipeline_with_tokenizer(&artifact, &tokenizer_json)?;
-        let tokenizer = pipeline.tokenizer.tokenizer();
+        let tokenizer = pipeline.profile.tokenizer.tokenizer();
         let first_piece = tokenizer.decode(&[4], false)?;
         let second_piece = tokenizer.decode(&[5], false)?;
         assert_eq!(first_piece, "�", "the first byte is not standalone UTF-8");
@@ -1782,7 +1960,7 @@ mod tests {
         );
         assert_eq!(
             prepared.tokenizer_identity(),
-            direct_pipeline.tokenizer.identity(),
+            direct_pipeline.profile.tokenizer.identity(),
             "prepared requests must retain their verified tokenizer identity"
         );
         assert_eq!(
@@ -1818,11 +1996,11 @@ mod tests {
             "the initial last-token decoder step must use the prompt width"
         );
         assert!(
-            requirements.max_context() < pipeline.limits.context_tokens,
+            requirements.max_context() < pipeline.profile.limits.context_tokens,
             "the prepared context should remain narrower than the configured ceiling"
         );
         assert!(
-            requirements.max_step_tokens() < pipeline.limits.context_tokens,
+            requirements.max_step_tokens() < pipeline.profile.limits.context_tokens,
             "the prepared step should remain narrower than the configured ceiling"
         );
         Ok(())

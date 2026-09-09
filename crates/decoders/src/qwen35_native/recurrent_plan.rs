@@ -103,7 +103,7 @@ impl DeviceRecurrentPlan {
     ///
     /// No device allocation, upload, submission, state mutation, or cache
     /// publication occurs here.
-    pub(super) fn from_weights(weights: &Qwen35Weights<'_>, block: usize) -> Result<Self> {
+    pub(super) fn from_weights(weights: &Qwen35Weights, block: usize) -> Result<Self> {
         let block_index = u64::try_from(block).map_err(|_| {
             ArithmeticOverflowSnafu {
                 context: "native recurrent block index",
@@ -199,7 +199,7 @@ impl DeviceRecurrentPlan {
 }
 
 impl RecurrentProjectionWeights {
-    fn from_weights(weights: &Qwen35Weights<'_>, block: u64) -> Result<Self> {
+    fn from_weights(weights: &Qwen35Weights, block: u64) -> Result<Self> {
         Ok(Self {
             qkv: projection(
                 weights,
@@ -227,7 +227,7 @@ impl RecurrentProjectionWeights {
 
 impl RecurrentF32Parameters {
     fn from_weights(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         block: u64,
         layout: ExecutionLayout,
         convolution: kernels::CausalConvAllocationPlan,

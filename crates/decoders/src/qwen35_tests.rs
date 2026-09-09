@@ -567,6 +567,23 @@ fn execution_uses_source_defined_rope_defaults_and_refuses_effective_scaling()
 }
 
 #[test]
+fn qwen35_weights_retain_verified_payload_after_caller_drop() -> std::result::Result<(), String> {
+    let payload = verify_fixture(&fixture_with_feed_forward(1, TEST_PROJECTION_INPUT_WIDTH)?)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    drop(payload);
+
+    let output = weights
+        .project("blk.0.ffn_down.weight", &ordered_projection_activations()?)
+        .map_err(|error| error.to_string())?;
+    assert_eq!(
+        output.len(),
+        TEST_PROJECTION_OUTPUT_WIDTH,
+        "weights must retain the same verified backing after their caller releases its handle"
+    );
+    Ok(())
+}
+
+#[test]
 fn recurrent_step_does_not_commit_state_when_late_output_row_refuses()
 -> std::result::Result<(), String> {
     let mut fixture = fixture(1)?;

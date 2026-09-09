@@ -26,7 +26,7 @@ pub(super) struct NativeMatrix {
 
 impl NativeWeights {
     pub(super) fn upload(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         plan: &DeviceFullAttentionPlan,
         device: &Device,
     ) -> Result<Self> {
@@ -45,7 +45,7 @@ impl NativeWeights {
 
 impl NativeMatrix {
     pub(super) fn upload(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         plan: &ProjectionWeight,
         device: &Device,
     ) -> Result<Self> {
@@ -66,7 +66,7 @@ impl NativeMatrix {
 }
 
 pub(super) fn f32_parameter_buffer(
-    weights: &Qwen35Weights<'_>,
+    weights: &Qwen35Weights,
     plan: &F32Parameter,
     device: &Device,
 ) -> Result<DeviceBuffer<f32>> {

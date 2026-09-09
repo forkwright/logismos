@@ -8,6 +8,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use isa::matches_configured_architecture;
@@ -147,6 +148,27 @@ pub struct AdmittedPlacement {
     pub total_estimated_bytes: u64,
 }
 
+/// A nonzero device-byte extent requested by an in-process resource owner.
+///
+/// This is a checked accounting input, not observed residency, allocator
+/// overhead, or evidence that a device physically granted the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestedDeviceBytes(NonZeroU64);
+
+impl RequestedDeviceBytes {
+    /// Construct one nonzero requested device-byte extent.
+    #[must_use]
+    pub const fn new(bytes: NonZeroU64) -> Self {
+        Self(bytes)
+    }
+
+    /// Return the requested byte extent.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 /// Mutable accounting authority for one immutable declared resource grant.
 ///
 /// A ledger pins devices, capacities, availability, and static commitments at
@@ -184,9 +206,32 @@ pub struct PreparedPlan {
 /// a caller from releasing the same reservation twice.
 #[derive(Debug)]
 pub struct ReservationLease {
-    brand: Arc<LedgerBrand>,
-    lease_id: u64,
+    lease: LeaseCapability,
     placement: AdmittedPlacement,
+}
+
+/// One committed in-process reservation of requested bytes on one declared device.
+///
+/// This capability is consumed by [`ReservationLedger::release_bytes`]. It is
+/// deliberately non-cloneable so dropped ownership cannot release accounting.
+#[derive(Debug)]
+pub struct DeviceByteLease {
+    lease: LeaseCapability,
+    requested_bytes: RequestedDeviceBytes,
+}
+
+impl DeviceByteLease {
+    /// Borrow the declared device receiving this requested-byte reservation.
+    #[must_use]
+    pub fn device_id(&self) -> &str {
+        &self.lease.device_id
+    }
+
+    /// Return the exact requested-byte extent retained by this lease.
+    #[must_use]
+    pub const fn requested_bytes(&self) -> RequestedDeviceBytes {
+        self.requested_bytes
+    }
 }
 
 /// A failed lease release that returns the unconsumed capability to its owner.
@@ -197,6 +242,13 @@ pub struct ReservationLease {
 pub struct LeaseReleaseFailure {
     reason: PlacementRefusal,
     lease: ReservationLease,
+}
+
+/// A failed requested-byte release that returns its still-live capability.
+#[derive(Debug)]
+pub struct DeviceByteLeaseReleaseFailure {
+    reason: DeviceByteReservationError,
+    lease: DeviceByteLease,
 }
 
 #[derive(Debug)]
@@ -212,6 +264,120 @@ struct ResourceSnapshot {
 struct LeaseRecord {
     device_id: String,
     reserved_bytes: u64,
+}
+
+#[derive(Debug)]
+struct LeaseCapability {
+    brand: Arc<LedgerBrand>,
+    lease_id: u64,
+    device_id: String,
+    reserved_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LeaseReleaseReason {
+    Foreign,
+    Unknown,
+    ArithmeticOverflow { scope: &'static str },
+}
+
+#[derive(Debug)]
+enum LeaseReservationError {
+    Placement(PlacementRefusal),
+    ArithmeticOverflow { scope: &'static str },
+}
+
+#[derive(Debug)]
+struct ReservationCommit {
+    dynamic_reserved: BTreeMap<String, u64>,
+    first_lease_id: u64,
+    next_lease_id: u64,
+    next_revision: u64,
+}
+
+/// Typed refusal for an in-process requested-byte reservation.
+///
+/// This type is intentionally not serializable: it is not part of the v1
+/// placement JSON contract.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum DeviceByteReservationError {
+    /// The declared device is absent from this ledger's immutable snapshot.
+    #[snafu(display("declared device {device_id} is absent from this ledger"))]
+    UnknownRequestedDevice {
+        /// Absent declared device identity.
+        device_id: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// The declared device is outside this ledger's configured ISA contract.
+    #[snafu(display("declared device {device_id} has unsupported ISA {gfx_isa}"))]
+    UnsupportedRequestedDevice {
+        /// Unsupported declared device.
+        device_id: String,
+        /// Declared ISA.
+        gfx_isa: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// The declared device is unavailable for new reservations.
+    #[snafu(display("declared device {device_id} is offline"))]
+    UnavailableRequestedDevice {
+        /// Offline declared device.
+        device_id: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// The requested bytes do not fit beside existing accounting.
+    #[snafu(display(
+        "device {device_id} is exhausted: needs {required_bytes}, has {available_bytes}"
+    ))]
+    RequestedBytesExhausted {
+        /// Device whose declared capacity was insufficient.
+        device_id: String,
+        /// Requested bytes.
+        required_bytes: u64,
+        /// Remaining accounted bytes.
+        available_bytes: u64,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Checked accounting arithmetic overflowed.
+    #[snafu(display("byte arithmetic overflow while computing {scope}"))]
+    RequestedByteArithmeticOverflow {
+        /// Calculation that overflowed.
+        scope: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Existing ledger accounting rejected the requested-byte reservation.
+    #[snafu(display("requested-byte accounting refused the reservation: {source}"))]
+    RequestedByteAccounting {
+        /// Existing placement accounting refusal.
+        source: PlacementRefusal,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// A requested-byte capability belongs to another ledger instance.
+    #[snafu(display("requested-byte lease belongs to another reservation ledger"))]
+    ForeignRequestedByteLease {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// A requested-byte capability is not active in this ledger.
+    #[snafu(display("requested-byte lease is not active in this ledger"))]
+    UnknownRequestedByteLease {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }
 
 /// Typed reason a request cannot yield a plan.
@@ -463,63 +629,109 @@ impl ReservationLedger {
             return Err(PlacementRefusal::StalePreparedPlan);
         }
 
-        let lease_count = u64::try_from(prepared.placements.len()).map_err(|_| {
-            PlacementRefusal::ArithmeticOverflow {
-                scope: "prepared placement count",
-            }
-        })?;
-        let _next_lease_id = self.next_lease_id.checked_add(lease_count).ok_or(
-            PlacementRefusal::ArithmeticOverflow {
-                scope: "reservation lease identifier",
-            },
-        )?;
-        let next_revision =
-            self.revision
-                .checked_add(1)
-                .ok_or(PlacementRefusal::ArithmeticOverflow {
-                    scope: "reservation ledger revision",
-                })?;
+        let reservations = prepared
+            .placements
+            .iter()
+            .map(|placement| {
+                (
+                    placement.device_id.as_str(),
+                    placement.total_estimated_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        let commit = self
+            .prepare_reservation(&reservations)
+            .map_err(PlacementRefusal::from)?;
+        let leases = self.lease_capabilities(&reservations, &commit);
+        self.apply_reservation(commit, &reservations);
+        drop(reservations);
+        Ok(prepared
+            .placements
+            .into_iter()
+            .zip(leases)
+            .map(|(placement, lease)| ReservationLease { lease, placement })
+            .collect())
+    }
 
-        let mut candidate_reserved = self.dynamic_reserved.clone();
-        for placement in &prepared.placements {
-            let reserved = candidate_reserved
-                .entry(placement.device_id.clone())
-                .or_default();
-            *reserved = reserved
-                .checked_add(placement.total_estimated_bytes)
-                .ok_or(PlacementRefusal::ArithmeticOverflow {
-                    scope: "dynamic device reservation",
-                })?;
+    /// Reserve one nonzero requested-byte extent on an available declared device.
+    ///
+    /// The request competes with v1 placement leases in this same ledger. It
+    /// is an in-process accounting operation and neither allocates device
+    /// memory nor extends the placement JSON contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed in-process refusal without mutation when the device is
+    /// unknown, unavailable, unsupported, exhausted, or accounting overflows.
+    pub fn reserve_bytes(
+        &mut self,
+        device_id: &str,
+        bytes: RequestedDeviceBytes,
+    ) -> Result<DeviceByteLease, DeviceByteReservationError> {
+        let (lease, _) = self.reserve_bytes_batch(device_id, bytes, None)?;
+        Ok(lease)
+    }
+
+    /// Atomically reserve one mandatory and one optional requested-byte extent.
+    ///
+    /// Both extents compete with every v1 and requested-byte lease in this
+    /// ledger. Every device and aggregate capacity check completes before any
+    /// reservation, lease identifier, or revision is mutated. This is
+    /// in-process requested accounting only; it neither allocates device
+    /// memory nor extends the placement JSON contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns one typed in-process refusal without mutating this ledger when
+    /// either extent is unknown, unavailable, unsupported, exhausted, or
+    /// cannot be represented by checked accounting.
+    pub fn reserve_bytes_batch(
+        &mut self,
+        first_device_id: &str,
+        first_bytes: RequestedDeviceBytes,
+        second: Option<(&str, RequestedDeviceBytes)>,
+    ) -> Result<(DeviceByteLease, Option<DeviceByteLease>), DeviceByteReservationError> {
+        self.require_reservable_device(first_device_id)?;
+        if let Some((device_id, _)) = second {
+            self.require_reservable_device(device_id)?;
         }
-        let _remaining = remaining_after_reservations(&self.snapshot, &candidate_reserved)?;
-
-        let mut leases = Vec::with_capacity(prepared.placements.len());
-        let mut next_lease_id = self.next_lease_id;
-        for placement in prepared.placements {
-            let lease_id = next_lease_id;
-            next_lease_id =
-                next_lease_id
-                    .checked_add(1)
-                    .ok_or(PlacementRefusal::ArithmeticOverflow {
-                        scope: "reservation lease identifier",
-                    })?;
-            self.active_leases.insert(
-                lease_id,
-                LeaseRecord {
-                    device_id: placement.device_id.clone(),
-                    reserved_bytes: placement.total_estimated_bytes,
-                },
-            );
-            leases.push(ReservationLease {
+        let mut reservations = vec![(first_device_id, first_bytes.get())];
+        if let Some((device_id, bytes)) = second {
+            reservations.push((device_id, bytes.get()));
+        }
+        let commit = self
+            .prepare_reservation(&reservations)
+            .map_err(DeviceByteReservationError::from)?;
+        let first = DeviceByteLease {
+            lease: LeaseCapability {
                 brand: Arc::clone(&self.brand),
-                lease_id,
-                placement,
-            });
-        }
-        self.dynamic_reserved = candidate_reserved;
-        self.next_lease_id = next_lease_id;
-        self.revision = next_revision;
-        Ok(leases)
+                lease_id: commit.first_lease_id,
+                device_id: first_device_id.to_owned(),
+                reserved_bytes: first_bytes.get(),
+            },
+            requested_bytes: first_bytes,
+        };
+        let second = if let Some((device_id, bytes)) = second {
+            let lease_id = commit.first_lease_id.checked_add(1).ok_or(
+                DeviceByteReservationError::RequestedByteArithmeticOverflow {
+                    scope: "requested-byte batch lease identifier",
+                    location: error_location(),
+                },
+            )?;
+            Some(DeviceByteLease {
+                lease: LeaseCapability {
+                    brand: Arc::clone(&self.brand),
+                    lease_id,
+                    device_id: device_id.to_owned(),
+                    reserved_bytes: bytes.get(),
+                },
+                requested_bytes: bytes,
+            })
+        } else {
+            None
+        };
+        self.apply_reservation(commit, &reservations);
+        Ok((first, second))
     }
 
     /// Release one committed reservation.
@@ -529,50 +741,196 @@ impl ReservationLedger {
     /// Returns the typed refusal and original lease without mutation when the
     /// lease belongs to another ledger or was not active in this ledger.
     pub fn release(&mut self, lease: ReservationLease) -> Result<(), Box<LeaseReleaseFailure>> {
-        if !Arc::ptr_eq(&self.brand, &lease.brand) {
-            return Err(Box::new(LeaseReleaseFailure::new(
-                PlacementRefusal::ForeignReservationLease,
-                lease,
-            )));
-        }
-        let Some(record) = self.active_leases.get(&lease.lease_id) else {
-            return Err(Box::new(LeaseReleaseFailure::new(
-                PlacementRefusal::UnknownReservationLease,
-                lease,
-            )));
-        };
-        if record.device_id != lease.placement.device_id
-            || record.reserved_bytes != lease.placement.total_estimated_bytes
+        let ReservationLease {
+            lease: capability,
+            placement,
+        } = lease;
+        if capability.device_id != placement.device_id
+            || capability.reserved_bytes != placement.total_estimated_bytes
         {
             return Err(Box::new(LeaseReleaseFailure::new(
                 PlacementRefusal::UnknownReservationLease,
-                lease,
+                ReservationLease {
+                    lease: capability,
+                    placement,
+                },
             )));
         }
+        match self.release_lease(capability) {
+            Ok(()) => Ok(()),
+            Err((reason, capability)) => Err(Box::new(LeaseReleaseFailure::new(
+                placement_release_error(reason),
+                ReservationLease {
+                    lease: capability,
+                    placement,
+                },
+            ))),
+        }
+    }
 
+    /// Release one requested-byte reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed reason and original lease without mutation when the
+    /// lease belongs to another ledger, is inactive, or release arithmetic
+    /// cannot advance safely.
+    pub fn release_bytes(
+        &mut self,
+        lease: DeviceByteLease,
+    ) -> Result<(), Box<DeviceByteLeaseReleaseFailure>> {
+        let DeviceByteLease {
+            lease,
+            requested_bytes,
+        } = lease;
+        match self.release_lease(lease) {
+            Ok(()) => Ok(()),
+            Err((reason, lease)) => Err(Box::new(DeviceByteLeaseReleaseFailure::new(
+                DeviceByteReservationError::from(reason),
+                DeviceByteLease {
+                    lease,
+                    requested_bytes,
+                },
+            ))),
+        }
+    }
+
+    fn require_reservable_device(&self, device_id: &str) -> Result<(), DeviceByteReservationError> {
+        let device = self
+            .snapshot
+            .devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .ok_or_else(|| DeviceByteReservationError::UnknownRequestedDevice {
+                device_id: device_id.to_owned(),
+                location: error_location(),
+            })?;
+        if !matches_configured_architecture(&device.gfx_isa) {
+            return Err(DeviceByteReservationError::UnsupportedRequestedDevice {
+                device_id: device.id.clone(),
+                gfx_isa: device.gfx_isa.clone(),
+                location: error_location(),
+            });
+        }
+        if device.availability == Availability::Offline {
+            return Err(DeviceByteReservationError::UnavailableRequestedDevice {
+                device_id: device.id.clone(),
+                location: error_location(),
+            });
+        }
+        Ok(())
+    }
+
+    fn prepare_reservation(
+        &self,
+        reservations: &[(&str, u64)],
+    ) -> Result<ReservationCommit, LeaseReservationError> {
+        let lease_count = u64::try_from(reservations.len()).map_err(|_| {
+            LeaseReservationError::ArithmeticOverflow {
+                scope: "reservation count",
+            }
+        })?;
+        let next_lease_id = self.next_lease_id.checked_add(lease_count).ok_or(
+            LeaseReservationError::ArithmeticOverflow {
+                scope: "reservation lease identifier",
+            },
+        )?;
+        let next_revision =
+            self.revision
+                .checked_add(1)
+                .ok_or(LeaseReservationError::ArithmeticOverflow {
+                    scope: "reservation ledger revision",
+                })?;
+        let mut candidate_reserved = self.dynamic_reserved.clone();
+        for (device_id, bytes) in reservations {
+            let reserved = candidate_reserved
+                .entry((*device_id).to_owned())
+                .or_default();
+            *reserved =
+                reserved
+                    .checked_add(*bytes)
+                    .ok_or(LeaseReservationError::ArithmeticOverflow {
+                        scope: "dynamic device reservation",
+                    })?;
+        }
+        remaining_after_reservations(&self.snapshot, &candidate_reserved)
+            .map_err(LeaseReservationError::from)?;
+
+        Ok(ReservationCommit {
+            dynamic_reserved: candidate_reserved,
+            first_lease_id: self.next_lease_id,
+            next_lease_id,
+            next_revision,
+        })
+    }
+
+    fn lease_capabilities(
+        &self,
+        reservations: &[(&str, u64)],
+        commit: &ReservationCommit,
+    ) -> Vec<LeaseCapability> {
+        reservations
+            .iter()
+            .zip(commit.first_lease_id..commit.next_lease_id)
+            .map(|((device_id, bytes), lease_id)| LeaseCapability {
+                brand: Arc::clone(&self.brand),
+                lease_id,
+                device_id: (*device_id).to_owned(),
+                reserved_bytes: *bytes,
+            })
+            .collect()
+    }
+
+    fn apply_reservation(&mut self, commit: ReservationCommit, reservations: &[(&str, u64)]) {
+        for ((device_id, bytes), lease_id) in reservations
+            .iter()
+            .zip(commit.first_lease_id..commit.next_lease_id)
+        {
+            self.active_leases.insert(
+                lease_id,
+                LeaseRecord {
+                    device_id: (*device_id).to_owned(),
+                    reserved_bytes: *bytes,
+                },
+            );
+        }
+        self.dynamic_reserved = commit.dynamic_reserved;
+        self.next_lease_id = commit.next_lease_id;
+        self.revision = commit.next_revision;
+    }
+
+    fn release_lease(
+        &mut self,
+        lease: LeaseCapability,
+    ) -> Result<(), (LeaseReleaseReason, LeaseCapability)> {
+        if !Arc::ptr_eq(&self.brand, &lease.brand) {
+            return Err((LeaseReleaseReason::Foreign, lease));
+        }
+        let Some(record) = self.active_leases.get(&lease.lease_id) else {
+            return Err((LeaseReleaseReason::Unknown, lease));
+        };
+        if record.device_id != lease.device_id || record.reserved_bytes != lease.reserved_bytes {
+            return Err((LeaseReleaseReason::Unknown, lease));
+        }
         let Some(current_reserved) = self.dynamic_reserved.get(record.device_id.as_str()) else {
-            return Err(Box::new(LeaseReleaseFailure::new(
-                PlacementRefusal::UnknownReservationLease,
-                lease,
-            )));
+            return Err((LeaseReleaseReason::Unknown, lease));
         };
         let Some(next_reserved) = current_reserved.checked_sub(record.reserved_bytes) else {
-            return Err(Box::new(LeaseReleaseFailure::new(
-                PlacementRefusal::ArithmeticOverflow {
+            return Err((
+                LeaseReleaseReason::ArithmeticOverflow {
                     scope: "dynamic device release",
                 },
                 lease,
-            )));
+            ));
         };
         let Some(next_revision) = self.revision.checked_add(1) else {
-            return Err(Box::new(LeaseReleaseFailure::new(
-                PlacementRefusal::ArithmeticOverflow {
+            return Err((
+                LeaseReleaseReason::ArithmeticOverflow {
                     scope: "reservation ledger revision",
                 },
                 lease,
-            )));
+            ));
         };
-
         let device_id = record.device_id.clone();
         self.active_leases.remove(&lease.lease_id);
         if next_reserved == 0 {
@@ -595,6 +953,97 @@ impl LeaseReleaseFailure {
     pub fn into_parts(self) -> (PlacementRefusal, ReservationLease) {
         (self.reason, self.lease)
     }
+}
+
+impl DeviceByteLeaseReleaseFailure {
+    fn new(reason: DeviceByteReservationError, lease: DeviceByteLease) -> Self {
+        Self { reason, lease }
+    }
+
+    /// Return the typed reason and still-live requested-byte lease.
+    #[must_use]
+    pub fn into_parts(self) -> (DeviceByteReservationError, DeviceByteLease) {
+        (self.reason, self.lease)
+    }
+}
+
+impl From<PlacementRefusal> for LeaseReservationError {
+    fn from(value: PlacementRefusal) -> Self {
+        Self::Placement(value)
+    }
+}
+
+impl From<LeaseReservationError> for PlacementRefusal {
+    fn from(value: LeaseReservationError) -> Self {
+        match value {
+            LeaseReservationError::Placement(reason) => reason,
+            LeaseReservationError::ArithmeticOverflow { scope } => {
+                PlacementRefusal::ArithmeticOverflow { scope }
+            }
+        }
+    }
+}
+
+impl From<LeaseReservationError> for DeviceByteReservationError {
+    fn from(value: LeaseReservationError) -> Self {
+        match value {
+            LeaseReservationError::Placement(PlacementRefusal::CapacityExhausted {
+                device_id,
+                required_bytes,
+                available_bytes,
+            }) => Self::RequestedBytesExhausted {
+                device_id,
+                required_bytes,
+                available_bytes,
+                location: error_location(),
+            },
+            LeaseReservationError::Placement(PlacementRefusal::ArithmeticOverflow { scope })
+            | LeaseReservationError::ArithmeticOverflow { scope } => {
+                Self::RequestedByteArithmeticOverflow {
+                    scope,
+                    location: error_location(),
+                }
+            }
+            LeaseReservationError::Placement(source) => Self::RequestedByteAccounting {
+                source,
+                location: error_location(),
+            },
+        }
+    }
+}
+
+impl From<LeaseReleaseReason> for DeviceByteReservationError {
+    fn from(value: LeaseReleaseReason) -> Self {
+        match value {
+            LeaseReleaseReason::Foreign => Self::ForeignRequestedByteLease {
+                location: error_location(),
+            },
+            LeaseReleaseReason::Unknown => Self::UnknownRequestedByteLease {
+                location: error_location(),
+            },
+            LeaseReleaseReason::ArithmeticOverflow { scope } => {
+                Self::RequestedByteArithmeticOverflow {
+                    scope,
+                    location: error_location(),
+                }
+            }
+        }
+    }
+}
+
+fn placement_release_error(reason: LeaseReleaseReason) -> PlacementRefusal {
+    match reason {
+        LeaseReleaseReason::Foreign => PlacementRefusal::ForeignReservationLease,
+        LeaseReleaseReason::Unknown => PlacementRefusal::UnknownReservationLease,
+        LeaseReleaseReason::ArithmeticOverflow { scope } => {
+            PlacementRefusal::ArithmeticOverflow { scope }
+        }
+    }
+}
+
+#[track_caller]
+fn error_location() -> snafu::Location {
+    core::panic::Location::caller()
 }
 
 impl PreparedPlan {
@@ -1097,6 +1546,11 @@ mod contract_tests {
     const DIGEST_B: &str =
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+    fn requested(bytes: u64) -> Result<RequestedDeviceBytes, PlacementRefusal> {
+        let bytes = std::num::NonZeroU64::new(bytes).ok_or(PlacementRefusal::InvalidRequest)?;
+        Ok(RequestedDeviceBytes::new(bytes))
+    }
+
     fn plan_input(devices: &str, artifacts: &str, workloads: &str) -> String {
         format!(
             r#"{{"schema_version":1,"devices":{devices},"artifacts":{artifacts},"workloads":{workloads},"commitments":[]}}"#
@@ -1384,6 +1838,225 @@ mod contract_tests {
             ),
             "a later request cannot replace static commitments"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn requested_byte_leases_compete_with_v1_placement_leases() -> Result<(), PlacementRefusal> {
+        let input = plan_input(
+            r#"[{"id":"w7900","gfx_isa":"gfx1100","total_bytes":10,"reserved_bytes":0,"availability":"available"}]"#,
+            &format!(r#"[{{"artifact_id":"model","digest":"{DIGEST_A}"}}]"#),
+            r#"[{"profile_id":"main","artifact_id":"model","memory_estimate":{"weights_bytes":6,"kv_cache_bytes":0,"workspace_bytes":0,"headroom_bytes":0},"placement":{"kind":"requested_device","device_id":"w7900"}}]"#,
+        );
+        let request = PlanRequest::from_json(&input)?;
+        let mut ledger = ReservationLedger::new(&request)?;
+        let prepared = ledger.prepare(&request)?;
+        let mut v1_leases = ledger.commit(prepared)?;
+        assert!(matches!(
+            ledger.reserve_bytes("w7900", requested(5)?),
+            Err(DeviceByteReservationError::RequestedBytesExhausted { .. })
+        ));
+        let byte_lease = ledger
+            .reserve_bytes("w7900", requested(4)?)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        assert_eq!(byte_lease.device_id(), "w7900");
+        assert_eq!(byte_lease.requested_bytes().get(), 4);
+        assert_eq!(ledger.dynamic_reserved.get("w7900"), Some(&10));
+        ledger
+            .release_bytes(byte_lease)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        let v1_lease = v1_leases
+            .pop()
+            .ok_or(PlacementRefusal::UnknownReservationLease)?;
+        ledger
+            .release(v1_lease)
+            .map_err(|failure| failure.into_parts().0)?;
+        assert!(ledger.dynamic_reserved.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn requested_byte_batch_is_atomic_and_returns_independent_leases()
+    -> Result<(), PlacementRefusal> {
+        let input = plan_input(
+            r#"[{"id":"w7900","gfx_isa":"gfx1100","total_bytes":10,"reserved_bytes":0,"availability":"available"}]"#,
+            "[]",
+            "[]",
+        );
+        let request = PlanRequest::from_json(&input)?;
+        let mut ledger = ReservationLedger::new(&request)?;
+        assert!(matches!(
+            ledger.reserve_bytes_batch("w7900", requested(4)?, Some(("w7900", requested(7)?))),
+            Err(DeviceByteReservationError::RequestedBytesExhausted { .. })
+        ));
+        assert!(ledger.dynamic_reserved.is_empty());
+        assert!(ledger.active_leases.is_empty());
+        assert!(matches!(
+            ledger.reserve_bytes_batch("w7900", requested(4)?, Some(("unknown", requested(1)?))),
+            Err(DeviceByteReservationError::UnknownRequestedDevice { .. })
+        ));
+        assert!(ledger.dynamic_reserved.is_empty());
+        assert!(ledger.active_leases.is_empty());
+        let (first, second) = ledger
+            .reserve_bytes_batch("w7900", requested(4)?, Some(("w7900", requested(6)?)))
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        let second = second.ok_or(PlacementRefusal::UnknownReservationLease)?;
+        ledger
+            .release_bytes(first)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        assert_eq!(ledger.dynamic_reserved.get("w7900"), Some(&6));
+        ledger
+            .release_bytes(second)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        assert!(ledger.dynamic_reserved.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn requested_byte_leases_release_exactly_one_and_dropping_never_releases()
+    -> Result<(), PlacementRefusal> {
+        let input = plan_input(
+            r#"[{"id":"w7900","gfx_isa":"gfx1100","total_bytes":10,"reserved_bytes":0,"availability":"available"}]"#,
+            "[]",
+            "[]",
+        );
+        let request = PlanRequest::from_json(&input)?;
+        let mut ledger = ReservationLedger::new(&request)?;
+        let first = ledger
+            .reserve_bytes("w7900", requested(3)?)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        let second = ledger
+            .reserve_bytes("w7900", requested(4)?)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        drop(first);
+        assert_eq!(ledger.dynamic_reserved.get("w7900"), Some(&7));
+        ledger
+            .release_bytes(second)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        assert_eq!(ledger.dynamic_reserved.get("w7900"), Some(&3));
+        assert_eq!(ledger.active_leases.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn requested_byte_failures_preserve_capability_and_accounting() -> Result<(), PlacementRefusal>
+    {
+        let input = plan_input(
+            r#"[{"id":"w7900","gfx_isa":"gfx1100","total_bytes":10,"reserved_bytes":0,"availability":"available"}]"#,
+            "[]",
+            "[]",
+        );
+        let request = PlanRequest::from_json(&input)?;
+        let mut first = ReservationLedger::new(&request)?;
+        let mut second = ReservationLedger::new(&request)?;
+        let lease = first
+            .reserve_bytes("w7900", requested(3)?)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        let failure = second
+            .release_bytes(lease)
+            .map_err(|failure| *failure)
+            .err()
+            .ok_or(PlacementRefusal::UnknownReservationLease)?;
+        let (reason, lease) = failure.into_parts();
+        assert!(matches!(
+            reason,
+            DeviceByteReservationError::ForeignRequestedByteLease { .. }
+        ));
+        assert_eq!(first.dynamic_reserved.get("w7900"), Some(&3));
+        first
+            .release_bytes(lease)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+
+        let unknown = DeviceByteLease {
+            lease: LeaseCapability {
+                brand: Arc::clone(&second.brand),
+                lease_id: 999,
+                device_id: "w7900".to_owned(),
+                reserved_bytes: 1,
+            },
+            requested_bytes: requested(1)?,
+        };
+        let failure = second
+            .release_bytes(unknown)
+            .map_err(|failure| *failure)
+            .err()
+            .ok_or(PlacementRefusal::UnknownReservationLease)?;
+        let (reason, unknown) = failure.into_parts();
+        assert!(matches!(
+            reason,
+            DeviceByteReservationError::UnknownRequestedByteLease { .. }
+        ));
+        assert!(second.active_leases.is_empty());
+        drop(unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn requested_byte_reservations_invalidate_prepared_plans_and_validate_devices()
+    -> Result<(), PlacementRefusal> {
+        let input = plan_input(
+            r#"[
+                {"id":"w7900","gfx_isa":"gfx1100","total_bytes":10,"reserved_bytes":0,"availability":"available"},
+                {"id":"offline","gfx_isa":"gfx1100","total_bytes":10,"reserved_bytes":0,"availability":"offline"},
+                {"id":"wrong-isa","gfx_isa":"gfx900","total_bytes":10,"reserved_bytes":0,"availability":"available"}
+            ]"#,
+            &format!(r#"[{{"artifact_id":"model","digest":"{DIGEST_A}"}}]"#),
+            r#"[{"profile_id":"main","artifact_id":"model","memory_estimate":{"weights_bytes":1,"kv_cache_bytes":0,"workspace_bytes":0,"headroom_bytes":0},"placement":{"kind":"requested_device","device_id":"w7900"}}]"#,
+        );
+        let request = PlanRequest::from_json(&input)?;
+        let mut ledger = ReservationLedger::new(&request)?;
+        let prepared = ledger.prepare(&request)?;
+        let lease = ledger
+            .reserve_bytes("w7900", requested(1)?)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        ledger
+            .release_bytes(lease)
+            .map_err(|_| PlacementRefusal::InvalidRequest)?;
+        assert!(matches!(
+            ledger.commit(prepared),
+            Err(PlacementRefusal::StalePreparedPlan)
+        ));
+        assert!(matches!(
+            ledger.reserve_bytes("unknown", requested(1)?),
+            Err(DeviceByteReservationError::UnknownRequestedDevice { .. })
+        ));
+        assert!(matches!(
+            ledger.reserve_bytes("offline", requested(1)?),
+            Err(DeviceByteReservationError::UnavailableRequestedDevice { .. })
+        ));
+        assert!(matches!(
+            ledger.reserve_bytes("wrong-isa", requested(1)?),
+            Err(DeviceByteReservationError::UnsupportedRequestedDevice { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn requested_byte_reservations_honor_static_commitments_and_overflow_without_mutation()
+    -> Result<(), PlacementRefusal> {
+        let input = plan_input(
+            r#"[{"id":"w7900","gfx_isa":"gfx1100","total_bytes":10,"reserved_bytes":0,"availability":"available"}]"#,
+            "[]",
+            "[]",
+        )
+        .replace(
+            "\"commitments\":[]",
+            "\"commitments\":[{\"device_id\":\"w7900\",\"estimated_bytes\":7}]",
+        );
+        let request = PlanRequest::from_json(&input)?;
+        let mut ledger = ReservationLedger::new(&request)?;
+        assert!(matches!(
+            ledger.reserve_bytes("w7900", requested(4)?),
+            Err(DeviceByteReservationError::RequestedBytesExhausted { .. })
+        ));
+        assert!(ledger.dynamic_reserved.is_empty());
+
+        ledger.dynamic_reserved.insert("w7900".to_owned(), u64::MAX);
+        assert!(matches!(
+            ledger.reserve_bytes("w7900", requested(1)?),
+            Err(DeviceByteReservationError::RequestedByteArithmeticOverflow { .. })
+        ));
+        assert_eq!(ledger.dynamic_reserved.get("w7900"), Some(&u64::MAX));
         Ok(())
     }
 }

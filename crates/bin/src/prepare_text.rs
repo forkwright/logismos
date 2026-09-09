@@ -414,9 +414,7 @@ pub(crate) struct PreparedTextOutcome {
 }
 
 impl PreparedTextOutcome {
-    fn from_prepared(
-        prepared: &text::PreparedGeneration<'_, '_>,
-    ) -> Result<Self, PrepareTextError> {
+    fn from_prepared(prepared: &text::PreparedGeneration) -> Result<Self, PrepareTextError> {
         let requirements = prepared.decoder_cpu_requirements();
         let model = VerifiedIdentityReceipt {
             algorithm: "sha256",

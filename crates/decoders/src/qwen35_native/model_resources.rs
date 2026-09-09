@@ -3,6 +3,7 @@
 use cache::NativePagedKvPool;
 use hipcore::{Device, DeviceBuffer, Stream};
 use snafu::ResultExt;
+use std::sync::Arc;
 
 use super::CompletionResource;
 use super::dispatch::{DeferredFullAttention, launch_rms_norm};
@@ -29,22 +30,34 @@ struct ModelStep {
 
 enum NativeModelLayer {
     Full(Box<NativeWeights>),
-    Recurrent(Box<NativeRecurrentLayerResources>),
+    Recurrent(Box<NativeRecurrentLayerWeights>),
 }
 
-struct NativeRecurrentLayerResources {
+struct NativeRecurrentLayerWeights {
     weights: NativeRecurrentWeights,
-    state: NativeRecurrentState,
     finish: LayerFinishWeights,
 }
 
-/// One non-cloneable bundle retaining every native allocation through completion.
-pub(super) struct ModelDeviceResources {
+enum NativeSessionLayer {
+    Full,
+    Recurrent(NativeRecurrentState),
+}
+
+/// Immutable native uploads retained by every session created from one model.
+pub(super) struct NativeResidentModelResources {
+    verified_weights: Qwen35Weights,
     plan: DeviceModelPlan,
+    device: Device,
     embedding: NativeMatrix,
     output: NativeMatrix,
     output_norm: DeviceBuffer<f32>,
     layers: Vec<NativeModelLayer>,
+}
+
+/// One non-cloneable mutable native session retaining submitted work through completion.
+pub(super) struct ModelSessionResources {
+    model: Arc<NativeResidentModelResources>,
+    plan: DeviceModelPlan,
     kv: Option<NativePagedKvPool>,
     stream: Stream,
     numerical_status: kernels::numerical_status::NativeNumericalStatus,
@@ -54,52 +67,76 @@ pub(super) struct ModelDeviceResources {
     hidden_a: DeviceBuffer<f32>,
     hidden_b: DeviceBuffer<f32>,
     final_normalized: DeviceBuffer<f32>,
+    layers: Vec<NativeSessionLayer>,
     step: Option<ModelStep>,
     position: usize,
 }
 
-impl ModelDeviceResources {
+impl NativeResidentModelResources {
     pub(super) fn new(
-        weights: &Qwen35Weights<'_>,
+        weights: &Qwen35Weights,
         plan: DeviceModelPlan,
         device: &Device,
     ) -> Result<Self> {
         let _ = plan.bytes.total()?;
-        let stream = Stream::new(device).context(NativeDeviceSnafu)?;
-        let numerical_status = kernels::numerical_status::NativeNumericalStatus::new(device)
-            .context(NativeKernelSnafu)?;
         let embedding = NativeMatrix::upload(weights, &plan.embedding, device)?;
         let output = NativeMatrix::upload(weights, &plan.output, device)?;
         let output_norm = f32_parameter_buffer(weights, &plan.output_norm, device)?;
-        let layers = upload_layers(weights, &plan, device)?;
+        let layers = upload_resident_layers(weights, &plan, device)?;
+        Ok(Self {
+            verified_weights: weights.clone(),
+            plan,
+            device: device.clone(),
+            embedding,
+            output,
+            output_norm,
+            layers,
+        })
+    }
+
+    pub(super) fn plan_session(&self, max_context: usize) -> Result<DeviceModelPlan> {
+        derive_session_plan(&self.verified_weights, &self.plan, max_context)
+    }
+
+    pub(super) const fn context_ceiling(&self) -> usize {
+        self.plan.layout.max_context()
+    }
+}
+
+impl ModelSessionResources {
+    pub(super) fn new(
+        model: Arc<NativeResidentModelResources>,
+        plan: DeviceModelPlan,
+    ) -> Result<Self> {
+        let stream = Stream::new(&model.device).context(NativeDeviceSnafu)?;
+        let numerical_status = kernels::numerical_status::NativeNumericalStatus::new(&model.device)
+            .context(NativeKernelSnafu)?;
         let kv = plan
             .kv
-            .map(|plan| NativePagedKvPool::new(plan, device))
+            .map(|plan| NativePagedKvPool::new(plan, &model.device))
             .transpose()
             .context(NativePagedKvSnafu)?;
         let full_workspace = plan
             .full_workspace
             .as_ref()
-            .map(|workspace| NativeWorkspace::new(workspace, device))
+            .map(|workspace| NativeWorkspace::new(workspace, &model.device))
             .transpose()?;
         let recurrent_workspace = plan
             .recurrent_workspace
             .as_ref()
-            .map(|workspace| NativeRecurrentWorkspace::new(workspace, device))
+            .map(|workspace| NativeRecurrentWorkspace::new(workspace, &model.device))
             .transpose()?;
-        let finish_workspace = LayerFinishWorkspace::new(plan.finish_workspace, device)?;
+        let finish_workspace = LayerFinishWorkspace::new(plan.finish_workspace, &model.device)?;
         let hidden_a =
-            DeviceBuffer::alloc(device, plan.layout.hidden).context(NativeDeviceSnafu)?;
+            DeviceBuffer::alloc(&model.device, plan.layout.hidden).context(NativeDeviceSnafu)?;
         let hidden_b =
-            DeviceBuffer::alloc(device, plan.layout.hidden).context(NativeDeviceSnafu)?;
-        let final_normalized =
-            DeviceBuffer::alloc(device, plan.output_rms.elements()).context(NativeDeviceSnafu)?;
+            DeviceBuffer::alloc(&model.device, plan.layout.hidden).context(NativeDeviceSnafu)?;
+        let final_normalized = DeviceBuffer::alloc(&model.device, plan.output_rms.elements())
+            .context(NativeDeviceSnafu)?;
+        let layers = allocate_session_layers(&plan, &model.device)?;
         Ok(Self {
+            model,
             plan,
-            embedding,
-            output,
-            output_norm,
-            layers,
             kv,
             stream,
             numerical_status,
@@ -109,6 +146,7 @@ impl ModelDeviceResources {
             hidden_a,
             hidden_b,
             final_normalized,
+            layers,
             step: None,
             position: 0,
         })
@@ -125,7 +163,7 @@ impl ModelDeviceResources {
         let (cosine, sine) = self.prepare_attention_controls(token)?;
         self.step = Some(ModelStep {
             token,
-            logits: DeviceBuffer::alloc(self.stream.device(), self.output.shape.rows())
+            logits: DeviceBuffer::alloc(self.stream.device(), self.model.output.shape.rows())
                 .context(NativeDeviceSnafu)?,
             cosine,
             sine,
@@ -158,8 +196,8 @@ impl ModelDeviceResources {
         unsafe {
             kernels::row_gemv::launch_row_decode_f32_checked(
                 step.token.embedding,
-                self.embedding.bytes.as_device_ptr(),
-                self.embedding.bytes.len(),
+                self.model.embedding.bytes.as_device_ptr(),
+                self.model.embedding.bytes.len(),
                 self.hidden_a.as_device_ptr(),
                 self.hidden_a.len(),
                 &self.stream,
@@ -179,9 +217,19 @@ impl ModelDeviceResources {
             .context(NativePagedKvSnafu)?;
         let (mut input, mut output) = (&self.hidden_a, &self.hidden_b);
         let mut full_layer = 0_usize;
-        for (plan, layer) in self.plan.layers.iter().zip(&self.layers) {
-            match (plan, layer) {
-                (NativeBlockPlan::Full(plan), NativeModelLayer::Full(weights)) => {
+        for ((plan, layer), session_layer) in self
+            .plan
+            .layers
+            .iter()
+            .zip(&self.model.layers)
+            .zip(&self.layers)
+        {
+            match (plan, layer, session_layer) {
+                (
+                    NativeBlockPlan::Full(plan),
+                    NativeModelLayer::Full(weights),
+                    NativeSessionLayer::Full,
+                ) => {
                     let append = append.as_mut().ok_or_else(|| {
                         NativeSessionStateSnafu {
                             rule: "native full-attention block requires one model KV append",
@@ -242,6 +290,7 @@ impl ModelDeviceResources {
                 (
                     NativeBlockPlan::Recurrent { plan, finish },
                     NativeModelLayer::Recurrent(resources),
+                    NativeSessionLayer::Recurrent(state),
                 ) => {
                     let workspace = self.recurrent_workspace.as_ref().ok_or_else(|| {
                         NativeSessionStateSnafu {
@@ -253,7 +302,7 @@ impl ModelDeviceResources {
                         plan,
                         weights: &resources.weights,
                         workspace,
-                        state: &resources.state,
+                        state,
                         input,
                         output,
                         finish_plan: finish,
@@ -279,7 +328,7 @@ impl ModelDeviceResources {
             launch_rms_norm(
                 self.plan.output_rms,
                 input,
-                &self.output_norm,
+                &self.model.output_norm,
                 &self.final_normalized,
                 &self.stream,
                 &self.numerical_status,
@@ -287,7 +336,7 @@ impl ModelDeviceResources {
         }?;
         // SAFETY: the verified output matrix and exact final/logit spans remain owned through completion.
         unsafe {
-            self.output.launch(
+            self.model.output.launch(
                 &self.final_normalized,
                 &step.logits,
                 &self.stream,
@@ -316,8 +365,8 @@ impl ModelDeviceResources {
             }
         }
         for layer in &mut self.layers {
-            if let NativeModelLayer::Recurrent(resources) = layer {
-                resources.state.publish_completed();
+            if let NativeSessionLayer::Recurrent(state) = layer {
+                state.publish_completed();
             }
         }
         self.position = next_position;
@@ -352,7 +401,7 @@ impl ModelDeviceResources {
     }
 }
 
-impl CompletionResource for ModelDeviceResources {
+impl CompletionResource for ModelSessionResources {
     type Error = crate::Error;
 
     fn synchronize(&mut self) -> Result<()> {
@@ -366,8 +415,47 @@ impl CompletionResource for ModelDeviceResources {
     }
 }
 
-fn upload_layers(
-    weights: &Qwen35Weights<'_>,
+fn derive_session_plan(
+    weights: &Qwen35Weights,
+    resident: &DeviceModelPlan,
+    max_context: usize,
+) -> Result<DeviceModelPlan> {
+    if max_context > resident.layout.max_context() {
+        return NativeSessionStateSnafu {
+            rule: "native session context must not exceed its resident model ceiling",
+        }
+        .fail();
+    }
+    let session = DeviceModelPlan::from_weights(weights, max_context, resident.page_tokens)?;
+    if session.embedding.shape != resident.embedding.shape
+        || session.output.shape != resident.output.shape
+        || session.output_rms.elements() != resident.output_rms.elements()
+        || !same_layer_roles(&session.layers, &resident.layers)
+    {
+        return NativeSessionStateSnafu {
+            rule: "native session plan must retain resident uploaded-weight bindings",
+        }
+        .fail();
+    }
+    Ok(session)
+}
+
+fn same_layer_roles(session: &[NativeBlockPlan], resident: &[NativeBlockPlan]) -> bool {
+    session.len() == resident.len()
+        && session.iter().zip(resident).all(|(session, resident)| {
+            matches!(
+                (session, resident),
+                (NativeBlockPlan::Full(_), NativeBlockPlan::Full(_))
+                    | (
+                        NativeBlockPlan::Recurrent { .. },
+                        NativeBlockPlan::Recurrent { .. }
+                    )
+            )
+        })
+}
+
+fn upload_resident_layers(
+    weights: &Qwen35Weights,
     plan: &DeviceModelPlan,
     device: &Device,
 ) -> Result<Vec<NativeModelLayer>> {
@@ -384,9 +472,8 @@ fn upload_layers(
                 NativeModelLayer::Full(Box::new(NativeWeights::upload(weights, plan, device)?))
             }
             NativeBlockPlan::Recurrent { plan, finish } => {
-                NativeModelLayer::Recurrent(Box::new(NativeRecurrentLayerResources {
+                NativeModelLayer::Recurrent(Box::new(NativeRecurrentLayerWeights {
                     weights: NativeRecurrentWeights::upload(weights, plan, device)?,
-                    state: NativeRecurrentState::new(plan, device)?,
                     finish: LayerFinishWeights::upload(weights, finish, device)?,
                 }))
             }
@@ -400,4 +487,75 @@ fn upload_layers(
         .fail();
     }
     Ok(layers)
+}
+
+fn allocate_session_layers(
+    plan: &DeviceModelPlan,
+    device: &Device,
+) -> Result<Vec<NativeSessionLayer>> {
+    let mut layers = Vec::new();
+    layers
+        .try_reserve_exact(plan.layers.len())
+        .context(ExecutionAllocationSnafu {
+            target: "native model session layers",
+            length: plan.layers.len(),
+        })?;
+    for block in &plan.layers {
+        layers.push(match block {
+            NativeBlockPlan::Full(_) => NativeSessionLayer::Full,
+            NativeBlockPlan::Recurrent { plan, .. } => {
+                NativeSessionLayer::Recurrent(NativeRecurrentState::new(plan, device)?)
+            }
+        });
+    }
+    if layers.len() != plan.layers.len() {
+        return NativeSessionStateSnafu {
+            rule: "native model session layers must exactly cover every planned block",
+        }
+        .fail();
+    }
+    Ok(layers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_session_plan;
+    use crate::Qwen35Weights;
+    use crate::qwen35::tests::{canonical_hybrid_fixture_with_context, verify_fixture};
+    use crate::qwen35_native::model_plan::DeviceModelPlan;
+    use crate::qwen35_native::model_step::ModelTokenPlan;
+
+    const RESIDENT_CONTEXT: usize = 16;
+    const SESSION_CONTEXT: usize = 4;
+    const PAGE_TOKENS: kernels::attention::NativePageTokens =
+        kernels::attention::NativePageTokens::B8;
+
+    #[test]
+    fn session_plan_reuses_resident_binding_at_exact_smaller_context()
+    -> core::result::Result<(), String> {
+        let artifact = verify_fixture(&canonical_hybrid_fixture_with_context(RESIDENT_CONTEXT)?)?;
+        let weights =
+            Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let resident = DeviceModelPlan::from_weights(&weights, RESIDENT_CONTEXT, PAGE_TOKENS)
+            .map_err(|error| error.to_string())?;
+        let session = derive_session_plan(&weights, &resident, SESSION_CONTEXT)
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(session.layout.max_context(), SESSION_CONTEXT);
+        assert_eq!(session.page_tokens, resident.page_tokens);
+        assert_eq!(session.layers.len(), resident.layers.len());
+        assert!(
+            session.bytes.key_values < resident.bytes.key_values,
+            "a smaller exact session context must allocate its own smaller K/V extent"
+        );
+        assert!(
+            ModelTokenPlan::from_model(&session, SESSION_CONTEXT, 0).is_err(),
+            "the per-use plan cannot dispatch beyond its exact requested context"
+        );
+        assert!(
+            derive_session_plan(&weights, &resident, RESIDENT_CONTEXT + 1).is_err(),
+            "a session plan cannot exceed the resident model's immutable ceiling"
+        );
+        Ok(())
+    }
 }

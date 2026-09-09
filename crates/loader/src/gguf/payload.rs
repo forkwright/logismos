@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::Read;
 use std::num::NonZeroU64;
 use std::path::Path;
+use std::sync::Arc;
 
 use rustix::fs::{Mode, OFlags};
 use sha2::{Digest, Sha256};
@@ -41,19 +42,26 @@ impl ArtifactByteLimit {
 
 /// Immutable GGUF bytes verified against a required SHA-256 digest.
 ///
-/// The backing is one private allocation read exactly once from `path`; later
-/// tensor access neither maps nor reopens that path. Digest equality proves
-/// only equality to the caller-supplied bytes: it does not establish publisher
-/// authenticity or an atomic filesystem snapshot.
+/// Clones retain the same private backing and observation through shared
+/// ownership; they do not reread `path` or duplicate serialized payload bytes.
+/// The backing is read exactly once from `path`; later tensor access neither
+/// maps nor reopens that path. Digest equality proves only equality to the
+/// caller-supplied bytes: it does not establish publisher authenticity or an
+/// atomic filesystem snapshot.
 ///
 /// ```compile_fail
 /// use loader::gguf::{ObservedArtifact, VerifiedArtifact};
 ///
 /// fn forge_artifact(observation: ObservedArtifact) {
-///     let _ = VerifiedArtifact { backing: Vec::new(), observation };
+///     let _ = VerifiedArtifact::from_parts(Vec::new(), observation);
 /// }
 /// ```
+#[derive(Clone)]
 pub struct VerifiedArtifact {
+    inner: Arc<VerifiedArtifactInner>,
+}
+
+struct VerifiedArtifactInner {
     backing: Vec<u8>,
     observation: ObservedArtifact,
 }
@@ -92,16 +100,16 @@ impl VerifiedArtifact {
         let parsed = Reader::parse(&backing)?;
         parsed.validate_tensor_extents(serialized_bytes)?;
         let inspection = parsed.inspection(serialized_bytes, ArtifactDigest::Sha256(actual))?;
-        Ok(Self {
+        Ok(Self::from_parts(
             backing,
-            observation: ObservedArtifact { inspection, parsed },
-        })
+            ObservedArtifact { inspection, parsed },
+        ))
     }
 
     /// Borrow reporting facts derived from the same owned and verified bytes.
     #[must_use]
     pub fn observation(&self) -> &ObservedArtifact {
-        &self.observation
+        &self.inner.observation
     }
 
     /// Borrow one checked tensor from this artifact's private backing.
@@ -116,19 +124,19 @@ impl VerifiedArtifact {
     /// this verified artifact, or [`crate::Error::Gguf`] if an internal checked
     /// extent cannot be represented as a backing slice.
     pub fn tensor(&self, name: &str) -> Result<VerifiedTensor<'_>> {
-        let descriptor = self.observation.descriptor_by_name(name)?;
-        let serialized_bytes = u64::try_from(self.backing.len()).map_err(|_| {
+        let descriptor = self.observation().descriptor_by_name(name)?;
+        let serialized_bytes = u64::try_from(self.inner.backing.len()).map_err(|_| {
             GgufSnafu {
                 offset: 0u64,
                 msg: format!(
                     "verified artifact backing length {} exceeds u64::MAX",
-                    self.backing.len()
+                    self.inner.backing.len()
                 ),
             }
             .build()
         })?;
         let extent = self
-            .observation
+            .observation()
             .parsed
             .extent_for(descriptor, serialized_bytes)?;
         let start = usize::try_from(extent.start).map_err(|_| {
@@ -151,7 +159,7 @@ impl VerifiedArtifact {
             }
             .build()
         })?;
-        let bytes = self.backing.get(start..end).ok_or_else(|| {
+        let bytes = self.inner.backing.get(start..end).ok_or_else(|| {
             GgufSnafu {
                 offset: extent.start,
                 msg: format!(
@@ -162,6 +170,15 @@ impl VerifiedArtifact {
             .build()
         })?;
         Ok(VerifiedTensor { descriptor, bytes })
+    }
+
+    fn from_parts(backing: Vec<u8>, observation: ObservedArtifact) -> Self {
+        Self {
+            inner: Arc::new(VerifiedArtifactInner {
+                backing,
+                observation,
+            }),
+        }
     }
 }
 
@@ -194,8 +211,8 @@ impl fmt::Debug for VerifiedArtifact {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("VerifiedArtifact")
-            .field("serialized_bytes", &self.backing.len())
-            .field("digest", &self.observation.inspection().digest)
+            .field("serialized_bytes", &self.inner.backing.len())
+            .field("digest", &self.inner.observation.inspection().digest)
             .finish_non_exhaustive()
     }
 }
