@@ -74,6 +74,8 @@ pub struct PagedDecodePlan {
     kv_heads: usize,
     head_width: usize,
     gqa_group: usize,
+    query_elements: usize,
+    row_elements: usize,
     scale: f32,
     workspace: PagedDecodeWorkspace,
 }
@@ -84,8 +86,9 @@ impl PagedDecodePlan {
     /// # Errors
     ///
     /// Returns [`PagedDecodeError`] when a dimension is zero, query heads do
-    /// not divide evenly across key/value heads, the f32 scale cannot be
-    /// represented finitely, or the required workspace sum overflows.
+    /// not divide evenly across key/value heads, any complete query/row span
+    /// or allocation layout overflows, the f32 scale cannot be represented
+    /// finitely, or the required workspace sum overflows.
     pub fn try_from_dimensions(
         visible_tokens: usize,
         query_heads: usize,
@@ -103,6 +106,10 @@ impl PagedDecodePlan {
             }
             .fail();
         }
+        let row_elements = checked_product(kv_heads, head_width, "kv_heads * head_width")?;
+        let query_elements = checked_product(query_heads, head_width, "query_heads * head_width")?;
+        validate_f32_layout("query span", query_elements)?;
+        validate_f32_layout("key/value row span", row_elements)?;
         let head_width_f32 = head_width
             .to_f32()
             .filter(|value| value.is_finite())
@@ -116,12 +123,16 @@ impl PagedDecodePlan {
                 .checked_add(head_width)
                 .ok_or_else(|| WorkspaceOverflowSnafu.build())?,
         };
+        validate_f32_layout("scores", workspace.scores)?;
+        validate_f32_layout("head output", workspace.head_output)?;
         Ok(Self {
             visible_tokens,
             query_heads,
             kv_heads,
             head_width,
             gqa_group: query_heads / kv_heads,
+            query_elements,
+            row_elements,
             scale,
             workspace,
         })
@@ -194,13 +205,8 @@ impl PagedDecodePlan {
         Ok(query_head / self.gqa_group)
     }
 
-    fn row_elements(self) -> PagedDecodeResult<usize> {
-        self.kv_heads.checked_mul(self.head_width).ok_or_else(|| {
-            DimensionOverflowSnafu {
-                dimensions: "kv_heads * head_width",
-            }
-            .build()
-        })
+    const fn row_elements(self) -> usize {
+        self.row_elements
     }
 }
 
@@ -246,6 +252,22 @@ pub enum PagedDecodeError {
     /// The two concurrent CPU workspace allocations could not be summed.
     #[snafu(display("{PAGED_DECODE}: score and output workspace sum overflows usize"))]
     WorkspaceOverflow {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// An exact f32 span or allocation extent cannot form a Rust layout.
+    #[snafu(display(
+        "{PAGED_DECODE}: {allocation} layout for {elements} f32 elements is unrepresentable"
+    ))]
+    AllocationLayout {
+        /// Span or allocation role.
+        allocation: &'static str,
+        /// Exact requested f32 element count.
+        elements: usize,
+        /// Layout failure reported by the standard library.
+        source: std::alloc::LayoutError,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
@@ -375,7 +397,9 @@ pub enum PagedDecodeRowsError<E> {
 /// order. A row is exactly `[kv_heads, head_width]`; the selected key/value
 /// head is `query_head / gqa_group`. The f32 calculation intentionally keeps
 /// the decoder's materialized-score order: scores, then maximum, then
-/// normalizer, then output values all progress in ascending token order.
+/// normalizer, then output values all progress in ascending token order. It
+/// validates every full-row extent but inspects finite scalars only in the
+/// selected head, so unrelated GQA heads are not operation inputs.
 ///
 /// # Errors
 ///
@@ -398,9 +422,7 @@ where
     let kv_head = plan
         .validate_query(query_head, query)
         .map_err(|source| PagedDecodeRowsError::Kernel { source })?;
-    let row_elements = plan
-        .row_elements()
-        .map_err(|source| PagedDecodeRowsError::Kernel { source })?;
+    let row_elements = plan.row_elements();
     let head_start =
         kv_head
             .checked_mul(plan.head_width)
@@ -427,7 +449,7 @@ where
             key_row(token).map_err(|source| PagedDecodeRowsError::KeyRow { token, source })?;
         validate_exact_length("key row", row.len(), row_elements)
             .map_err(|source| PagedDecodeRowsError::Kernel { source })?;
-        validate_finite("key row", row)
+        validate_finite("selected key head", &row[head_start..head_end])
             .map_err(|source| PagedDecodeRowsError::Kernel { source })?;
         let score = scaled_dot(query, &row[head_start..head_end], plan.scale, token)
             .map_err(|source| PagedDecodeRowsError::Kernel { source })?;
@@ -467,7 +489,7 @@ where
             value_row(token).map_err(|source| PagedDecodeRowsError::ValueRow { token, source })?;
         validate_exact_length("value row", row.len(), row_elements)
             .map_err(|source| PagedDecodeRowsError::Kernel { source })?;
-        validate_finite("value row", row)
+        validate_finite("selected value head", &row[head_start..head_end])
             .map_err(|source| PagedDecodeRowsError::Kernel { source })?;
         for (column, value) in row[head_start..head_end].iter().copied().enumerate() {
             output[column] += probability * value;
@@ -500,6 +522,14 @@ fn reserve_f32(allocation: &'static str, elements: usize) -> PagedDecodeResult<V
             elements,
         })?;
     Ok(values)
+}
+
+fn validate_f32_layout(allocation: &'static str, elements: usize) -> PagedDecodeResult<()> {
+    std::alloc::Layout::array::<f32>(elements).context(AllocationLayoutSnafu {
+        allocation,
+        elements,
+    })?;
+    Ok(())
 }
 
 fn validate_nonzero_dimension(dimension: &'static str, value: usize) -> PagedDecodeResult<()> {
@@ -625,18 +655,14 @@ impl NativePagedDecodePlan {
                 }
                 .build()
             })?;
-        let query_elements = checked_product(
-            logical.query_heads,
-            logical.head_width,
-            "query_heads * head_width",
-        )?;
+        let query_elements = logical.query_elements;
         let key_value_elements = checked_product(
             checked_product(
                 physical_pages,
                 page_tokens.get(),
                 "physical_pages * page_tokens",
             )?,
-            logical.row_elements()?,
+            logical.row_elements(),
             "physical_pages * page_tokens * kv_heads * head_width",
         )?;
         Ok(Self {
@@ -991,7 +1017,8 @@ mod tests {
 
         assert_eq!(key_tokens, [0, 1]);
         assert_eq!(value_tokens, [0, 1]);
-        assert_relative_eq!(output[0], 7.0, epsilon = 1.0e-5);
+        let expected = (3.0_f64 + 11.0 * 1.0_f64.exp()) / (1.0 + 1.0_f64.exp());
+        assert_relative_eq!(output[0], expected as f32, epsilon = 1.0e-5);
         Ok(())
     }
 
@@ -1072,7 +1099,71 @@ mod tests {
     }
 
     #[test]
-    fn independent_online_f64_witness_handles_repeated_maximums_and_page_boundary()
+    fn constructor_eagerly_refuses_complete_span_and_allocation_layout_overflow() {
+        assert!(matches!(
+            PagedDecodePlan::try_from_dimensions(1, usize::MAX, usize::MAX, 2),
+            Err(PagedDecodeError::DimensionOverflow {
+                dimensions: "kv_heads * head_width",
+                ..
+            })
+        ));
+        assert!(matches!(
+            PagedDecodePlan::try_from_dimensions(1, usize::MAX, 1, 2),
+            Err(PagedDecodeError::DimensionOverflow {
+                dimensions: "query_heads * head_width",
+                ..
+            })
+        ));
+        let layout_overflow = (isize::MAX as usize / core::mem::size_of::<f32>()) + 1;
+        assert!(matches!(
+            PagedDecodePlan::try_from_dimensions(layout_overflow, 1, 1, 1),
+            Err(PagedDecodeError::AllocationLayout {
+                allocation: "scores",
+                elements,
+                ..
+            }) if elements == layout_overflow
+        ));
+    }
+
+    #[test]
+    fn per_head_operation_ignores_other_gqa_heads_but_refuses_selected_poison()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let plan = PagedDecodePlan::try_from_dimensions(1, 2, 2, 2)?;
+        let query = [1.0_f32, 0.0];
+        let unused_poison = [1.0_f32, 0.0, f32::NAN, f32::NAN];
+        let values = [3.0_f32, 5.0, f32::NAN, f32::NAN];
+        let output = paged_decode_cpu(
+            plan,
+            0,
+            &query,
+            |_| Ok::<_, std::io::Error>(&unused_poison),
+            |_| Ok::<_, std::io::Error>(&values),
+        )?;
+        assert_eq!(output.as_slice(), &[3.0, 5.0]);
+
+        let selected_poison = [f32::NAN, 0.0, 1.0, 0.0];
+        let refused = paged_decode_cpu(
+            plan,
+            0,
+            &query,
+            |_| Ok::<_, std::io::Error>(&selected_poison),
+            |_| Ok::<_, std::io::Error>(&values),
+        );
+        assert!(matches!(
+            refused,
+            Err(PagedDecodeRowsError::Kernel {
+                source: PagedDecodeError::NonFiniteInput {
+                    input: "selected key head",
+                    index: 0,
+                    ..
+                }
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn independent_online_f64_witness_matches_actual_cpu_with_repeated_maximums()
     -> core::result::Result<(), Box<dyn std::error::Error>> {
         let query = [1.0_f32, -1.0];
         let keys = [
@@ -1089,9 +1180,18 @@ mod tests {
         ];
         let materialized = f64_materialized_oracle(&query, 0, &keys, &values)?;
         let online = f64_online_oracle(&query, 0, &keys, &values)?;
+        let plan = PagedDecodePlan::try_from_dimensions(keys.len(), 1, 1, query.len())?;
+        let actual = paged_decode_cpu(
+            plan,
+            0,
+            &query,
+            |token| Ok::<_, std::io::Error>(keys[token].as_slice()),
+            |token| Ok::<_, std::io::Error>(values[token].as_slice()),
+        )?;
 
-        for (materialized, online) in materialized.iter().zip(online) {
+        for ((materialized, online), actual) in materialized.iter().zip(online).zip(actual) {
             assert_relative_eq!(*materialized, online, epsilon = 1.0e-12);
+            assert_relative_eq!(actual, *materialized as f32, epsilon = 1.0e-5);
         }
         Ok(())
     }

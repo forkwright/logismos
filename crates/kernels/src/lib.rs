@@ -58,13 +58,13 @@ pub mod row_gemv;
 #[cfg(feature = "gpu")]
 pub mod softmax;
 
+pub use crate::attention::{
+    PagedDecodeError, PagedDecodePlan, PagedDecodeResult, PagedDecodeRowsError,
+    PagedDecodeRowsResult, paged_decode_cpu,
+};
 pub use crate::causal_conv::{
     CausalConvAllocationPlan, CausalConvError, CausalConvInput, CausalConvOutput, CausalConvResult,
     causal_conv_fwd,
-};
-pub use crate::attention::{
-    PagedDecodeError, PagedDecodePlan, PagedDecodeRowsError, PagedDecodeRowsResult,
-    PagedDecodeResult, paged_decode_cpu,
 };
 pub use crate::error::{Error, Result};
 pub use crate::gdn::{
