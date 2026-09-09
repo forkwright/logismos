@@ -6,7 +6,9 @@ use snafu::ResultExt;
 use crate::error::{ArithmeticOverflowSnafu, NativePagedKvSnafu, NativeSessionStateSnafu};
 use crate::qwen35_native::plan::{DeviceByteDemand, DeviceFullAttentionPlan};
 use crate::qwen35_native::resources::DeviceResources;
-use crate::qwen35_native::{BeginError, CompletionError, ResourceOwner, ResourceState};
+use crate::qwen35_native::{
+    BeginError, CompletionError, CompletionResource, ResourceOwner, ResourceState,
+};
 use crate::{Qwen35Weights, Result};
 
 /// Checked device-allocation demand for one full-attention-block qualification session.
@@ -153,13 +155,28 @@ impl<'weights, 'artifact> Qwen35NativeLayerPlan<'weights, 'artifact> {
 /// Observable blocking-session state after completed or failed submissions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum Qwen35NativeLayerSessionState {
+pub enum Qwen35NativeSessionState {
     /// No work is submitted and the owned bundle may accept its next token.
     Ready,
     /// A submission reached a known-idle state but the session is permanently poisoned.
     PoisonedKnownIdle,
     /// Completion remains uncertain; the complete owned bundle is retained or forgotten.
     PoisonedCompletionUncertain,
+}
+
+/// Backwards-compatible state name for the single-layer qualification session.
+pub type Qwen35NativeLayerSessionState = Qwen35NativeSessionState;
+
+pub(super) fn session_state<Resource: CompletionResource>(
+    owner: &ResourceOwner<Resource>,
+) -> Qwen35NativeSessionState {
+    match owner.state() {
+        Some(ResourceState::Ready(_)) => Qwen35NativeSessionState::Ready,
+        Some(ResourceState::PoisonedIdle(_)) => Qwen35NativeSessionState::PoisonedKnownIdle,
+        Some(ResourceState::InFlight(_) | ResourceState::PoisonedUncertain(_)) | None => {
+            Qwen35NativeSessionState::PoisonedCompletionUncertain
+        }
+    }
 }
 
 /// One owned blocking native full-attention-block qualification session.
@@ -175,15 +192,7 @@ impl Qwen35NativeLayerSession {
     /// Return the session's externally observable completion state.
     #[must_use]
     pub fn state(&self) -> Qwen35NativeLayerSessionState {
-        match self.owner.state() {
-            Some(ResourceState::Ready(_)) => Qwen35NativeLayerSessionState::Ready,
-            Some(ResourceState::PoisonedIdle(_)) => {
-                Qwen35NativeLayerSessionState::PoisonedKnownIdle
-            }
-            Some(ResourceState::InFlight(_) | ResourceState::PoisonedUncertain(_)) | None => {
-                Qwen35NativeLayerSessionState::PoisonedCompletionUncertain
-            }
-        }
+        session_state(&self.owner)
     }
 
     /// Execute one token through exactly one admitted native full-attention block.
