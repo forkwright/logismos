@@ -10,6 +10,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include "numerical_status.h"
+
 // WHY: preserve the explicitly documented native multiply/add and online
 // update order. This operation is mathematically softmax-equivalent but does
 // not claim the CPU materialized-score rounding sequence.
@@ -26,7 +28,8 @@ extern "C" __global__ void logismos_paged_decode_q1_f32_kernel(
     std::uint32_t query_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_width,
-    std::uint32_t page_tokens)
+    std::uint32_t page_tokens,
+    std::uint32_t* numerical_status)
 {
     constexpr std::uint32_t WAVE_WIDTH = 32U;
     const std::uint32_t query_head = blockIdx.x;
@@ -41,6 +44,7 @@ extern "C" __global__ void logismos_paged_decode_q1_f32_kernel(
     const std::size_t lane_index = static_cast<std::size_t>(lane);
     const std::size_t query_start = static_cast<std::size_t>(query_head) * width;
     const std::size_t output_start = query_start;
+    const float checked_scale = logismos_status_input(scale, numerical_status);
     float running_maximum = -INFINITY;
     float running_normalizer = 0.0f;
 
@@ -65,24 +69,43 @@ extern "C" __global__ void logismos_paged_decode_q1_f32_kernel(
 
         float partial_dot = 0.0f;
         for (std::size_t column = lane_index; column < width; column += WAVE_WIDTH) {
-            const float product = query_f32[query_start + column] * keys_f32[kv_start + column];
-            partial_dot = partial_dot + product;
+            const float query = logismos_status_input(query_f32[query_start + column], numerical_status);
+            const float key = logismos_status_input(keys_f32[kv_start + column], numerical_status);
+            const float product = logismos_status_mul(query, key, numerical_status);
+            partial_dot = logismos_status_add(partial_dot, product, numerical_status);
         }
         // INVARIANT: the fixed tree is the native dot-reduction order.
         for (std::uint32_t offset = WAVE_WIDTH / 2U; offset > 0U; offset /= 2U) {
-            partial_dot += __shfl_down(partial_dot, offset, WAVE_WIDTH);
+            const float shuffled = __shfl_down(partial_dot, offset, WAVE_WIDTH);
+            if (lane < offset) {
+                partial_dot = logismos_status_add(partial_dot, shuffled, numerical_status);
+            }
         }
-        float score = lane == 0U ? partial_dot * scale : 0.0f;
+        float score = lane == 0U ? logismos_status_mul(partial_dot, checked_scale, numerical_status) : 0.0f;
         score = __shfl(score, 0, WAVE_WIDTH);
+        score = logismos_status_result(score, numerical_status);
 
-        const float next_maximum = fmaxf(running_maximum, score);
-        const float prior_rescale = isinf(running_maximum) ? 0.0f : expf(running_maximum - next_maximum);
-        const float token_weight = expf(score - next_maximum);
-        const float next_normalizer = prior_rescale * running_normalizer + token_weight;
+        if (token != 0U) {
+            logismos_status_arithmetic_operand(running_maximum, numerical_status);
+        }
+        const float next_maximum = logismos_status_result(fmaxf(running_maximum, score), numerical_status);
+        const float prior_rescale = token == 0U
+            ? 0.0f
+            : logismos_status_exp(logismos_status_sub(running_maximum, next_maximum, numerical_status), numerical_status);
+        const float token_weight = logismos_status_exp(
+            logismos_status_sub(score, next_maximum, numerical_status), numerical_status);
+        const float next_normalizer = logismos_status_add(
+            logismos_status_mul(prior_rescale, running_normalizer, numerical_status),
+            token_weight,
+            numerical_status);
         for (std::size_t column = lane_index; column < width; column += WAVE_WIDTH) {
             const std::size_t output_index = output_start + column;
-            output_f32[output_index] = prior_rescale * output_f32[output_index]
-                + token_weight * values_f32[kv_start + column];
+            const float prior_output = logismos_status_arithmetic_operand(output_f32[output_index], numerical_status);
+            const float value = logismos_status_input(values_f32[kv_start + column], numerical_status);
+            output_f32[output_index] = logismos_status_add(
+                logismos_status_mul(prior_rescale, prior_output, numerical_status),
+                logismos_status_mul(token_weight, value, numerical_status),
+                numerical_status);
         }
         running_maximum = next_maximum;
         running_normalizer = next_normalizer;
@@ -90,7 +113,10 @@ extern "C" __global__ void logismos_paged_decode_q1_f32_kernel(
 
     for (std::size_t column = lane_index; column < width; column += WAVE_WIDTH) {
         const std::size_t output_index = output_start + column;
-        output_f32[output_index] = output_f32[output_index] / running_normalizer;
+        output_f32[output_index] = logismos_status_div(
+            logismos_status_arithmetic_operand(output_f32[output_index], numerical_status),
+            logismos_status_arithmetic_operand(running_normalizer, numerical_status),
+            numerical_status);
     }
 }
 #pragma clang fp contract(on)

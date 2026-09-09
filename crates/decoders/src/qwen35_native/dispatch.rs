@@ -22,6 +22,12 @@ impl CompletionResource for DeviceResources {
     fn synchronize(&mut self) -> Result<()> {
         self.stream.synchronize().context(NativeDeviceSnafu)
     }
+
+    fn validate_after_synchronization(&mut self) -> Result<()> {
+        self.numerical_status
+            .read_after_synchronization()
+            .context(NativeKernelSnafu)
+    }
 }
 
 /// Borrowed native full-attention launch inputs with no cache-publication authority.
@@ -34,6 +40,7 @@ pub(super) struct DeferredFullAttention<'resources> {
     pub(super) plan: WorkspacePlan,
     pub(super) step: FullAttentionStep<'resources>,
     pub(super) stream: &'resources Stream,
+    pub(super) numerical_status: &'resources kernels::numerical_status::NativeNumericalStatus,
     pub(super) full_layer: usize,
 }
 
@@ -47,11 +54,11 @@ impl DeviceResources {
     ///
     /// # Safety
     ///
-    /// Every owned device input, verified weight, and intermediate must be
-    /// finite and normal-or-zero through completion. The prepared input and
-    /// all owned resources must remain exclusively owned on this stream's
-    /// device until the caller has established completion or retained them
-    /// after uncertainty.
+    /// The prepared input and all owned resources, including the sticky status
+    /// allocation, must remain exclusively owned on this stream's device until
+    /// the caller has established completion or retained them after uncertainty.
+    /// Checked launches classify their explicit operands and results; this does
+    /// not prove math-library internals or device floating-point mode.
     pub(crate) unsafe fn submit_step(&mut self) -> Result<()> {
         let step = self.step.as_ref().ok_or_else(|| {
             NativeSessionStateSnafu {
@@ -72,6 +79,7 @@ impl DeviceResources {
             plan: self.plan.workspace,
             step: step.full_attention(),
             stream,
+            numerical_status: &self.numerical_status,
             full_layer: 0,
         };
         // SAFETY: submit_step's contract retains the bundle, and this private
@@ -86,9 +94,9 @@ impl DeferredFullAttention<'_> {
     ///
     /// # Safety
     ///
-    /// The borrowed buffers and append must remain exclusively owned on this
-    /// stream through completion. All inputs, weights, controls, and
-    /// intermediates must satisfy the native finite normal-or-zero contract.
+    /// The borrowed buffers, append, and sticky status must remain exclusively
+    /// owned on this stream through completion. Checked launches classify their
+    /// explicit operands and results before the owner publishes cache state.
     pub(super) unsafe fn submit(&self, append: &mut NativePagedAppend<'_>) -> Result<()> {
         // SAFETY: submit's contract retains the exact checked pre-attention
         // buffers and weights through completion.
@@ -107,6 +115,7 @@ impl DeferredFullAttention<'_> {
             weights: self.finish_weights,
             workspace: self.finish_workspace,
             stream: self.stream,
+            numerical_status: self.numerical_status,
         };
         // SAFETY: submit's contract retains the exact input, attention
         // projection, output, finish weights, and finish scratch through completion.
@@ -118,7 +127,7 @@ impl DeferredFullAttention<'_> {
         let workspace = self.workspace;
         let stream = self.stream;
         // SAFETY: this method's caller retains the exact checked spans and
-        // finite normal-or-zero operands through completion.
+        // sticky status allocation through completion.
         unsafe {
             launch_rms_norm(
                 self.plan.hidden_norm,
@@ -126,25 +135,35 @@ impl DeferredFullAttention<'_> {
                 &weights.input_norm,
                 &workspace.hidden,
                 stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: the checked matrix descriptor and distinct spans remain live.
         unsafe {
-            weights
-                .q_gate
-                .launch(&workspace.hidden, &workspace.q_gate, stream)
+            weights.q_gate.launch(
+                &workspace.hidden,
+                &workspace.q_gate,
+                stream,
+                self.numerical_status,
+            )
         }?;
         // SAFETY: the checked matrix descriptor and distinct spans remain live.
         unsafe {
-            weights
-                .key
-                .launch(&workspace.hidden, &workspace.key, stream)
+            weights.key.launch(
+                &workspace.hidden,
+                &workspace.key,
+                stream,
+                self.numerical_status,
+            )
         }?;
         // SAFETY: the checked matrix descriptor and distinct spans remain live.
         unsafe {
-            weights
-                .value
-                .launch(&workspace.hidden, &workspace.value, stream)
+            weights.value.launch(
+                &workspace.hidden,
+                &workspace.value,
+                stream,
+                self.numerical_status,
+            )
         }?;
         // SAFETY: the checked split geometry and exact spans remain live.
         unsafe {
@@ -154,6 +173,7 @@ impl DeferredFullAttention<'_> {
                 &workspace.query,
                 &workspace.gate,
                 stream,
+                self.numerical_status,
             )
         }
     }
@@ -163,7 +183,7 @@ impl DeferredFullAttention<'_> {
         let workspace = self.workspace;
         let stream = self.stream;
         // SAFETY: this method's caller retains the exact checked spans and
-        // finite normal-or-zero operands through completion.
+        // sticky status allocation through completion.
         unsafe {
             launch_rms_norm(
                 self.plan.query_norm,
@@ -171,6 +191,7 @@ impl DeferredFullAttention<'_> {
                 &weights.query_norm,
                 &workspace.normalized_query,
                 stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: the exact checked K-normalization spans remain live.
@@ -181,6 +202,7 @@ impl DeferredFullAttention<'_> {
                 &weights.key_norm,
                 &workspace.normalized_key,
                 stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: the controls and rotated Q span are distinct exact buffers.
@@ -191,6 +213,7 @@ impl DeferredFullAttention<'_> {
                 self.step.cosine,
                 self.step.sine,
                 stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: the controls and rotated K span are distinct exact buffers.
@@ -201,6 +224,7 @@ impl DeferredFullAttention<'_> {
                 self.step.cosine,
                 self.step.sine,
                 stream,
+                self.numerical_status,
             )
         }
     }
@@ -231,11 +255,12 @@ impl DeferredFullAttention<'_> {
         // SAFETY: the opaque cache view retains K/V/table spans, while query
         // and output are separate owned exact spans on its stream.
         unsafe {
-            layer.launch_paged_decode(
+            layer.launch_paged_decode_checked(
                 self.step.attention,
                 &workspace.normalized_query,
                 &workspace.attention,
                 self.stream,
+                self.numerical_status,
             )
         }
         .context(NativePagedKvSnafu)
@@ -244,7 +269,7 @@ impl DeferredFullAttention<'_> {
     unsafe fn project_attention(&self) -> Result<()> {
         let workspace = self.workspace;
         // SAFETY: this method's caller retains the checked exact elementwise
-        // spans and finite normal-or-zero operands through completion.
+        // spans and sticky status allocation through completion.
         unsafe {
             launch_sigmoid_mul(
                 self.plan.gate,
@@ -252,13 +277,17 @@ impl DeferredFullAttention<'_> {
                 &workspace.gate,
                 &workspace.gated,
                 self.stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: the checked matrix descriptor and distinct spans remain live.
         unsafe {
-            self.weights
-                .output
-                .launch(&workspace.gated, &workspace.output_projection, self.stream)
+            self.weights.output.launch(
+                &workspace.gated,
+                &workspace.output_projection,
+                self.stream,
+                self.numerical_status,
+            )
         }
     }
 }
@@ -269,17 +298,19 @@ impl NativeMatrix {
     /// # Safety
     ///
     /// `input` and `output` must be non-overlapping device spans on `stream`'s
-    /// device with finite normal-or-zero operands through completion.
+    /// device with its sticky status allocation through completion. The checked
+    /// kernel classifies explicit operands and results before publication.
     pub(super) unsafe fn launch(
         &self,
         input: &DeviceBuffer<f32>,
         output: &DeviceBuffer<f32>,
         stream: &Stream,
+        numerical_status: &kernels::numerical_status::NativeNumericalStatus,
     ) -> Result<()> {
         // SAFETY: the caller upholds the native row-GEMV device-span and
-        // finite-domain contract for this verified descriptor.
+        // status-lifetime contract for this verified descriptor.
         unsafe {
-            kernels::row_gemv::launch_row_gemv_f32(
+            kernels::row_gemv::launch_row_gemv_f32_checked(
                 self.shape,
                 self.bytes.as_device_ptr(),
                 self.bytes.len(),
@@ -288,6 +319,7 @@ impl NativeMatrix {
                 output.as_device_ptr(),
                 output.len(),
                 stream,
+                numerical_status,
             )
         }
         .context(NativeKernelSnafu)
@@ -297,17 +329,19 @@ impl NativeMatrix {
 /// # Safety
 ///
 /// The three spans must be distinct exact buffers on `stream`'s device and
-/// retain finite normal-or-zero values through completion.
+/// retain the status allocation through completion. The checked kernel records
+/// explicit operand and arithmetic faults for the post-sync owner to classify.
 pub(super) unsafe fn launch_rms_norm(
     plan: kernels::decoder_ops::RmsNormF32Plan,
     input: &DeviceBuffer<f32>,
     weight: &DeviceBuffer<f32>,
     output: &DeviceBuffer<f32>,
     stream: &Stream,
+    numerical_status: &kernels::numerical_status::NativeNumericalStatus,
 ) -> Result<()> {
-    // SAFETY: caller establishes the checked exact spans and numerical domain.
+    // SAFETY: caller establishes exact spans and retains the status allocation.
     unsafe {
-        kernels::decoder_ops::launch_rms_norm_f32(
+        kernels::decoder_ops::launch_rms_norm_f32_checked(
             plan,
             input.as_device_ptr().cast_const(),
             input.len(),
@@ -316,6 +350,7 @@ pub(super) unsafe fn launch_rms_norm(
             output.as_device_ptr(),
             output.len(),
             stream,
+            numerical_status,
         )
     }
     .context(NativeKernelSnafu)
@@ -324,17 +359,19 @@ pub(super) unsafe fn launch_rms_norm(
 /// # Safety
 ///
 /// `values` must be exclusive, while coefficient spans remain immutable and
-/// all three buffers stay live on `stream`'s device through completion.
+/// all buffers, including `numerical_status`, stay live on `stream`'s device
+/// through completion.
 unsafe fn launch_rotary(
     plan: kernels::decoder_ops::RotaryHalfSplitF32Plan,
     values: &DeviceBuffer<f32>,
     cosine: &DeviceBuffer<f32>,
     sine: &DeviceBuffer<f32>,
     stream: &Stream,
+    numerical_status: &kernels::numerical_status::NativeNumericalStatus,
 ) -> Result<()> {
-    // SAFETY: caller establishes the exact non-aliasing spans and f32 domain.
+    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
     unsafe {
-        kernels::decoder_ops::launch_rotary_half_split_f32_in_place(
+        kernels::decoder_ops::launch_rotary_half_split_f32_in_place_checked(
             plan,
             values.as_device_ptr(),
             values.len(),
@@ -343,6 +380,7 @@ unsafe fn launch_rotary(
             sine.as_device_ptr().cast_const(),
             sine.len(),
             stream,
+            numerical_status,
         )
     }
     .context(NativeKernelSnafu)
@@ -351,17 +389,18 @@ unsafe fn launch_rotary(
 /// # Safety
 ///
 /// The input and two output spans must be distinct exact buffers on
-/// `stream`'s device and remain live through completion.
+/// `stream`'s device and retain `numerical_status` through completion.
 unsafe fn launch_split(
     plan: kernels::decoder_ops::SplitQGateF32Plan,
     input: &DeviceBuffer<f32>,
     query: &DeviceBuffer<f32>,
     gate: &DeviceBuffer<f32>,
     stream: &Stream,
+    numerical_status: &kernels::numerical_status::NativeNumericalStatus,
 ) -> Result<()> {
-    // SAFETY: caller establishes the exact non-aliasing spans and f32 domain.
+    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
     unsafe {
-        kernels::decoder_ops::launch_split_q_gate_f32(
+        kernels::decoder_ops::launch_split_q_gate_f32_checked(
             plan,
             input.as_device_ptr().cast_const(),
             input.len(),
@@ -370,6 +409,7 @@ unsafe fn launch_split(
             gate.as_device_ptr(),
             gate.len(),
             stream,
+            numerical_status,
         )
     }
     .context(NativeKernelSnafu)
@@ -378,17 +418,18 @@ unsafe fn launch_split(
 /// # Safety
 ///
 /// The two inputs and output must be distinct exact spans on `stream`'s device
-/// with finite normal-or-zero operands through completion.
+/// with the shared status allocation through completion.
 pub(super) unsafe fn launch_sigmoid_mul(
     plan: kernels::decoder_ops::ElementwiseF32Plan,
     value: &DeviceBuffer<f32>,
     gate: &DeviceBuffer<f32>,
     output: &DeviceBuffer<f32>,
     stream: &Stream,
+    numerical_status: &kernels::numerical_status::NativeNumericalStatus,
 ) -> Result<()> {
-    // SAFETY: caller establishes the exact non-aliasing spans and f32 domain.
+    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
     unsafe {
-        kernels::decoder_ops::sigmoid_mul(
+        kernels::decoder_ops::sigmoid_mul_checked(
             plan,
             value.as_device_ptr().cast_const(),
             value.len(),
@@ -397,6 +438,7 @@ pub(super) unsafe fn launch_sigmoid_mul(
             output.as_device_ptr(),
             output.len(),
             stream,
+            numerical_status,
         )
     }
     .context(NativeKernelSnafu)
@@ -405,17 +447,18 @@ pub(super) unsafe fn launch_sigmoid_mul(
 /// # Safety
 ///
 /// The two inputs and output must be distinct exact spans on `stream`'s device
-/// with finite normal-or-zero operands through completion.
+/// with the shared status allocation through completion.
 pub(super) unsafe fn launch_silu_mul(
     plan: kernels::decoder_ops::ElementwiseF32Plan,
     gate: &DeviceBuffer<f32>,
     up: &DeviceBuffer<f32>,
     output: &DeviceBuffer<f32>,
     stream: &Stream,
+    numerical_status: &kernels::numerical_status::NativeNumericalStatus,
 ) -> Result<()> {
-    // SAFETY: caller establishes the exact non-aliasing spans and f32 domain.
+    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
     unsafe {
-        kernels::decoder_ops::silu_mul(
+        kernels::decoder_ops::silu_mul_checked(
             plan,
             gate.as_device_ptr().cast_const(),
             gate.len(),
@@ -424,6 +467,7 @@ pub(super) unsafe fn launch_silu_mul(
             output.as_device_ptr(),
             output.len(),
             stream,
+            numerical_status,
         )
     }
     .context(NativeKernelSnafu)
@@ -432,17 +476,18 @@ pub(super) unsafe fn launch_silu_mul(
 /// # Safety
 ///
 /// The two inputs and output must be distinct exact spans on `stream`'s device
-/// with finite normal-or-zero operands through completion.
+/// with the shared status allocation through completion.
 pub(super) unsafe fn launch_residual(
     plan: kernels::decoder_ops::ElementwiseF32Plan,
     left: &DeviceBuffer<f32>,
     right: &DeviceBuffer<f32>,
     output: &DeviceBuffer<f32>,
     stream: &Stream,
+    numerical_status: &kernels::numerical_status::NativeNumericalStatus,
 ) -> Result<()> {
-    // SAFETY: caller establishes the exact non-aliasing spans and f32 domain.
+    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
     unsafe {
-        kernels::decoder_ops::residual_add(
+        kernels::decoder_ops::residual_add_checked(
             plan,
             left.as_device_ptr().cast_const(),
             left.len(),
@@ -451,6 +496,7 @@ pub(super) unsafe fn launch_residual(
             output.as_device_ptr(),
             output.len(),
             stream,
+            numerical_status,
         )
     }
     .context(NativeKernelSnafu)

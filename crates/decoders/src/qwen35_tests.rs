@@ -1383,6 +1383,22 @@ pub(crate) fn canonical_hybrid_fixture_with_context_and_rotary(
     Ok(fixture)
 }
 
+/// Preserve canonical structure while introducing an invalid early embedding operand.
+pub(crate) fn canonical_hybrid_fixture_with_invalid_embedding_operand()
+-> std::result::Result<Fixture, String> {
+    let mut fixture = canonical_hybrid_fixture()?;
+    set_invalid_f32_tensor(&mut fixture, TOKEN_EMBEDDING_TENSOR)?;
+    Ok(fixture)
+}
+
+/// Preserve canonical structure while introducing an invalid late output-head operand.
+pub(crate) fn canonical_hybrid_fixture_with_invalid_output_head_operand()
+-> std::result::Result<Fixture, String> {
+    let mut fixture = canonical_hybrid_fixture()?;
+    set_invalid_f32_tensor(&mut fixture, OUTPUT_TENSOR)?;
+    Ok(fixture)
+}
+
 /// Preserve the canonical main model while varying only its optional auxiliary block.
 pub(crate) fn canonical_hybrid_fixture_with_nextn(
     context: usize,
@@ -3661,6 +3677,24 @@ fn mutate_tensor_shape(
         return Ok(());
     }
     Err(format!("fixture tensor `{name}` was not found"))
+}
+
+fn set_invalid_f32_tensor(fixture: &mut Fixture, name: &str) -> std::result::Result<(), String> {
+    let elements = fixture
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == name)
+        .ok_or_else(|| format!("fixture tensor `{name}` was not found"))?
+        .dims
+        .iter()
+        .try_fold(1_u64, |elements, dimension| {
+            elements.checked_mul(*dimension)
+        })
+        .ok_or_else(|| format!("fixture tensor `{name}` element count overflowed"))?;
+    let elements = usize::try_from(elements).map_err(|error| {
+        format!("fixture tensor `{name}` element count must fit usize: {error}")
+    })?;
+    set_f32_values(fixture, name, vec![f32::NAN; elements])
 }
 
 fn rename_tensor(fixture: &mut Fixture, from: &str, to: &str) -> std::result::Result<(), String> {

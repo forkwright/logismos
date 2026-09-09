@@ -29,7 +29,7 @@ const CAUSAL_CONV_STEP_KERNEL: &str = "causal_conv_step_f32";
 
 #[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 unsafe extern "C" {
-    fn logismos_launch_causal_conv_step_f32(
+    fn logismos_launch_causal_conv_step_f32_checked(
         input_f32: *const c_void,
         weights_f32: *const c_void,
         history_in_f32: *const c_void,
@@ -37,6 +37,7 @@ unsafe extern "C" {
         output_f32: *mut c_void,
         channel_count: u32,
         width: u32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 }
@@ -429,9 +430,102 @@ pub unsafe fn launch_causal_conv_step_f32(
     output_elements: usize,
     stream: &Stream,
 ) -> Result<()> {
+    // SAFETY: the raw caller retains the documented allocation and numerical obligations.
+    unsafe {
+        launch_causal_conv_step_f32_impl(
+            plan,
+            input_f32,
+            input_elements,
+            weights_f32,
+            weight_elements,
+            history_in_f32,
+            history_in_elements,
+            history_out_f32,
+            history_out_elements,
+            output_f32,
+            output_elements,
+            stream,
+            None,
+        )
+    }
+}
+
+#[cfg(feature = "gpu")]
+/// Submit the staged operation with sticky input and intermediate numerical checks.
+///
+/// Submission success does not validate arithmetic. Read `status` after proven
+/// stream completion before publishing any staged state or output.
+///
+/// # Safety
+///
+/// The allocation, lifetime, aliasing and stream requirements of [`launch_causal_conv_step_f32`]
+/// still apply. `status` must be on the same device, nonaliasing and retained
+/// through completion. The execution environment must qualify the checked
+/// kernel's denorm-preserving compiler and math-library behavior; caller
+/// prequalification of each explicit arithmetic intermediate is not required.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the checked operation retains the exact staged-buffer ABI"
+)]
+pub unsafe fn launch_causal_conv_step_f32_checked(
+    plan: CausalConvAllocationPlan,
+    input_f32: *const f32,
+    input_elements: usize,
+    weights_f32: *const f32,
+    weight_elements: usize,
+    history_in_f32: *const f32,
+    history_in_elements: usize,
+    history_out_f32: *mut f32,
+    history_out_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &crate::numerical_status::NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: the checked caller retains all device and status allocation obligations.
+    unsafe {
+        launch_causal_conv_step_f32_impl(
+            plan,
+            input_f32,
+            input_elements,
+            weights_f32,
+            weight_elements,
+            history_in_f32,
+            history_in_elements,
+            history_out_f32,
+            history_out_elements,
+            output_f32,
+            output_elements,
+            stream,
+            Some(status),
+        )
+    }
+}
+
+#[cfg(feature = "gpu")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one launch owner validates both raw and checked staged-buffer calls"
+)]
+unsafe fn launch_causal_conv_step_f32_impl(
+    plan: CausalConvAllocationPlan,
+    input_f32: *const f32,
+    input_elements: usize,
+    weights_f32: *const f32,
+    weight_elements: usize,
+    history_in_f32: *const f32,
+    history_in_elements: usize,
+    history_out_f32: *mut f32,
+    history_out_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: Option<&crate::numerical_status::NativeNumericalStatus>,
+) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (
+            status,
             plan,
             input_f32,
             input_elements,
@@ -463,13 +557,20 @@ pub unsafe fn launch_causal_conv_step_f32(
             output_f32,
             output_elements,
         )?;
+        let numerical_status = match status {
+            Some(status) => {
+                // SAFETY: the caller retains this nonaliasing status on the stream device.
+                unsafe { status.as_device_ptr().cast::<c_void>() }
+            }
+            None => core::ptr::null_mut(),
+        };
         stream.make_current()?;
         // SAFETY: the caller upholds device ownership, lifetime, concurrent
         // access, and numerical-domain obligations documented above; checked
         // spans and the allocation-plan owner established exact extents,
         // alignment, non-aliasing results, and ABI dimensions.
         let code = unsafe {
-            logismos_launch_causal_conv_step_f32(
+            logismos_launch_causal_conv_step_f32_checked(
                 input_f32.cast::<c_void>(),
                 weights_f32.cast::<c_void>(),
                 history_in_f32.cast::<c_void>(),
@@ -477,6 +578,7 @@ pub unsafe fn launch_causal_conv_step_f32(
                 output_f32.cast::<c_void>(),
                 abi.channel_count,
                 abi.width,
+                numerical_status,
                 stream.raw().cast::<c_void>(),
             )
         };
@@ -759,6 +861,33 @@ mod tests {
         assert!(
             actual.history().is_empty(),
             "width one must return no history"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hidden_subnormal_tap_remains_a_counterexample_after_normal_output() -> CausalConvResult<()> {
+        let history = [f32::MIN_POSITIVE];
+        let weights = [0.5_f32, 1.0];
+        let input = [1.0_f32];
+        let subnormal_tap = history[0] * weights[0];
+        assert!(history[0].is_normal(), "history operand must begin normal");
+        assert!(weights[0].is_normal(), "weight operand must begin normal");
+        assert!(
+            subnormal_tap.is_subnormal(),
+            "first tap product must be subnormal"
+        );
+
+        let admitted = CausalConvInput::new(&input, &weights, &history, 1, 1, 2)?;
+        let actual = causal_conv_fwd(&admitted)?;
+        assert_eq!(
+            actual.output(),
+            &[1.0],
+            "the final CPU output remains normal"
+        );
+        assert!(
+            actual.output()[0].is_normal(),
+            "a normal final output must not hide the earlier subnormal tap"
         );
         Ok(())
     }
@@ -1142,6 +1271,109 @@ mod tests {
     #[cfg(feature = "gpu")]
     #[test]
     #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
+    fn initialized_status_classifies_causal_step_inputs_and_hidden_intermediates()
+    -> core::result::Result<(), String> {
+        use hipcore::{Device, DeviceBuffer, Stream};
+
+        let device = Device::new(0).map_err(|error| format!("open reserved device 0: {error}"))?;
+        let stream = Stream::new(&device).map_err(|error| format!("create stream: {error}"))?;
+        let plan = CausalConvAllocationPlan::try_from_dimensions(1, 1, 2)
+            .map_err(|error| format!("build causal status plan: {error}"))?;
+        let cases = [
+            ("clean", [1.0_f32], [0.5_f32, 1.0], [1.0_f32], 0_u32),
+            (
+                "input subnormal",
+                [f32::from_bits(1)],
+                [1.0_f32, 1.0],
+                [1.0_f32],
+                crate::numerical_status::NativeNumericalStatusCategory::InputSubnormal.bit()
+                    | crate::numerical_status::NativeNumericalStatusCategory::ArithmeticSubnormal
+                        .bit(),
+            ),
+            (
+                "hidden arithmetic underflow",
+                [1.0_f32],
+                [0.5_f32, 1.0],
+                [f32::MIN_POSITIVE],
+                crate::numerical_status::NativeNumericalStatusCategory::ArithmeticSubnormal.bit(),
+            ),
+            (
+                "input nonfinite",
+                [f32::INFINITY],
+                [1.0_f32, 1.0],
+                [1.0_f32],
+                crate::numerical_status::NativeNumericalStatusCategory::InputNonFinite.bit()
+                    | crate::numerical_status::NativeNumericalStatusCategory::ArithmeticNonFinite
+                        .bit(),
+            ),
+            (
+                "arithmetic overflow",
+                [f32::MAX],
+                [0.5_f32, 2.0],
+                [1.0_f32],
+                crate::numerical_status::NativeNumericalStatusCategory::ArithmeticNonFinite.bit(),
+            ),
+        ];
+
+        for (name, input_host, weights_host, history_host, expected_bits) in cases {
+            let input = DeviceBuffer::from_host(&device, &input_host)
+                .map_err(|error| format!("{name}: upload input: {error}"))?;
+            let weights = DeviceBuffer::from_host(&device, &weights_host)
+                .map_err(|error| format!("{name}: upload weights: {error}"))?;
+            let history_in = DeviceBuffer::from_host(&device, &history_host)
+                .map_err(|error| format!("{name}: upload history: {error}"))?;
+            let history_out = DeviceBuffer::from_host(&device, &[-1234.5_f32])
+                .map_err(|error| format!("{name}: initialize staged history: {error}"))?;
+            let output = DeviceBuffer::from_host(&device, &[-1234.5_f32])
+                .map_err(|error| format!("{name}: initialize staged output: {error}"))?;
+            let status = crate::numerical_status::NativeNumericalStatus::new(&device)
+                .map_err(|error| format!("{name}: initialize status: {error}"))?;
+            // SAFETY: these distinct owned buffers match the checked plan and remain live through synchronization.
+            unsafe {
+                launch_causal_conv_step_f32_checked(
+                    plan,
+                    input.as_device_ptr(),
+                    input.len(),
+                    weights.as_device_ptr(),
+                    weights.len(),
+                    history_in.as_device_ptr(),
+                    history_in.len(),
+                    history_out.as_device_ptr(),
+                    history_out.len(),
+                    output.as_device_ptr(),
+                    output.len(),
+                    &stream,
+                    &status,
+                )
+            }
+            .map_err(|error| format!("{name}: launch checked causal step: {error}"))?;
+            stream
+                .synchronize()
+                .map_err(|error| format!("{name}: synchronize: {error}"))?;
+            assert_eq!(
+                native_status_bits(&status)?,
+                expected_bits,
+                "{name}: initialized status must contain the exact typed mask"
+            );
+            assert_device_values(&input, &input_host, name, "input")?;
+            assert_device_values(&weights, &weights_host, name, "weights")?;
+            assert_device_values(&history_in, &history_host, name, "history")?;
+            if expected_bits == 0 {
+                let admitted =
+                    CausalConvInput::new(&input_host, &weights_host, &history_host, 1, 1, 2)
+                        .map_err(|error| format!("{name}: admit CPU oracle: {error}"))?;
+                let expected = causal_conv_fwd(&admitted)
+                    .map_err(|error| format!("{name}: evaluate CPU oracle: {error}"))?;
+                assert_device_values(&output, expected.output(), name, "clean output")?;
+                assert_device_values(&history_out, expected.history(), name, "clean history")?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
     fn reserved_device_step_matches_oracle_continuation_and_width_one()
     -> core::result::Result<(), String> {
         use hipcore::{Device, DeviceBuffer, Stream};
@@ -1450,6 +1682,35 @@ mod tests {
             vec![f32::MAX.to_bits()],
             "the immutable caller history must remain bitwise unchanged after rejection"
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    fn native_status_bits(
+        status: &crate::numerical_status::NativeNumericalStatus,
+    ) -> core::result::Result<u32, String> {
+        match status.read_after_synchronization() {
+            Ok(()) => Ok(0),
+            Err(crate::Error::NumericalStatus {
+                source: crate::numerical_status::NativeNumericalStatusError::Observed { mask },
+                ..
+            }) => Ok(mask.bits()),
+            Err(error) => Err(format!("read typed native status: {error}")),
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn assert_device_values(
+        buffer: &hipcore::DeviceBuffer<f32>,
+        expected: &[f32],
+        case: &str,
+        name: &str,
+    ) -> core::result::Result<(), String> {
+        let mut actual = vec![0.0_f32; buffer.len()];
+        buffer
+            .copy_to_host(&mut actual)
+            .map_err(|error| format!("{case}: read {name}: {error}"))?;
+        assert_eq!(actual, expected, "{case}: {name} must match exactly");
         Ok(())
     }
 

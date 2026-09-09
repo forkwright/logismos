@@ -6,7 +6,7 @@
 
 extern "C" __global__ void logismos_paged_decode_q1_f32_kernel(
     const float*, const float*, const float*, const std::uint32_t*, float*, float,
-    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t*);
 
 namespace {
 constexpr std::uint32_t WAVE_WIDTH = 32U;
@@ -25,6 +25,7 @@ extern "C" hipError_t logismos_launch_paged_decode_q1_f32(
     std::uint32_t page_tokens,
     std::uint32_t physical_pages,
     float scale,
+    void* numerical_status,
     hipStream_t stream)
 {
     (void)physical_pages;
@@ -43,6 +44,7 @@ extern "C" hipError_t logismos_launch_paged_decode_q1_f32(
         query_heads,
         kv_heads,
         head_width,
-        page_tokens);
+        page_tokens,
+        reinterpret_cast<std::uint32_t*>(numerical_status));
     return hipGetLastError();
 }

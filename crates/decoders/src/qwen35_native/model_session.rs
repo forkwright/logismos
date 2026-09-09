@@ -111,6 +111,15 @@ impl Qwen35NativeExecutionDeviceDemand {
         self.bytes.recurrent_state_staged
     }
 
+    /// Requested sticky native numerical-status bytes.
+    ///
+    /// This one session-owned word is never reset. Any checked-arithmetic
+    /// status makes the owned session permanently unusable.
+    #[must_use]
+    pub const fn numerical_status_bytes(self) -> usize {
+        self.bytes.numerical_status
+    }
+
     /// Checked total requested device bytes across this one owned session.
     #[must_use]
     pub const fn total_bytes(self) -> usize {
@@ -214,13 +223,13 @@ impl Qwen35NativeExecutionSession {
     ///
     /// # Safety
     ///
-    /// The caller guarantees a qualified `gfx1100` device and finite
-    /// normal-or-zero values for every operand and intermediate in the native
-    /// numerical domain, including verified weights, embedding rows, full and
-    /// recurrent state, K/V, controls, workspace, normalization, and output.
-    /// This one-token blocking qualification boundary does not independently
-    /// establish numerical validity, hardware parity, performance, physical-GPU
-    /// qualification, capacity, or serving safety.
+    /// The caller guarantees a qualified `gfx1100` device. Checked launches
+    /// classify explicit operands and arithmetic results in one owned sticky
+    /// status word before KV, recurrent state, position, or logits publish.
+    /// This depends on the qualified compiler, math implementation, and device
+    /// preserving the checked denorm contract. It does not establish hardware
+    /// parity, performance, physical-GPU qualification, capacity, artifact
+    /// quality, or serving safety.
     pub unsafe fn step(&mut self, token: u32) -> Result<DeviceBuffer<f32>> {
         let mut in_flight = self.owner.begin().map_err(begin_error)?;
         {
@@ -230,7 +239,8 @@ impl Qwen35NativeExecutionSession {
         in_flight.mark_submitted();
         {
             let resources = in_flight.resource().map_err(completion_error)?;
-            // SAFETY: the caller supplies the complete native numerical-domain and device qualification guarantees.
+            // SAFETY: the caller establishes device qualification; checked
+            // launchers retain and classify their explicit numerical inputs.
             unsafe { resources.submit_step()? };
         }
         in_flight

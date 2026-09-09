@@ -10,6 +10,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include "numerical_status.h"
+
 // WHY: this is a correctness baseline for Qwen's separately rounded f32 L2
 // arithmetic. Keep contraction and reassociation disabled only for this source.
 #pragma clang fp contract(off)
@@ -24,7 +26,8 @@ __global__ void decoder_recurrent_qk_l2_f32_kernel(
     float* __restrict__ key,
     const std::uint32_t source_key_heads,
     const std::uint32_t key_width,
-    const float epsilon) {
+    const float epsilon,
+    std::uint32_t* numerical_status) {
     const std::uint32_t value_head = blockIdx.x;
     const std::uint32_t lane = threadIdx.x;
     if (lane >= kWaveSize) {
@@ -42,17 +45,30 @@ __global__ void decoder_recurrent_qk_l2_f32_kernel(
         for (std::size_t column = 0; column < width; ++column) {
             const float query_value = convolved[source_start + column];
             const float key_value = convolved[source_elements + source_start + column];
-            query_sum = query_sum + query_value * query_value;
-            key_sum = key_sum + key_value * key_value;
+            logismos_status_input(query_value, numerical_status);
+            logismos_status_input(key_value, numerical_status);
+            query_sum = logismos_status_add(
+                query_sum, logismos_status_mul(query_value, query_value, numerical_status), numerical_status);
+            key_sum = logismos_status_add(
+                key_sum, logismos_status_mul(key_value, key_value, numerical_status), numerical_status);
         }
     }
     query_sum = __shfl(query_sum, 0, kWaveSize);
     key_sum = __shfl(key_sum, 0, kWaveSize);
-    const float query_denominator = fmaxf(sqrtf(query_sum), epsilon);
-    const float key_denominator = fmaxf(sqrtf(key_sum), epsilon);
+    logismos_status_input(epsilon, numerical_status);
+    const float query_root = logismos_status_sqrt(query_sum, numerical_status);
+    const float key_root = logismos_status_sqrt(key_sum, numerical_status);
+    const float query_denominator = fmaxf(query_root, epsilon);
+    const float key_denominator = fmaxf(key_root, epsilon);
+    logismos_status_result(query_denominator, numerical_status);
+    logismos_status_result(key_denominator, numerical_status);
     for (std::size_t column = lane; column < width; column += kWaveSize) {
-        query[target_start + column] = convolved[source_start + column] / query_denominator;
-        key[target_start + column] = convolved[source_elements + source_start + column] / key_denominator;
+        const float query_value = convolved[source_start + column];
+        const float key_value = convolved[source_elements + source_start + column];
+        logismos_status_input(query_value, numerical_status);
+        logismos_status_input(key_value, numerical_status);
+        query[target_start + column] = logismos_status_div(query_value, query_denominator, numerical_status);
+        key[target_start + column] = logismos_status_div(key_value, key_denominator, numerical_status);
     }
 }
 }
@@ -65,6 +81,7 @@ extern "C" hipError_t logismos_launch_decoder_recurrent_qk_l2_f32(
     const std::uint32_t value_heads,
     const std::uint32_t key_width,
     const float epsilon,
+    void* numerical_status,
     hipStream_t stream) {
     decoder_recurrent_qk_l2_f32_kernel<<<dim3(value_heads), dim3(kWaveSize), 0, stream>>>(
         reinterpret_cast<const float*>(convolved),
@@ -72,7 +89,8 @@ extern "C" hipError_t logismos_launch_decoder_recurrent_qk_l2_f32(
         reinterpret_cast<float*>(key),
         source_key_heads,
         key_width,
-        epsilon);
+        epsilon,
+        reinterpret_cast<std::uint32_t*>(numerical_status));
     return hipGetLastError();
 }
 

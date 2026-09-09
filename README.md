@@ -18,8 +18,9 @@ The standalone [serialized-row GEMV](crates/kernels/src/row_gemv/mod.rs) primiti
 shares checked format geometry with `quant` and supplies an explicit CPU
 reference plus private HIP launchers for its executable row formats. Serialized
 F32 weights remain f32 rather than being converted to fp16.
-The GPU numerical domain excludes subnormal
-scales, operands and intermediates pending denormal-mode qualification.
+The native numerical profile remains zero-or-normal. Checked launchers record
+subnormal/nonfinite inputs and explicit arithmetic intermediates in one sticky
+status; raw launchers retain caller-owned numerical preconditions.
 GPU compilation is not numerical or performance
 qualification; the safe text/retrieval pipelines remain CPU-only.
 
@@ -38,9 +39,12 @@ uploaded or executed by this main autoregressive baseline. The narrower
 `Qwen35NativeLayerPlan` remains available for single-block qualification.
 
 One model owner retains device weights, scratch, recurrent committed/staged
-state, paged KV, controls, stream and pending logits. It publishes all state
-only after whole-token completion and permanently poisons on a submitted
-failure, retaining the entire bundle if completion remains uncertain.
+state, paged KV, controls, stream, numerical status and pending logits. It
+publishes state only after whole-token synchronization and a clear status read.
+Arithmetic failures poison the session without returning logits or publishing
+KV, recurrent state or position; uncertain completion retains the entire bundle.
+The status checks explicit operations, not hidden math-library temporaries, and
+still requires a qualified denorm-preserving compiler/math/device profile.
 The `logismos` facade selects this surface; direct CPU consumers keep it off.
 This is a qualification boundary, not a safe GPU text pipeline, serving,
 a resource grant, or evidence of W7900/XTX numerical or performance parity.

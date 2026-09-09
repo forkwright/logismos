@@ -14,11 +14,12 @@ fn byte_demand_sums_every_native_category() -> core::result::Result<(), String> 
         controls: 23,
         key_values: 29,
         table: 31,
+        numerical_status: 37,
     };
     assert_eq!(
         demand.total().map_err(|error| error.to_string())?,
-        143,
-        "native byte accounting must include weights, named scratch, I/O, controls, K/V, and table"
+        180,
+        "native byte accounting must include weights, named scratch, I/O, controls, K/V, table, and numerical status"
     );
     Ok(())
 }
@@ -32,6 +33,7 @@ fn byte_demand_refuses_aggregate_overflow() {
         controls: 0,
         key_values: 0,
         table: 0,
+        numerical_status: 0,
     };
     assert!(
         demand.total().is_err(),
@@ -44,8 +46,13 @@ fn verified_full_block_plan_accepts_each_explicit_native_page_size()
 -> std::result::Result<(), String> {
     let artifact = verify_fixture(&canonical_hybrid_fixture()?)?;
     let weights = Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
-    for (page_tokens, key_values, total) in [
-        (kernels::attention::NativePageTokens::B8, 32_768, 76_640),
+    let numerical_status = kernels::numerical_status::NativeNumericalStatus::byte_demand();
+    for (page_tokens, key_values, base_total) in [
+        (
+            kernels::attention::NativePageTokens::B8,
+            32_768,
+            76_640_usize,
+        ),
         (kernels::attention::NativePageTokens::B16, 65_536, 109_408),
         (kernels::attention::NativePageTokens::B32, 131_072, 174_944),
     ] {
@@ -72,6 +79,13 @@ fn verified_full_block_plan_accepts_each_explicit_native_page_size()
             plan.bytes.key_values, key_values,
             "page selector changes only K/V backing"
         );
+        assert_eq!(
+            plan.bytes.numerical_status, numerical_status,
+            "one session-owned sticky numerical status must be accounted exactly once"
+        );
+        let total = base_total
+            .checked_add(numerical_status)
+            .ok_or("hand-derived native byte total overflow")?;
         assert_eq!(
             plan.bytes.total().map_err(|error| error.to_string())?,
             total,

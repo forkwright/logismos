@@ -1,11 +1,12 @@
 //! Checked T=1 recurrent beta and log-decay scalar operation.
 
 #[cfg(not(logismos_no_gpu_kernels))]
-use std::ffi::c_void;
+use core::ffi::c_void;
 
 use hipcore::Stream;
 
 use super::{ELEMENTWISE_THREADS, Result};
+use crate::numerical_status::NativeNumericalStatus;
 
 const RECURRENT_SCALARS_KERNEL: &str = "decoder_recurrent_scalars_f32";
 
@@ -19,6 +20,7 @@ unsafe extern "C" {
         beta_f32: *mut c_void,
         log_decay_f32: *mut c_void,
         value_heads: u32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 }
@@ -101,6 +103,104 @@ pub unsafe fn launch_recurrent_scalars_f32(
     log_decay_elements: usize,
     stream: &Stream,
 ) -> Result<()> {
+    // SAFETY: this raw boundary retains its documented caller-owned numerical
+    // and device-lifetime obligations while selecting no sticky status word.
+    unsafe {
+        launch_recurrent_scalars_f32_with_status(
+            plan,
+            alpha_f32,
+            alpha_elements,
+            dt_f32,
+            dt_elements,
+            a_f32,
+            a_elements,
+            beta_projection_f32,
+            beta_projection_elements,
+            beta_f32,
+            beta_elements,
+            log_decay_f32,
+            log_decay_elements,
+            stream,
+            None,
+        )
+    }
+}
+
+/// Launch recurrent scalars while recording explicit numerical-domain failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through same-stream completion on the same
+/// device and must be read only after successful synchronization. Checked
+/// classification replaces the raw path's explicit finite normal-or-zero
+/// operand/intermediate obligation; it still requires the qualified compiler,
+/// denorm, math-library, and device profile.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "six exact scalar spans are one non-aliased recurrent operation contract"
+)]
+pub unsafe fn launch_recurrent_scalars_f32_checked(
+    plan: RecurrentScalarsF32Plan,
+    alpha_f32: *const f32,
+    alpha_elements: usize,
+    dt_f32: *const f32,
+    dt_elements: usize,
+    a_f32: *const f32,
+    a_elements: usize,
+    beta_projection_f32: *const f32,
+    beta_projection_elements: usize,
+    beta_f32: *mut f32,
+    beta_elements: usize,
+    log_decay_f32: *mut f32,
+    log_decay_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: the checked boundary retains raw pointer/device ownership
+    // obligations and retains status through same-stream synchronization.
+    unsafe {
+        launch_recurrent_scalars_f32_with_status(
+            plan,
+            alpha_f32,
+            alpha_elements,
+            dt_f32,
+            dt_elements,
+            a_f32,
+            a_elements,
+            beta_projection_f32,
+            beta_projection_elements,
+            beta_f32,
+            beta_elements,
+            log_decay_f32,
+            log_decay_elements,
+            stream,
+            Some(status),
+        )
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "six exact scalar spans are one non-aliased recurrent operation contract"
+)]
+unsafe fn launch_recurrent_scalars_f32_with_status(
+    plan: RecurrentScalarsF32Plan,
+    alpha_f32: *const f32,
+    alpha_elements: usize,
+    dt_f32: *const f32,
+    dt_elements: usize,
+    a_f32: *const f32,
+    a_elements: usize,
+    beta_projection_f32: *const f32,
+    beta_projection_elements: usize,
+    beta_f32: *mut f32,
+    beta_elements: usize,
+    log_decay_f32: *mut f32,
+    log_decay_elements: usize,
+    stream: &Stream,
+    status: Option<&NativeNumericalStatus>,
+) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (
@@ -118,6 +218,7 @@ pub unsafe fn launch_recurrent_scalars_f32(
             log_decay_f32,
             log_decay_elements,
             stream,
+            status,
         );
         super::no_gpu_refusal(RECURRENT_SCALARS_KERNEL)
     }
@@ -139,8 +240,15 @@ pub unsafe fn launch_recurrent_scalars_f32(
             log_decay_elements,
         )?;
         stream.make_current()?;
-        // SAFETY: checked exact spans plus the caller's numerical and ownership
-        // contract establish the private kernel ABI's preconditions.
+        let numerical_status = match status {
+            Some(status) => {
+                // SAFETY: the checked caller retains this nonaliasing status on the stream device.
+                unsafe { status.as_device_ptr().cast::<c_void>() }
+            }
+            None => core::ptr::null_mut(),
+        };
+        // SAFETY: exact spans establish ABI extents; callers retain their
+        // device/lifetime contract and checked callers retain status through sync.
         let code = unsafe {
             logismos_launch_recurrent_scalars_f32(
                 alpha_f32.cast::<c_void>(),
@@ -150,6 +258,7 @@ pub unsafe fn launch_recurrent_scalars_f32(
                 beta_f32.cast::<c_void>(),
                 log_decay_f32.cast::<c_void>(),
                 plan.value_heads_u32,
+                numerical_status,
                 stream.raw().cast::<c_void>(),
             )
         };

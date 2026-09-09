@@ -47,6 +47,7 @@ pub(super) struct ModelDeviceResources {
     layers: Vec<NativeModelLayer>,
     kv: Option<NativePagedKvPool>,
     stream: Stream,
+    numerical_status: kernels::numerical_status::NativeNumericalStatus,
     full_workspace: Option<NativeWorkspace>,
     recurrent_workspace: Option<NativeRecurrentWorkspace>,
     finish_workspace: LayerFinishWorkspace,
@@ -65,6 +66,8 @@ impl ModelDeviceResources {
     ) -> Result<Self> {
         let _ = plan.bytes.total()?;
         let stream = Stream::new(device).context(NativeDeviceSnafu)?;
+        let numerical_status = kernels::numerical_status::NativeNumericalStatus::new(device)
+            .context(NativeKernelSnafu)?;
         let embedding = NativeMatrix::upload(weights, &plan.embedding, device)?;
         let output = NativeMatrix::upload(weights, &plan.output, device)?;
         let output_norm = f32_parameter_buffer(weights, &plan.output_norm, device)?;
@@ -99,6 +102,7 @@ impl ModelDeviceResources {
             layers,
             kv,
             stream,
+            numerical_status,
             full_workspace,
             recurrent_workspace,
             finish_workspace,
@@ -136,7 +140,8 @@ impl ModelDeviceResources {
     /// The complete owned bundle, including serialized weights, controls,
     /// staged K/V, recurrent state, input lookup output, and logits, remains
     /// exclusively owned on this ordered stream until completion is proved.
-    /// Every supplied and derived f32 operand is finite normal-or-zero.
+    /// Every native primitive receives this session's sticky checked-status
+    /// allocation. Its post-sync read precedes all logical publication.
     #[expect(
         clippy::too_many_lines,
         reason = "one ordered native submission must retain the full model transaction and its single KV append"
@@ -151,13 +156,14 @@ impl ModelDeviceResources {
         // SAFETY: this bundle owns the exact serialized embedding matrix,
         // first hidden row, and ordered stream through completion.
         unsafe {
-            kernels::row_gemv::launch_row_decode_f32(
+            kernels::row_gemv::launch_row_decode_f32_checked(
                 step.token.embedding,
                 self.embedding.bytes.as_device_ptr(),
                 self.embedding.bytes.len(),
                 self.hidden_a.as_device_ptr(),
                 self.hidden_a.len(),
                 &self.stream,
+                &self.numerical_status,
             )
         }
         .context(NativeKernelSnafu)?;
@@ -221,6 +227,7 @@ impl ModelDeviceResources {
                             attention,
                         },
                         stream: &self.stream,
+                        numerical_status: &self.numerical_status,
                         full_layer,
                     };
                     // SAFETY: the enclosing submission owns every borrowed span through completion.
@@ -253,6 +260,7 @@ impl ModelDeviceResources {
                         finish_weights: &resources.finish,
                         finish_workspace: &self.finish_workspace,
                         stream: &self.stream,
+                        numerical_status: &self.numerical_status,
                     };
                     // SAFETY: the enclosing submission retains all staged recurrent state through completion.
                     unsafe { deferred.submit() }?;
@@ -274,12 +282,17 @@ impl ModelDeviceResources {
                 &self.output_norm,
                 &self.final_normalized,
                 &self.stream,
+                &self.numerical_status,
             )
         }?;
         // SAFETY: the verified output matrix and exact final/logit spans remain owned through completion.
         unsafe {
-            self.output
-                .launch(&self.final_normalized, &step.logits, &self.stream)
+            self.output.launch(
+                &self.final_normalized,
+                &step.logits,
+                &self.stream,
+                &self.numerical_status,
+            )
         }?;
         if let Some(append) = append {
             append.prepare_commit().context(NativePagedKvSnafu)?;
@@ -344,6 +357,12 @@ impl CompletionResource for ModelDeviceResources {
 
     fn synchronize(&mut self) -> Result<()> {
         self.stream.synchronize().context(NativeDeviceSnafu)
+    }
+
+    fn validate_after_synchronization(&mut self) -> Result<()> {
+        self.numerical_status
+            .read_after_synchronization()
+            .context(NativeKernelSnafu)
     }
 }
 

@@ -7,7 +7,7 @@
 //! contiguous convolution tail already has the GDN row layout.
 
 #[cfg(not(logismos_no_gpu_kernels))]
-use std::ffi::c_void;
+use core::ffi::c_void;
 
 use hipcore::Stream;
 #[cfg(test)]
@@ -20,6 +20,7 @@ use crate::error::LaunchSnafu;
 #[cfg(logismos_no_gpu_kernels)]
 use crate::error::NoGpuBuildSnafu;
 use crate::error::{Result, UnsupportedShapeSnafu};
+use crate::numerical_status::NativeNumericalStatus;
 
 const RECURRENT_QK_L2_KERNEL: &str = "decoder_recurrent_qk_l2_f32";
 
@@ -33,6 +34,7 @@ unsafe extern "C" {
         value_heads: u32,
         key_width: u32,
         epsilon: f32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 }
@@ -189,6 +191,72 @@ pub unsafe fn launch_recurrent_qk_l2_f32(
     key_elements: usize,
     stream: &Stream,
 ) -> Result<()> {
+    // SAFETY: this raw boundary retains its documented caller-owned numerical
+    // and device-lifetime obligations while selecting no sticky status word.
+    unsafe {
+        launch_recurrent_qk_l2_f32_with_status(
+            plan,
+            convolved_f32,
+            convolved_elements,
+            query_f32,
+            query_elements,
+            key_f32,
+            key_elements,
+            stream,
+            None,
+        )
+    }
+}
+
+/// Launch recurrent Q/K L2 normalization while recording explicit numerical failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through same-stream completion on the same
+/// device and must be read only after successful synchronization. Checked
+/// classification replaces the raw path's explicit finite normal-or-zero
+/// operand/intermediate obligation; it still requires the qualified compiler,
+/// denorm, math-library, and device profile.
+pub unsafe fn launch_recurrent_qk_l2_f32_checked(
+    plan: RecurrentQkL2F32Plan,
+    convolved_f32: *const f32,
+    convolved_elements: usize,
+    query_f32: *mut f32,
+    query_elements: usize,
+    key_f32: *mut f32,
+    key_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: the checked boundary retains raw pointer/device ownership
+    // obligations and retains status through same-stream synchronization.
+    unsafe {
+        launch_recurrent_qk_l2_f32_with_status(
+            plan,
+            convolved_f32,
+            convolved_elements,
+            query_f32,
+            query_elements,
+            key_f32,
+            key_elements,
+            stream,
+            Some(status),
+        )
+    }
+}
+
+unsafe fn launch_recurrent_qk_l2_f32_with_status(
+    plan: RecurrentQkL2F32Plan,
+    convolved_f32: *const f32,
+    convolved_elements: usize,
+    query_f32: *mut f32,
+    query_elements: usize,
+    key_f32: *mut f32,
+    key_elements: usize,
+    stream: &Stream,
+    status: Option<&NativeNumericalStatus>,
+) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (
@@ -200,6 +268,7 @@ pub unsafe fn launch_recurrent_qk_l2_f32(
             key_f32,
             key_elements,
             stream,
+            status,
         );
         no_gpu_refusal()
     }
@@ -215,9 +284,15 @@ pub unsafe fn launch_recurrent_qk_l2_f32(
             key_elements,
         )?;
         stream.make_current()?;
-        // SAFETY: exact spans, non-aliasing writable outputs, and ABI-sized
-        // geometry were checked locally; the caller upholds device ownership,
-        // lifetime, and finite normal-or-zero arithmetic obligations.
+        let numerical_status = match status {
+            Some(status) => {
+                // SAFETY: the checked caller retains this nonaliasing status on the stream device.
+                unsafe { status.as_device_ptr().cast::<c_void>() }
+            }
+            None => core::ptr::null_mut(),
+        };
+        // SAFETY: exact spans establish ABI extents; callers retain their
+        // device/lifetime contract and checked callers retain status through sync.
         let code = unsafe {
             logismos_launch_decoder_recurrent_qk_l2_f32(
                 convolved_f32.cast::<c_void>(),
@@ -227,6 +302,7 @@ pub unsafe fn launch_recurrent_qk_l2_f32(
                 plan.value_heads_u32,
                 plan.key_width_u32,
                 plan.epsilon,
+                numerical_status,
                 stream.raw().cast::<c_void>(),
             )
         };

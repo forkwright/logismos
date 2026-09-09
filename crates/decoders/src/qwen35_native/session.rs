@@ -71,6 +71,15 @@ impl Qwen35NativeLayerDeviceDemand {
         self.bytes.table
     }
 
+    /// Requested sticky native numerical-status bytes.
+    ///
+    /// This one session-owned word remains allocated for the session lifetime;
+    /// a nonzero checked-arithmetic status permanently poisons that session.
+    #[must_use]
+    pub const fn numerical_status_bytes(self) -> usize {
+        self.bytes.numerical_status
+    }
+
     /// Checked total requested device bytes across this one owned session.
     #[must_use]
     pub const fn total_bytes(self) -> usize {
@@ -196,11 +205,12 @@ impl Qwen35NativeLayerSession {
     /// # Safety
     ///
     /// `input` must be a live one-row allocation on this session's qualified
-    /// `gfx1100` device. The caller guarantees finite normal-or-zero values for
-    /// every input, weight, K/V, control, and intermediate value required by
-    /// the native numerical domain, and no pending external operation may use
-    /// `input`. This blocking boundary does not independently establish those
-    /// conditions or hardware parity.
+    /// `gfx1100` device, and no pending external operation may use `input`.
+    /// Checked launches classify explicit operands and arithmetic results in
+    /// the owned sticky status word before logical publication. This still
+    /// relies on a qualified denorm-preserving compiler, math implementation,
+    /// and device profile; it does not establish hardware parity or safe
+    /// serving.
     pub unsafe fn step(&mut self, input: DeviceBuffer<f32>) -> Result<DeviceBuffer<f32>> {
         let mut in_flight = self.owner.begin().map_err(begin_error)?;
         {
@@ -210,7 +220,8 @@ impl Qwen35NativeLayerSession {
         in_flight.mark_submitted();
         {
             let resources = in_flight.resource().map_err(completion_error)?;
-            // SAFETY: the caller supplied the raw numerical-domain and device-lifetime guarantees for this synchronous step.
+            // SAFETY: the caller established the device and input-lifetime
+            // obligations; checked launchers record explicit numerical faults.
             unsafe { resources.submit_step()? };
         }
         in_flight
@@ -254,7 +265,8 @@ pub(super) fn begin_error(error: BeginError) -> crate::Error {
 pub(super) fn completion_error(error: CompletionError<crate::Error>) -> crate::Error {
     match error {
         CompletionError::Commit { source, .. }
-        | CompletionError::Synchronization { source, .. } => source,
+        | CompletionError::Synchronization { source, .. }
+        | CompletionError::PostSynchronizationValidation { source, .. } => source,
         CompletionError::MissingResource => NativeSessionStateSnafu {
             rule: "native in-flight guard lost its owned resource bundle",
         }

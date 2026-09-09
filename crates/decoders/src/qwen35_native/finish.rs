@@ -73,6 +73,7 @@ pub(super) struct DeferredLayerFinish<'resources> {
     pub(super) weights: &'resources LayerFinishWeights,
     pub(super) workspace: &'resources LayerFinishWorkspace,
     pub(super) stream: &'resources Stream,
+    pub(super) numerical_status: &'resources kernels::numerical_status::NativeNumericalStatus,
 }
 
 impl LayerFinishPlan {
@@ -213,8 +214,9 @@ impl DeferredLayerFinish<'_> {
     ///
     /// # Safety
     ///
-    /// All borrowed device buffers must be exact, non-overlapping spans on the
-    /// stream device and retain finite normal-or-zero values through completion.
+    /// All borrowed device buffers and the sticky status must be exact,
+    /// non-overlapping spans on the stream device through completion. Checked
+    /// launches classify explicit operands and results before publication.
     pub(super) unsafe fn submit(&self) -> Result<()> {
         // SAFETY: the caller retains the exact checked input, attention
         // projection, output, weights, and scratch spans through completion.
@@ -225,9 +227,10 @@ impl DeferredLayerFinish<'_> {
                 self.attention_projection,
                 &self.workspace.attention_residual,
                 self.stream,
+                self.numerical_status,
             )
         }?;
-        // SAFETY: the caller retains exact normal-or-zero operands and output.
+        // SAFETY: the caller retains the exact checked operands and output.
         unsafe {
             launch_rms_norm(
                 self.plan.post_attention_norm,
@@ -235,6 +238,7 @@ impl DeferredLayerFinish<'_> {
                 &self.weights.post_attention_norm,
                 &self.workspace.post_norm,
                 self.stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: the checked matrix descriptor and exact owned spans remain
@@ -244,6 +248,7 @@ impl DeferredLayerFinish<'_> {
                 &self.workspace.post_norm,
                 &self.workspace.ffn_gate,
                 self.stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: the checked matrix descriptor and exact owned spans remain
@@ -253,9 +258,10 @@ impl DeferredLayerFinish<'_> {
                 &self.workspace.post_norm,
                 &self.workspace.ffn_up,
                 self.stream,
+                self.numerical_status,
             )
         }?;
-        // SAFETY: the caller retains exact normal-or-zero operands and output.
+        // SAFETY: the caller retains the exact checked operands and output.
         unsafe {
             launch_silu_mul(
                 self.plan.ffn,
@@ -263,6 +269,7 @@ impl DeferredLayerFinish<'_> {
                 &self.workspace.ffn_up,
                 &self.workspace.ffn_product,
                 self.stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: the checked matrix descriptor and exact owned spans remain
@@ -272,6 +279,7 @@ impl DeferredLayerFinish<'_> {
                 &self.workspace.ffn_product,
                 &self.workspace.ffn_down,
                 self.stream,
+                self.numerical_status,
             )
         }?;
         // SAFETY: the caller retains the exact input and final output spans
@@ -283,6 +291,7 @@ impl DeferredLayerFinish<'_> {
                 &self.workspace.ffn_down,
                 self.output,
                 self.stream,
+                self.numerical_status,
             )
         }
     }

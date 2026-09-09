@@ -45,6 +45,12 @@ trait CompletionResource {
     type Error;
 
     fn synchronize(&mut self) -> core::result::Result<(), Self::Error>;
+
+    /// Validate synchronized device-side state before any logical publication.
+    ///
+    /// This has no default because every owned native resource must make an
+    /// explicit decision about its post-synchronization failure boundary.
+    fn validate_after_synchronization(&mut self) -> core::result::Result<(), Self::Error>;
 }
 
 enum ResourceState<Resource> {
@@ -66,6 +72,7 @@ enum CompletionError<Error> {
     NotSubmitted,
     Commit { source: Error },
     Synchronization { source: Error },
+    PostSynchronizationValidation { source: Error },
 }
 
 struct ResourceOwner<Resource: CompletionResource> {
@@ -158,6 +165,12 @@ impl<Resource: CompletionResource> InFlight<'_, Resource> {
             return Err(CompletionError::Synchronization { source });
         }
 
+        let validation = self.resource()?.validate_after_synchronization();
+        if let Err(source) = validation {
+            self.poison_known_idle();
+            return Err(CompletionError::PostSynchronizationValidation { source });
+        }
+
         let value = match commit(self.resource()?) {
             Ok(value) => value,
             Err(source) => {
@@ -243,23 +256,29 @@ mod tests {
 
     struct TestResource {
         synchronizations: Rc<Cell<usize>>,
+        validations: Rc<Cell<usize>>,
         drops: Rc<Cell<usize>>,
         publications: Rc<Cell<usize>>,
         synchronization_script: VecDeque<core::result::Result<(), TestError>>,
+        validation_script: VecDeque<core::result::Result<(), TestError>>,
     }
 
     impl TestResource {
         fn new(
             synchronizations: Rc<Cell<usize>>,
+            validations: Rc<Cell<usize>>,
             drops: Rc<Cell<usize>>,
             publications: Rc<Cell<usize>>,
             synchronization_script: impl IntoIterator<Item = core::result::Result<(), TestError>>,
+            validation_script: impl IntoIterator<Item = core::result::Result<(), TestError>>,
         ) -> Self {
             Self {
                 synchronizations,
+                validations,
                 drops,
                 publications,
                 synchronization_script: synchronization_script.into_iter().collect(),
+                validation_script: validation_script.into_iter().collect(),
             }
         }
 
@@ -280,6 +299,15 @@ mod tests {
                 None => Err(TestError::MissingScriptEntry),
             }
         }
+
+        fn validate_after_synchronization(&mut self) -> core::result::Result<(), Self::Error> {
+            self.validations
+                .set(self.validations.get().saturating_add(1));
+            match self.validation_script.pop_front() {
+                Some(outcome) => outcome,
+                None => Err(TestError::MissingScriptEntry),
+            }
+        }
     }
 
     impl Drop for TestResource {
@@ -291,25 +319,31 @@ mod tests {
     struct OwnerFixture {
         owner: ResourceOwner<TestResource>,
         synchronizations: Rc<Cell<usize>>,
+        validations: Rc<Cell<usize>>,
         drops: Rc<Cell<usize>>,
         publications: Rc<Cell<usize>>,
     }
 
     fn owner(
-        script: impl IntoIterator<Item = core::result::Result<(), TestError>>,
+        synchronization_script: impl IntoIterator<Item = core::result::Result<(), TestError>>,
+        validation_script: impl IntoIterator<Item = core::result::Result<(), TestError>>,
     ) -> OwnerFixture {
         let synchronizations = Rc::new(Cell::new(0));
+        let validations = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
         let publications = Rc::new(Cell::new(0));
         let owner = ResourceOwner::new(TestResource::new(
             Rc::clone(&synchronizations),
+            Rc::clone(&validations),
             Rc::clone(&drops),
             Rc::clone(&publications),
-            script,
+            synchronization_script,
+            validation_script,
         ));
         OwnerFixture {
             owner,
             synchronizations,
+            validations,
             drops,
             publications,
         }
@@ -322,7 +356,7 @@ mod tests {
             synchronizations,
             drops,
             ..
-        } = owner([]);
+        } = owner([], []);
         let guard = owner.begin()?;
         drop(guard);
         assert!(matches!(owner.state(), Some(ResourceState::Ready(_))));
@@ -338,9 +372,10 @@ mod tests {
         let OwnerFixture {
             mut owner,
             synchronizations,
+            validations,
             drops,
             publications,
-        } = owner([Ok(())]);
+        } = owner([Ok(())], [Ok(())]);
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         guard
@@ -351,6 +386,7 @@ mod tests {
             .map_err(|_| BeginError::MissingResource)?;
         assert!(matches!(owner.state(), Some(ResourceState::Ready(_))));
         assert_eq!(synchronizations.get(), 1);
+        assert_eq!(validations.get(), 1);
         assert_eq!(publications.get(), 1);
         drop(owner);
         assert_eq!(drops.get(), 1);
@@ -364,7 +400,8 @@ mod tests {
             synchronizations,
             drops,
             publications,
-        } = owner([]);
+            ..
+        } = owner([], []);
         let guard = owner.begin()?;
         let error = guard
             .complete(|resource| {
@@ -390,7 +427,8 @@ mod tests {
             synchronizations,
             drops,
             publications,
-        } = owner([Ok(())]);
+            ..
+        } = owner([Ok(())], [Ok(())]);
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         let error = guard
@@ -423,7 +461,8 @@ mod tests {
             synchronizations,
             drops,
             publications,
-        } = owner([Ok(())]);
+            ..
+        } = owner([Ok(())], []);
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         drop(guard);
@@ -447,7 +486,8 @@ mod tests {
             synchronizations,
             drops,
             publications,
-        } = owner([Err(TestError::ScriptFailure), Ok(())]);
+            ..
+        } = owner([Err(TestError::ScriptFailure), Ok(())], []);
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         let error = guard
@@ -483,7 +523,11 @@ mod tests {
             synchronizations,
             drops,
             publications,
-        } = owner([Err(TestError::ScriptFailure), Err(TestError::ScriptFailure)]);
+            ..
+        } = owner(
+            [Err(TestError::ScriptFailure), Err(TestError::ScriptFailure)],
+            [],
+        );
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         drop(guard);
@@ -495,6 +539,44 @@ mod tests {
         drop(owner);
         assert_eq!(synchronizations.get(), 2);
         assert_eq!(drops.get(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn post_sync_validation_failure_never_invokes_publication()
+    -> core::result::Result<(), BeginError> {
+        let OwnerFixture {
+            mut owner,
+            synchronizations,
+            validations,
+            drops,
+            publications,
+        } = owner([Ok(())], [Err(TestError::ScriptFailure)]);
+        let mut guard = owner.begin()?;
+        guard.mark_submitted();
+        let error = guard
+            .complete(|resource| {
+                resource.publish();
+                Ok(())
+            })
+            .err()
+            .ok_or(BeginError::MissingResource)?;
+        assert!(matches!(
+            error,
+            CompletionError::PostSynchronizationValidation {
+                source: TestError::ScriptFailure,
+            }
+        ));
+        assert!(matches!(
+            owner.state(),
+            Some(ResourceState::PoisonedIdle(_))
+        ));
+        assert!(matches!(owner.begin(), Err(BeginError::NotReady)));
+        assert_eq!(synchronizations.get(), 1);
+        assert_eq!(validations.get(), 1);
+        assert_eq!(publications.get(), 0);
+        drop(owner);
+        assert_eq!(drops.get(), 1);
         Ok(())
     }
 
@@ -513,7 +595,8 @@ mod tests {
             synchronizations,
             drops,
             publications,
-        } = owner([Ok(()), Ok(())]);
+            ..
+        } = owner([Ok(()), Ok(())], [Ok(())]);
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         // This controlled unwind proves the real guard's destructor synchronizes

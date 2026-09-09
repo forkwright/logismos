@@ -167,7 +167,7 @@ checked allocation spans and launch dimensions. One wave32 block serves each
 query head: lane-strided dot products use a fixed shuffle tree, followed by
 token-ordered online softmax and staged output normalization. The native f32
 order deliberately differs from the CPU operation's preserved materialized
-score/softmax/value order. The unsafe asynchronous launcher requires valid
+score/softmax/value order. The raw unsafe asynchronous launcher requires valid
 device table entries, finite normal-or-zero arithmetic, buffer lifetimes and a
 nonaliasing staged output; it does not inspect device data or validate results.
 CPU arithmetic witnesses and compiled code objects do not qualify GPU numerical
@@ -185,14 +185,28 @@ The unsafe blocking session composes input RMSNorm, Q/gate/K/V projections,
 per-head Q/K RMSNorm, partial text mRoPE, staged paged attention, sigmoid gating,
 output projection/residual, post-attention norm and the full SwiGLU/residual
 path. CPU and native control preparation share the allocation-free per-pair
-mRoPE derivation. Original f32 kernels retain their explicit normal-or-zero
-arithmetic contract; a final output scan cannot establish that precondition.
+mRoPE derivation. Raw f32 launchers retain caller-owned normal-or-zero
+arithmetic preconditions. Both native session consumers instead use checked
+variants throughout; a final output scan would miss invalid intermediates.
+
+`kernels::numerical_status` owns one initialized, non-cloneable device status
+per session. Rust owns its typed categories and byte extent; HIP constants
+derive from that representation. Bitwise input classification precedes F16
+scale conversion or F32 arithmetic, and explicit operation results accumulate
+sticky subnormal/nonfinite flags without changing the numerical result or
+skipping required shuffles. Only live reduction lanes perform reduction adds;
+unused lane arithmetic cannot falsely refuse a valid result. Deliberate attention maximum initialization is
+algorithm state, not a model operand. This checks Logismos operations and
+math-call results, not hidden library temporaries. Source-local denorm controls
+do not qualify emitted FP modes, math libraries or device behavior; the native
+entry remains an unsafe qualified-environment boundary.
 
 The native cache reuses the CPU's logical reservation/COW ledger but keeps
 separate layer-major K/V allocations and a device table mirror. A completed
 append parks its sole reservation inside the cache without publishing, ending
-the borrow so the complete session can synchronize. Only then may the cache
-publish and the session advance position and return its owned device output.
+the borrow so the complete session can synchronize. Only after synchronization
+and a successful status read may the cache publish and the session advance
+position and return its owned device output.
 The guard starts before the first kernel submission. Preflight refusal is
 retryable; any submitted failure poisons the session without publishing its
 logical state. Uncertain completion retains all resources, including immutable
@@ -221,9 +235,9 @@ final logits. One append spans every full layer, interleaved with recurrent
 work, and is prepared once. After synchronization, all fallible local checks
 precede KV publication; recurrent state swaps and position advancement then
 form an infallible tail. The public demand distinguishes actual immutable
-uploads, shared workspaces, hidden/final/logit/control buffers, KV/table and
-active/staged recurrent allocations. It excludes host/runtime overhead and
-arbitrarily retained returned logits. It is neither a resource grant nor
+uploads, shared workspaces, hidden/final/logit/control buffers, KV/table,
+active/staged recurrent allocations and numerical status. It excludes
+host/runtime overhead and arbitrarily retained returned logits. It is neither a resource grant nor
 measured physical residency. Native numeric obligations remain explicitly
 unsafe; compiler-checked, ignored device witnesses are not execution evidence.
 
