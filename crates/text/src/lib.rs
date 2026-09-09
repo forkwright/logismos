@@ -6,6 +6,9 @@
 //! template, and one explicitly receipt-verified `tokenizer.json`. It accepts
 //! only text messages, renders through a capability-free MiniJinja environment,
 //! then executes greedy CPU generation in a fresh session for each request.
+//! [`PreparedGeneration`] also exposes a HIP-free per-request driver port so a
+//! separate private adapter can reuse the same bounded greedy loop without
+//! making this crate a native execution or service authority.
 //!
 //! A failed pipeline call returns neither a session nor partial generated text.
 //! Its private execution is dropped, but a completed underlying decoder step is
@@ -236,6 +239,43 @@ pub struct PreparedGeneration {
     max_output_tokens: usize,
 }
 
+/// Per-request token execution consumed by the bounded greedy driver.
+///
+/// The first call receives the complete, nonempty prepared prompt. Each later
+/// call receives exactly one previously selected non-stop token ID. A driver
+/// returns the last-token vocabulary row for its supplied IDs, and may use the
+/// cancellation source between internal prompt-token operations.
+///
+/// Implementors are responsible for binding their private execution to the
+/// exact [`PreparedGeneration`] weights and context inspected before this port
+/// consumes the preparation. This port is not service authority, GPU-residency
+/// proof, or a release qualification for a native backend.
+pub trait GenerationDriver {
+    /// Execute one nonempty batch of prepared token IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed pipeline error used by the shared generation
+    /// loop. Implementations must preserve their typed source rather than
+    /// replacing a backend failure with text.
+    fn step(&mut self, token_ids: &[u32], cancellation: &dyn Cancellation) -> Result<Vec<f32>>;
+}
+
+/// Explicit CPU implementation of the shared generation-driver port.
+///
+/// The shared loop observes cancellation before each whole CPU decoder step.
+/// Unlike a native prefill adapter, this implementation intentionally passes
+/// the complete prompt to the established batched CPU execution contract.
+struct CpuGenerationDriver {
+    execution: decoders::Qwen35Execution,
+}
+
+impl GenerationDriver for CpuGenerationDriver {
+    fn step(&mut self, token_ids: &[u32], _cancellation: &dyn Cancellation) -> Result<Vec<f32>> {
+        self.execution.step(token_ids).context(DecoderSnafu)
+    }
+}
+
 impl PreparedGeneration {
     /// Borrow the exact template rendering bound to this prepared request.
     ///
@@ -295,7 +335,7 @@ impl PreparedGeneration {
         self.plan.cpu_requirements().max_context()
     }
 
-    /// Construct one decoder session and generate from this exact prepared prompt.
+    /// Construct one CPU decoder session and generate from this exact prepared prompt.
     ///
     /// This consumes the prepared request so callers cannot alter or reuse its
     /// prompt IDs with another pipeline or execution plan. A cancellation or
@@ -318,51 +358,109 @@ impl PreparedGeneration {
         } = self;
         drop(rendered_prompt);
         check_cancelled(cancellation, "decoder session construction")?;
-        let mut execution = plan.execution().context(DecoderSnafu)?;
-        check_cancelled(cancellation, "prompt decoder step")?;
-        let mut logits = execution.step(&prompt_token_ids).context(DecoderSnafu)?;
-        let mut generated = Vec::new();
-        generated
-            .try_reserve_exact(max_output_tokens)
-            .context(AllocationSnafu {
-                target: "generated token IDs",
-            })?;
-        let finish_reason = loop {
-            check_cancelled(cancellation, "greedy selection")?;
-            let next =
-                greedy_last_logits(&logits, pipeline.profile.tokenizer.tokenizer().vocab_size())?;
-            if pipeline.profile.special_tokens.stop_ids.contains(&next) {
-                break FinishReason::EndOfSequence;
-            }
-            generated.push(next);
-            if generated.len() == max_output_tokens {
-                break FinishReason::Length;
-            }
-            check_cancelled(cancellation, "next decoder step")?;
-            // Selection is complete; do not retain the old vocabulary row while
-            // the decoder allocates the next step's workspace and output.
-            drop(logits);
-            logits = execution.step(&[next]).context(DecoderSnafu)?;
+        let mut driver = CpuGenerationDriver {
+            execution: plan.execution().context(DecoderSnafu)?,
         };
-        check_cancelled(cancellation, "collective output decoding")?;
-        let text = pipeline
-            .profile
-            .tokenizer
-            .tokenizer()
-            .decode(&generated, false)
-            .context(TokenizerSnafu)?;
-        check_limit(
-            "decoded output bytes",
-            text.len(),
-            pipeline.profile.limits.output_bytes,
-        )?;
-        check_cancelled(cancellation, "publishing completed response")?;
-        Ok(Generation {
-            text,
-            token_ids: generated,
-            finish_reason,
-        })
+        run_generation(
+            &pipeline,
+            &prompt_token_ids,
+            max_output_tokens,
+            &mut driver,
+            cancellation,
+        )
     }
+
+    /// Generate through one caller-owned execution adapter.
+    ///
+    /// The adapter is called once with the exact complete prepared prompt and
+    /// then once per selected generated token. This consumes the preparation,
+    /// so the immutable prompt, profile, plan, and output cap cannot be reused
+    /// with another driver. An adapter that internally pre-fills token by token
+    /// receives the cancellation source for those boundaries.
+    ///
+    /// The caller must construct the adapter from [`Self::verified_weights`]
+    /// and [`Self::context_tokens`] of this same preparation before consuming
+    /// it. The port deliberately does not claim safe native inference, service
+    /// authority, artifact quality, or GPU qualification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed adapter, cancellation, sampling, tokenizer, allocation,
+    /// or output-limit error. No partial response is published on failure.
+    pub fn generate_with_driver(
+        self,
+        driver: &mut dyn GenerationDriver,
+        cancellation: &dyn Cancellation,
+    ) -> Result<Generation> {
+        let Self {
+            pipeline,
+            plan: _,
+            rendered_prompt,
+            prompt_token_ids,
+            max_output_tokens,
+        } = self;
+        drop(rendered_prompt);
+        check_cancelled(cancellation, "decoder session construction")?;
+        run_generation(
+            &pipeline,
+            &prompt_token_ids,
+            max_output_tokens,
+            driver,
+            cancellation,
+        )
+    }
+}
+
+fn run_generation(
+    pipeline: &TextPipeline,
+    prompt_token_ids: &[u32],
+    max_output_tokens: usize,
+    driver: &mut dyn GenerationDriver,
+    cancellation: &dyn Cancellation,
+) -> Result<Generation> {
+    check_cancelled(cancellation, "prompt decoder step")?;
+    let mut logits = driver.step(prompt_token_ids, cancellation)?;
+    let mut generated = Vec::new();
+    generated
+        .try_reserve_exact(max_output_tokens)
+        .context(AllocationSnafu {
+            target: "generated token IDs",
+        })?;
+    let finish_reason = loop {
+        check_cancelled(cancellation, "greedy selection")?;
+        let next =
+            greedy_last_logits(&logits, pipeline.profile.tokenizer.tokenizer().vocab_size())?;
+        if pipeline.profile.special_tokens.stop_ids.contains(&next) {
+            break FinishReason::EndOfSequence;
+        }
+        generated.push(next);
+        if generated.len() == max_output_tokens {
+            break FinishReason::Length;
+        }
+        check_cancelled(cancellation, "next decoder step")?;
+        // Selection is complete; do not retain the old vocabulary row while
+        // the decoder allocates the next step's workspace and output.
+        drop(logits);
+        logits = driver.step(&[next], cancellation)?;
+    };
+    check_cancelled(cancellation, "collective output decoding")?;
+    let text = pipeline
+        .profile
+        .tokenizer
+        .tokenizer()
+        .decode(&generated, false)
+        .context(TokenizerSnafu)?;
+    check_limit(
+        "decoded output bytes",
+        text.len(),
+        pipeline.profile.limits.output_bytes,
+    )?;
+    check_cancelled(cancellation, "publishing completed response")?;
+    Ok(Generation {
+        text,
+        token_ids: generated,
+        finish_reason,
+    })
 }
 
 impl Generation {
@@ -471,7 +569,18 @@ impl TextPipeline {
         })
     }
 
-    /// Prepare and generate greedily in one fresh private decoder session.
+    /// Return whether this pipeline retains the profile that prepared a request.
+    ///
+    /// Clones share one in-process profile owner. Independently constructed
+    /// pipelines conservatively return false even if their artifacts and
+    /// tokenizer bytes compare equal. This is not an authenticity check, host
+    /// grant, or proof of device residency.
+    #[must_use]
+    pub fn owns_preparation(&self, prepared: &PreparedGeneration) -> bool {
+        Arc::ptr_eq(&self.profile, &prepared.pipeline.profile)
+    }
+
+    /// Prepare and generate greedily in one fresh private CPU decoder session.
     ///
     /// A cancellation or later failure returns no partial text. Any completed
     /// decoder `step` remains committed only inside the private session that is
