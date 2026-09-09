@@ -146,7 +146,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             let a_host = a.to_host_f16()?;
             let b_host = b.to_host_f16()?;
             let out = kernels::matmul::cpu::matmul_fp16_ref(&a_host, &b_host, m, n, ka);
-            Tensor::from_cpu(taxis::CpuStorage::F16(out), Shape::new(&[m, n]))
+            Ok(Tensor::from_cpu(taxis::CpuStorage::F16(out), Shape::new(&[m, n]))?)
         }
         // WHY(forkwright/logismos#39): a mixed pair used to fall through
         // the old wildcard arm — commented "CPU fallback — both on

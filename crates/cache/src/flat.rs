@@ -23,6 +23,7 @@
 
 use std::borrow::Cow;
 
+use snafu::ResultExt;
 use taxis::{CpuStorage, DType, Shape, Tensor};
 
 use crate::KvCache;
@@ -193,12 +194,12 @@ fn allocate_buffers(count: usize, bytes: usize, target: &'static str) -> Result<
     let mut buffers = Vec::new();
     buffers
         .try_reserve_exact(count)
-        .map_err(|source| FlatAllocationSnafu { target, source }.build())?;
+        .context(FlatAllocationSnafu { target })?;
     for _ in 0..count {
         let mut buffer = Vec::new();
         buffer
             .try_reserve_exact(bytes)
-            .map_err(|source| FlatAllocationSnafu { target, source }.build())?;
+            .context(FlatAllocationSnafu { target })?;
         buffer.resize(bytes, 0);
         buffers.push(buffer);
     }
@@ -233,13 +234,7 @@ impl FlatKvCache {
         let v_buffers = allocate_buffers(layout.num_layers, buffer_bytes, "V")?;
         let mut lens = Vec::new();
         lens.try_reserve_exact(layout.num_layers)
-            .map_err(|source| {
-                FlatAllocationSnafu {
-                    target: "length",
-                    source,
-                }
-                .build()
-            })?;
+            .context(FlatAllocationSnafu { target: "length" })?;
         lens.resize(layout.num_layers, 0);
         Ok(Self {
             lens,

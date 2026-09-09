@@ -199,7 +199,7 @@ pub fn rope_apply(qk: &Tensor, table: &CosSinTable) -> Result<Tensor> {
                 heads,
                 head_dim,
             )?;
-            Tensor::from_cpu(taxis::CpuStorage::F16(host), qk.shape().clone())
+            Ok(Tensor::from_cpu(taxis::CpuStorage::F16(host), qk.shape().clone())?)
         }
     }
 }

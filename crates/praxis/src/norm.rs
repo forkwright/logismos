@@ -119,7 +119,7 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
             let x_host = x.to_host_f16()?;
             let w_host = weight.to_host_f16()?;
             let y = kernels::rms_norm::cpu::rms_norm_fp16_ref(&x_host, &w_host, m, n, eps);
-            Tensor::from_cpu(taxis::CpuStorage::F16(y), x.shape().clone())
+            Ok(Tensor::from_cpu(taxis::CpuStorage::F16(y), x.shape().clone())?)
         }
         // WHY(forkwright/logismos#38): a mixed pair used to fall through
         // the old wildcard arm into the CPU path above, silently
