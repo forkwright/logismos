@@ -7,13 +7,13 @@ use hipcore::Stream;
 use num_traits::ToPrimitive;
 use snafu::ResultExt;
 
+#[cfg(any(test, not(logismos_no_gpu_kernels)))]
+use crate::device_span::{checked_f32_device_span, reject_overlapping_f32_spans};
 #[cfg(not(logismos_no_gpu_kernels))]
 use crate::error::LaunchSnafu;
 #[cfg(logismos_no_gpu_kernels)]
 use crate::error::NoGpuBuildSnafu;
 use crate::error::{Result, UnsupportedShapeSnafu};
-#[cfg(any(test, not(logismos_no_gpu_kernels)))]
-use crate::device_span::{checked_f32_device_span, reject_overlapping_f32_spans};
 
 const RMS_NORM_KERNEL: &str = "decoder_rms_norm_f32";
 const ROTARY_KERNEL: &str = "decoder_rotary_half_split_f32";
@@ -249,12 +249,8 @@ impl SplitQGateF32Plan {
     pub fn try_from_dimensions(heads: usize, key_width: usize) -> Result<Self> {
         validate_nonzero(SPLIT_Q_GATE_KERNEL, "heads", heads)?;
         validate_nonzero(SPLIT_Q_GATE_KERNEL, "key_width", key_width)?;
-        let output_elements = checked_product(
-            SPLIT_Q_GATE_KERNEL,
-            heads,
-            key_width,
-            "heads * key_width",
-        )?;
+        let output_elements =
+            checked_product(SPLIT_Q_GATE_KERNEL, heads, key_width, "heads * key_width")?;
         let input_elements = checked_product(
             SPLIT_Q_GATE_KERNEL,
             output_elements,
@@ -359,19 +355,41 @@ pub unsafe fn launch_rms_norm_f32(
 ) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
-        let _ = (plan, input_f32, input_elements, weight_f32, weight_elements, output_f32, output_elements, stream);
+        let _ = (
+            plan,
+            input_f32,
+            input_elements,
+            weight_f32,
+            weight_elements,
+            output_f32,
+            output_elements,
+            stream,
+        );
         no_gpu_refusal(RMS_NORM_KERNEL)
     }
     #[cfg(not(logismos_no_gpu_kernels))]
     {
-        validate_rms_launch(plan, input_f32, input_elements, weight_f32, weight_elements, output_f32, output_elements)?;
+        validate_rms_launch(
+            plan,
+            input_f32,
+            input_elements,
+            weight_f32,
+            weight_elements,
+            output_f32,
+            output_elements,
+        )?;
         stream.make_current()?;
         // SAFETY: the caller's ownership and finite-domain contract plus the
         // checked plan/spans establish the private ABI's preconditions.
         let code = unsafe {
             logismos_launch_decoder_rms_norm_f32(
-                input_f32.cast::<c_void>(), weight_f32.cast::<c_void>(), output_f32.cast::<c_void>(),
-                plan.rows_u32, plan.width_u32, plan.epsilon, stream.raw().cast::<c_void>(),
+                input_f32.cast::<c_void>(),
+                weight_f32.cast::<c_void>(),
+                output_f32.cast::<c_void>(),
+                plan.rows_u32,
+                plan.width_u32,
+                plan.epsilon,
+                stream.raw().cast::<c_void>(),
             )
         };
         launch_result(RMS_NORM_KERNEL, code)
@@ -402,19 +420,41 @@ pub unsafe fn launch_rotary_half_split_f32_in_place(
 ) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
-        let _ = (plan, values_f32, value_elements, cos_f32, cos_elements, sin_f32, sin_elements, stream);
+        let _ = (
+            plan,
+            values_f32,
+            value_elements,
+            cos_f32,
+            cos_elements,
+            sin_f32,
+            sin_elements,
+            stream,
+        );
         no_gpu_refusal(ROTARY_KERNEL)
     }
     #[cfg(not(logismos_no_gpu_kernels))]
     {
-        validate_rotary_launch(plan, values_f32, value_elements, cos_f32, cos_elements, sin_f32, sin_elements)?;
+        validate_rotary_launch(
+            plan,
+            values_f32,
+            value_elements,
+            cos_f32,
+            cos_elements,
+            sin_f32,
+            sin_elements,
+        )?;
         stream.make_current()?;
         // SAFETY: validated spans and the caller's device/numerical contract
         // establish the private ABI's preconditions.
         let code = unsafe {
             logismos_launch_decoder_rotary_half_split_f32(
-                values_f32.cast::<c_void>(), cos_f32.cast::<c_void>(), sin_f32.cast::<c_void>(),
-                plan.heads_u32, plan.width_u32, plan.rotary_width_u32, stream.raw().cast::<c_void>(),
+                values_f32.cast::<c_void>(),
+                cos_f32.cast::<c_void>(),
+                sin_f32.cast::<c_void>(),
+                plan.heads_u32,
+                plan.width_u32,
+                plan.rotary_width_u32,
+                stream.raw().cast::<c_void>(),
             )
         };
         launch_result(ROTARY_KERNEL, code)
@@ -444,18 +484,39 @@ pub unsafe fn launch_split_q_gate_f32(
 ) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
-        let _ = (plan, q_gate_f32, q_gate_elements, query_f32, query_elements, gate_f32, gate_elements, stream);
+        let _ = (
+            plan,
+            q_gate_f32,
+            q_gate_elements,
+            query_f32,
+            query_elements,
+            gate_f32,
+            gate_elements,
+            stream,
+        );
         no_gpu_refusal(SPLIT_Q_GATE_KERNEL)
     }
     #[cfg(not(logismos_no_gpu_kernels))]
     {
-        validate_split_launch(plan, q_gate_f32, q_gate_elements, query_f32, query_elements, gate_f32, gate_elements)?;
+        validate_split_launch(
+            plan,
+            q_gate_f32,
+            q_gate_elements,
+            query_f32,
+            query_elements,
+            gate_f32,
+            gate_elements,
+        )?;
         stream.make_current()?;
         // SAFETY: validated spans and the caller's ownership contract establish the ABI.
         let code = unsafe {
             logismos_launch_decoder_split_q_gate_f32(
-                q_gate_f32.cast::<c_void>(), query_f32.cast::<c_void>(), gate_f32.cast::<c_void>(),
-                plan.heads_u32, plan.key_width_u32, stream.raw().cast::<c_void>(),
+                q_gate_f32.cast::<c_void>(),
+                query_f32.cast::<c_void>(),
+                gate_f32.cast::<c_void>(),
+                plan.heads_u32,
+                plan.key_width_u32,
+                stream.raw().cast::<c_void>(),
             )
         };
         launch_result(SPLIT_Q_GATE_KERNEL, code)
@@ -487,8 +548,15 @@ pub unsafe fn sigmoid_mul(
     // ownership and numerical-domain obligations for the shared launch path.
     unsafe {
         launch_elementwise(
-            plan, value_f32, value_elements, gate_f32, gate_elements, output_f32,
-            output_elements, stream, SIGMOID_MUL_KERNEL,
+            plan,
+            value_f32,
+            value_elements,
+            gate_f32,
+            gate_elements,
+            output_f32,
+            output_elements,
+            stream,
+            SIGMOID_MUL_KERNEL,
         )
     }
 }
@@ -518,8 +586,15 @@ pub unsafe fn silu_mul(
     // ownership and numerical-domain obligations for the shared launch path.
     unsafe {
         launch_elementwise(
-            plan, gate_f32, gate_elements, up_f32, up_elements, output_f32, output_elements,
-            stream, SILU_MUL_KERNEL,
+            plan,
+            gate_f32,
+            gate_elements,
+            up_f32,
+            up_elements,
+            output_f32,
+            output_elements,
+            stream,
+            SILU_MUL_KERNEL,
         )
     }
 }
@@ -549,8 +624,15 @@ pub unsafe fn residual_add(
     // ownership and numerical-domain obligations for the shared launch path.
     unsafe {
         launch_elementwise(
-            plan, left_f32, left_elements, right_f32, right_elements, output_f32,
-            output_elements, stream, RESIDUAL_ADD_KERNEL,
+            plan,
+            left_f32,
+            left_elements,
+            right_f32,
+            right_elements,
+            output_f32,
+            output_elements,
+            stream,
+            RESIDUAL_ADD_KERNEL,
         )
     }
 }
@@ -568,27 +650,62 @@ unsafe fn launch_elementwise(
 ) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
-        let _ = (plan, left_f32, left_elements, right_f32, right_elements, output_f32, output_elements, stream);
+        let _ = (
+            plan,
+            left_f32,
+            left_elements,
+            right_f32,
+            right_elements,
+            output_f32,
+            output_elements,
+            stream,
+        );
         no_gpu_refusal(kernel)
     }
     #[cfg(not(logismos_no_gpu_kernels))]
     {
-        validate_elementwise_launch(plan, left_f32, left_elements, right_f32, right_elements, output_f32, output_elements, kernel)?;
+        validate_elementwise_launch(
+            plan,
+            left_f32,
+            left_elements,
+            right_f32,
+            right_elements,
+            output_f32,
+            output_elements,
+            kernel,
+        )?;
         stream.make_current()?;
         // SAFETY: this function preserves the public caller's safety contract
         // after exact-span validation and selects the matching private ABI.
         let code = unsafe {
             match kernel {
                 SIGMOID_MUL_KERNEL => logismos_launch_decoder_sigmoid_mul_f32(
-                    left_f32.cast::<c_void>(), right_f32.cast::<c_void>(), output_f32.cast::<c_void>(), plan.elements_u32, stream.raw().cast::<c_void>(),
+                    left_f32.cast::<c_void>(),
+                    right_f32.cast::<c_void>(),
+                    output_f32.cast::<c_void>(),
+                    plan.elements_u32,
+                    stream.raw().cast::<c_void>(),
                 ),
                 SILU_MUL_KERNEL => logismos_launch_decoder_silu_mul_f32(
-                    left_f32.cast::<c_void>(), right_f32.cast::<c_void>(), output_f32.cast::<c_void>(), plan.elements_u32, stream.raw().cast::<c_void>(),
+                    left_f32.cast::<c_void>(),
+                    right_f32.cast::<c_void>(),
+                    output_f32.cast::<c_void>(),
+                    plan.elements_u32,
+                    stream.raw().cast::<c_void>(),
                 ),
                 RESIDUAL_ADD_KERNEL => logismos_launch_decoder_residual_add_f32(
-                    left_f32.cast::<c_void>(), right_f32.cast::<c_void>(), output_f32.cast::<c_void>(), plan.elements_u32, stream.raw().cast::<c_void>(),
+                    left_f32.cast::<c_void>(),
+                    right_f32.cast::<c_void>(),
+                    output_f32.cast::<c_void>(),
+                    plan.elements_u32,
+                    stream.raw().cast::<c_void>(),
                 ),
-                _ => return unsupported_shape(kernel, "unknown elementwise native operation".to_owned()),
+                _ => {
+                    return unsupported_shape(
+                        kernel,
+                        "unknown elementwise native operation".to_owned(),
+                    );
+                }
             }
         };
         launch_result(kernel, code)
@@ -605,7 +722,12 @@ fn launch_result(kernel: &'static str, code: u32) -> Result<()> {
     if code == 0 {
         Ok(())
     } else {
-        LaunchSnafu { kernel, kind: hipcore::ErrorKind::from_raw(code), code }.fail()
+        LaunchSnafu {
+            kernel,
+            kind: hipcore::ErrorKind::from_raw(code),
+            code,
+        }
+        .fail()
     }
 }
 
@@ -624,7 +746,12 @@ fn validate_rms_launch(
     validate_length(RMS_NORM_KERNEL, "output", output_elements, plan.elements)?;
     let input = checked_f32_device_span(RMS_NORM_KERNEL, input_f32, input_elements, "input")?;
     let weight = checked_f32_device_span(RMS_NORM_KERNEL, weight_f32, weight_elements, "weight")?;
-    let output = checked_f32_device_span(RMS_NORM_KERNEL, output_f32.cast_const(), output_elements, "output")?;
+    let output = checked_f32_device_span(
+        RMS_NORM_KERNEL,
+        output_f32.cast_const(),
+        output_elements,
+        "output",
+    )?;
     reject_overlapping_f32_spans(RMS_NORM_KERNEL, output, input)?;
     reject_overlapping_f32_spans(RMS_NORM_KERNEL, output, weight)
 }
@@ -640,10 +767,21 @@ fn validate_rotary_launch(
     sin_elements: usize,
 ) -> Result<()> {
     validate_length(ROTARY_KERNEL, "values", value_elements, plan.elements)?;
-    validate_length(ROTARY_KERNEL, "cosine coefficients", cos_elements, plan.pairs)?;
+    validate_length(
+        ROTARY_KERNEL,
+        "cosine coefficients",
+        cos_elements,
+        plan.pairs,
+    )?;
     validate_length(ROTARY_KERNEL, "sine coefficients", sin_elements, plan.pairs)?;
-    let values = checked_f32_device_span(ROTARY_KERNEL, values_f32.cast_const(), value_elements, "values")?;
-    let cosine = checked_f32_device_span(ROTARY_KERNEL, cos_f32, cos_elements, "cosine coefficients")?;
+    let values = checked_f32_device_span(
+        ROTARY_KERNEL,
+        values_f32.cast_const(),
+        value_elements,
+        "values",
+    )?;
+    let cosine =
+        checked_f32_device_span(ROTARY_KERNEL, cos_f32, cos_elements, "cosine coefficients")?;
     let sine = checked_f32_device_span(ROTARY_KERNEL, sin_f32, sin_elements, "sine coefficients")?;
     reject_overlapping_f32_spans(ROTARY_KERNEL, values, cosine)?;
     reject_overlapping_f32_spans(ROTARY_KERNEL, values, sine)
@@ -659,12 +797,42 @@ fn validate_split_launch(
     gate_f32: *mut f32,
     gate_elements: usize,
 ) -> Result<()> {
-    validate_length(SPLIT_Q_GATE_KERNEL, "Q/gate source", q_gate_elements, plan.input_elements)?;
-    validate_length(SPLIT_Q_GATE_KERNEL, "query output", query_elements, plan.output_elements)?;
-    validate_length(SPLIT_Q_GATE_KERNEL, "gate output", gate_elements, plan.output_elements)?;
-    let source = checked_f32_device_span(SPLIT_Q_GATE_KERNEL, q_gate_f32, q_gate_elements, "Q/gate source")?;
-    let query = checked_f32_device_span(SPLIT_Q_GATE_KERNEL, query_f32.cast_const(), query_elements, "query output")?;
-    let gate = checked_f32_device_span(SPLIT_Q_GATE_KERNEL, gate_f32.cast_const(), gate_elements, "gate output")?;
+    validate_length(
+        SPLIT_Q_GATE_KERNEL,
+        "Q/gate source",
+        q_gate_elements,
+        plan.input_elements,
+    )?;
+    validate_length(
+        SPLIT_Q_GATE_KERNEL,
+        "query output",
+        query_elements,
+        plan.output_elements,
+    )?;
+    validate_length(
+        SPLIT_Q_GATE_KERNEL,
+        "gate output",
+        gate_elements,
+        plan.output_elements,
+    )?;
+    let source = checked_f32_device_span(
+        SPLIT_Q_GATE_KERNEL,
+        q_gate_f32,
+        q_gate_elements,
+        "Q/gate source",
+    )?;
+    let query = checked_f32_device_span(
+        SPLIT_Q_GATE_KERNEL,
+        query_f32.cast_const(),
+        query_elements,
+        "query output",
+    )?;
+    let gate = checked_f32_device_span(
+        SPLIT_Q_GATE_KERNEL,
+        gate_f32.cast_const(),
+        gate_elements,
+        "gate output",
+    )?;
     reject_overlapping_f32_spans(SPLIT_Q_GATE_KERNEL, query, source)?;
     reject_overlapping_f32_spans(SPLIT_Q_GATE_KERNEL, gate, source)?;
     reject_overlapping_f32_spans(SPLIT_Q_GATE_KERNEL, query, gate)
@@ -686,40 +854,90 @@ fn validate_elementwise_launch(
     validate_length(kernel, "output", output_elements, plan.elements)?;
     let left = checked_f32_device_span(kernel, left_f32, left_elements, "left operand")?;
     let right = checked_f32_device_span(kernel, right_f32, right_elements, "right operand")?;
-    let output = checked_f32_device_span(kernel, output_f32.cast_const(), output_elements, "output")?;
+    let output =
+        checked_f32_device_span(kernel, output_f32.cast_const(), output_elements, "output")?;
     reject_overlapping_f32_spans(kernel, output, left)?;
     reject_overlapping_f32_spans(kernel, output, right)
 }
 
 fn validate_nonzero(kernel: &'static str, name: &'static str, value: usize) -> Result<()> {
-    if value == 0 { unsupported_shape(kernel, format!("{name} must be greater than zero")) } else { Ok(()) }
+    if value == 0 {
+        unsupported_shape(kernel, format!("{name} must be greater than zero"))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_positive_normal(kernel: &'static str, name: &'static str, value: f32) -> Result<()> {
-    if value.is_normal() && value.is_sign_positive() { Ok(()) } else { unsupported_shape(kernel, format!("{name} must be positive normal finite f32")) }
+    if value.is_normal() && value.is_sign_positive() {
+        Ok(())
+    } else {
+        unsupported_shape(kernel, format!("{name} must be positive normal finite f32"))
+    }
 }
 
-fn checked_product(kernel: &'static str, left: usize, right: usize, name: &'static str) -> Result<usize> {
-    left.checked_mul(right).ok_or_else(|| UnsupportedShapeSnafu { kernel, msg: format!("{name} overflows usize") }.build())
+fn checked_product(
+    kernel: &'static str,
+    left: usize,
+    right: usize,
+    name: &'static str,
+) -> Result<usize> {
+    left.checked_mul(right).ok_or_else(|| {
+        UnsupportedShapeSnafu {
+            kernel,
+            msg: format!("{name} overflows usize"),
+        }
+        .build()
+    })
 }
 
 fn validate_f32_layout(kernel: &'static str, name: &'static str, elements: usize) -> Result<()> {
-    std::alloc::Layout::array::<f32>(elements).map_err(|_| UnsupportedShapeSnafu { kernel, msg: format!("{name} length {elements} exceeds the Rust allocation layout domain") }.build())?;
+    std::alloc::Layout::array::<f32>(elements).map_err(|_| {
+        UnsupportedShapeSnafu {
+            kernel,
+            msg: format!("{name} length {elements} exceeds the Rust allocation layout domain"),
+        }
+        .build()
+    })?;
     Ok(())
 }
 
 fn abi_u32(kernel: &'static str, name: &'static str, value: usize) -> Result<u32> {
-    u32::try_from(value).map_err(|_| UnsupportedShapeSnafu { kernel, msg: format!("{name} {value} exceeds the u32 HIP ABI") }.build())
+    u32::try_from(value).map_err(|_| {
+        UnsupportedShapeSnafu {
+            kernel,
+            msg: format!("{name} {value} exceeds the u32 HIP ABI"),
+        }
+        .build()
+    })
 }
 
 fn validate_grid(kernel: &'static str, work_items: usize, threads: usize) -> Result<()> {
-    let rounded = work_items.checked_add(threads - 1).ok_or_else(|| UnsupportedShapeSnafu { kernel, msg: "native launch-grid rounding overflows usize".to_owned() }.build())?;
+    let rounded = work_items.checked_add(threads - 1).ok_or_else(|| {
+        UnsupportedShapeSnafu {
+            kernel,
+            msg: "native launch-grid rounding overflows usize".to_owned(),
+        }
+        .build()
+    })?;
     let blocks = rounded / threads;
     abi_u32(kernel, "native launch-grid blocks", blocks).map(|_| ())
 }
 
-fn validate_length(kernel: &'static str, name: &'static str, actual: usize, expected: usize) -> Result<()> {
-    if actual == expected { Ok(()) } else { unsupported_shape(kernel, format!("{name} length {actual} must equal checked {expected}")) }
+fn validate_length(
+    kernel: &'static str,
+    name: &'static str,
+    actual: usize,
+    expected: usize,
+) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        unsupported_shape(
+            kernel,
+            format!("{name} length {actual} must equal checked {expected}"),
+        )
+    }
 }
 
 fn unsupported_shape<T>(kernel: &'static str, msg: String) -> Result<T> {
@@ -728,15 +946,29 @@ fn unsupported_shape<T>(kernel: &'static str, msg: String) -> Result<T> {
 
 fn reserve_native_reference(operation: &'static str, elements: usize) -> Result<Vec<f32>> {
     let mut output = Vec::new();
-    output.try_reserve_exact(elements).context(crate::error::CpuF32AllocationSnafu { operation, requested_len: elements })?;
+    output
+        .try_reserve_exact(elements)
+        .context(crate::error::CpuF32AllocationSnafu {
+            operation,
+            requested_len: elements,
+        })?;
     Ok(output)
 }
 
-fn validate_reference_length(operation: &'static str, name: &'static str, actual: usize, expected: usize) -> Result<()> {
+fn validate_reference_length(
+    operation: &'static str,
+    name: &'static str,
+    actual: usize,
+    expected: usize,
+) -> Result<()> {
     validate_length(operation, name, actual, expected)
 }
 
-fn rms_norm_native_order_reference(plan: RmsNormF32Plan, input: &[f32], weight: &[f32]) -> Result<Vec<f32>> {
+fn rms_norm_native_order_reference(
+    plan: RmsNormF32Plan,
+    input: &[f32],
+    weight: &[f32],
+) -> Result<Vec<f32>> {
     validate_reference_length(RMS_NORM_KERNEL, "input", input.len(), plan.elements)?;
     validate_reference_length(RMS_NORM_KERNEL, "weight", weight.len(), plan.width)?;
     let mut output = reserve_native_reference("decoder RMSNorm reference", plan.elements)?;
@@ -745,34 +977,91 @@ fn rms_norm_native_order_reference(plan: RmsNormF32Plan, input: &[f32], weight: 
         for lane in 0..WAVE_SIZE {
             let mut column = lane;
             while column < plan.width {
-                let value = input_row.get(column).copied().ok_or_else(|| UnsupportedShapeSnafu { kernel: RMS_NORM_KERNEL, msg: "checked row access failed".to_owned() }.build())?;
-                let partial = lanes.get(lane).copied().ok_or_else(|| UnsupportedShapeSnafu { kernel: RMS_NORM_KERNEL, msg: "fixed wave lane access failed".to_owned() }.build())?;
-                let slot = lanes.get_mut(lane).ok_or_else(|| UnsupportedShapeSnafu { kernel: RMS_NORM_KERNEL, msg: "fixed wave lane mutation failed".to_owned() }.build())?;
+                let value = input_row.get(column).copied().ok_or_else(|| {
+                    UnsupportedShapeSnafu {
+                        kernel: RMS_NORM_KERNEL,
+                        msg: "checked row access failed".to_owned(),
+                    }
+                    .build()
+                })?;
+                let partial = lanes.get(lane).copied().ok_or_else(|| {
+                    UnsupportedShapeSnafu {
+                        kernel: RMS_NORM_KERNEL,
+                        msg: "fixed wave lane access failed".to_owned(),
+                    }
+                    .build()
+                })?;
+                let slot = lanes.get_mut(lane).ok_or_else(|| {
+                    UnsupportedShapeSnafu {
+                        kernel: RMS_NORM_KERNEL,
+                        msg: "fixed wave lane mutation failed".to_owned(),
+                    }
+                    .build()
+                })?;
                 *slot = partial + value * value;
-                column = column.checked_add(WAVE_SIZE).ok_or_else(|| UnsupportedShapeSnafu { kernel: RMS_NORM_KERNEL, msg: "lane-strided column overflow".to_owned() }.build())?;
+                column = column.checked_add(WAVE_SIZE).ok_or_else(|| {
+                    UnsupportedShapeSnafu {
+                        kernel: RMS_NORM_KERNEL,
+                        msg: "lane-strided column overflow".to_owned(),
+                    }
+                    .build()
+                })?;
             }
         }
         for offset in [16_usize, 8, 4, 2, 1] {
             for lane in 0..offset {
-                let partial = lanes.get(lane).copied().ok_or_else(|| UnsupportedShapeSnafu { kernel: RMS_NORM_KERNEL, msg: "fixed wave lane access failed".to_owned() }.build())?;
-                let peer = lanes.get(lane + offset).copied().ok_or_else(|| UnsupportedShapeSnafu { kernel: RMS_NORM_KERNEL, msg: "fixed wave peer access failed".to_owned() }.build())?;
-                let slot = lanes.get_mut(lane).ok_or_else(|| UnsupportedShapeSnafu { kernel: RMS_NORM_KERNEL, msg: "fixed wave lane mutation failed".to_owned() }.build())?;
+                let partial = lanes.get(lane).copied().ok_or_else(|| {
+                    UnsupportedShapeSnafu {
+                        kernel: RMS_NORM_KERNEL,
+                        msg: "fixed wave lane access failed".to_owned(),
+                    }
+                    .build()
+                })?;
+                let peer = lanes.get(lane + offset).copied().ok_or_else(|| {
+                    UnsupportedShapeSnafu {
+                        kernel: RMS_NORM_KERNEL,
+                        msg: "fixed wave peer access failed".to_owned(),
+                    }
+                    .build()
+                })?;
+                let slot = lanes.get_mut(lane).ok_or_else(|| {
+                    UnsupportedShapeSnafu {
+                        kernel: RMS_NORM_KERNEL,
+                        msg: "fixed wave lane mutation failed".to_owned(),
+                    }
+                    .build()
+                })?;
                 *slot = partial + peer;
             }
         }
-        let sum = lanes.first().copied().ok_or_else(|| UnsupportedShapeSnafu { kernel: RMS_NORM_KERNEL, msg: "fixed wave has no lane zero".to_owned() }.build())?;
-        let width = plan.width.to_f32().ok_or_else(|| UnsupportedShapeSnafu {
-            kernel: RMS_NORM_KERNEL,
-            msg: "checked RMSNorm width cannot convert to f32".to_owned(),
-        }
-        .build())?;
+        let sum = lanes.first().copied().ok_or_else(|| {
+            UnsupportedShapeSnafu {
+                kernel: RMS_NORM_KERNEL,
+                msg: "fixed wave has no lane zero".to_owned(),
+            }
+            .build()
+        })?;
+        let width = plan.width.to_f32().ok_or_else(|| {
+            UnsupportedShapeSnafu {
+                kernel: RMS_NORM_KERNEL,
+                msg: "checked RMSNorm width cannot convert to f32".to_owned(),
+            }
+            .build()
+        })?;
         let inverse = (sum / width + plan.epsilon).sqrt().recip();
-        for (value, scale) in input_row.iter().zip(weight.iter()) { output.push(*value * inverse * *scale); }
+        for (value, scale) in input_row.iter().zip(weight.iter()) {
+            output.push(*value * inverse * *scale);
+        }
     }
     Ok(output)
 }
 
-fn rotary_half_split_native_order_reference(plan: RotaryHalfSplitF32Plan, values: &[f32], cos: &[f32], sin: &[f32]) -> Result<Vec<f32>> {
+fn rotary_half_split_native_order_reference(
+    plan: RotaryHalfSplitF32Plan,
+    values: &[f32],
+    cos: &[f32],
+    sin: &[f32],
+) -> Result<Vec<f32>> {
     validate_reference_length(ROTARY_KERNEL, "values", values.len(), plan.elements)?;
     validate_reference_length(ROTARY_KERNEL, "cosine coefficients", cos.len(), plan.pairs)?;
     validate_reference_length(ROTARY_KERNEL, "sine coefficients", sin.len(), plan.pairs)?;
@@ -780,43 +1069,123 @@ fn rotary_half_split_native_order_reference(plan: RotaryHalfSplitF32Plan, values
     output.extend_from_slice(values);
     for row in output.chunks_exact_mut(plan.width) {
         for pair in 0..plan.pairs {
-            let partner = pair.checked_add(plan.pairs).ok_or_else(|| UnsupportedShapeSnafu { kernel: ROTARY_KERNEL, msg: "half-split pair index overflow".to_owned() }.build())?;
-            let left = row.get(pair).copied().ok_or_else(|| UnsupportedShapeSnafu { kernel: ROTARY_KERNEL, msg: "checked left pair access failed".to_owned() }.build())?;
-            let right = row.get(partner).copied().ok_or_else(|| UnsupportedShapeSnafu { kernel: ROTARY_KERNEL, msg: "checked right pair access failed".to_owned() }.build())?;
-            let cosine = cos.get(pair).copied().ok_or_else(|| UnsupportedShapeSnafu { kernel: ROTARY_KERNEL, msg: "checked cosine access failed".to_owned() }.build())?;
-            let sine = sin.get(pair).copied().ok_or_else(|| UnsupportedShapeSnafu { kernel: ROTARY_KERNEL, msg: "checked sine access failed".to_owned() }.build())?;
-            let left_slot = row.get_mut(pair).ok_or_else(|| UnsupportedShapeSnafu { kernel: ROTARY_KERNEL, msg: "checked left pair mutation failed".to_owned() }.build())?;
+            let partner = pair.checked_add(plan.pairs).ok_or_else(|| {
+                UnsupportedShapeSnafu {
+                    kernel: ROTARY_KERNEL,
+                    msg: "half-split pair index overflow".to_owned(),
+                }
+                .build()
+            })?;
+            let left = row.get(pair).copied().ok_or_else(|| {
+                UnsupportedShapeSnafu {
+                    kernel: ROTARY_KERNEL,
+                    msg: "checked left pair access failed".to_owned(),
+                }
+                .build()
+            })?;
+            let right = row.get(partner).copied().ok_or_else(|| {
+                UnsupportedShapeSnafu {
+                    kernel: ROTARY_KERNEL,
+                    msg: "checked right pair access failed".to_owned(),
+                }
+                .build()
+            })?;
+            let cosine = cos.get(pair).copied().ok_or_else(|| {
+                UnsupportedShapeSnafu {
+                    kernel: ROTARY_KERNEL,
+                    msg: "checked cosine access failed".to_owned(),
+                }
+                .build()
+            })?;
+            let sine = sin.get(pair).copied().ok_or_else(|| {
+                UnsupportedShapeSnafu {
+                    kernel: ROTARY_KERNEL,
+                    msg: "checked sine access failed".to_owned(),
+                }
+                .build()
+            })?;
+            let left_slot = row.get_mut(pair).ok_or_else(|| {
+                UnsupportedShapeSnafu {
+                    kernel: ROTARY_KERNEL,
+                    msg: "checked left pair mutation failed".to_owned(),
+                }
+                .build()
+            })?;
             *left_slot = left * cosine - right * sine;
-            let right_slot = row.get_mut(partner).ok_or_else(|| UnsupportedShapeSnafu { kernel: ROTARY_KERNEL, msg: "checked right pair mutation failed".to_owned() }.build())?;
+            let right_slot = row.get_mut(partner).ok_or_else(|| {
+                UnsupportedShapeSnafu {
+                    kernel: ROTARY_KERNEL,
+                    msg: "checked right pair mutation failed".to_owned(),
+                }
+                .build()
+            })?;
             *right_slot = left * sine + right * cosine;
         }
     }
     Ok(output)
 }
 
-fn split_q_gate_native_order_reference(plan: SplitQGateF32Plan, source: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
-    validate_reference_length(SPLIT_Q_GATE_KERNEL, "Q/gate source", source.len(), plan.input_elements)?;
+fn split_q_gate_native_order_reference(
+    plan: SplitQGateF32Plan,
+    source: &[f32],
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    validate_reference_length(
+        SPLIT_Q_GATE_KERNEL,
+        "Q/gate source",
+        source.len(),
+        plan.input_elements,
+    )?;
     let mut query = reserve_native_reference("decoder Q split reference", plan.output_elements)?;
     let mut gate = reserve_native_reference("decoder gate split reference", plan.output_elements)?;
     for head in source.chunks_exact(plan.key_width * 2) {
-        let query_part = head.get(..plan.key_width).ok_or_else(|| UnsupportedShapeSnafu { kernel: SPLIT_Q_GATE_KERNEL, msg: "checked query half access failed".to_owned() }.build())?;
-        let gate_part = head.get(plan.key_width..).ok_or_else(|| UnsupportedShapeSnafu { kernel: SPLIT_Q_GATE_KERNEL, msg: "checked gate half access failed".to_owned() }.build())?;
+        let query_part = head.get(..plan.key_width).ok_or_else(|| {
+            UnsupportedShapeSnafu {
+                kernel: SPLIT_Q_GATE_KERNEL,
+                msg: "checked query half access failed".to_owned(),
+            }
+            .build()
+        })?;
+        let gate_part = head.get(plan.key_width..).ok_or_else(|| {
+            UnsupportedShapeSnafu {
+                kernel: SPLIT_Q_GATE_KERNEL,
+                msg: "checked gate half access failed".to_owned(),
+            }
+            .build()
+        })?;
         query.extend_from_slice(query_part);
         gate.extend_from_slice(gate_part);
     }
     Ok((query, gate))
 }
 
-fn sigmoid_mul_native_order_reference(plan: ElementwiseF32Plan, value: &[f32], gate: &[f32]) -> Result<Vec<f32>> {
-    elementwise_native_order_reference(plan, value, gate, SIGMOID_MUL_KERNEL, |left, right| left * (1.0_f32 / (1.0_f32 + (-right).exp())))
+fn sigmoid_mul_native_order_reference(
+    plan: ElementwiseF32Plan,
+    value: &[f32],
+    gate: &[f32],
+) -> Result<Vec<f32>> {
+    elementwise_native_order_reference(plan, value, gate, SIGMOID_MUL_KERNEL, |left, right| {
+        left * (1.0_f32 / (1.0_f32 + (-right).exp()))
+    })
 }
 
-fn silu_mul_native_order_reference(plan: ElementwiseF32Plan, gate: &[f32], up: &[f32]) -> Result<Vec<f32>> {
-    elementwise_native_order_reference(plan, gate, up, SILU_MUL_KERNEL, |left, right| (left / (1.0_f32 + (-left).exp())) * right)
+fn silu_mul_native_order_reference(
+    plan: ElementwiseF32Plan,
+    gate: &[f32],
+    up: &[f32],
+) -> Result<Vec<f32>> {
+    elementwise_native_order_reference(plan, gate, up, SILU_MUL_KERNEL, |left, right| {
+        (left / (1.0_f32 + (-left).exp())) * right
+    })
 }
 
-fn residual_add_native_order_reference(plan: ElementwiseF32Plan, left: &[f32], right: &[f32]) -> Result<Vec<f32>> {
-    elementwise_native_order_reference(plan, left, right, RESIDUAL_ADD_KERNEL, |left, right| left + right)
+fn residual_add_native_order_reference(
+    plan: ElementwiseF32Plan,
+    left: &[f32],
+    right: &[f32],
+) -> Result<Vec<f32>> {
+    elementwise_native_order_reference(plan, left, right, RESIDUAL_ADD_KERNEL, |left, right| {
+        left + right
+    })
 }
 
 fn elementwise_native_order_reference(
@@ -829,7 +1198,11 @@ fn elementwise_native_order_reference(
     validate_reference_length(operation, "left operand", left.len(), plan.elements)?;
     validate_reference_length(operation, "right operand", right.len(), plan.elements)?;
     let mut output = reserve_native_reference(operation, plan.elements)?;
-    output.extend(left.iter().zip(right.iter()).map(|(left, right)| transform(*left, *right)));
+    output.extend(
+        left.iter()
+            .zip(right.iter())
+            .map(|(left, right)| transform(*left, *right)),
+    );
     Ok(output)
 }
 
@@ -840,7 +1213,8 @@ mod tests {
     const TOLERANCE: f32 = 1e-3;
 
     #[test]
-    fn rms_wave_order_tracks_f64_oracle_on_asymmetric_tail() -> core::result::Result<(), Box<dyn std::error::Error>> {
+    fn rms_wave_order_tracks_f64_oracle_on_asymmetric_tail()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
         let plan = RmsNormF32Plan::try_from_dimensions(2, 37, 1e-5)?;
         let mut input = Vec::with_capacity(plan.elements());
         for index in 0..plan.elements() {
@@ -857,25 +1231,52 @@ mod tests {
     }
 
     #[test]
-    fn half_split_rotation_preserves_tail_and_refuses_adjacent_pairing() -> core::result::Result<(), Box<dyn std::error::Error>> {
+    fn half_split_rotation_preserves_tail_and_refuses_adjacent_pairing()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
         let plan = RotaryHalfSplitF32Plan::try_from_dimensions(2, 7, 4)?;
-        let values = [1.0_f32, 10.0, 2.0, 20.0, 101.0, 102.0, 103.0, -3.0, 30.0, 4.0, 40.0, 201.0, 202.0, 203.0];
+        let values = [
+            1.0_f32, 10.0, 2.0, 20.0, 101.0, 102.0, 103.0, -3.0, 30.0, 4.0, 40.0, 201.0, 202.0,
+            203.0,
+        ];
         let cos = [0.0_f32, 1.0];
         let sin = [1.0_f32, 0.0];
         let actual = rotary_half_split_native_order_reference(plan, &values, &cos, &sin)?;
-        assert_eq!(actual.get(..4), Some(&[-2.0, 10.0, 1.0, 20.0][..]), "first head must rotate half-split pairs");
-        assert_eq!(actual.get(4..7), Some(&values[4..7]), "leading partial rotary span must preserve its tail");
-        assert_eq!(actual.get(7..11), Some(&[-4.0, 30.0, -3.0, 40.0][..]), "second head keeps its own half-split pairing");
+        assert_eq!(
+            actual.get(..4),
+            Some(&[-2.0, 10.0, 1.0, 20.0][..]),
+            "first head must rotate half-split pairs"
+        );
+        assert_eq!(
+            actual.get(4..7),
+            Some(&values[4..7]),
+            "leading partial rotary span must preserve its tail"
+        );
+        assert_eq!(
+            actual.get(7..11),
+            Some(&[-4.0, 30.0, -3.0, 40.0][..]),
+            "second head keeps its own half-split pairing"
+        );
         Ok(())
     }
 
     #[test]
-    fn split_and_elementwise_operations_preserve_qwen_order() -> core::result::Result<(), Box<dyn std::error::Error>> {
+    fn split_and_elementwise_operations_preserve_qwen_order()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
         let split = SplitQGateF32Plan::try_from_dimensions(2, 3)?;
-        let source = [1.0_f32, 2.0, 3.0, -2.0, 0.0, 2.0, 10.0, 20.0, 30.0, 3.0, -1.0, 0.5];
+        let source = [
+            1.0_f32, 2.0, 3.0, -2.0, 0.0, 2.0, 10.0, 20.0, 30.0, 3.0, -1.0, 0.5,
+        ];
         let (query, gate) = split_q_gate_native_order_reference(split, &source)?;
-        assert_eq!(query, vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0], "query must select the first per-head half");
-        assert_eq!(gate, vec![-2.0, 0.0, 2.0, 3.0, -1.0, 0.5], "gate must select the second per-head half");
+        assert_eq!(
+            query,
+            vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0],
+            "query must select the first per-head half"
+        );
+        assert_eq!(
+            gate,
+            vec![-2.0, 0.0, 2.0, 3.0, -1.0, 0.5],
+            "gate must select the second per-head half"
+        );
         let plan = ElementwiseF32Plan::try_from_elements(query.len())?;
         let sigmoid = sigmoid_mul_native_order_reference(plan, &query, &gate)?;
         let silu = silu_mul_native_order_reference(plan, &gate, &query)?;
@@ -884,36 +1285,141 @@ mod tests {
             let q = f64::from(*query.get(index).ok_or("query index")?);
             let g = f64::from(*gate.get(index).ok_or("gate index")?);
             let expected = q * (1.0 / (1.0 + (-g).exp())) + (g / (1.0 + (-g).exp())) * q;
-            assert!((f64::from(*got) - expected).abs() <= f64::from(TOLERANCE), "index {index}: got {got}, expected {expected}");
+            assert!(
+                (f64::from(*got) - expected).abs() <= f64::from(TOLERANCE),
+                "index {index}: got {got}, expected {expected}"
+            );
         }
         Ok(())
     }
 
     #[test]
-    fn plans_and_device_validators_refuse_shape_alias_alignment_and_abi_errors() -> core::result::Result<(), Box<dyn std::error::Error>> {
-        assert!(RmsNormF32Plan::try_from_dimensions(0, 1, 1e-5).is_err(), "zero row count is invalid");
-        assert!(RmsNormF32Plan::try_from_dimensions(1, 1, f32::MIN_POSITIVE / 2.0).is_err(), "subnormal epsilon violates native-domain qualification");
-        assert!(RotaryHalfSplitF32Plan::try_from_dimensions(1, 3, 3).is_err(), "odd rotary width is invalid");
-        assert!(SplitQGateF32Plan::try_from_dimensions(usize::MAX, 2).is_err(), "overflowing split geometry is invalid");
+    fn plans_and_device_validators_refuse_shape_alias_alignment_and_abi_errors()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            RmsNormF32Plan::try_from_dimensions(0, 1, 1e-5).is_err(),
+            "zero row count is invalid"
+        );
+        assert!(
+            RmsNormF32Plan::try_from_dimensions(1, 1, f32::MIN_POSITIVE / 2.0).is_err(),
+            "subnormal epsilon violates native-domain qualification"
+        );
+        assert!(
+            RotaryHalfSplitF32Plan::try_from_dimensions(1, 3, 3).is_err(),
+            "odd rotary width is invalid"
+        );
+        assert!(
+            SplitQGateF32Plan::try_from_dimensions(usize::MAX, 2).is_err(),
+            "overflowing split geometry is invalid"
+        );
         let plan = ElementwiseF32Plan::try_from_elements(2)?;
         let values = [1.0_f32, 2.0];
         let mut output = [0.0_f32; 2];
-        validate_elementwise_launch(plan, values.as_ptr(), values.len(), values.as_ptr(), values.len(), output.as_mut_ptr(), output.len(), RESIDUAL_ADD_KERNEL)?;
-        assert!(validate_elementwise_launch(plan, values.as_ptr(), 1, values.as_ptr(), values.len(), output.as_mut_ptr(), output.len(), RESIDUAL_ADD_KERNEL).is_err(), "short declared span must be refused");
-        assert!(validate_elementwise_launch(plan, values.as_ptr(), values.len(), values.as_ptr(), values.len(), values.as_ptr().cast_mut(), values.len(), RESIDUAL_ADD_KERNEL).is_err(), "output alias must be refused");
-        assert!(validate_elementwise_launch(plan, values.as_ptr(), values.len(), values.as_ptr(), values.len(), output.as_mut_ptr().wrapping_byte_add(1), output.len(), RESIDUAL_ADD_KERNEL).is_err(), "misaligned output must be refused");
-        assert!(matches!(checked_f32_device_span(RESIDUAL_ADD_KERNEL, core::ptr::NonNull::<f32>::dangling().as_ptr(), usize::MAX, "overflow"), Err(crate::Error::UnsupportedShape { .. })), "unrepresentable device span must be refused");
-        if let Ok(too_wide) = usize::try_from(u64::from(u32::MAX) + 1) { assert!(ElementwiseF32Plan::try_from_elements(too_wide).is_err(), "u32 ABI overflow must be refused"); }
+        validate_elementwise_launch(
+            plan,
+            values.as_ptr(),
+            values.len(),
+            values.as_ptr(),
+            values.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            RESIDUAL_ADD_KERNEL,
+        )?;
+        assert!(
+            validate_elementwise_launch(
+                plan,
+                values.as_ptr(),
+                1,
+                values.as_ptr(),
+                values.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                RESIDUAL_ADD_KERNEL
+            )
+            .is_err(),
+            "short declared span must be refused"
+        );
+        assert!(
+            validate_elementwise_launch(
+                plan,
+                values.as_ptr(),
+                values.len(),
+                values.as_ptr(),
+                values.len(),
+                values.as_ptr().cast_mut(),
+                values.len(),
+                RESIDUAL_ADD_KERNEL
+            )
+            .is_err(),
+            "output alias must be refused"
+        );
+        assert!(
+            validate_elementwise_launch(
+                plan,
+                values.as_ptr(),
+                values.len(),
+                values.as_ptr(),
+                values.len(),
+                output.as_mut_ptr().wrapping_byte_add(1),
+                output.len(),
+                RESIDUAL_ADD_KERNEL
+            )
+            .is_err(),
+            "misaligned output must be refused"
+        );
+        assert!(
+            matches!(
+                checked_f32_device_span(
+                    RESIDUAL_ADD_KERNEL,
+                    core::ptr::NonNull::<f32>::dangling().as_ptr(),
+                    usize::MAX,
+                    "overflow"
+                ),
+                Err(crate::Error::UnsupportedShape { .. })
+            ),
+            "unrepresentable device span must be refused"
+        );
+        if let Ok(too_wide) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(
+                ElementwiseF32Plan::try_from_elements(too_wide).is_err(),
+                "u32 ABI overflow must be refused"
+            );
+        }
         Ok(())
     }
 
     #[cfg(logismos_no_gpu_kernels)]
     #[test]
-    fn cpu_only_build_refuses_each_native_entry_without_hip() -> core::result::Result<(), Box<dyn std::error::Error>> {
-        assert!(matches!(no_gpu_refusal(RMS_NORM_KERNEL), Err(crate::Error::NoGpuBuild { .. })), "RMSNorm must report typed no-GPU refusal");
-        assert!(matches!(no_gpu_refusal(ROTARY_KERNEL), Err(crate::Error::NoGpuBuild { .. })), "rotary must report typed no-GPU refusal");
-        assert!(matches!(no_gpu_refusal(SPLIT_Q_GATE_KERNEL), Err(crate::Error::NoGpuBuild { .. })), "split must report typed no-GPU refusal");
-        assert!(matches!(no_gpu_refusal(SIGMOID_MUL_KERNEL), Err(crate::Error::NoGpuBuild { .. })), "sigmoid multiplication must report typed no-GPU refusal");
+    fn cpu_only_build_refuses_each_native_entry_without_hip()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            matches!(
+                no_gpu_refusal(RMS_NORM_KERNEL),
+                Err(crate::Error::NoGpuBuild { .. })
+            ),
+            "RMSNorm must report typed no-GPU refusal"
+        );
+        assert!(
+            matches!(
+                no_gpu_refusal(ROTARY_KERNEL),
+                Err(crate::Error::NoGpuBuild { .. })
+            ),
+            "rotary must report typed no-GPU refusal"
+        );
+        assert!(
+            matches!(
+                no_gpu_refusal(SPLIT_Q_GATE_KERNEL),
+                Err(crate::Error::NoGpuBuild { .. })
+            ),
+            "split must report typed no-GPU refusal"
+        );
+        assert!(
+            matches!(
+                no_gpu_refusal(SIGMOID_MUL_KERNEL),
+                Err(crate::Error::NoGpuBuild { .. })
+            ),
+            "sigmoid multiplication must report typed no-GPU refusal"
+        );
         Ok(())
     }
 
@@ -930,68 +1436,191 @@ mod tests {
             .map_err(|error| format!("plan RMSNorm: {error}"))?;
         let rms_input_host = [1.0_f32, -2.0, 3.0];
         let rms_weight_host = [0.5_f32, 1.5, -1.0];
-        let rms_input = DeviceBuffer::from_host(&device, &rms_input_host).map_err(|error| format!("upload RMSNorm input: {error}"))?;
-        let rms_weight = DeviceBuffer::from_host(&device, &rms_weight_host).map_err(|error| format!("upload RMSNorm weight: {error}"))?;
-        let rms_output = DeviceBuffer::alloc(&device, rms_plan.elements()).map_err(|error| format!("allocate RMSNorm output: {error}"))?;
+        let rms_input = DeviceBuffer::from_host(&device, &rms_input_host)
+            .map_err(|error| format!("upload RMSNorm input: {error}"))?;
+        let rms_weight = DeviceBuffer::from_host(&device, &rms_weight_host)
+            .map_err(|error| format!("upload RMSNorm weight: {error}"))?;
+        let rms_output = DeviceBuffer::alloc(&device, rms_plan.elements())
+            .map_err(|error| format!("allocate RMSNorm output: {error}"))?;
         // SAFETY: distinct buffers satisfy the exact plan spans and remain live through synchronization.
-        unsafe { launch_rms_norm_f32(rms_plan, rms_input.as_device_ptr(), rms_input.len(), rms_weight.as_device_ptr(), rms_weight.len(), rms_output.as_device_ptr(), rms_output.len(), &stream) }
-            .map_err(|error| format!("launch RMSNorm: {error}"))?;
-        stream.synchronize().map_err(|error| format!("synchronize RMSNorm: {error}"))?;
+        unsafe {
+            launch_rms_norm_f32(
+                rms_plan,
+                rms_input.as_device_ptr(),
+                rms_input.len(),
+                rms_weight.as_device_ptr(),
+                rms_weight.len(),
+                rms_output.as_device_ptr(),
+                rms_output.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch RMSNorm: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize RMSNorm: {error}"))?;
         let rms_actual = read_device(&rms_output)?;
-        let rms_expected = rms_norm_native_order_reference(rms_plan, &rms_input_host, &rms_weight_host).map_err(|error| format!("RMSNorm reference: {error}"))?;
+        let rms_expected =
+            rms_norm_native_order_reference(rms_plan, &rms_input_host, &rms_weight_host)
+                .map_err(|error| format!("RMSNorm reference: {error}"))?;
         assert_close_f32(&rms_actual, &rms_expected, "device RMSNorm");
 
-        let rotary_plan = RotaryHalfSplitF32Plan::try_from_dimensions(1, 5, 4).map_err(|error| format!("plan rotary: {error}"))?;
+        let rotary_plan = RotaryHalfSplitF32Plan::try_from_dimensions(1, 5, 4)
+            .map_err(|error| format!("plan rotary: {error}"))?;
         let rotary_values_host = [1.0_f32, 2.0, 3.0, 4.0, 99.0];
         let cosine_host = [0.0_f32, 1.0];
         let sine_host = [1.0_f32, 0.0];
-        let rotary_values = DeviceBuffer::from_host(&device, &rotary_values_host).map_err(|error| format!("upload rotary values: {error}"))?;
-        let cosine = DeviceBuffer::from_host(&device, &cosine_host).map_err(|error| format!("upload cosine: {error}"))?;
-        let sine = DeviceBuffer::from_host(&device, &sine_host).map_err(|error| format!("upload sine: {error}"))?;
+        let rotary_values = DeviceBuffer::from_host(&device, &rotary_values_host)
+            .map_err(|error| format!("upload rotary values: {error}"))?;
+        let cosine = DeviceBuffer::from_host(&device, &cosine_host)
+            .map_err(|error| format!("upload cosine: {error}"))?;
+        let sine = DeviceBuffer::from_host(&device, &sine_host)
+            .map_err(|error| format!("upload sine: {error}"))?;
         // SAFETY: values is exclusive and does not alias either coefficient buffer.
-        unsafe { launch_rotary_half_split_f32_in_place(rotary_plan, rotary_values.as_device_ptr(), rotary_values.len(), cosine.as_device_ptr(), cosine.len(), sine.as_device_ptr(), sine.len(), &stream) }
-            .map_err(|error| format!("launch rotary: {error}"))?;
-        stream.synchronize().map_err(|error| format!("synchronize rotary: {error}"))?;
+        unsafe {
+            launch_rotary_half_split_f32_in_place(
+                rotary_plan,
+                rotary_values.as_device_ptr(),
+                rotary_values.len(),
+                cosine.as_device_ptr(),
+                cosine.len(),
+                sine.as_device_ptr(),
+                sine.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch rotary: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize rotary: {error}"))?;
         let rotary_actual = read_device(&rotary_values)?;
-        let rotary_expected = rotary_half_split_native_order_reference(rotary_plan, &rotary_values_host, &cosine_host, &sine_host).map_err(|error| format!("rotary reference: {error}"))?;
+        let rotary_expected = rotary_half_split_native_order_reference(
+            rotary_plan,
+            &rotary_values_host,
+            &cosine_host,
+            &sine_host,
+        )
+        .map_err(|error| format!("rotary reference: {error}"))?;
         assert_close_f32(&rotary_actual, &rotary_expected, "device rotary");
 
-        let split_plan = SplitQGateF32Plan::try_from_dimensions(1, 3).map_err(|error| format!("plan split: {error}"))?;
+        let split_plan = SplitQGateF32Plan::try_from_dimensions(1, 3)
+            .map_err(|error| format!("plan split: {error}"))?;
         let split_source_host = [1.0_f32, 2.0, 3.0, -2.0, 0.0, 2.0];
-        let split_source = DeviceBuffer::from_host(&device, &split_source_host).map_err(|error| format!("upload split source: {error}"))?;
-        let split_query = DeviceBuffer::alloc(&device, split_plan.output_elements()).map_err(|error| format!("allocate split query: {error}"))?;
-        let split_gate = DeviceBuffer::alloc(&device, split_plan.output_elements()).map_err(|error| format!("allocate split gate: {error}"))?;
+        let split_source = DeviceBuffer::from_host(&device, &split_source_host)
+            .map_err(|error| format!("upload split source: {error}"))?;
+        let split_query = DeviceBuffer::alloc(&device, split_plan.output_elements())
+            .map_err(|error| format!("allocate split query: {error}"))?;
+        let split_gate = DeviceBuffer::alloc(&device, split_plan.output_elements())
+            .map_err(|error| format!("allocate split gate: {error}"))?;
         // SAFETY: source is immutable and the two outputs are distinct exact plan spans.
-        unsafe { launch_split_q_gate_f32(split_plan, split_source.as_device_ptr(), split_source.len(), split_query.as_device_ptr(), split_query.len(), split_gate.as_device_ptr(), split_gate.len(), &stream) }
-            .map_err(|error| format!("launch split: {error}"))?;
-        stream.synchronize().map_err(|error| format!("synchronize split: {error}"))?;
-        let (query_expected, gate_expected) = split_q_gate_native_order_reference(split_plan, &split_source_host).map_err(|error| format!("split reference: {error}"))?;
-        assert_close_f32(&read_device(&split_query)?, &query_expected, "device Q split");
-        assert_close_f32(&read_device(&split_gate)?, &gate_expected, "device gate split");
+        unsafe {
+            launch_split_q_gate_f32(
+                split_plan,
+                split_source.as_device_ptr(),
+                split_source.len(),
+                split_query.as_device_ptr(),
+                split_query.len(),
+                split_gate.as_device_ptr(),
+                split_gate.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch split: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize split: {error}"))?;
+        let (query_expected, gate_expected) =
+            split_q_gate_native_order_reference(split_plan, &split_source_host)
+                .map_err(|error| format!("split reference: {error}"))?;
+        assert_close_f32(
+            &read_device(&split_query)?,
+            &query_expected,
+            "device Q split",
+        );
+        assert_close_f32(
+            &read_device(&split_gate)?,
+            &gate_expected,
+            "device gate split",
+        );
 
-        let elementwise = ElementwiseF32Plan::try_from_elements(query_expected.len()).map_err(|error| format!("plan elementwise: {error}"))?;
-        let elementwise_output = DeviceBuffer::alloc(&device, elementwise.elements()).map_err(|error| format!("allocate elementwise output: {error}"))?;
+        let elementwise = ElementwiseF32Plan::try_from_elements(query_expected.len())
+            .map_err(|error| format!("plan elementwise: {error}"))?;
+        let elementwise_output = DeviceBuffer::alloc(&device, elementwise.elements())
+            .map_err(|error| format!("allocate elementwise output: {error}"))?;
         // SAFETY: all source/output buffers are distinct exact plan spans.
-        unsafe { sigmoid_mul(elementwise, split_query.as_device_ptr(), split_query.len(), split_gate.as_device_ptr(), split_gate.len(), elementwise_output.as_device_ptr(), elementwise_output.len(), &stream) }
-            .map_err(|error| format!("launch sigmoid multiplication: {error}"))?;
-        stream.synchronize().map_err(|error| format!("synchronize sigmoid multiplication: {error}"))?;
+        unsafe {
+            sigmoid_mul(
+                elementwise,
+                split_query.as_device_ptr(),
+                split_query.len(),
+                split_gate.as_device_ptr(),
+                split_gate.len(),
+                elementwise_output.as_device_ptr(),
+                elementwise_output.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch sigmoid multiplication: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize sigmoid multiplication: {error}"))?;
         let sigmoid_actual = read_device(&elementwise_output)?;
-        let sigmoid_expected = sigmoid_mul_native_order_reference(elementwise, &query_expected, &gate_expected).map_err(|error| format!("sigmoid reference: {error}"))?;
-        assert_close_f32(&sigmoid_actual, &sigmoid_expected, "device sigmoid multiplication");
+        let sigmoid_expected =
+            sigmoid_mul_native_order_reference(elementwise, &query_expected, &gate_expected)
+                .map_err(|error| format!("sigmoid reference: {error}"))?;
+        assert_close_f32(
+            &sigmoid_actual,
+            &sigmoid_expected,
+            "device sigmoid multiplication",
+        );
         // SAFETY: inputs remain immutable and output remains an exclusive exact plan span.
-        unsafe { silu_mul(elementwise, split_gate.as_device_ptr(), split_gate.len(), split_query.as_device_ptr(), split_query.len(), elementwise_output.as_device_ptr(), elementwise_output.len(), &stream) }
-            .map_err(|error| format!("launch SiLU multiplication: {error}"))?;
-        stream.synchronize().map_err(|error| format!("synchronize SiLU multiplication: {error}"))?;
+        unsafe {
+            silu_mul(
+                elementwise,
+                split_gate.as_device_ptr(),
+                split_gate.len(),
+                split_query.as_device_ptr(),
+                split_query.len(),
+                elementwise_output.as_device_ptr(),
+                elementwise_output.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch SiLU multiplication: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize SiLU multiplication: {error}"))?;
         let silu_actual = read_device(&elementwise_output)?;
-        let silu_expected = silu_mul_native_order_reference(elementwise, &gate_expected, &query_expected).map_err(|error| format!("SiLU reference: {error}"))?;
+        let silu_expected =
+            silu_mul_native_order_reference(elementwise, &gate_expected, &query_expected)
+                .map_err(|error| format!("SiLU reference: {error}"))?;
         assert_close_f32(&silu_actual, &silu_expected, "device SiLU multiplication");
         // SAFETY: both input buffers and the output buffer remain distinct through completion.
-        unsafe { residual_add(elementwise, split_query.as_device_ptr(), split_query.len(), split_gate.as_device_ptr(), split_gate.len(), elementwise_output.as_device_ptr(), elementwise_output.len(), &stream) }
-            .map_err(|error| format!("launch residual addition: {error}"))?;
-        stream.synchronize().map_err(|error| format!("synchronize residual addition: {error}"))?;
+        unsafe {
+            residual_add(
+                elementwise,
+                split_query.as_device_ptr(),
+                split_query.len(),
+                split_gate.as_device_ptr(),
+                split_gate.len(),
+                elementwise_output.as_device_ptr(),
+                elementwise_output.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch residual addition: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize residual addition: {error}"))?;
         let residual_actual = read_device(&elementwise_output)?;
-        let residual_expected = residual_add_native_order_reference(elementwise, &query_expected, &gate_expected).map_err(|error| format!("residual reference: {error}"))?;
-        assert_close_f32(&residual_actual, &residual_expected, "device residual addition");
+        let residual_expected =
+            residual_add_native_order_reference(elementwise, &query_expected, &gate_expected)
+                .map_err(|error| format!("residual reference: {error}"))?;
+        assert_close_f32(
+            &residual_actual,
+            &residual_expected,
+            "device residual addition",
+        );
         Ok(())
     }
 
@@ -1001,38 +1630,63 @@ mod tests {
         width: usize,
         epsilon: f64,
     ) -> Result<Vec<f64>> {
-        let width_u32 = u32::try_from(width).map_err(|_| UnsupportedShapeSnafu {
-            kernel: RMS_NORM_KERNEL,
-            msg: "f64 oracle width exceeds the checked u32 plan domain".to_owned(),
-        }
-        .build())?;
+        let width_u32 = u32::try_from(width).map_err(|_| {
+            UnsupportedShapeSnafu {
+                kernel: RMS_NORM_KERNEL,
+                msg: "f64 oracle width exceeds the checked u32 plan domain".to_owned(),
+            }
+            .build()
+        })?;
         let width_f64 = f64::from(width_u32);
         let mut output = Vec::with_capacity(input.len());
         for row in input.chunks_exact(width) {
-            let sum = row.iter().map(|value| f64::from(*value) * f64::from(*value)).sum::<f64>();
+            let sum = row
+                .iter()
+                .map(|value| f64::from(*value) * f64::from(*value))
+                .sum::<f64>();
             let inverse = (sum / width_f64 + epsilon).sqrt().recip();
-            output.extend(row.iter().zip(weight.iter()).map(|(value, scale)| f64::from(*value) * inverse * f64::from(*scale)));
+            output.extend(
+                row.iter()
+                    .zip(weight.iter())
+                    .map(|(value, scale)| f64::from(*value) * inverse * f64::from(*scale)),
+            );
         }
         Ok(output)
     }
 
     fn assert_close_f64(actual: &[f32], expected: &[f64], operation: &str) {
-        assert_eq!(actual.len(), expected.len(), "{operation} output lengths must match");
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{operation} output lengths must match"
+        );
         for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
-            assert!((f64::from(*actual) - expected).abs() <= f64::from(TOLERANCE), "{operation} index {index}: got {actual}, expected {expected}");
+            assert!(
+                (f64::from(*actual) - expected).abs() <= f64::from(TOLERANCE),
+                "{operation} index {index}: got {actual}, expected {expected}"
+            );
         }
     }
 
     fn assert_close_f32(actual: &[f32], expected: &[f32], operation: &str) {
-        assert_eq!(actual.len(), expected.len(), "{operation} output lengths must match");
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{operation} output lengths must match"
+        );
         for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
-            assert!((actual - expected).abs() <= TOLERANCE, "{operation} index {index}: got {actual}, expected {expected}");
+            assert!(
+                (actual - expected).abs() <= TOLERANCE,
+                "{operation} index {index}: got {actual}, expected {expected}"
+            );
         }
     }
 
     fn read_device(buffer: &hipcore::DeviceBuffer<f32>) -> core::result::Result<Vec<f32>, String> {
         let mut host = vec![0.0_f32; buffer.len()];
-        buffer.copy_to_host(&mut host).map_err(|error| format!("copy device buffer: {error}"))?;
+        buffer
+            .copy_to_host(&mut host)
+            .map_err(|error| format!("copy device buffer: {error}"))?;
         Ok(host)
     }
 }
