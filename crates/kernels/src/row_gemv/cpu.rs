@@ -128,25 +128,33 @@ mod tests {
     }
 
     #[test]
-    fn q4_logical_lane_order_preserves_dyadic_cancellation()
+    fn packed_native_logical_lane_order_preserves_dyadic_cancellation()
     -> core::result::Result<(), Box<dyn std::error::Error>> {
-        let fixture = q4_logical_order_fixture();
-        let shape = RowGemvShape::new(
-            quant::RowFormat::Q4K,
-            fixture.rows,
-            fixture.width,
-            fixture.matrix.len(),
-            fixture.activations.len(),
-            fixture.rows,
-        )?;
-        let actual = row_gemv_f32(&fixture.matrix, &fixture.activations, shape)?;
-        let packed_order =
-            (fixture.activations[0] + fixture.activations[32]) + fixture.activations[1];
-        assert_eq!(actual, [0.0_f32], "logical Q4_K lane order");
-        assert_eq!(
-            packed_order, 1.0_f32,
-            "packed low/high interleaving discriminator"
-        );
+        for order_fixture in logical_order_fixtures() {
+            let shape = RowGemvShape::new(
+                order_fixture.format,
+                order_fixture.fixture.rows,
+                order_fixture.fixture.width,
+                order_fixture.fixture.matrix.len(),
+                order_fixture.fixture.activations.len(),
+                order_fixture.fixture.rows,
+            )?;
+            let actual = row_gemv_f32(
+                &order_fixture.fixture.matrix,
+                &order_fixture.fixture.activations,
+                shape,
+            )?;
+            let packed_order = (order_fixture.fixture.activations[0]
+                + order_fixture.fixture.activations[order_fixture.high_lane])
+                + order_fixture.fixture.activations[1];
+            assert_eq!(actual, [0.0_f32], "{} logical lane order", order_fixture.label);
+            assert_eq!(
+                packed_order,
+                1.0_f32,
+                "{} packed interleaving discriminator",
+                order_fixture.label
+            );
+        }
         Ok(())
     }
 
@@ -163,7 +171,7 @@ mod tests {
             let mut fixture = fixture(format).map_err(|error| error.to_string())?;
             let row_bytes = quant::row_byte_len(format, fixture.width)
                 .map_err(|error| format!("derive {format} row bytes: {error}"))?;
-            let tail = fixture.matrix[..row_bytes].to_vec();
+            let tail = fixture.matrix[row_bytes..row_bytes * 2].to_vec();
             fixture.matrix.extend(tail);
             let rows = fixture.rows + 1;
             let shape = RowGemvShape::new(
@@ -181,7 +189,7 @@ mod tests {
                 .map_err(|error| format!("upload {format} matrix: {error}"))?;
             let activations = DeviceBuffer::<f32>::from_host(&device, &fixture.activations)
                 .map_err(|error| format!("upload {format} activations: {error}"))?;
-            let output = DeviceBuffer::<f32>::alloc(&device, rows)
+            let output = DeviceBuffer::<f32>::from_host(&device, &vec![-1234.5_f32; rows])
                 .map_err(|error| format!("allocate {format} output: {error}"))?;
             // SAFETY: distinct allocations match the checked exact extents and
             // remain alive and exclusively owned through synchronization.
@@ -221,47 +229,50 @@ mod tests {
             }
             assert_gpu_close(&actual, &expected, format.to_string().as_str())?;
         }
-        let fixture = q4_logical_order_fixture();
-        let shape = RowGemvShape::new(
-            quant::RowFormat::Q4K,
-            fixture.rows,
-            fixture.width,
-            fixture.matrix.len(),
-            fixture.activations.len(),
-            fixture.rows,
-        )
-        .map_err(|error| format!("validate Q4_K order shape: {error}"))?;
-        let matrix = DeviceBuffer::<u8>::from_host(&device, &fixture.matrix)
-            .map_err(|error| format!("upload Q4_K order matrix: {error}"))?;
-        let activations = DeviceBuffer::<f32>::from_host(&device, &fixture.activations)
-            .map_err(|error| format!("upload Q4_K order activations: {error}"))?;
-        let output = DeviceBuffer::<f32>::alloc(&device, fixture.rows)
-            .map_err(|error| format!("allocate Q4_K order output: {error}"))?;
-        // SAFETY: the checked Q4_K shape exactly describes three distinct live buffers.
-        unsafe {
-            crate::row_gemv::launch_row_gemv_f32(
-                shape,
-                matrix.as_device_ptr(),
-                matrix.len(),
-                activations.as_device_ptr(),
-                activations.len(),
-                output.as_device_ptr(),
-                output.len(),
-                &stream,
+        for order_fixture in logical_order_fixtures() {
+            let shape = RowGemvShape::new(
+                order_fixture.format,
+                order_fixture.fixture.rows,
+                order_fixture.fixture.width,
+                order_fixture.fixture.matrix.len(),
+                order_fixture.fixture.activations.len(),
+                order_fixture.fixture.rows,
             )
-        }
-        .map_err(|error| format!("launch Q4_K order fixture: {error}"))?;
-        stream
-            .synchronize()
-            .map_err(|error| format!("synchronize Q4_K order fixture: {error}"))?;
-        let mut actual = [f32::NAN; 1];
-        output
-            .copy_to_host(&mut actual)
-            .map_err(|error| format!("read Q4_K order output: {error}"))?;
-        if actual != [0.0_f32] {
-            return Err(format!(
-                "Q4_K logical-order device result was {actual:?}, expected [0.0]"
-            ));
+            .map_err(|error| format!("validate {} order shape: {error}", order_fixture.label))?;
+            let matrix = DeviceBuffer::<u8>::from_host(&device, &order_fixture.fixture.matrix)
+                .map_err(|error| format!("upload {} order matrix: {error}", order_fixture.label))?;
+            let activations =
+                DeviceBuffer::<f32>::from_host(&device, &order_fixture.fixture.activations)
+                    .map_err(|error| format!("upload {} order activations: {error}", order_fixture.label))?;
+            let output = DeviceBuffer::<f32>::alloc(&device, order_fixture.fixture.rows)
+                .map_err(|error| format!("allocate {} order output: {error}", order_fixture.label))?;
+            // SAFETY: the checked serialized-row shape describes three distinct live buffers.
+            unsafe {
+                crate::row_gemv::launch_row_gemv_f32(
+                    shape,
+                    matrix.as_device_ptr(),
+                    matrix.len(),
+                    activations.as_device_ptr(),
+                    activations.len(),
+                    output.as_device_ptr(),
+                    output.len(),
+                    &stream,
+                )
+            }
+            .map_err(|error| format!("launch {} order fixture: {error}", order_fixture.label))?;
+            stream
+                .synchronize()
+                .map_err(|error| format!("synchronize {} order fixture: {error}", order_fixture.label))?;
+            let mut actual = [f32::NAN; 1];
+            output
+                .copy_to_host(&mut actual)
+                .map_err(|error| format!("read {} order output: {error}", order_fixture.label))?;
+            if actual != [0.0_f32] {
+                return Err(format!(
+                    "{} logical-order device result was {actual:?}, expected [0.0]",
+                    order_fixture.label
+                ));
+            }
         }
         Ok(())
     }
@@ -285,73 +296,40 @@ mod tests {
         activations: Vec<f32>,
     }
 
-    fn fixture(
+    struct LogicalOrderFixture {
+        label: &'static str,
         format: quant::RowFormat,
-    ) -> core::result::Result<Fixture, Box<dyn std::error::Error>> {
+        high_lane: usize,
+        fixture: Fixture,
+    }
+
+    fn fixture(format: quant::RowFormat) -> core::result::Result<Fixture, Box<dyn std::error::Error>> {
         let rows = 2;
         let (width, first, second) = match format {
             quant::RowFormat::F32 => (
                 4,
-                [0.0_f32; 4]
-                    .into_iter()
-                    .flat_map(f32::to_le_bytes)
-                    .collect(),
-                [-1.0_f32, 2.5, -0.75, 0.0]
-                    .into_iter()
-                    .flat_map(f32::to_le_bytes)
-                    .collect(),
+                [0.0_f32; 4].into_iter().flat_map(f32::to_le_bytes).collect(),
+                [-1.0_f32, 2.5, -0.75, 0.0].into_iter().flat_map(f32::to_le_bytes).collect(),
             ),
             quant::RowFormat::Q8_0 => (
                 64,
-                [
-                    block_q8(0x0000, ramp_i8(-17, 3)),
-                    block_q8(0x0000, ramp_i8(39, -2)),
-                ]
-                .concat(),
-                [
-                    block_q8(0x3800, ramp_i8(7, 5)),
-                    block_q8(0x3c00, ramp_i8(-41, 4)),
-                ]
-                .concat(),
+                [block_q8(0x0000, ramp_i8(-17, 3)), block_q8(0x0000, ramp_i8(39, -2))].concat(),
+                [block_q8(0x3800, ramp_i8(7, 5)), block_q8(0x3c00, ramp_i8(-41, 4))].concat(),
             ),
             quant::RowFormat::Q4K => (
                 512,
-                [
-                    block_q4(0x0000, 0x0000, 0x51),
-                    block_q4(0x0000, 0x0000, 0xa7),
-                ]
-                .concat(),
-                [
-                    block_q4(0xbc00, 0x3c00, 0x2e),
-                    block_q4(0x3c00, 0x3800, 0xd4),
-                ]
-                .concat(),
+                [block_q4(0x0000, 0x0000, 0x51), block_q4(0x0000, 0x0000, 0xa7)].concat(),
+                [block_q4(0xbc00, 0x3c00, 0x2e), block_q4(0x3c00, 0x3800, 0xd4)].concat(),
             ),
             quant::RowFormat::Q5K => (
                 512,
-                [
-                    block_q5(0x0000, 0x0000, 0x03, 0x51),
-                    block_q5(0x0000, 0x0000, 0x54, 0xa7),
-                ]
-                .concat(),
-                [
-                    block_q5(0xbc00, 0x3c00, 0x9a, 0x2e),
-                    block_q5(0x3c00, 0x3800, 0xc3, 0xd4),
-                ]
-                .concat(),
+                [block_q5(0x0000, 0x0000, 0x03, 0x51), block_q5(0x0000, 0x0000, 0x54, 0xa7)].concat(),
+                [block_q5(0xbc00, 0x3c00, 0x9a, 0x2e), block_q5(0x3c00, 0x3800, 0xc3, 0xd4)].concat(),
             ),
             quant::RowFormat::Q6K => (
                 512,
-                [
-                    block_q6(0xe4, 0x10, 3, 0x0000),
-                    block_q6(0x1b, 0xa5, -2, 0x0000),
-                ]
-                .concat(),
-                [
-                    block_q6(0x6c, 0x3e, 5, 0xbc00),
-                    block_q6(0x93, 0xc1, -4, 0x3c00),
-                ]
-                .concat(),
+                [block_q6(0xe4, 0x10, 3, 0x0000), block_q6(0x1b, 0xa5, -2, 0x0000)].concat(),
+                [block_q6(0x6c, 0x3e, 5, 0xbc00), block_q6(0x93, 0xc1, -4, 0x3c00)].concat(),
             ),
             quant::RowFormat::IQ4NL => (
                 64,
@@ -360,16 +338,8 @@ mod tests {
             ),
             quant::RowFormat::IQ4XS => (
                 512,
-                [
-                    block_iq4_xs(0x0000, 0x1b, 0x51),
-                    block_iq4_xs(0x0000, 0xe4, 0xa7),
-                ]
-                .concat(),
-                [
-                    block_iq4_xs(0x3800, 0x6c, 0x2e),
-                    block_iq4_xs(0x3c00, 0x93, 0xd4),
-                ]
-                .concat(),
+                [block_iq4_xs(0x0000, 0x1b, 0x51), block_iq4_xs(0x0000, 0xe4, 0xa7)].concat(),
+                [block_iq4_xs(0x3800, 0x6c, 0x2e), block_iq4_xs(0x3c00, 0x93, 0xd4)].concat(),
             ),
             _ => return Err("unknown executable row format".into()),
         };
@@ -378,12 +348,50 @@ mod tests {
         let activations = (0..width)
             .map(|index| (index as f32 - 91.0) / 29.0)
             .collect();
-        Ok(Fixture {
-            rows,
-            width,
-            matrix,
-            activations,
-        })
+        Ok(Fixture { rows, width, matrix, activations })
+    }
+
+    fn logical_order_fixtures() -> [LogicalOrderFixture; 5] {
+        [
+            LogicalOrderFixture {
+                label: "Q4_K",
+                format: quant::RowFormat::Q4K,
+                high_lane: 32,
+                fixture: q4_logical_order_fixture(),
+            },
+            LogicalOrderFixture {
+                label: "Q5_K",
+                format: quant::RowFormat::Q5K,
+                high_lane: 32,
+                fixture: q5_logical_order_fixture(),
+            },
+            LogicalOrderFixture {
+                label: "Q6_K",
+                format: quant::RowFormat::Q6K,
+                high_lane: 32,
+                fixture: q6_logical_order_fixture(),
+            },
+            LogicalOrderFixture {
+                label: "IQ4_NL",
+                format: quant::RowFormat::IQ4NL,
+                high_lane: 16,
+                fixture: iq4_nl_logical_order_fixture(),
+            },
+            LogicalOrderFixture {
+                label: "IQ4_XS",
+                format: quant::RowFormat::IQ4XS,
+                high_lane: 16,
+                fixture: iq4_xs_logical_order_fixture(),
+            },
+        ]
+    }
+
+    fn logical_order_activations(width: usize, high_lane: usize) -> Vec<f32> {
+        let mut activations = vec![0.0_f32; width];
+        activations[0] = 16_777_216.0_f32;
+        activations[1] = 1.0_f32;
+        activations[high_lane] = -16_777_216.0_f32;
+        activations
     }
 
     fn q4_logical_order_fixture() -> Fixture {
@@ -392,15 +400,62 @@ mod tests {
         block[4] = 1;
         block[5] = 1;
         block[16..].fill(0x11);
-        let mut activations = vec![0.0_f32; quant::Q4_K_VALUES_PER_BLOCK];
-        activations[0] = 16_777_216.0_f32;
-        activations[1] = 1.0_f32;
-        activations[32] = -16_777_216.0_f32;
         Fixture {
             rows: 1,
             width: quant::Q4_K_VALUES_PER_BLOCK,
             matrix: block,
-            activations,
+            activations: logical_order_activations(quant::Q4_K_VALUES_PER_BLOCK, 32),
+        }
+    }
+
+    fn q5_logical_order_fixture() -> Fixture {
+        let mut block = vec![0_u8; quant::Q5_K_BLOCK_BYTES];
+        block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        block[4] = 1;
+        block[5] = 1;
+        block[48..].fill(0x11);
+        Fixture {
+            rows: 1,
+            width: quant::Q5_K_VALUES_PER_BLOCK,
+            matrix: block,
+            activations: logical_order_activations(quant::Q5_K_VALUES_PER_BLOCK, 32),
+        }
+    }
+
+    fn q6_logical_order_fixture() -> Fixture {
+        let mut block = vec![0x11_u8; quant::q6_k::Q6_K_LOW_BITS_BYTES];
+        block.extend([0xaa_u8; quant::q6_k::Q6_K_HIGH_BITS_BYTES]);
+        block.extend([1_u8; quant::q6_k::Q6_K_SCALE_BYTES]);
+        block.extend(0x3c00_u16.to_le_bytes());
+        Fixture {
+            rows: 1,
+            width: quant::Q6_K_VALUES_PER_BLOCK,
+            matrix: block,
+            activations: logical_order_activations(quant::Q6_K_VALUES_PER_BLOCK, 32),
+        }
+    }
+
+    fn iq4_nl_logical_order_fixture() -> Fixture {
+        let mut block = 0x3c00_u16.to_le_bytes().to_vec();
+        block.extend([0x88_u8; quant::iq4_nl::IQ4_NL_QUANT_BYTES]);
+        Fixture {
+            rows: 1,
+            width: quant::IQ4_NL_VALUES_PER_BLOCK,
+            matrix: block,
+            activations: logical_order_activations(quant::IQ4_NL_VALUES_PER_BLOCK, 16),
+        }
+    }
+
+    fn iq4_xs_logical_order_fixture() -> Fixture {
+        let mut block = 0x3c00_u16.to_le_bytes().to_vec();
+        block.extend(2_u16.to_le_bytes());
+        block.extend([1_u8, 0, 0, 0]);
+        block.extend([0x88_u8; quant::iq4_xs::IQ4_XS_QUANT_BYTES]);
+        Fixture {
+            rows: 1,
+            width: quant::IQ4_XS_VALUES_PER_BLOCK,
+            matrix: block,
+            activations: logical_order_activations(quant::IQ4_XS_VALUES_PER_BLOCK, 16),
         }
     }
 
@@ -425,10 +480,7 @@ mod tests {
 
     fn block_q5(scale: u16, minimum: u16, high: u8, pattern: u8) -> Vec<u8> {
         let mut block = block_q4(scale, minimum, pattern);
-        block.splice(
-            16..16,
-            (0..32).map(|index| high.rotate_left(index as u32 % 8)),
-        );
+        block.splice(16..16, (0..32).map(|index| high.rotate_left(index as u32 % 8)));
         block
     }
 
@@ -481,9 +533,7 @@ mod tests {
         match format {
             quant::RowFormat::F32 => {
                 let offset = index * 4;
-                Ok(f64::from(f32::from_le_bytes(
-                    row[offset..offset + 4].try_into()?,
-                )))
+                Ok(f64::from(f32::from_le_bytes(row[offset..offset + 4].try_into()?)))
             }
             quant::RowFormat::Q8_0 => {
                 let block = &row[index / 32 * 34..];
@@ -509,51 +559,30 @@ mod tests {
         }
     }
 
-    fn oracle_q4(
-        row: &[u8],
-        index: usize,
-    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+    fn oracle_q4(row: &[u8], index: usize) -> core::result::Result<f64, Box<dyn std::error::Error>> {
         let block = &row[index / 256 * 144..];
         let group = index % 256 / 32;
         let lane = index % 32;
         let (scale, minimum) = q_scale_min(&block[4..16], group);
         let packed = block[16 + group / 2 * 32 + lane];
-        let quant = if group.is_multiple_of(2) {
-            packed & 0x0f
-        } else {
-            packed >> 4
-        };
+        let quant = if group.is_multiple_of(2) { packed & 0x0f } else { packed >> 4 };
         Ok(f16(block)? * f64::from(scale) * f64::from(quant)
             - f16(&block[2..])? * f64::from(minimum))
     }
 
-    fn oracle_q5(
-        row: &[u8],
-        index: usize,
-    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+    fn oracle_q5(row: &[u8], index: usize) -> core::result::Result<f64, Box<dyn std::error::Error>> {
         let block = &row[index / 256 * 176..];
         let group = index % 256 / 32;
         let lane = index % 32;
         let (scale, minimum) = q_scale_min(&block[4..16], group);
         let packed = block[48 + group / 2 * 32 + lane];
-        let fifth = if block[16 + lane] & (1 << group) == 0 {
-            0
-        } else {
-            16
-        };
-        let quant = (if group.is_multiple_of(2) {
-            packed & 0x0f
-        } else {
-            packed >> 4
-        }) + fifth;
+        let fifth = if block[16 + lane] & (1 << group) == 0 { 0 } else { 16 };
+        let quant = (if group.is_multiple_of(2) { packed & 0x0f } else { packed >> 4 }) + fifth;
         Ok(f16(block)? * f64::from(scale) * f64::from(quant)
             - f16(&block[2..])? * f64::from(minimum))
     }
 
-    fn oracle_q6(
-        row: &[u8],
-        index: usize,
-    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+    fn oracle_q6(row: &[u8], index: usize) -> core::result::Result<f64, Box<dyn std::error::Error>> {
         let block = &row[index / 256 * 210..];
         let local = index % 256;
         let half = local / 128;
@@ -567,42 +596,24 @@ mod tests {
         Ok(f16(&block[208..])? * f64::from(scale) * f64::from(quant))
     }
 
-    fn oracle_iq4_nl(
-        row: &[u8],
-        index: usize,
-    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+    fn oracle_iq4_nl(row: &[u8], index: usize) -> core::result::Result<f64, Box<dyn std::error::Error>> {
         let block = &row[index / 32 * 18..];
         let lane = index % 32;
         let packed = block[2 + lane % 16];
-        let code = if lane < 16 {
-            packed & 0x0f
-        } else {
-            packed >> 4
-        };
+        let code = if lane < 16 { packed & 0x0f } else { packed >> 4 };
         Ok(f16(block)? * f64::from(iq4_value(code)))
     }
 
-    fn oracle_iq4_xs(
-        row: &[u8],
-        index: usize,
-    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+    fn oracle_iq4_xs(row: &[u8], index: usize) -> core::result::Result<f64, Box<dyn std::error::Error>> {
         let block = &row[index / 256 * 136..];
         let local = index % 256;
         let group = local / 32;
         let lane = local % 32;
-        let low = if group.is_multiple_of(2) {
-            block[4 + group / 2] & 0x0f
-        } else {
-            block[4 + group / 2] >> 4
-        };
+        let low = if group.is_multiple_of(2) { block[4 + group / 2] & 0x0f } else { block[4 + group / 2] >> 4 };
         let high = (u16::from_le_bytes([block[2], block[3]]) >> (group * 2)) & 0x03;
         let group_scale = i16::from(low | ((high as u8) << 4)) - 32;
         let packed = block[8 + group * 16 + lane % 16];
-        let code = if lane < 16 {
-            packed & 0x0f
-        } else {
-            packed >> 4
-        };
+        let code = if lane < 16 { packed & 0x0f } else { packed >> 4 };
         Ok(f16(block)? * f64::from(group_scale) * f64::from(iq4_value(code)))
     }
 
@@ -635,16 +646,17 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "gpu")]
-    fn assert_gpu_close(
-        actual: &[f32],
-        expected: &[f32],
-        label: &str,
-    ) -> core::result::Result<(), String> {
+    #[cfg(test)]
+    fn assert_gpu_close(actual: &[f32], expected: &[f32], label: &str) -> core::result::Result<(), String> {
         if actual.len() != expected.len() {
             return Err(format!("{label} device result length differs"));
         }
         for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            if !actual.is_finite() || !expected.is_finite() {
+                return Err(format!(
+                    "{label} device row {index} is non-finite: got {actual}, expected {expected}"
+                ));
+            }
             let tolerance = 1e-3_f32.max(expected.abs() * 1e-3);
             if (*actual - *expected).abs() > tolerance {
                 return Err(format!(
@@ -653,5 +665,11 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn gpu_comparison_refuses_nonfinite_results() {
+        assert!(assert_gpu_close(&[f32::NAN], &[0.0_f32], "test").is_err());
+        assert!(assert_gpu_close(&[0.0_f32], &[f32::INFINITY], "test").is_err());
     }
 }

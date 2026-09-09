@@ -204,7 +204,7 @@ fn abi_error(label: &'static str, value: usize) -> crate::Error {
 ///
 /// The format-specific HIP kernels preserve serial row/block/lane f32 decode,
 /// product, and accumulation order. They are correctness baselines, not
-/// packed-matrix or whole-model execution paths.
+/// batched GEMM or whole-model execution paths.
 ///
 /// # Errors
 ///
@@ -302,12 +302,7 @@ unsafe fn launch_format(
     unsafe {
         match format {
             quant::RowFormat::F32 => Ok(logismos_launch_f32_row_gemv_f32(
-                matrix,
-                activations,
-                output,
-                rows,
-                width,
-                stream,
+                matrix, activations, output, rows, width, stream,
             )),
             quant::RowFormat::Q8_0 => Ok(logismos_launch_q8_0_row_gemv_f32(
                 matrix,
@@ -404,11 +399,9 @@ fn no_gpu_build_refusal() -> Result<()> {
 
 pub(crate) fn reserve_output(rows: usize) -> Result<Vec<f32>> {
     let mut output = Vec::new();
-    output
-        .try_reserve_exact(rows)
-        .context(RowGemvAllocationSnafu {
-            requested_len: rows,
-        })?;
+    output.try_reserve_exact(rows).context(RowGemvAllocationSnafu {
+        requested_len: rows,
+    })?;
     Ok(output)
 }
 
@@ -468,6 +461,36 @@ mod tests {
         ));
     }
 
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn shape_refuses_values_beyond_the_signed_hip_abi() {
+        let beyond_i32 = i32::MAX as usize + 1;
+        let rows_result = RowGemvShape::new(
+            quant::RowFormat::F32,
+            beyond_i32,
+            1,
+            beyond_i32 * core::mem::size_of::<f32>(),
+            1,
+            beyond_i32,
+        );
+        assert!(matches!(
+            rows_result,
+            Err(Error::UnsupportedShape { kernel: KERNEL, .. })
+        ));
+        let width_result = RowGemvShape::new(
+            quant::RowFormat::F32,
+            1,
+            beyond_i32,
+            beyond_i32 * core::mem::size_of::<f32>(),
+            beyond_i32,
+            1,
+        );
+        assert!(matches!(
+            width_result,
+            Err(Error::UnsupportedShape { kernel: KERNEL, .. })
+        ));
+    }
+
     #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
     #[test]
     fn device_validator_isolates_length_alignment_and_alias_refusals()
@@ -485,91 +508,87 @@ mod tests {
             output.as_mut_ptr(),
             output.len(),
         )?;
-        assert!(
-            super::validate_device_buffers(
-                shape,
-                matrix.as_ptr(),
-                matrix.len() - 1,
-                activations.as_ptr(),
-                activations.len(),
-                output.as_mut_ptr(),
-                output.len(),
-            )
-            .is_err()
-        );
-        assert!(
-            super::validate_device_buffers(
-                shape,
-                matrix.as_ptr(),
-                matrix.len(),
-                activations.as_ptr(),
-                activations.len() - 1,
-                output.as_mut_ptr(),
-                output.len(),
-            )
-            .is_err()
-        );
-        assert!(
-            super::validate_device_buffers(
-                shape,
-                matrix.as_ptr(),
-                matrix.len(),
-                activations.as_ptr(),
-                activations.len(),
-                output.as_mut_ptr(),
-                output.len() - 1,
-            )
-            .is_err()
-        );
-        assert!(
-            super::validate_device_buffers(
-                shape,
-                core::ptr::null(),
-                matrix.len(),
-                activations.as_ptr(),
-                activations.len(),
-                output.as_mut_ptr(),
-                output.len(),
-            )
-            .is_err()
-        );
-        assert!(
-            super::validate_device_buffers(
-                shape,
-                matrix.as_ptr(),
-                matrix.len(),
-                activations.as_ptr(),
-                activations.len(),
-                output.as_mut_ptr().wrapping_byte_add(1),
-                output.len(),
-            )
-            .is_err()
-        );
-        assert!(
-            super::validate_device_buffers(
-                shape,
-                matrix.as_ptr(),
-                matrix.len(),
-                activations.as_ptr(),
-                activations.len(),
-                activations.as_ptr().cast_mut(),
-                output.len(),
-            )
-            .is_err()
-        );
+        let misaligned_matrix = [0.0_f32; 5];
+        super::validate_device_buffers(
+            shape,
+            misaligned_matrix.as_ptr().cast::<u8>().wrapping_byte_add(1),
+            matrix.len(),
+            activations.as_ptr(),
+            activations.len(),
+            output.as_mut_ptr(),
+            output.len(),
+        )?;
+        assert!(super::validate_device_buffers(
+            shape,
+            matrix.as_ptr(),
+            matrix.len() - 1,
+            activations.as_ptr(),
+            activations.len(),
+            output.as_mut_ptr(),
+            output.len(),
+        )
+        .is_err());
+        assert!(super::validate_device_buffers(
+            shape,
+            matrix.as_ptr(),
+            matrix.len(),
+            activations.as_ptr(),
+            activations.len() - 1,
+            output.as_mut_ptr(),
+            output.len(),
+        )
+        .is_err());
+        assert!(super::validate_device_buffers(
+            shape,
+            matrix.as_ptr(),
+            matrix.len(),
+            activations.as_ptr(),
+            activations.len(),
+            output.as_mut_ptr(),
+            output.len() - 1,
+        )
+        .is_err());
+        assert!(super::validate_device_buffers(
+            shape,
+            core::ptr::null(),
+            matrix.len(),
+            activations.as_ptr(),
+            activations.len(),
+            output.as_mut_ptr(),
+            output.len(),
+        )
+        .is_err());
+        assert!(super::validate_device_buffers(
+            shape,
+            matrix.as_ptr(),
+            matrix.len(),
+            activations.as_ptr(),
+            activations.len(),
+            output.as_mut_ptr().wrapping_byte_add(1),
+            output.len(),
+        )
+        .is_err());
+        assert!(super::validate_device_buffers(
+            shape,
+            matrix.as_ptr(),
+            matrix.len(),
+            activations.as_ptr(),
+            activations.len(),
+            activations.as_ptr().cast_mut(),
+            output.len(),
+        )
+        .is_err());
         let mut aligned_matrix = [0.0_f32; 4];
-        assert!(
-            super::validate_device_buffers(
-                shape,
-                aligned_matrix.as_ptr().cast::<u8>(),
-                matrix.len(),
-                activations.as_ptr(),
-                activations.len(),
-                aligned_matrix.as_mut_ptr(),
-                output.len(),
-            )
-            .is_err()
-        );
+        assert!(super::validate_device_buffers(
+            shape,
+            aligned_matrix.as_ptr().cast::<u8>(),
+            matrix.len(),
+            activations.as_ptr(),
+            activations.len(),
+            aligned_matrix.as_mut_ptr(),
+            output.len(),
+        )
+        .is_err());
         assert!(matches!(
             crate::device_span::checked_u8_device_span(
                 KERNEL,
@@ -585,9 +604,6 @@ mod tests {
     #[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
     #[test]
     fn cpu_only_build_refuses_gpu_launch_without_a_device() {
-        assert!(matches!(
-            super::no_gpu_build_refusal(),
-            Err(Error::NoGpuBuild { .. })
-        ));
+        assert!(matches!(super::no_gpu_build_refusal(), Err(Error::NoGpuBuild { .. })));
     }
 }
