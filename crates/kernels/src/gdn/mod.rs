@@ -1615,11 +1615,16 @@ mod tests {
                 Err(crate::Error::UnsupportedShape { .. })
             ));
         }
+        grouped_buffers.q.clear();
+        assert!(matches!(
+            grouped_buffers.validate(grouped_plan, 1.0),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
         assert!(matches!(
             validate_gdn_step_launch(
                 plan,
                 q.as_ptr(),
-                0,
+                q.len(),
                 k.as_ptr(),
                 k.len(),
                 v.as_ptr(),
