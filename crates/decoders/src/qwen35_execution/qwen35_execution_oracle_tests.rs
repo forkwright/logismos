@@ -4,8 +4,8 @@ use super::*;
 use crate::Qwen35Weights;
 use crate::qwen35::tests::{
     CanonicalHybridOracle, OracleStateSnapshot, canonical_hybrid_fixture,
-    canonical_hybrid_fixture_with_context,
-    mixed_quantized_hybrid_fixture, set_f32_value, verify_fixture,
+    canonical_hybrid_fixture_with_context, mixed_quantized_hybrid_fixture, set_f32_value,
+    verify_fixture,
 };
 
 const STATE_ABSOLUTE_TOLERANCE: f64 = 1.0e-3;
@@ -89,11 +89,27 @@ fn paged_kv_crosses_the_selected_boundary_and_rolls_back_a_committed_tail()
     assert_private_state_matches_oracle(&unchunked, &expected_state)?;
 
     let mut chunked = weights.execution(16).map_err(|error| error.to_string())?;
-    let mut chunked_logits = chunked.step(&tokens[..7]).map_err(|error| error.to_string())?;
-    chunked_logits.extend(chunked.step(&tokens[7..8]).map_err(|error| error.to_string())?);
-    chunked_logits.extend(chunked.step(&tokens[8..]).map_err(|error| error.to_string())?);
-    assert_eq!(chunked_logits, actual, "unequal chunks must preserve token-serial logits");
-    assert_eq!(private_state_snapshot(&chunked)?, private_state_snapshot(&unchunked)?);
+    let mut chunked_logits = chunked
+        .step(&tokens[..7])
+        .map_err(|error| error.to_string())?;
+    chunked_logits.extend(
+        chunked
+            .step(&tokens[7..8])
+            .map_err(|error| error.to_string())?,
+    );
+    chunked_logits.extend(
+        chunked
+            .step(&tokens[8..])
+            .map_err(|error| error.to_string())?,
+    );
+    assert_eq!(
+        chunked_logits, actual,
+        "unequal chunks must preserve token-serial logits"
+    );
+    assert_eq!(
+        private_state_snapshot(&chunked)?,
+        private_state_snapshot(&unchunked)?
+    );
 
     let prefix = &tokens[..7];
     let suffix = &tokens[7..15];
@@ -111,8 +127,14 @@ fn paged_kv_crosses_the_selected_boundary_and_rolls_back_a_committed_tail()
     let mut control = weights.execution(16).map_err(|error| error.to_string())?;
     control.step(prefix).map_err(|error| error.to_string())?;
     let expected_retry = control.step(suffix).map_err(|error| error.to_string())?;
-    assert_eq!(retry, expected_retry, "a dropped append must preserve retry equivalence");
-    assert_eq!(private_state_snapshot(&rollback)?, private_state_snapshot(&control)?);
+    assert_eq!(
+        retry, expected_retry,
+        "a dropped append must preserve retry equivalence"
+    );
+    assert_eq!(
+        private_state_snapshot(&rollback)?,
+        private_state_snapshot(&control)?
+    );
     Ok(())
 }
 
@@ -158,10 +180,9 @@ fn private_state_snapshot(
         })
         .map(|(convolution, gdn)| (convolution.to_vec(), gdn.to_vec()))
         .collect();
-    let pool = execution
-        .paged_kv_pool
-        .as_ref()
-        .ok_or_else(|| "full-attention execution is missing private paged KV backing".to_string())?;
+    let pool = execution.paged_kv_pool.as_ref().ok_or_else(|| {
+        "full-attention execution is missing private paged KV backing".to_string()
+    })?;
     let full = execution
         .layers
         .iter()
@@ -202,10 +223,9 @@ fn assert_private_state_matches_oracle(
         assert_f32_slice_matches_f64(actual_convolution, &expected.0, "convolution", index)?;
         assert_f32_slice_matches_f64(actual_gdn, &expected.1, "GDN", index)?;
     }
-    let pool = execution
-        .paged_kv_pool
-        .as_ref()
-        .ok_or_else(|| "full-attention execution is missing private paged KV backing".to_string())?;
+    let pool = execution.paged_kv_pool.as_ref().ok_or_else(|| {
+        "full-attention execution is missing private paged KV backing".to_string()
+    })?;
     let actual_full = execution
         .layers
         .iter()

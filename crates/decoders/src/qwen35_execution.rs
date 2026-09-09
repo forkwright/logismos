@@ -1,7 +1,7 @@
 //! Bounded CPU token-to-logits execution for a verified Qwen3.5 payload.
 
-use cache::{PagedKvGeometry, PagedKvPlan, PagedKvPool};
 use cache::paged::{PagedAppend, PagedLayerKv};
+use cache::{PagedKvGeometry, PagedKvPlan, PagedKvPool};
 use loader::gguf::{GgmlType, MetaValue, MetaValueType};
 use num_traits::ToPrimitive;
 use quant::f32_row::F32Row;
@@ -10,10 +10,9 @@ use snafu::ResultExt;
 use crate::error::{
     ArithmeticOverflowSnafu, ExecutionAllocationPlanSnafu, ExecutionAllocationSnafu,
     ExecutionArithmeticSnafu, ExecutionContextSnafu, ExecutionCpuSnafu, ExecutionPagedKvSnafu,
-    ExecutionTokenSnafu,
-    MetadataRelationSnafu, MetadataTypeSnafu, MissingMetadataSnafu, PayloadTensorSnafu,
-    ProjectionBytesSnafu, ProjectionDtypeSnafu, ProjectionRowSnafu, RecurrentRmsNormSnafu,
-    TensorShapeSnafu,
+    ExecutionTokenSnafu, MetadataRelationSnafu, MetadataTypeSnafu, MissingMetadataSnafu,
+    PayloadTensorSnafu, ProjectionBytesSnafu, ProjectionDtypeSnafu, ProjectionRowSnafu,
+    RecurrentRmsNormSnafu, TensorShapeSnafu,
 };
 use crate::qwen35::recurrent_layernorm_rms_epsilon;
 use crate::qwen35_requirements::Qwen35CpuRequirements;
@@ -229,7 +228,10 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
         let mut append = self
             .paged_kv_pool
             .as_mut()
-            .map(|pool| pool.begin_append(token_ids.len()).context(ExecutionPagedKvSnafu))
+            .map(|pool| {
+                pool.begin_append(token_ids.len())
+                    .context(ExecutionPagedKvSnafu)
+            })
             .transpose()?;
         let logits = staged.step_staged(token_ids, append.as_deref_mut())?;
         if let Some(append) = append {
@@ -475,12 +477,15 @@ fn full_attention(
     full_layer: usize,
     append_token: usize,
 ) -> Result<Vec<f32>> {
-    let attention_tokens = position.checked_add(append_token).and_then(|token| token.checked_add(1)).ok_or_else(|| {
-        ArithmeticOverflowSnafu {
-            context: "full-attention token count",
-        }
-        .build()
-    })?;
+    let attention_tokens = position
+        .checked_add(append_token)
+        .and_then(|token| token.checked_add(1))
+        .ok_or_else(|| {
+            ArithmeticOverflowSnafu {
+                context: "full-attention token count",
+            }
+            .build()
+        })?;
     let allocations = FullAttentionWorkspaceAllocations::try_from_layout(layout, attention_tokens)?;
     let norm = read_f32(
         weights,
@@ -588,9 +593,7 @@ fn full_attention(
     append
         .write_layer_row(full_layer, append_token, &key, &value)
         .context(ExecutionPagedKvSnafu)?;
-    let kv = append
-        .layer_kv(full_layer)
-        .context(ExecutionPagedKvSnafu)?;
+    let kv = append.layer_kv(full_layer).context(ExecutionPagedKvSnafu)?;
     if kv.tokens() != attention_tokens {
         return ExecutionContextSnafu {
             requested: kv.tokens(),
@@ -950,76 +953,76 @@ fn attend(
     layout: &Layout,
     allocations: FullAttentionWorkspaceAllocations,
 ) -> Result<Vec<f32>> {
-        ensure_execution_plan(
-            "attention scores",
-            kv.tokens(),
-            allocations.attention_scores,
-        )?;
-        let mut scores = reserve("attention scores", allocations.attention_scores)?;
-        let scale = layout
-            .key
-            .to_f32()
+    ensure_execution_plan(
+        "attention scores",
+        kv.tokens(),
+        allocations.attention_scores,
+    )?;
+    let mut scores = reserve("attention scores", allocations.attention_scores)?;
+    let scale = layout
+        .key
+        .to_f32()
+        .ok_or_else(|| {
+            ArithmeticOverflowSnafu {
+                context: "attention key width",
+            }
+            .build()
+        })?
+        .sqrt()
+        .recip();
+    for token in 0..kv.tokens() {
+        let head_start = kv_head.checked_mul(layout.key).ok_or_else(|| {
+            ArithmeticOverflowSnafu {
+                context: "KV key head offset",
+            }
+            .build()
+        })?;
+        let row = kv.key_row(token).context(ExecutionPagedKvSnafu)?;
+        let key = row
+            .get(head_start..head_start + layout.key)
             .ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "attention key width",
-                }
-                .build()
-            })?
-            .sqrt()
-            .recip();
-        for token in 0..kv.tokens() {
-            let head_start = kv_head
-                .checked_mul(layout.key)
-                .ok_or_else(|| {
-                    ArithmeticOverflowSnafu {
-                        context: "KV key head offset",
-                    }
-                    .build()
-                })?;
-            let row = kv.key_row(token).context(ExecutionPagedKvSnafu)?;
-            let key = row.get(head_start..head_start + layout.key).ok_or_else(|| {
                 ExecutionContextSnafu {
                     requested: head_start,
                     rule: "KV key range must fit retained state",
                 }
                 .build()
             })?;
-            let score = query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>() * scale;
-            finite_one(score, "attention score", token)?;
-            scores.push(score);
-        }
-        let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let normalizer = scores
-            .iter()
-            .map(|score| (*score - maximum).exp())
-            .sum::<f32>();
-        finite_one(normalizer, "attention softmax normalizer", 0)?;
-        let mut output = reserve("attention head output", allocations.attention_head_output)?;
-        output.resize(allocations.attention_head_output, 0.0);
-        for (token, score) in scores.iter().enumerate() {
-            let probability = (*score - maximum).exp() / normalizer;
-            let head_start = kv_head
-                .checked_mul(layout.key)
-                .ok_or_else(|| {
-                    ArithmeticOverflowSnafu {
-                        context: "KV value head offset",
-                    }
-                    .build()
-                })?;
-            let row = kv.value_row(token).context(ExecutionPagedKvSnafu)?;
-            let value = row.get(head_start..head_start + layout.key).ok_or_else(|| {
+        let score = query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>() * scale;
+        finite_one(score, "attention score", token)?;
+        scores.push(score);
+    }
+    let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let normalizer = scores
+        .iter()
+        .map(|score| (*score - maximum).exp())
+        .sum::<f32>();
+    finite_one(normalizer, "attention softmax normalizer", 0)?;
+    let mut output = reserve("attention head output", allocations.attention_head_output)?;
+    output.resize(allocations.attention_head_output, 0.0);
+    for (token, score) in scores.iter().enumerate() {
+        let probability = (*score - maximum).exp() / normalizer;
+        let head_start = kv_head.checked_mul(layout.key).ok_or_else(|| {
+            ArithmeticOverflowSnafu {
+                context: "KV value head offset",
+            }
+            .build()
+        })?;
+        let row = kv.value_row(token).context(ExecutionPagedKvSnafu)?;
+        let value = row
+            .get(head_start..head_start + layout.key)
+            .ok_or_else(|| {
                 ExecutionContextSnafu {
                     requested: head_start,
                     rule: "KV value range must fit retained state",
                 }
                 .build()
             })?;
-            for (index, (destination, source)) in output.iter_mut().zip(value).enumerate() {
-                *destination += probability * source;
-                finite_one(*destination, "attention value", index)?;
-            }
+        for (index, (destination, source)) in output.iter_mut().zip(value).enumerate() {
+            *destination += probability * source;
+            finite_one(*destination, "attention value", index)?;
         }
-        Ok(output)
+    }
+    Ok(output)
 }
 
 #[derive(Debug, Clone, Copy)]

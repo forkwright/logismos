@@ -347,8 +347,12 @@ fn assert_same_execution_state(
                     .paged_kv_pool
                     .as_ref()
                     .ok_or_else(|| "right execution is missing paged KV backing".to_string())?;
-                let left_kv = left_pool.layer_kv(*left_layer).map_err(|error| error.to_string())?;
-                let right_kv = right_pool.layer_kv(*right_layer).map_err(|error| error.to_string())?;
+                let left_kv = left_pool
+                    .layer_kv(*left_layer)
+                    .map_err(|error| error.to_string())?;
+                let right_kv = right_pool
+                    .layer_kv(*right_layer)
+                    .map_err(|error| error.to_string())?;
                 assert_eq!(left_kv.tokens(), right_kv.tokens());
                 for token in 0..left_kv.tokens() {
                     assert_eq!(
@@ -356,8 +360,12 @@ fn assert_same_execution_state(
                         right_kv.key_row(token).map_err(|error| error.to_string())?
                     );
                     assert_eq!(
-                        left_kv.value_row(token).map_err(|error| error.to_string())?,
-                        right_kv.value_row(token).map_err(|error| error.to_string())?
+                        left_kv
+                            .value_row(token)
+                            .map_err(|error| error.to_string())?,
+                        right_kv
+                            .value_row(token)
+                            .map_err(|error| error.to_string())?
                     );
                 }
             }

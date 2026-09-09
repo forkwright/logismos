@@ -1,7 +1,7 @@
 //! Executor-owned logical CPU allocation requirements for Qwen3.5.
 
-use loader::gguf::ArtifactDigest;
 use cache::PagedKvPlan;
+use loader::gguf::ArtifactDigest;
 
 use crate::error::ArithmeticOverflowSnafu;
 use crate::qwen35::Qwen35RecurrentLayout;
