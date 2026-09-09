@@ -233,7 +233,7 @@ impl<'weights, 'artifact> Qwen35Execution<'weights, 'artifact> {
                     .context(ExecutionPagedKvSnafu)
             })
             .transpose()?;
-        let logits = staged.step_staged(token_ids, append.as_deref_mut())?;
+        let logits = staged.step_staged(token_ids, append.as_mut())?;
         if let Some(append) = append {
             append.commit().context(ExecutionPagedKvSnafu)?;
         }
