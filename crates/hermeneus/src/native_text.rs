@@ -1,6 +1,7 @@
 //! Shared native text execution with explicit per-use custody.
 
 use std::fmt;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use decoders::{
@@ -28,7 +29,7 @@ pub struct NativeTextResident {
 
 struct NativeTextResidentInner {
     pipeline: TextPipeline,
-    model: Qwen35NativeExecutionModel,
+    model: ManuallyDrop<Qwen35NativeExecutionModel>,
 }
 
 /// Failure while creating a shared native text resident.
@@ -143,15 +144,13 @@ impl NativeTextResident {
         page_tokens: NativePageTokens,
     ) -> Result<Self, NativeTextResidentBuildFailure> {
         let profile = pipeline.execution_profile();
-        let artifact_ceiling = profile
-            .weights()
-            .execution_context_ceiling()
-            .map_err(|source| NativeTextResidentBuildFailure::Plan {
+        let context_ceiling = effective_context_ceiling(profile).map_err(|source| {
+            NativeTextResidentBuildFailure::Plan {
                 source,
                 pipeline: pipeline.clone(),
                 location: snafu::location!(),
-            })?;
-        let context_ceiling = profile.context_ceiling().min(artifact_ceiling);
+            }
+        })?;
         let plan = Qwen35NativeExecutionPlan::try_from_weights(
             profile.weights(),
             context_ceiling,
@@ -171,7 +170,10 @@ impl NativeTextResident {
             }
         })?;
         Ok(Self {
-            inner: Arc::new(NativeTextResidentInner { pipeline, model }),
+            inner: Arc::new(NativeTextResidentInner {
+                pipeline,
+                model: ManuallyDrop::new(model),
+            }),
         })
     }
 
@@ -188,11 +190,7 @@ impl NativeTextResident {
         &self,
         prepared: PreparedGeneration,
     ) -> Result<NativeTextUsePlan, NativeTextUsePlanFailure> {
-        if !self.inner.pipeline.owns_preparation(&prepared) {
-            return Err(NativeTextUsePlanFailure::ForeignPreparation {
-                location: snafu::location!(),
-            });
-        }
+        let prepared = bind_preparation(&self.inner.pipeline, prepared)?;
         let session = self
             .inner
             .model
@@ -213,21 +211,46 @@ impl NativeTextResident {
     pub fn close(self) -> NativeTextResidentClose {
         match Arc::try_unwrap(self.inner) {
             Err(inner) => NativeTextResidentClose::InUse(Self { inner }),
-            Ok(NativeTextResidentInner { pipeline, model }) => match model.close() {
-                Qwen35NativeExecutionModelClose::InUse(model) => {
-                    NativeTextResidentClose::InUse(Self {
-                        inner: Arc::new(NativeTextResidentInner { pipeline, model }),
-                    })
+            Ok(NativeTextResidentInner { pipeline, model }) => {
+                match ManuallyDrop::into_inner(model).close() {
+                    Qwen35NativeExecutionModelClose::InUse(model) => {
+                        NativeTextResidentClose::InUse(Self {
+                            inner: Arc::new(NativeTextResidentInner {
+                                pipeline,
+                                model: ManuallyDrop::new(model),
+                            }),
+                        })
+                    }
+                    Qwen35NativeExecutionModelClose::Teardown(inner) => {
+                        NativeTextResidentClose::Teardown(NativeTextResidentTeardown {
+                            pipeline,
+                            inner,
+                        })
+                    }
                 }
-                Qwen35NativeExecutionModelClose::Teardown(inner) => {
-                    NativeTextResidentClose::Teardown(NativeTextResidentTeardown {
-                        pipeline,
-                        inner,
-                    })
-                }
-            },
+            }
         }
     }
+}
+
+fn bind_preparation(
+    pipeline: &TextPipeline,
+    prepared: PreparedGeneration,
+) -> Result<PreparedGeneration, NativeTextUsePlanFailure> {
+    if pipeline.owns_preparation(&prepared) {
+        return Ok(prepared);
+    }
+    Err(NativeTextUsePlanFailure::ForeignPreparation {
+        location: snafu::location!(),
+    })
+}
+
+fn effective_context_ceiling(
+    profile: text::ExecutionProfile<'_>,
+) -> Result<usize, decoders::Error> {
+    Ok(profile
+        .context_ceiling()
+        .min(profile.weights().execution_context_ceiling()?))
 }
 
 /// Failure while binding one consumed text preparation to a native use plan.
@@ -496,10 +519,52 @@ impl NativeTextUseClose {
     }
 }
 
+trait CloseAcknowledgement {
+    fn is_released(&self) -> bool;
+}
+
+impl CloseAcknowledgement for NativeTextUseClose {
+    fn is_released(&self) -> bool {
+        self.is_released()
+    }
+}
+
+enum PublishAfterClose<Output, ExecutionError, Close> {
+    Published(Output),
+    Execution {
+        source: ExecutionError,
+        close: Close,
+    },
+    Close {
+        close: Close,
+    },
+}
+
+fn retain_before_publish<Output, ExecutionError, Close>(
+    execution: Result<Output, ExecutionError>,
+    close: Close,
+) -> PublishAfterClose<Output, ExecutionError, Close>
+where
+    Close: CloseAcknowledgement,
+{
+    match execution {
+        Ok(output) if close.is_released() => PublishAfterClose::Published(output),
+        Ok(_) => PublishAfterClose::Close { close },
+        Err(source) => PublishAfterClose::Execution { source, close },
+    }
+}
+
 /// Failure after a native text use consumed its exact preparation.
 #[must_use = "generation failure retains every unresolved native owner"]
 #[non_exhaustive]
 pub enum NativeTextGenerationFailure {
+    /// Cancellation was observed before native session construction.
+    Cancelled {
+        /// Unallocated native use plan retained with its exact preparation.
+        plan: Box<NativeTextUsePlan>,
+        /// Caller-acquired row retained with the cancelled plan.
+        storage: RecycledLogitsStorage,
+    },
     /// The caller's row did not match this preparation before session allocation.
     Storage {
         /// Original typed text storage validation failure.
@@ -566,7 +631,7 @@ impl NativeTextGenerationFailure {
     pub fn session_teardown_state(&self) -> Option<Qwen35NativeExecutionSessionTeardownState> {
         match self {
             Self::Execution { close, .. } | Self::Close { close } => close.state(),
-            Self::Storage { .. } | Self::Construction { .. } => None,
+            Self::Cancelled { .. } | Self::Storage { .. } | Self::Construction { .. } => None,
         }
     }
 }
@@ -574,6 +639,9 @@ impl NativeTextGenerationFailure {
 impl fmt::Debug for NativeTextGenerationFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled { .. } => formatter
+                .debug_struct("NativeTextGenerationFailure::Cancelled")
+                .finish_non_exhaustive(),
             Self::Storage { source, .. } => formatter
                 .debug_struct("NativeTextGenerationFailure::Storage")
                 .field("source", source)
@@ -596,6 +664,8 @@ impl fmt::Debug for NativeTextGenerationFailure {
 impl fmt::Display for NativeTextGenerationFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled { .. } => formatter
+                .write_str("native text generation was cancelled before session construction"),
             Self::Storage { source, .. } => {
                 write!(formatter, "native text row validation failed: {source}")
             }
@@ -619,6 +689,7 @@ impl fmt::Display for NativeTextGenerationFailure {
 impl std::error::Error for NativeTextGenerationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Cancelled { .. } => None,
             Self::Storage { source, .. } => Some(source),
             Self::Construction { source, .. } => Some(source.as_ref()),
             Self::Execution { source, .. } => Some(source),
@@ -725,10 +796,12 @@ fn finish_generation(
     generation: Result<Generation, RecycledGenerationError<NativeTextDriverError>>,
     close: NativeTextUseClose,
 ) -> Result<Generation, NativeTextGenerationFailure> {
-    match generation {
-        Ok(generation) if close.is_released() => Ok(generation),
-        Ok(_) => Err(NativeTextGenerationFailure::Close { close }),
-        Err(source) => Err(NativeTextGenerationFailure::Execution { source, close }),
+    match retain_before_publish(generation, close) {
+        PublishAfterClose::Published(generation) => Ok(generation),
+        PublishAfterClose::Execution { source, close } => {
+            Err(NativeTextGenerationFailure::Execution { source, close })
+        }
+        PublishAfterClose::Close { close } => Err(NativeTextGenerationFailure::Close { close }),
     }
 }
 
@@ -760,14 +833,85 @@ fn release_error(release: &BufferRelease) -> Option<&(dyn std::error::Error + 's
         BufferRelease::Released(_) => None,
         BufferRelease::Pending(pending) => Some(pending.error()),
         BufferRelease::Quarantined(quarantine) => Some(quarantine.error()),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::num::{NonZeroU64, NonZeroUsize};
+
+    use loader::gguf::{ArtifactByteLimit, Sha256Digest, VerifiedArtifact};
+    use sha2::{Digest, Sha256};
+    use test_fixtures::{Qwen35FixtureConfig, build_qwen35_fixture};
+    use text::{
+        GenerationRequest, NeverCancelled, PipelineLimits, TextMessage, TextRole,
+        TokenizerCompanion,
+    };
+    use tokenize::{TokenizerByteLimit, TokenizerDigest, TokenizerIdentity};
 
     use super::*;
+
+    const TOKENIZER_JSON: &str = r#"{
+      "version":"1.0","truncation":null,"padding":null,
+      "added_tokens":[
+        {"id":1,"content":"<bos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+        {"id":2,"content":"<eos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}
+      ],
+      "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},
+      "post_processor":null,"decoder":null,
+      "model":{"type":"WordLevel","vocab":{"[UNK]":0,"<bos>":1,"<eos>":2,"hello":3,"assistant":4},"unk_token":"[UNK]"}
+    }"#;
+
+    fn synthetic_pipeline(
+        context_tokens: usize,
+    ) -> Result<(tempfile::TempDir, TextPipeline), Box<dyn std::error::Error>> {
+        let fixture = build_qwen35_fixture(&Qwen35FixtureConfig::default())?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("synthetic.gguf");
+        std::fs::write(&path, fixture.bytes)?;
+        let artifact =
+            VerifiedArtifact::load(
+                &path,
+                Sha256Digest::from_bytes(fixture.sha256),
+                ArtifactByteLimit::new(NonZeroU64::new(fixture.byte_len).ok_or_else(|| {
+                    std::io::Error::other("synthetic fixture has zero byte length")
+                })?),
+            )?;
+        let tokenizer_bytes = TOKENIZER_JSON.as_bytes();
+        let tokenizer_limit = TokenizerByteLimit::new(
+            NonZeroUsize::new(tokenizer_bytes.len())
+                .ok_or_else(|| std::io::Error::other("synthetic tokenizer is empty"))?,
+        );
+        let digest = TokenizerDigest::from_bytes(Sha256::digest(tokenizer_bytes).into());
+        let pipeline = TextPipeline::new(
+            &artifact,
+            TokenizerCompanion::new(
+                tokenizer_bytes,
+                TokenizerIdentity::new(tokenizer_bytes.len(), digest),
+            ),
+            PipelineLimits {
+                tokenizer_bytes: tokenizer_limit,
+                template_bytes: 4_096,
+                messages: 4,
+                message_bytes: 128,
+                prompt_bytes: 256,
+                rendered_bytes: 256,
+                context_tokens,
+                output_tokens: 6,
+                output_bytes: 128,
+                template_fuel: 10_000,
+                template_recursion: 16,
+            },
+        )?;
+        Ok((directory, pipeline))
+    }
+
+    fn prepared(pipeline: &TextPipeline) -> Result<PreparedGeneration, text::Error> {
+        let messages = [TextMessage::new(TextRole::User, "hello")];
+        pipeline.prepare(GenerationRequest::new(&messages, 1, false), &NeverCancelled)
+    }
 
     #[derive(Default)]
     struct SyntheticDriver {

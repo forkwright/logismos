@@ -25,5 +25,12 @@ kernels = { workspace = true, optional = true }
 snafu = { workspace = true, optional = true }
 text = { workspace = true, optional = true }
 
+[dev-dependencies]
+loader = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+test-fixtures = { path = "../test-fixtures" }
+tokenize = { workspace = true }
+
 [lints]
 workspace = true

@@ -511,8 +511,13 @@ dependencies = [
  "decoders",
  "hipcore",
  "kernels",
+ "loader",
+ "sha2",
  "snafu",
+ "tempfile",
+ "test-fixtures",
  "text",
+ "tokenize",
 ]
 
 [[package]]
