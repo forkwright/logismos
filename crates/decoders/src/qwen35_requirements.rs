@@ -83,14 +83,19 @@ impl Qwen35CpuRequirements {
 
     /// Return retained executor `f32` backing, excluding artifact bytes.
     ///
-    /// This includes decoded recurrent parameters as well as mutable recurrent
-    /// history/state and full-attention KV state.
+    /// This includes decoded recurrent parameters, mutable recurrent history
+    /// and state, and the selected KV pool's padded maximum-context backing
+    /// plus its preallocated tail-copy spare.
     #[must_use]
     pub const fn retained_bytes(self) -> u64 {
         self.retained_bytes
     }
 
-    /// Return the staged transaction's cloned retained `f32` backing.
+    /// Return separately allocated recurrent transaction-copy `f32` backing.
+    ///
+    /// Paged KV copy-on-write uses the already-retained spare, so it adds no
+    /// allocation here. A mixed recurrent/full-attention plan therefore has
+    /// less transaction-copy backing than retained backing.
     #[must_use]
     pub const fn transaction_copy_bytes(self) -> u64 {
         self.transaction_copy_bytes
@@ -113,8 +118,9 @@ impl Qwen35CpuRequirements {
 
     /// Return the complete executor-owned logical `f32` upper bound.
     ///
-    /// This is retained state plus its staged copy, transient workspace, and
-    /// returned logits. Serialized artifact backing is deliberately separate.
+    /// This is retained backing plus separately allocated recurrent copies,
+    /// transient workspace, and returned logits. The KV pool is counted once;
+    /// serialized artifact backing is deliberately separate.
     #[must_use]
     pub const fn logical_f32_upper_bound_bytes(self) -> u64 {
         self.logical_f32_upper_bound_bytes
