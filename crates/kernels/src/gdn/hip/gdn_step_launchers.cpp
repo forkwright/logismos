@@ -7,7 +7,11 @@
 extern "C" __global__ void logismos_gdn_grouped_step_f32_kernel(
     const float*, const float*, const float*, const float*, const float*,
     const float*, float*, float*, float, std::uint32_t, std::uint32_t,
-    std::uint32_t, std::uint32_t);
+    std::uint32_t, std::uint32_t, std::uint32_t*);
+
+extern "C" hipError_t logismos_launch_gdn_grouped_step_f32_checked(
+    const void*, const void*, const void*, const void*, const void*, const void*, void*, void*,
+    float, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, void*, hipStream_t);
 
 extern "C" hipError_t logismos_launch_gdn_grouped_step_f32(
     const void* q_f32,
@@ -23,6 +27,18 @@ extern "C" hipError_t logismos_launch_gdn_grouped_step_f32(
     std::uint32_t value_head_count,
     std::uint32_t key_dim,
     std::uint32_t value_dim,
+    hipStream_t stream)
+{
+    return logismos_launch_gdn_grouped_step_f32_checked(q_f32, k_f32, v_f32, beta_f32, g_f32,
+        state_in_f32, state_out_f32, output_f32, scale, key_head_count, value_head_count,
+        key_dim, value_dim, nullptr, stream);
+}
+
+extern "C" hipError_t logismos_launch_gdn_grouped_step_f32_checked(
+    const void* q_f32, const void* k_f32, const void* v_f32, const void* beta_f32,
+    const void* g_f32, const void* state_in_f32, void* state_out_f32, void* output_f32,
+    float scale, std::uint32_t key_head_count, std::uint32_t value_head_count,
+    std::uint32_t key_dim, std::uint32_t value_dim, void* numerical_status,
     hipStream_t stream)
 {
     const dim3 block(value_dim, 1, 1);
@@ -42,6 +58,7 @@ extern "C" hipError_t logismos_launch_gdn_grouped_step_f32(
         key_head_count,
         value_head_count,
         key_dim,
-        value_dim);
+        value_dim,
+        reinterpret_cast<std::uint32_t*>(numerical_status));
     return hipGetLastError();
 }
