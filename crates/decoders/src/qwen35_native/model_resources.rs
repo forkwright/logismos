@@ -115,20 +115,20 @@ pub(super) struct NativeResidentTeardownParts {
 #[must_use = "resident teardown retains live native ownership"]
 pub(super) enum NativeResidentTeardown {
     /// Creating a fresh owned teardown stream failed before HIP admission.
-    Unadmitted(NativeResidentTeardownParts),
+    Unadmitted(_NativeResidentTeardownParts),
     /// Stream creation failed without establishing that no handle was returned.
     ///
     /// The complete creation error never enters ordinary teardown or the
     /// normal inventory. Retain unknown future error variants as conservatively
     /// as today's non-null-on-error quarantine, with the disarmed buffers.
     CreationQuarantined {
-        parts: NativeResidentTeardownParts,
-        error: StreamCreationError,
+        _parts: NativeResidentTeardownParts,
+        _error: StreamCreationError,
     },
     /// Checked accounting admitted a prefix and retained the remaining buffers.
     PartiallyAdmitted {
-        inventory: TeardownInventory,
-        buffers: Vec<TeardownBuffer>,
+        _inventory: TeardownInventory,
+        _buffers: Vec<TeardownBuffer>,
     },
     /// HIP's actual aggregate outcome for every admitted resident owner.
     Releasing(InventoryRelease),
@@ -143,16 +143,16 @@ pub(super) enum NativeResidentTeardown {
 #[must_use = "native session teardown retains live native ownership"]
 pub(super) enum ModelSessionTeardown {
     /// The supplied stream was not an owned HIP stream; no buffer was admitted.
-    Unadmitted(ModelSessionTeardownParts),
+    Unadmitted(_ModelSessionTeardownParts),
     /// Some buffers were admitted and a checked accounting refusal retained the rest.
     ///
     /// This is deliberately opaque to the caller: both the admitted inventory
     /// and every rejected or unvisited inert owner remain retained, with no
     /// ordinary destructor reachable.
     PartiallyAdmitted {
-        inventory: TeardownInventory,
-        buffers: Vec<TeardownBuffer>,
-        resident: ResidentRetention<NativeResidentModelResources>,
+        _inventory: TeardownInventory,
+        _buffers: Vec<TeardownBuffer>,
+        _resident: ResidentRetention<NativeResidentModelResources>,
     },
     /// The HIP inventory owns the stream and all session buffers; its exact
     /// release outcome is retained with the resident owner.
@@ -315,9 +315,9 @@ impl ModelSessionTeardownParts {
                 // cannot allocate or drop it through an ordinary destructor.
                 buffers.push(error.into_buffer());
                 return ModelSessionTeardown::PartiallyAdmitted {
-                    inventory,
-                    buffers,
-                    resident,
+                    _inventory: inventory,
+                    _buffers: buffers,
+                    _resident: resident,
                 };
             }
         }
@@ -342,8 +342,8 @@ impl NativeResidentTeardownParts {
             }
             Err(error) => {
                 return NativeResidentTeardown::CreationQuarantined {
-                    parts: Self { device, buffers },
-                    error,
+                    _parts: Self { device, buffers },
+                    _error: error,
                 };
             }
         };
@@ -357,7 +357,10 @@ impl NativeResidentTeardownParts {
         while let Some(buffer) = buffers.pop() {
             if let Err(error) = inventory.push_teardown_buffer(buffer) {
                 buffers.push(error.into_buffer());
-                return NativeResidentTeardown::PartiallyAdmitted { inventory, buffers };
+                return NativeResidentTeardown::PartiallyAdmitted {
+                    _inventory: inventory,
+                    _buffers: buffers,
+                };
             }
         }
         NativeResidentTeardown::Releasing(inventory.begin_release())
@@ -392,15 +395,6 @@ impl NativeResidentModelResources {
 
     pub(super) const fn context_ceiling(&self) -> usize {
         self.plan.layout.max_context()
-    }
-
-    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
-        self.embedding.into_buffer_sink(sink);
-        self.output.into_buffer_sink(sink);
-        sink.push_f32(self.output_norm);
-        for layer in self.layers {
-            layer.into_buffer_sink(sink);
-        }
     }
 
     /// Disarm the final unique resident owner before it creates teardown work.

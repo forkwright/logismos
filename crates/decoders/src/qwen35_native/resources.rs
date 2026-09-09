@@ -136,33 +136,6 @@ impl DeviceResources {
         });
         Ok(())
     }
-
-    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) -> Stream {
-        let Self {
-            plan,
-            weights,
-            kv,
-            stream,
-            numerical_status,
-            workspace,
-            finish_workspace,
-            step,
-            position: _,
-        } = self;
-        drop(plan);
-        weights.into_buffer_sink(sink);
-        let (keys, values, table) = kv.into_buffers().into_parts();
-        sink.push_f32(keys);
-        sink.push_f32(values);
-        sink.push_u32(table);
-        sink.push_u32(numerical_status.into_buffer());
-        workspace.into_buffer_sink(sink);
-        finish_workspace.into_buffer_sink(sink);
-        if let Some(step) = step {
-            step.into_buffer_sink(sink);
-        }
-        stream
-    }
 }
 
 impl StepBuffers {
@@ -174,13 +147,6 @@ impl StepBuffers {
             sine: &self.sine,
             attention: self.attention,
         }
-    }
-
-    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
-        sink.push_f32(self.input);
-        sink.push_f32(self.output);
-        sink.push_f32(self.cosine);
-        sink.push_f32(self.sine);
     }
 }
 
