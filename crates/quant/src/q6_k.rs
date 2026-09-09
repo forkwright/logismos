@@ -90,9 +90,10 @@ impl Q6KBlock {
                     let upper = (packed_high >> (quarter * 2)) & 0x03;
                     let quantized = i16::from((upper << 4) | lower) - 32;
                     let scale_index = scale_base + quarter * 2 + lane / 16;
-                    decoded[half_block * 128 + quarter * Q6_K_VALUES_PER_QUARTER + lane] = super_scale
-                        * f32::from(i8::from_le_bytes([scales[scale_index]]))
-                        * f32::from(quantized);
+                    decoded[half_block * 128 + quarter * Q6_K_VALUES_PER_QUARTER + lane] =
+                        super_scale
+                            * f32::from(i8::from_le_bytes([scales[scale_index]]))
+                            * f32::from(quantized);
                 }
             }
         }

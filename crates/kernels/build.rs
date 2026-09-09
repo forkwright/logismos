@@ -188,7 +188,9 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         || q6_scales_per_half * q6_half_block_count != q6_scales
         || q6_values_per_scale * q6_scales != q6_values
     {
-        return Err("quant constants violate serialized-row fixed-width field representation".to_string());
+        return Err(
+            "quant constants violate serialized-row fixed-width field representation".to_string(),
+        );
     }
     let q4_derived = checked_sum(&[q4_prefix, q4_scales, q4_quant], "Q4_K")?;
     let q5_derived = checked_sum(&[q5_prefix, q5_scales, q5_high, q5_quant], "Q5_K")?;

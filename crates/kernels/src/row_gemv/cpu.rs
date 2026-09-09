@@ -140,9 +140,13 @@ mod tests {
             fixture.rows,
         )?;
         let actual = row_gemv_f32(&fixture.matrix, &fixture.activations, shape)?;
-        let packed_order = (fixture.activations[0] + fixture.activations[32]) + fixture.activations[1];
+        let packed_order =
+            (fixture.activations[0] + fixture.activations[32]) + fixture.activations[1];
         assert_eq!(actual, [0.0_f32], "logical Q4_K lane order");
-        assert_eq!(packed_order, 1.0_f32, "packed low/high interleaving discriminator");
+        assert_eq!(
+            packed_order, 1.0_f32,
+            "packed low/high interleaving discriminator"
+        );
         Ok(())
     }
 
@@ -255,7 +259,9 @@ mod tests {
             .copy_to_host(&mut actual)
             .map_err(|error| format!("read Q4_K order output: {error}"))?;
         if actual != [0.0_f32] {
-            return Err(format!("Q4_K logical-order device result was {actual:?}, expected [0.0]"));
+            return Err(format!(
+                "Q4_K logical-order device result was {actual:?}, expected [0.0]"
+            ));
         }
         Ok(())
     }
