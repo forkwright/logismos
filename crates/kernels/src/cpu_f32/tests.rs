@@ -473,12 +473,17 @@ fn softmax_rejects_nan_and_positive_infinity_without_rejecting_masks() {
 
 #[test]
 fn softmax_preserves_row_offsets() -> Result<()> {
-    let x = [-4.0_f32, -3.0, -2.0, 3.0, 4.0, 5.0];
+    let x = [-4.0_f32, -3.0, -2.0, 5.0, 4.0, 3.0];
     let y = softmax_last_dim(&x, 2, 3)?;
-    for row in y.chunks_exact(3) {
-        assert!((row[0] - 0.090_030_57).abs() < 1e-6);
-        assert!((row[1] - 0.244_728_48).abs() < 1e-6);
-        assert!((row[2] - 0.665_240_94).abs() < 1e-6);
+    let expected_first = [0.090_030_57, 0.244_728_48, 0.665_240_94];
+    let expected_rows = [
+        expected_first,
+        [expected_first[2], expected_first[1], expected_first[0]],
+    ];
+    for (row, expected) in y.chunks_exact(3).zip(expected_rows) {
+        for (&actual, expected) in row.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
     }
     Ok(())
 }

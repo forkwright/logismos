@@ -5,12 +5,12 @@
 //! produces a fresh `taxis::Tensor` of shape
 //! `[len, num_kv_heads * head_dim]`.
 //!
-//! The cache stores bytes rather than typed `Vec<T>` so one impl covers
-//! every dtype. Conversion back to a typed tensor happens only at `get`
-//! time through the dtype-dispatched branch.
+//! The cache stores bytes rather than typed `Vec<T>` and marshals the
+//! supported f32/f16/bf16/i32/i8/u8 storage variants. F8 and I4 tensor
+//! marshalling is unsupported and returns a typed refusal.
 //!
-//! Paged + radix layouts (Phases 6 + 12) will replace the flat arrays
-//! with block tables but keep the same `KvCache` trait contract.
+//! Native hybrid execution uses separate execution-private paged KV. This
+//! legacy cache retains its flat tensor-based [`KvCache`] contract.
 //!
 //! ## Byte-marshalling convention
 //!
