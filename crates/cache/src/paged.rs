@@ -817,9 +817,9 @@ mod tests {
     }
 
     fn append_model(model: &mut [Vec<ModelRow>; LAYERS], start: usize, tokens: usize) {
-        for layer in 0..LAYERS {
+        for (layer, rows) in model.iter_mut().enumerate() {
             for relative in 0..tokens {
-                model[layer].push(model_row(layer, start + relative));
+                rows.push(model_row(layer, start + relative));
             }
         }
     }
@@ -937,12 +937,17 @@ mod tests {
         );
     }
 
-    fn exercise_partial_tail_rollback(page_tokens: usize, plan: PagedKvPlan) -> Result<()> {
-        let mut pool = PagedKvPool::new(plan)?;
-        let mut model = empty_model();
-        let start = page_tokens - 1;
-        assert_inventory(&pool, None);
+    struct TailWitness {
+        bundle: usize,
+        fill: usize,
+        payload: Vec<Vec<f32>>,
+    }
 
+    fn seed_partial_tail(
+        pool: &mut PagedKvPool,
+        model: &mut [Vec<ModelRow>; LAYERS],
+        start: usize,
+    ) -> Result<()> {
         {
             let mut seed = pool.begin_append(start)?;
             write_layer(&mut seed, 0, 0, start)?;
@@ -956,23 +961,37 @@ mod tests {
             write_layer(&mut seed, 1, 0, start)?;
             seed.commit()?;
         }
-        append_model(&mut model, 0, start);
-        assert_inventory(&pool, None);
-        assert_committed_matches(&pool, &model)?;
+        append_model(model, 0, start);
+        assert_inventory(pool, None);
+        assert_committed_matches(pool, model)?;
+        Ok(())
+    }
 
-        let original_bundle = pool.table[0];
-        let original_fill = pool.fills[0];
-        let original_payload = tail_payload(&pool, original_bundle, original_fill)?;
+    fn tail_witness(pool: &PagedKvPool) -> Result<TailWitness> {
+        let bundle = pool.table[0];
+        let fill = pool.fills[0];
+        Ok(TailWitness {
+            bundle,
+            fill,
+            payload: tail_payload(pool, bundle, fill)?,
+        })
+    }
+
+    fn exercise_incomplete_partial_append(
+        pool: &mut PagedKvPool,
+        start: usize,
+        witness: &TailWitness,
+    ) -> Result<()> {
         {
             let mut incomplete = pool.begin_append(2)?;
             assert!(incomplete.replaced_tail.is_some());
-            assert_ne!(incomplete.pool.table[0], original_bundle);
+            assert_ne!(incomplete.pool.table[0], witness.bundle);
             assert_staged_inventory(&incomplete);
             assert_tail_payload(
                 incomplete.pool,
-                original_bundle,
-                original_fill,
-                &original_payload,
+                witness.bundle,
+                witness.fill,
+                &witness.payload,
             )?;
 
             let first = model_row(0, start);
@@ -1002,9 +1021,9 @@ mod tests {
             incomplete.write_layer_row(0, 1, &second.key, &second.value)?;
             assert_tail_payload(
                 incomplete.pool,
-                original_bundle,
-                original_fill,
-                &original_payload,
+                witness.bundle,
+                witness.fill,
+                &witness.payload,
             )?;
             assert_staged_inventory(&incomplete);
             assert!(matches!(
@@ -1012,27 +1031,51 @@ mod tests {
                 Err(Error::PagedIncompleteAppend { .. })
             ));
         }
-        assert_eq!(pool.table[0], original_bundle);
-        assert_tail_payload(&pool, original_bundle, original_fill, &original_payload)?;
-        assert_inventory(&pool, None);
-        assert_committed_matches(&pool, &model)?;
+        Ok(())
+    }
 
+    fn assert_tail_restored(
+        pool: &PagedKvPool,
+        model: &[Vec<ModelRow>; LAYERS],
+        witness: &TailWitness,
+    ) -> Result<()> {
+        assert_eq!(pool.table[0], witness.bundle);
+        assert_tail_payload(pool, witness.bundle, witness.fill, &witness.payload)?;
+        assert_inventory(pool, None);
+        assert_committed_matches(pool, model)
+    }
+
+    fn drop_partial_append(pool: &mut PagedKvPool, start: usize) -> Result<()> {
         {
             let mut dropped = pool.begin_append(2)?;
             write_layer(&mut dropped, 0, start, 2)?;
             assert_staged_inventory(&dropped);
         }
-        assert_eq!(pool.table[0], original_bundle);
-        assert_tail_payload(&pool, original_bundle, original_fill, &original_payload)?;
-        assert_inventory(&pool, None);
-        assert_committed_matches(&pool, &model)?;
+        Ok(())
+    }
 
+    fn retry_partial_append(pool: &mut PagedKvPool, start: usize) -> Result<()> {
         {
             let mut retry = pool.begin_append(2)?;
             write_all(&mut retry, start, 2)?;
             assert_staged_inventory(&retry);
             retry.commit()?;
         }
+        Ok(())
+    }
+
+    fn exercise_partial_tail_rollback(page_tokens: usize, plan: PagedKvPlan) -> Result<()> {
+        let mut pool = PagedKvPool::new(plan)?;
+        let mut model = empty_model();
+        let start = page_tokens - 1;
+        assert_inventory(&pool, None);
+        seed_partial_tail(&mut pool, &mut model, start)?;
+        let witness = tail_witness(&pool)?;
+        exercise_incomplete_partial_append(&mut pool, start, &witness)?;
+        assert_tail_restored(&pool, &model, &witness)?;
+        drop_partial_append(&mut pool, start)?;
+        assert_tail_restored(&pool, &model, &witness)?;
+        retry_partial_append(&mut pool, start)?;
         append_model(&mut model, start, 2);
         assert_inventory(&pool, None);
         assert_committed_matches(&pool, &model)
@@ -1048,7 +1091,7 @@ mod tests {
         let mut model = empty_model();
         seed_committed(&mut pool, &mut model, start)?;
 
-        let old_tail = if start % page_tokens == 0 {
+        let old_tail = if start.is_multiple_of(page_tokens) {
             None
         } else {
             let page = pool.table.len() - 1;

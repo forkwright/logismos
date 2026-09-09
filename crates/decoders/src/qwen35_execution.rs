@@ -269,7 +269,7 @@ struct StagedExecution<'weights, 'artifact> {
     position: usize,
 }
 
-impl<'weights, 'artifact> StagedExecution<'weights, 'artifact> {
+impl StagedExecution<'_, '_> {
     fn step_staged(
         &mut self,
         token_ids: &[u32],
