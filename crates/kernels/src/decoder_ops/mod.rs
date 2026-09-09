@@ -3,11 +3,14 @@
 mod recurrent_layout;
 mod recurrent_scalars;
 
-pub use recurrent_layout::{RecurrentQkL2F32Plan, launch_recurrent_qk_l2_f32};
-pub use recurrent_scalars::{RecurrentScalarsF32Plan, launch_recurrent_scalars_f32};
+pub use recurrent_layout::{
+    RecurrentQkL2F32Plan, launch_recurrent_qk_l2_f32, launch_recurrent_qk_l2_f32_checked,
+};
+pub use recurrent_scalars::{
+    RecurrentScalarsF32Plan, launch_recurrent_scalars_f32, launch_recurrent_scalars_f32_checked,
+};
 
-#[cfg(not(logismos_no_gpu_kernels))]
-use std::ffi::c_void;
+use core::ffi::c_void;
 
 use hipcore::Stream;
 #[cfg(test)]
@@ -22,6 +25,7 @@ use crate::error::LaunchSnafu;
 #[cfg(logismos_no_gpu_kernels)]
 use crate::error::NoGpuBuildSnafu;
 use crate::error::{Result, UnsupportedShapeSnafu};
+use crate::numerical_status::NativeNumericalStatus;
 
 const RMS_NORM_KERNEL: &str = "decoder_rms_norm_f32";
 const ROTARY_KERNEL: &str = "decoder_rotary_half_split_f32";
@@ -43,6 +47,7 @@ unsafe extern "C" {
         rows: u32,
         width: u32,
         epsilon: f32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 
@@ -53,6 +58,7 @@ unsafe extern "C" {
         heads: u32,
         width: u32,
         rotary_width: u32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 
@@ -62,6 +68,7 @@ unsafe extern "C" {
         gate_f32: *mut c_void,
         heads: u32,
         key_width: u32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 
@@ -70,6 +77,7 @@ unsafe extern "C" {
         gate_f32: *const c_void,
         output_f32: *mut c_void,
         elements: u32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 
@@ -77,6 +85,7 @@ unsafe extern "C" {
         input_f32: *const c_void,
         output_f32: *mut c_void,
         elements: u32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 
@@ -85,6 +94,7 @@ unsafe extern "C" {
         up_f32: *const c_void,
         output_f32: *mut c_void,
         elements: u32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 
@@ -93,6 +103,7 @@ unsafe extern "C" {
         right_f32: *const c_void,
         output_f32: *mut c_void,
         elements: u32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 }
@@ -408,6 +419,71 @@ pub unsafe fn launch_rms_norm_f32(
                 plan.rows_u32,
                 plan.width_u32,
                 plan.epsilon,
+                core::ptr::null_mut(),
+                stream.raw().cast::<c_void>(),
+            )
+        };
+        launch_result(RMS_NORM_KERNEL, code)
+    }
+}
+
+/// Launch f32 RMSNorm while recording explicit numerical-domain failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through stream completion and belong to
+/// the same device as every supplied buffer.
+pub unsafe fn launch_rms_norm_f32_checked(
+    plan: RmsNormF32Plan,
+    input_f32: *const f32,
+    input_elements: usize,
+    weight_f32: *const f32,
+    weight_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = status;
+        // SAFETY: this forwards the unchanged raw arguments solely to retain its typed CPU refusal.
+        unsafe {
+            launch_rms_norm_f32(
+                plan,
+                input_f32,
+                input_elements,
+                weight_f32,
+                weight_elements,
+                output_f32,
+                output_elements,
+                stream,
+            )
+        }
+    }
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        validate_rms_launch(
+            plan,
+            input_f32,
+            input_elements,
+            weight_f32,
+            weight_elements,
+            output_f32,
+            output_elements,
+        )?;
+        stream.make_current()?;
+        // SAFETY: checked spans and the caller's status lifetime contract establish this private ABI.
+        let code = unsafe {
+            logismos_launch_decoder_rms_norm_f32(
+                input_f32.cast::<c_void>(),
+                weight_f32.cast::<c_void>(),
+                output_f32.cast::<c_void>(),
+                plan.rows_u32,
+                plan.width_u32,
+                plan.epsilon,
+                status.as_device_ptr().cast::<c_void>(),
                 stream.raw().cast::<c_void>(),
             )
         };
@@ -476,6 +552,70 @@ pub unsafe fn launch_rotary_half_split_f32_in_place(
                 plan.heads_u32,
                 plan.width_u32,
                 plan.rotary_width_u32,
+                core::ptr::null_mut(),
+                stream.raw().cast::<c_void>(),
+            )
+        };
+        launch_result(ROTARY_KERNEL, code)
+    }
+}
+
+/// Launch in-place half-split rotary embedding while recording explicit numerical failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through stream completion on the same device.
+pub unsafe fn launch_rotary_half_split_f32_in_place_checked(
+    plan: RotaryHalfSplitF32Plan,
+    values_f32: *mut f32,
+    value_elements: usize,
+    cos_f32: *const f32,
+    cos_elements: usize,
+    sin_f32: *const f32,
+    sin_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = status;
+        // SAFETY: this forwards the unchanged raw arguments solely to retain its typed CPU refusal.
+        unsafe {
+            launch_rotary_half_split_f32_in_place(
+                plan,
+                values_f32,
+                value_elements,
+                cos_f32,
+                cos_elements,
+                sin_f32,
+                sin_elements,
+                stream,
+            )
+        }
+    }
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        validate_rotary_launch(
+            plan,
+            values_f32,
+            value_elements,
+            cos_f32,
+            cos_elements,
+            sin_f32,
+            sin_elements,
+        )?;
+        stream.make_current()?;
+        // SAFETY: validated spans and the caller's status lifetime contract establish this private ABI.
+        let code = unsafe {
+            logismos_launch_decoder_rotary_half_split_f32(
+                values_f32.cast::<c_void>(),
+                cos_f32.cast::<c_void>(),
+                sin_f32.cast::<c_void>(),
+                plan.heads_u32,
+                plan.width_u32,
+                plan.rotary_width_u32,
+                status.as_device_ptr().cast::<c_void>(),
                 stream.raw().cast::<c_void>(),
             )
         };
@@ -541,6 +681,69 @@ pub unsafe fn launch_split_q_gate_f32(
                 gate_f32.cast::<c_void>(),
                 plan.heads_u32,
                 plan.key_width_u32,
+                core::ptr::null_mut(),
+                stream.raw().cast::<c_void>(),
+            )
+        };
+        launch_result(SPLIT_Q_GATE_KERNEL, code)
+    }
+}
+
+/// Launch Q/gate splitting while recording explicit input-domain failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through stream completion on the same device.
+pub unsafe fn launch_split_q_gate_f32_checked(
+    plan: SplitQGateF32Plan,
+    q_gate_f32: *const f32,
+    q_gate_elements: usize,
+    query_f32: *mut f32,
+    query_elements: usize,
+    gate_f32: *mut f32,
+    gate_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = status;
+        // SAFETY: this forwards the unchanged raw arguments solely to retain its typed CPU refusal.
+        unsafe {
+            launch_split_q_gate_f32(
+                plan,
+                q_gate_f32,
+                q_gate_elements,
+                query_f32,
+                query_elements,
+                gate_f32,
+                gate_elements,
+                stream,
+            )
+        }
+    }
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        validate_split_launch(
+            plan,
+            q_gate_f32,
+            q_gate_elements,
+            query_f32,
+            query_elements,
+            gate_f32,
+            gate_elements,
+        )?;
+        stream.make_current()?;
+        // SAFETY: validated spans and the caller's status lifetime contract establish this private ABI.
+        let code = unsafe {
+            logismos_launch_decoder_split_q_gate_f32(
+                q_gate_f32.cast::<c_void>(),
+                query_f32.cast::<c_void>(),
+                gate_f32.cast::<c_void>(),
+                plan.heads_u32,
+                plan.key_width_u32,
+                status.as_device_ptr().cast::<c_void>(),
                 stream.raw().cast::<c_void>(),
             )
         };
@@ -585,6 +788,41 @@ pub unsafe fn sigmoid_mul(
             output_elements,
             stream,
             SIGMOID_MUL_KERNEL,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+/// Launch `value * sigmoid(gate)` while recording explicit numerical failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through stream completion on the same device.
+pub unsafe fn sigmoid_mul_checked(
+    plan: ElementwiseF32Plan,
+    value_f32: *const f32,
+    value_elements: usize,
+    gate_f32: *const f32,
+    gate_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: this shares the raw operation's exact span and ownership contract with its status pointer.
+    unsafe {
+        launch_elementwise(
+            plan,
+            value_f32,
+            value_elements,
+            gate_f32,
+            gate_elements,
+            output_f32,
+            output_elements,
+            stream,
+            SIGMOID_MUL_KERNEL,
+            status.as_device_ptr().cast::<c_void>(),
         )
     }
 }
@@ -641,6 +879,62 @@ pub unsafe fn silu(
                 input_f32.cast::<c_void>(),
                 output_f32.cast::<c_void>(),
                 plan.elements_u32,
+                core::ptr::null_mut(),
+                stream.raw().cast::<c_void>(),
+            )
+        };
+        launch_result(SILU_KERNEL, code)
+    }
+}
+
+/// Launch `SiLU(input)` while recording explicit numerical failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through stream completion on the same device.
+pub unsafe fn silu_checked(
+    plan: ElementwiseF32Plan,
+    input_f32: *const f32,
+    input_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = status;
+        // SAFETY: this forwards the unchanged raw arguments solely to retain its typed CPU refusal.
+        unsafe {
+            silu(
+                plan,
+                input_f32,
+                input_elements,
+                output_f32,
+                output_elements,
+                stream,
+            )
+        }
+    }
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        validate_unary_launch(
+            plan,
+            input_f32,
+            input_elements,
+            output_f32,
+            output_elements,
+            SILU_KERNEL,
+        )?;
+        stream.make_current()?;
+        // SAFETY: checked spans and the caller's status lifetime contract establish this private ABI.
+        let code = unsafe {
+            logismos_launch_decoder_silu_f32(
+                input_f32.cast::<c_void>(),
+                output_f32.cast::<c_void>(),
+                plan.elements_u32,
+                status.as_device_ptr().cast::<c_void>(),
                 stream.raw().cast::<c_void>(),
             )
         };
@@ -685,6 +979,41 @@ pub unsafe fn silu_mul(
             output_elements,
             stream,
             SILU_MUL_KERNEL,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+/// Launch `SiLU(gate) * up` while recording explicit numerical failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through stream completion on the same device.
+pub unsafe fn silu_mul_checked(
+    plan: ElementwiseF32Plan,
+    gate_f32: *const f32,
+    gate_elements: usize,
+    up_f32: *const f32,
+    up_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: this shares the raw operation's exact span and ownership contract with its status pointer.
+    unsafe {
+        launch_elementwise(
+            plan,
+            gate_f32,
+            gate_elements,
+            up_f32,
+            up_elements,
+            output_f32,
+            output_elements,
+            stream,
+            SILU_MUL_KERNEL,
+            status.as_device_ptr().cast::<c_void>(),
         )
     }
 }
@@ -725,6 +1054,41 @@ pub unsafe fn residual_add(
             output_elements,
             stream,
             RESIDUAL_ADD_KERNEL,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+/// Launch `left + right` while recording explicit numerical failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through stream completion on the same device.
+pub unsafe fn residual_add_checked(
+    plan: ElementwiseF32Plan,
+    left_f32: *const f32,
+    left_elements: usize,
+    right_f32: *const f32,
+    right_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: this shares the raw operation's exact span and ownership contract with its status pointer.
+    unsafe {
+        launch_elementwise(
+            plan,
+            left_f32,
+            left_elements,
+            right_f32,
+            right_elements,
+            output_f32,
+            output_elements,
+            stream,
+            RESIDUAL_ADD_KERNEL,
+            status.as_device_ptr().cast::<c_void>(),
         )
     }
 }
@@ -739,6 +1103,7 @@ unsafe fn launch_elementwise(
     output_elements: usize,
     stream: &Stream,
     kernel: &'static str,
+    numerical_status: *mut c_void,
 ) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
@@ -751,6 +1116,7 @@ unsafe fn launch_elementwise(
             output_f32,
             output_elements,
             stream,
+            numerical_status,
         );
         no_gpu_refusal(kernel)
     }
@@ -776,6 +1142,7 @@ unsafe fn launch_elementwise(
                     right_f32.cast::<c_void>(),
                     output_f32.cast::<c_void>(),
                     plan.elements_u32,
+                    numerical_status,
                     stream.raw().cast::<c_void>(),
                 ),
                 SILU_MUL_KERNEL => logismos_launch_decoder_silu_mul_f32(
@@ -783,6 +1150,7 @@ unsafe fn launch_elementwise(
                     right_f32.cast::<c_void>(),
                     output_f32.cast::<c_void>(),
                     plan.elements_u32,
+                    numerical_status,
                     stream.raw().cast::<c_void>(),
                 ),
                 RESIDUAL_ADD_KERNEL => logismos_launch_decoder_residual_add_f32(
@@ -790,6 +1158,7 @@ unsafe fn launch_elementwise(
                     right_f32.cast::<c_void>(),
                     output_f32.cast::<c_void>(),
                     plan.elements_u32,
+                    numerical_status,
                     stream.raw().cast::<c_void>(),
                 ),
                 _ => {
@@ -1472,6 +1841,47 @@ mod tests {
     }
 
     #[test]
+    fn bad_intermediates_are_not_hidden_by_finite_decoder_outputs()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let rms = RmsNormF32Plan::try_from_dimensions(1, 2, 1e-5)?;
+        let rms_input = [f32::MAX, 0.0_f32];
+        let rms_output = rms_norm_native_order_reference(rms, &rms_input, &[1.0_f32, 1.0])?;
+        assert!(
+            (rms_input[0] * rms_input[0]).is_infinite(),
+            "RMSNorm must expose an overflowing square before reduction"
+        );
+        assert_eq!(
+            rms_output[1], 0.0,
+            "a finite zero output must not hide the earlier overflowing square"
+        );
+
+        let subnormal = f32::from_bits(1);
+        let hidden_square = subnormal * subnormal;
+        let variance = hidden_square + 1e-5_f32;
+        assert_eq!(
+            hidden_square, 0.0,
+            "the f32 square underflows before epsilon"
+        );
+        assert!(
+            variance.is_normal(),
+            "epsilon can make the final radicand look normal"
+        );
+
+        let silu =
+            silu_native_order_reference(ElementwiseF32Plan::try_from_elements(1)?, &[-f32::MAX])?;
+        assert!(
+            (-(-f32::MAX)).exp().is_infinite(),
+            "SiLU exponent overflows first"
+        );
+        assert_eq!(
+            silu,
+            vec![-0.0],
+            "SiLU can subsequently produce finite signed zero"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rms_validator_accepts_exact_spans_and_refuses_short_input()
     -> core::result::Result<(), Box<dyn std::error::Error>> {
         let rms_plan = RmsNormF32Plan::try_from_dimensions(1, 3, 1e-5)?;
@@ -1756,6 +2166,45 @@ mod tests {
                 "{kernel} must report typed no-GPU refusal"
             );
         }
+    }
+
+    #[cfg(not(logismos_no_gpu_kernels))]
+    #[test]
+    #[ignore = "requires an operator-reserved HIP device; source tests do not qualify hardware"]
+    fn initialized_status_refuses_hidden_silu_exponent_overflow() -> core::result::Result<(), String>
+    {
+        use hipcore::{Device, DeviceBuffer};
+
+        let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
+        let stream = Stream::new(&device).map_err(|error| format!("create stream: {error}"))?;
+        let input = DeviceBuffer::from_host(&device, &[-f32::MAX])
+            .map_err(|error| format!("upload overflowing SiLU input: {error}"))?;
+        let output = DeviceBuffer::from_host(&device, &[-1.0_f32])
+            .map_err(|error| format!("initialize SiLU output: {error}"))?;
+        let status = NativeNumericalStatus::new(&device)
+            .map_err(|error| format!("initialize numerical status: {error}"))?;
+        // SAFETY: both owned buffers match the checked extent and status remains live through synchronization.
+        unsafe {
+            silu_checked(
+                ElementwiseF32Plan::try_from_elements(1)
+                    .map_err(|error| format!("plan SiLU: {error}"))?,
+                input.as_device_ptr(),
+                input.len(),
+                output.as_device_ptr(),
+                output.len(),
+                &stream,
+                &status,
+            )
+        }
+        .map_err(|error| format!("launch checked SiLU: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize checked SiLU: {error}"))?;
+        assert!(
+            status.read_after_synchronization().is_err(),
+            "initialized status must retain exponent overflow"
+        );
+        Ok(())
     }
 
     #[cfg(not(logismos_no_gpu_kernels))]

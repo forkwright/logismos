@@ -6,8 +6,7 @@
 //! staged GDN step. It deliberately does not arrange V: for `T = 1`, V's
 //! contiguous convolution tail already has the GDN row layout.
 
-#[cfg(not(logismos_no_gpu_kernels))]
-use std::ffi::c_void;
+use core::ffi::c_void;
 
 use hipcore::Stream;
 #[cfg(test)]
@@ -20,6 +19,7 @@ use crate::error::LaunchSnafu;
 #[cfg(logismos_no_gpu_kernels)]
 use crate::error::NoGpuBuildSnafu;
 use crate::error::{Result, UnsupportedShapeSnafu};
+use crate::numerical_status::NativeNumericalStatus;
 
 const RECURRENT_QK_L2_KERNEL: &str = "decoder_recurrent_qk_l2_f32";
 
@@ -33,6 +33,7 @@ unsafe extern "C" {
         value_heads: u32,
         key_width: u32,
         epsilon: f32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 }
@@ -227,6 +228,71 @@ pub unsafe fn launch_recurrent_qk_l2_f32(
                 plan.value_heads_u32,
                 plan.key_width_u32,
                 plan.epsilon,
+                core::ptr::null_mut(),
+                stream.raw().cast::<c_void>(),
+            )
+        };
+        launch_result(code)
+    }
+}
+
+/// Launch recurrent Q/K L2 normalization while recording explicit numerical failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through stream completion on the same device.
+pub unsafe fn launch_recurrent_qk_l2_f32_checked(
+    plan: RecurrentQkL2F32Plan,
+    convolved_f32: *const f32,
+    convolved_elements: usize,
+    query_f32: *mut f32,
+    query_elements: usize,
+    key_f32: *mut f32,
+    key_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = status;
+        // SAFETY: this forwards the unchanged raw arguments solely to retain its typed CPU refusal.
+        unsafe {
+            launch_recurrent_qk_l2_f32(
+                plan,
+                convolved_f32,
+                convolved_elements,
+                query_f32,
+                query_elements,
+                key_f32,
+                key_elements,
+                stream,
+            )
+        }
+    }
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        validate_launch(
+            plan,
+            convolved_f32,
+            convolved_elements,
+            query_f32,
+            query_elements,
+            key_f32,
+            key_elements,
+        )?;
+        stream.make_current()?;
+        // SAFETY: checked spans and the caller's status lifetime contract establish this private ABI.
+        let code = unsafe {
+            logismos_launch_decoder_recurrent_qk_l2_f32(
+                convolved_f32.cast::<c_void>(),
+                query_f32.cast::<c_void>(),
+                key_f32.cast::<c_void>(),
+                plan.source_key_heads_u32,
+                plan.value_heads_u32,
+                plan.key_width_u32,
+                plan.epsilon,
+                status.as_device_ptr().cast::<c_void>(),
                 stream.raw().cast::<c_void>(),
             )
         };

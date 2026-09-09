@@ -1,11 +1,11 @@
 //! Checked T=1 recurrent beta and log-decay scalar operation.
 
-#[cfg(not(logismos_no_gpu_kernels))]
-use std::ffi::c_void;
+use core::ffi::c_void;
 
 use hipcore::Stream;
 
 use super::{ELEMENTWISE_THREADS, Result};
+use crate::numerical_status::NativeNumericalStatus;
 
 const RECURRENT_SCALARS_KERNEL: &str = "decoder_recurrent_scalars_f32";
 
@@ -19,6 +19,7 @@ unsafe extern "C" {
         beta_f32: *mut c_void,
         log_decay_f32: *mut c_void,
         value_heads: u32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 }
@@ -150,6 +151,93 @@ pub unsafe fn launch_recurrent_scalars_f32(
                 beta_f32.cast::<c_void>(),
                 log_decay_f32.cast::<c_void>(),
                 plan.value_heads_u32,
+                core::ptr::null_mut(),
+                stream.raw().cast::<c_void>(),
+            )
+        };
+        super::launch_result(RECURRENT_SCALARS_KERNEL, code)
+    }
+}
+
+/// Launch recurrent scalars while recording explicit numerical-domain failures.
+///
+/// # Safety
+///
+/// The raw launcher's pointer, lifetime, ownership, and stream requirements
+/// apply. `status` must remain live through stream completion on the same device.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "six exact scalar spans are one non-aliased recurrent operation contract"
+)]
+pub unsafe fn launch_recurrent_scalars_f32_checked(
+    plan: RecurrentScalarsF32Plan,
+    alpha_f32: *const f32,
+    alpha_elements: usize,
+    dt_f32: *const f32,
+    dt_elements: usize,
+    a_f32: *const f32,
+    a_elements: usize,
+    beta_projection_f32: *const f32,
+    beta_projection_elements: usize,
+    beta_f32: *mut f32,
+    beta_elements: usize,
+    log_decay_f32: *mut f32,
+    log_decay_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = status;
+        // SAFETY: this forwards the unchanged raw arguments solely to retain its typed CPU refusal.
+        unsafe {
+            launch_recurrent_scalars_f32(
+                plan,
+                alpha_f32,
+                alpha_elements,
+                dt_f32,
+                dt_elements,
+                a_f32,
+                a_elements,
+                beta_projection_f32,
+                beta_projection_elements,
+                beta_f32,
+                beta_elements,
+                log_decay_f32,
+                log_decay_elements,
+                stream,
+            )
+        }
+    }
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        validate_recurrent_scalars_launch(
+            plan,
+            alpha_f32,
+            alpha_elements,
+            dt_f32,
+            dt_elements,
+            a_f32,
+            a_elements,
+            beta_projection_f32,
+            beta_projection_elements,
+            beta_f32,
+            beta_elements,
+            log_decay_f32,
+            log_decay_elements,
+        )?;
+        stream.make_current()?;
+        // SAFETY: checked spans and the caller's status lifetime contract establish this private ABI.
+        let code = unsafe {
+            logismos_launch_recurrent_scalars_f32(
+                alpha_f32.cast::<c_void>(),
+                dt_f32.cast::<c_void>(),
+                a_f32.cast::<c_void>(),
+                beta_projection_f32.cast::<c_void>(),
+                beta_f32.cast::<c_void>(),
+                log_decay_f32.cast::<c_void>(),
+                plan.value_heads_u32,
+                status.as_device_ptr().cast::<c_void>(),
                 stream.raw().cast::<c_void>(),
             )
         };
