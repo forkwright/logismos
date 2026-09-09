@@ -182,6 +182,20 @@ mod tests {
             output
                 .copy_to_host(&mut actual)
                 .map_err(|error| format!("read {format} output: {error}"))?;
+            let mut matrix_after = vec![0_u8; matrix.len()];
+            matrix
+                .copy_to_host(&mut matrix_after)
+                .map_err(|error| format!("read {format} matrix: {error}"))?;
+            if matrix_after != fixture.matrix {
+                return Err(format!("{format} kernel modified immutable matrix bytes"));
+            }
+            let mut activations_after = vec![0.0_f32; activations.len()];
+            activations
+                .copy_to_host(&mut activations_after)
+                .map_err(|error| format!("read {format} activations: {error}"))?;
+            if activations_after != fixture.activations {
+                return Err(format!("{format} kernel modified immutable activations"));
+            }
             assert_gpu_close(&actual, &expected, format.to_string().as_str())?;
         }
         Ok(())
