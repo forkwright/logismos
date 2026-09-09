@@ -16,10 +16,10 @@ use crate::error::{
     PagedReadBeyondVisibleSnafu, PagedRowWidthSnafu, PagedWriteOrderSnafu, PagedZeroDimensionSnafu,
     Result,
 };
-#[cfg(feature = "gpu")]
-use crate::error::{PagedNativeDeviceMismatchSnafu, PagedNativePoisonedSnafu};
 #[cfg(any(feature = "gpu", test))]
 use crate::error::{PagedNativeCommitNotPreparedSnafu, PagedNativeCommitPreparedSnafu};
+#[cfg(feature = "gpu")]
+use crate::error::{PagedNativeDeviceMismatchSnafu, PagedNativePoisonedSnafu};
 
 /// Geometry shared by an execution plan and its private KV allocation.
 #[derive(Clone, Copy, Debug)]
