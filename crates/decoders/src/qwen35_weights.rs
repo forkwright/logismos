@@ -102,7 +102,7 @@ impl Qwen35Weights {
     }
 
     fn matrix(&self, name: &str) -> Result<CheckedMatrix<'_>> {
-        CheckedMatrix::from_payload(self.payload, name)
+        CheckedMatrix::from_payload(&self.payload, name)
     }
 
     #[cfg(feature = "gpu")]
