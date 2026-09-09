@@ -3,10 +3,51 @@
 //! The CPU operation accepts logical key/value rows through fallible borrows;
 //! it neither owns cache pages nor interprets a cache table. The optional HIP
 //! launcher has a separate, explicit dense physical-page descriptor.
+
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
+use std::ffi::c_void;
+
+#[cfg(feature = "gpu")]
+use hipcore::Stream;
 use num_traits::ToPrimitive;
 use snafu::{ResultExt, Snafu};
 
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+use crate::device_span::{
+    checked_device_span, checked_f32_device_span, reject_overlapping_device_spans,
+};
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
+use crate::error::LaunchSnafu;
+#[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
+use crate::error::NoGpuBuildSnafu;
+#[cfg(feature = "gpu")]
+use crate::error::Result as KernelResult;
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+use crate::error::UnsupportedShapeSnafu;
+
 const PAGED_DECODE: &str = "paged_decode";
+#[cfg(feature = "gpu")]
+const PAGED_DECODE_KERNEL: &str = "paged_decode_q1_f32";
+
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
+unsafe extern "C" {
+    fn logismos_launch_paged_decode_q1_f32(
+        query_f32: *const c_void,
+        keys_f32: *const c_void,
+        values_f32: *const c_void,
+        page_table_u32: *const c_void,
+        output_f32: *mut c_void,
+        visible_tokens: u32,
+        query_heads: u32,
+        kv_heads: u32,
+        head_width: u32,
+        page_tokens: u32,
+        physical_pages: u32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> u32;
+}
+
 /// Result alias for the logical paged-decode operation.
 pub type PagedDecodeResult<T> = core::result::Result<T, PagedDecodeError>;
 
@@ -215,6 +256,18 @@ pub enum PagedDecodeError {
     ScaleNotFinite {
         /// The rejected head width.
         head_width: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A native physical-page size is outside this operation's explicit ABI.
+    #[snafu(display(
+        "{PAGED_DECODE}: native page_tokens {page_tokens} is not one of B8, B16, or B32"
+    ))]
+    NativePageTokensUnsupported {
+        /// Rejected native physical-page token count.
+        page_tokens: usize,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,
@@ -490,6 +543,386 @@ fn ensure_finite(value: f32, stage: &'static str, index: usize) -> PagedDecodeRe
     }
 }
 
+/// Explicit physical tokens per native dense page.
+///
+/// This selection belongs only to the native addressing descriptor. It does
+/// not reuse or imply the CPU cache allocation selector.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativePageTokens {
+    /// Eight logical tokens per physical native page.
+    B8,
+    /// Sixteen logical tokens per physical native page.
+    B16,
+    /// Thirty-two logical tokens per physical native page.
+    B32,
+}
+
+#[cfg(feature = "gpu")]
+impl NativePageTokens {
+    /// Return the explicit number of logical tokens in one physical page.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        match self {
+            Self::B8 => 8,
+            Self::B16 => 16,
+            Self::B32 => 32,
+        }
+    }
+
+    fn try_from_tokens(page_tokens: usize) -> PagedDecodeResult<Self> {
+        match page_tokens {
+            8 => Ok(Self::B8),
+            16 => Ok(Self::B16),
+            32 => Ok(Self::B32),
+            _ => NativePageTokensUnsupportedSnafu { page_tokens }.fail(),
+        }
+    }
+}
+
+/// Checked native address layout for one all-query-head Q=1 decode call.
+///
+/// Keys and values are separate dense `f32` arrays with logical layout
+/// `[physical_page][in_page_token][kv_head][head_width]`. `page_table` has
+/// one `u32` physical-page index per logical page. The descriptor checks
+/// pointer extents and ABI dimensions, but cannot inspect device table values
+/// or scalar contents.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NativePagedDecodePlan {
+    logical: PagedDecodePlan,
+    page_tokens: NativePageTokens,
+    physical_pages: usize,
+    logical_pages: usize,
+    query_elements: usize,
+    key_value_elements: usize,
+    output_elements: usize,
+}
+
+#[cfg(feature = "gpu")]
+impl NativePagedDecodePlan {
+    /// Derive one explicit native dense-page descriptor from logical geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagedDecodeError`] when the requested native page size is not
+    /// B8/B16/B32, physical-page count is zero, or any native extent overflows.
+    pub fn try_from_paged_decode(
+        logical: PagedDecodePlan,
+        page_tokens: usize,
+        physical_pages: usize,
+    ) -> PagedDecodeResult<Self> {
+        let page_tokens = NativePageTokens::try_from_tokens(page_tokens)?;
+        validate_nonzero_dimension("physical_pages", physical_pages)?;
+        let logical_pages = logical
+            .visible_tokens
+            .checked_sub(1)
+            .and_then(|last| last.checked_div(page_tokens.get()))
+            .and_then(|page| page.checked_add(1))
+            .ok_or_else(|| {
+                DimensionOverflowSnafu {
+                    dimensions: "visible_tokens / page_tokens",
+                }
+                .build()
+            })?;
+        let query_elements = checked_product(
+            logical.query_heads,
+            logical.head_width,
+            "query_heads * head_width",
+        )?;
+        let key_value_elements = checked_product(
+            checked_product(
+                physical_pages,
+                page_tokens.get(),
+                "physical_pages * page_tokens",
+            )?,
+            logical.row_elements()?,
+            "physical_pages * page_tokens * kv_heads * head_width",
+        )?;
+        Ok(Self {
+            logical,
+            page_tokens,
+            physical_pages,
+            logical_pages,
+            query_elements,
+            key_value_elements,
+            output_elements: query_elements,
+        })
+    }
+
+    /// Return the logical Q=1 geometry that this native descriptor addresses.
+    #[must_use]
+    pub const fn logical(self) -> PagedDecodePlan {
+        self.logical
+    }
+
+    /// Return this descriptor's explicit physical page-token selector.
+    #[must_use]
+    pub const fn page_tokens(self) -> NativePageTokens {
+        self.page_tokens
+    }
+
+    /// Return the supplied dense physical-page count.
+    #[must_use]
+    pub const fn physical_pages(self) -> usize {
+        self.physical_pages
+    }
+
+    /// Return the checked table entry count for the visible logical prefix.
+    #[must_use]
+    pub const fn page_table_entries(self) -> usize {
+        self.logical_pages
+    }
+
+    /// Return the dense query extent `[query_heads, head_width]`.
+    #[must_use]
+    pub const fn query_elements(self) -> usize {
+        self.query_elements
+    }
+
+    /// Return the separate dense key or value physical-page extent.
+    #[must_use]
+    pub const fn key_value_elements(self) -> usize {
+        self.key_value_elements
+    }
+
+    /// Return the dense output extent `[query_heads, head_width]`.
+    #[must_use]
+    pub const fn output_elements(self) -> usize {
+        self.output_elements
+    }
+}
+
+/// Launch a staged all-query-head native Q=1 paged-attention operation.
+///
+/// The native descriptor is distinct from logical CPU cache ownership. Key
+/// and value inputs use `[physical_page][in_page_token][kv_head][head_width]`
+/// with separate arrays; each `u32` table entry maps one logical page to a
+/// physical page. `query_f32` and `output_f32` are `[query_head][head_width]`.
+/// The plan's contiguous GQA rule selects `query_head / gqa_group`.
+///
+/// The one-wave-per-query-head kernel uses all 32 lanes, including when the
+/// width is below 32 or has a tail. A lane serially accumulates coordinates
+/// `lane, lane + 32, ...`; a fixed down-shuffle tree (16, 8, 4, 2, 1) produces
+/// one dot product, and lane zero applies the f32 scale once. Every lane then
+/// updates its strided coordinates in `output_f32` as unnormalized running
+/// output while retaining the same online maximum and normalizer. Final
+/// division by the normalizer publishes each coordinate. This is mathematically
+/// equivalent to softmax but intentionally not the CPU materialized rounding
+/// order. The native source disables contraction and reassociation.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedShape`] when a supplied extent differs
+/// from the descriptor, a nonempty span is null, unaligned, unrepresentable,
+/// aliases the writable output, or a dimension cannot cross the `u32` ABI. A
+/// CPU-only build returns [`crate::Error::NoGpuBuild`] without initializing
+/// HIP. HIP stream-current and submission failures are propagated.
+///
+/// # Safety
+///
+/// Each nonempty pointer must remain live on `stream`'s device through stream
+/// completion. The output span requires exclusive access and must not alias
+/// any input. The caller must ensure every table entry is less than
+/// `physical_pages`, all inputs and every online intermediate are finite and
+/// normal-or-zero, and the selected device supports the fixed 32-thread block.
+/// Device contents are not inspectable here, so this boundary cannot reproduce
+/// CPU row, table-value, or finite-domain refusals.
+#[cfg(feature = "gpu")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the five native buffers, declared extents, descriptor, and stream form the fixed Q=1 ABI"
+)]
+pub unsafe fn launch_paged_decode_q1_f32(
+    plan: NativePagedDecodePlan,
+    query_f32: *const f32,
+    query_elements: usize,
+    keys_f32: *const f32,
+    key_elements: usize,
+    values_f32: *const f32,
+    value_elements: usize,
+    page_table_u32: *const u32,
+    page_table_entries: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+) -> KernelResult<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = (
+            plan,
+            query_f32,
+            query_elements,
+            keys_f32,
+            key_elements,
+            values_f32,
+            value_elements,
+            page_table_u32,
+            page_table_entries,
+            output_f32,
+            output_elements,
+            stream,
+        );
+        no_gpu_paged_decode_refusal()
+    }
+
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        let abi = validate_paged_decode_launch(
+            plan,
+            query_f32,
+            query_elements,
+            keys_f32,
+            key_elements,
+            values_f32,
+            value_elements,
+            page_table_u32,
+            page_table_entries,
+            output_f32,
+            output_elements,
+        )?;
+        stream.make_current()?;
+        // SAFETY: the caller upholds device ownership, lifetime, concurrent
+        // access, table-value, and numerical-domain obligations documented
+        // above; descriptor and span validation establish ABI extents.
+        let code = unsafe {
+            logismos_launch_paged_decode_q1_f32(
+                query_f32.cast::<c_void>(),
+                keys_f32.cast::<c_void>(),
+                values_f32.cast::<c_void>(),
+                page_table_u32.cast::<c_void>(),
+                output_f32.cast::<c_void>(),
+                abi.visible_tokens,
+                abi.query_heads,
+                abi.kv_heads,
+                abi.head_width,
+                abi.page_tokens,
+                abi.physical_pages,
+                plan.logical.scale,
+                stream.raw().cast::<c_void>(),
+            )
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            LaunchSnafu {
+                kernel: PAGED_DECODE_KERNEL,
+                kind: hipcore::ErrorKind::from_raw(code),
+                code,
+            }
+            .fail()
+        }
+    }
+}
+
+#[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
+fn no_gpu_paged_decode_refusal() -> KernelResult<()> {
+    NoGpuBuildSnafu {
+        kernel: PAGED_DECODE_KERNEL,
+    }
+    .fail()
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[derive(Debug, Clone, Copy)]
+struct PagedDecodeAbi {
+    visible_tokens: u32,
+    query_heads: u32,
+    kv_heads: u32,
+    head_width: u32,
+    page_tokens: u32,
+    physical_pages: u32,
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validation receives the fixed raw Q=1 paged-attention ABI without a second geometry owner"
+)]
+fn validate_paged_decode_launch(
+    plan: NativePagedDecodePlan,
+    query_f32: *const f32,
+    query_elements: usize,
+    keys_f32: *const f32,
+    key_elements: usize,
+    values_f32: *const f32,
+    value_elements: usize,
+    page_table_u32: *const u32,
+    page_table_entries: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+) -> KernelResult<PagedDecodeAbi> {
+    validate_native_length("query", query_elements, plan.query_elements)?;
+    validate_native_length("keys", key_elements, plan.key_value_elements)?;
+    validate_native_length("values", value_elements, plan.key_value_elements)?;
+    validate_native_length("page table", page_table_entries, plan.logical_pages)?;
+    validate_native_length("output", output_elements, plan.output_elements)?;
+
+    let query = checked_f32_device_span(PAGED_DECODE_KERNEL, query_f32, query_elements, "query")?;
+    let keys = checked_f32_device_span(PAGED_DECODE_KERNEL, keys_f32, key_elements, "keys")?;
+    let values =
+        checked_f32_device_span(PAGED_DECODE_KERNEL, values_f32, value_elements, "values")?;
+    let table = checked_device_span(
+        PAGED_DECODE_KERNEL,
+        page_table_u32,
+        page_table_entries,
+        "page table",
+    )?;
+    let output = checked_f32_device_span(
+        PAGED_DECODE_KERNEL,
+        output_f32.cast_const(),
+        output_elements,
+        "output",
+    )?;
+    for input in [query, keys, values, table] {
+        reject_overlapping_device_spans(PAGED_DECODE_KERNEL, output, input)?;
+    }
+
+    Ok(PagedDecodeAbi {
+        visible_tokens: native_u32("visible_tokens", plan.logical.visible_tokens)?,
+        query_heads: native_u32("query_heads", plan.logical.query_heads)?,
+        kv_heads: native_u32("kv_heads", plan.logical.kv_heads)?,
+        head_width: native_u32("head_width", plan.logical.head_width)?,
+        page_tokens: native_u32("page_tokens", plan.page_tokens.get())?,
+        physical_pages: native_u32("physical_pages", plan.physical_pages)?,
+    })
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn validate_native_length(name: &'static str, actual: usize, expected: usize) -> KernelResult<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        UnsupportedShapeSnafu {
+            kernel: PAGED_DECODE_KERNEL,
+            msg: format!(
+                "{name} length {actual} does not match native descriptor extent {expected}"
+            ),
+        }
+        .fail()
+    }
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn native_u32(name: &'static str, value: usize) -> KernelResult<u32> {
+    u32::try_from(value).map_err(|_| {
+        UnsupportedShapeSnafu {
+            kernel: PAGED_DECODE_KERNEL,
+            msg: format!("{name} {value} exceeds the HIP ABI u32 domain"),
+        }
+        .build()
+    })
+}
+
+fn checked_product(
+    left: usize,
+    right: usize,
+    dimensions: &'static str,
+) -> PagedDecodeResult<usize> {
+    left.checked_mul(right)
+        .ok_or_else(|| DimensionOverflowSnafu { dimensions }.build())
+}
+
 #[cfg(test)]
 mod tests {
     use approx::assert_relative_eq;
@@ -663,6 +1096,183 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn independent_f64_paged_witness_observes_table_indirection_and_partial_tail()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let logical = PagedDecodePlan::try_from_dimensions(9, 2, 1, 2)?;
+        let native = NativePagedDecodePlan::try_from_paged_decode(logical, 8, 2)?;
+        let query = [1.0_f32, 0.0, 0.0, 1.0];
+        let table = [1_u32, 0];
+        let mut keys = vec![0.0_f32; native.key_value_elements()];
+        let mut values = vec![0.0_f32; native.key_value_elements()];
+        for token in 0..logical.visible_tokens() {
+            let physical_page = usize::try_from(table[token / native.page_tokens().get()])?;
+            let in_page = token % native.page_tokens().get();
+            let start =
+                (physical_page * native.page_tokens().get() + in_page) * logical.head_width();
+            keys[start] = token as f32;
+            keys[start + 1] = -(token as f32);
+            values[start] = (token + 1) as f32;
+            values[start + 1] = ((token + 1) * 10) as f32;
+        }
+
+        let actual = f64_paged_online_oracle(native, &query, &keys, &values, &table)?;
+        let expected_first = f64_dense_logical_oracle(&query[..2], 9)?;
+        let expected_second = f64_dense_logical_oracle(&query[2..], 9)?;
+        for (actual, expected) in actual[..2].iter().zip(expected_first) {
+            assert_relative_eq!(*actual, expected, epsilon = 1.0e-6);
+        }
+        for (actual, expected) in actual[2..].iter().zip(expected_second) {
+            assert_relative_eq!(*actual, expected, epsilon = 1.0e-6);
+        }
+
+        let wrong_table = [0_u32, 1];
+        let wrong_order = f64_paged_online_oracle(native, &query, &keys, &values, &wrong_table)?;
+        assert_ne!(actual, wrong_order, "table order must select physical rows");
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn native_descriptor_is_explicit_and_span_validation_refuses_bad_extents()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let logical = PagedDecodePlan::try_from_dimensions(9, 2, 1, 3)?;
+        let native = NativePagedDecodePlan::try_from_paged_decode(logical, 8, 4)?;
+        assert_eq!(native.page_tokens(), NativePageTokens::B8);
+        assert_eq!(native.page_table_entries(), 2);
+        assert_eq!(native.query_elements(), 6);
+        assert_eq!(native.key_value_elements(), 96);
+        assert_eq!(native.output_elements(), 6);
+        assert_eq!(
+            NativePagedDecodePlan::try_from_paged_decode(logical, 16, 1)?.page_tokens(),
+            NativePageTokens::B16
+        );
+        assert_eq!(
+            NativePagedDecodePlan::try_from_paged_decode(logical, 32, 1)?.page_tokens(),
+            NativePageTokens::B32
+        );
+        assert!(matches!(
+            NativePagedDecodePlan::try_from_paged_decode(logical, 12, 1),
+            Err(PagedDecodeError::NativePageTokensUnsupported { .. })
+        ));
+
+        let query = 0x1000_usize as *const f32;
+        let keys = 0x2000_usize as *const f32;
+        let values = 0x3000_usize as *const f32;
+        let table = 0x4000_usize as *const u32;
+        let output = 0x5000_usize as *mut f32;
+        assert!(
+            validate_paged_decode_launch(
+                native,
+                query,
+                native.query_elements(),
+                keys,
+                native.key_value_elements(),
+                values,
+                native.key_value_elements(),
+                table,
+                native.page_table_entries(),
+                output,
+                native.output_elements(),
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_paged_decode_launch(
+                native,
+                query,
+                native.query_elements(),
+                keys,
+                native.key_value_elements(),
+                values,
+                native.key_value_elements(),
+                table,
+                native.page_table_entries(),
+                output,
+                native.output_elements() - 1,
+            ),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
+    fn reserved_device_q1_paged_attention_matches_independent_f64_oracle()
+    -> core::result::Result<(), String> {
+        use hipcore::{Device, DeviceBuffer, Stream};
+
+        let logical = PagedDecodePlan::try_from_dimensions(2, 2, 1, 2)
+            .map_err(|error| format!("build logical plan: {error}"))?;
+        let native = NativePagedDecodePlan::try_from_paged_decode(logical, 8, 1)
+            .map_err(|error| format!("build native plan: {error}"))?;
+        let query = [1.0_f32, 0.0, 0.0, 1.0];
+        let logical_keys = [vec![1.0_f32, 0.0], vec![0.0, 1.0]];
+        let logical_values = [vec![2.0_f32, 20.0], vec![4.0, 40.0]];
+        let mut native_keys = vec![0.0_f32; native.key_value_elements()];
+        let mut native_values = vec![0.0_f32; native.key_value_elements()];
+        for token in 0..logical.visible_tokens() {
+            let start = token * logical.head_width();
+            let end = start + logical.head_width();
+            native_keys[start..end].copy_from_slice(&logical_keys[token]);
+            native_values[start..end].copy_from_slice(&logical_values[token]);
+        }
+        let expected_first =
+            f64_materialized_oracle(&query[..2], 0, &logical_keys, &logical_values)
+                .map_err(|error| format!("first f64 oracle: {error}"))?;
+        let expected_second =
+            f64_materialized_oracle(&query[2..], 0, &logical_keys, &logical_values)
+                .map_err(|error| format!("second f64 oracle: {error}"))?;
+
+        let device = Device::new(0).map_err(|error| format!("open reserved device 0: {error}"))?;
+        let stream = Stream::new(&device).map_err(|error| format!("create stream: {error}"))?;
+        let query = DeviceBuffer::from_host(&device, &query)
+            .map_err(|error| format!("upload query: {error}"))?;
+        let keys = DeviceBuffer::from_host(&device, &native_keys)
+            .map_err(|error| format!("upload keys: {error}"))?;
+        let values = DeviceBuffer::from_host(&device, &native_values)
+            .map_err(|error| format!("upload values: {error}"))?;
+        let table = DeviceBuffer::from_host(&device, &[0_u32])
+            .map_err(|error| format!("upload page table: {error}"))?;
+        let output = DeviceBuffer::<f32>::alloc(&device, native.output_elements())
+            .map_err(|error| format!("allocate output: {error}"))?;
+        // SAFETY: each device allocation is distinct, has the descriptor's
+        // exact extent, and remains live until stream synchronization.
+        unsafe {
+            launch_paged_decode_q1_f32(
+                native,
+                query.as_device_ptr(),
+                query.len(),
+                keys.as_device_ptr(),
+                keys.len(),
+                values.as_device_ptr(),
+                values.len(),
+                table.as_device_ptr(),
+                table.len(),
+                output.as_device_ptr(),
+                output.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch paged decode: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize paged decode: {error}"))?;
+        let mut actual = vec![0.0_f32; output.len()];
+        output
+            .copy_to_host(&mut actual)
+            .map_err(|error| format!("read output: {error}"))?;
+        for (actual, expected) in actual[..2].iter().zip(expected_first) {
+            assert_relative_eq!(*actual, expected as f32, epsilon = 1.0e-3);
+        }
+        for (actual, expected) in actual[2..].iter().zip(expected_second) {
+            assert_relative_eq!(*actual, expected as f32, epsilon = 1.0e-3);
+        }
+        Ok(())
+    }
+
     fn f64_materialized_oracle(
         query: &[f32],
         kv_head: usize,
@@ -734,5 +1344,87 @@ mod tests {
             *result /= normalizer;
         }
         Ok(output)
+    }
+
+    #[cfg(feature = "gpu")]
+    fn f64_paged_online_oracle(
+        native: NativePagedDecodePlan,
+        query: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        table: &[u32],
+    ) -> core::result::Result<Vec<f64>, Box<dyn std::error::Error>> {
+        let logical = native.logical();
+        if query.len() != native.query_elements()
+            || keys.len() != native.key_value_elements()
+            || values.len() != native.key_value_elements()
+            || table.len() != native.page_table_entries()
+        {
+            return Err("independent paged oracle shape mismatch".into());
+        }
+        let mut output = vec![0.0_f64; native.output_elements()];
+        for query_head in 0..logical.query_heads() {
+            let kv_head = query_head / logical.gqa_group();
+            let query_start = query_head * logical.head_width();
+            let query_end = query_start + logical.head_width();
+            let mut maximum = f64::NEG_INFINITY;
+            let mut normalizer = 0.0_f64;
+            let mut head_output = vec![0.0_f64; logical.head_width()];
+            for token in 0..logical.visible_tokens() {
+                let page = token / native.page_tokens().get();
+                let physical_page = usize::try_from(table[page])?;
+                if physical_page >= native.physical_pages() {
+                    return Err("independent paged oracle page entry out of range".into());
+                }
+                let in_page = token % native.page_tokens().get();
+                let row_start = ((physical_page * native.page_tokens().get() + in_page)
+                    * logical.kv_heads()
+                    + kv_head)
+                    * logical.head_width();
+                let row_end = row_start + logical.head_width();
+                let mut dot = 0.0_f64;
+                for (query_value, key_value) in query[query_start..query_end]
+                    .iter()
+                    .zip(&keys[row_start..row_end])
+                {
+                    dot += f64::from(*query_value) * f64::from(*key_value);
+                }
+                let score = dot * f64::from(logical.scale());
+                let next_maximum = maximum.max(score);
+                let prior_rescale = if maximum.is_infinite() {
+                    0.0_f64
+                } else {
+                    (maximum - next_maximum).exp()
+                };
+                let token_weight = (score - next_maximum).exp();
+                for (result, value) in head_output.iter_mut().zip(&values[row_start..row_end]) {
+                    *result = prior_rescale * *result + token_weight * f64::from(*value);
+                }
+                maximum = next_maximum;
+                normalizer = prior_rescale * normalizer + token_weight;
+            }
+            for (column, value) in head_output.into_iter().enumerate() {
+                output[query_start + column] = value / normalizer;
+            }
+        }
+        Ok(output)
+    }
+
+    #[cfg(feature = "gpu")]
+    fn f64_dense_logical_oracle(
+        query: &[f32],
+        visible_tokens: usize,
+    ) -> core::result::Result<Vec<f64>, Box<dyn std::error::Error>> {
+        let width = query.len();
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        keys.try_reserve_exact(visible_tokens)?;
+        values.try_reserve_exact(visible_tokens)?;
+        for token in 0..visible_tokens {
+            let value = token as f32;
+            keys.push(vec![value, -value]);
+            values.push(vec![(token + 1) as f32, ((token + 1) * 10) as f32]);
+        }
+        f64_materialized_oracle(query, 0, &keys, &values)
     }
 }
