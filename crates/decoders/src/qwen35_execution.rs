@@ -477,15 +477,12 @@ fn full_attention(
     full_layer: usize,
     append_token: usize,
 ) -> Result<Vec<f32>> {
-    let attention_tokens = position
-        .checked_add(append_token)
-        .and_then(|token| token.checked_add(1))
-        .ok_or_else(|| {
-            ArithmeticOverflowSnafu {
-                context: "full-attention token count",
-            }
-            .build()
-        })?;
+    let attention_tokens = position.checked_add(1).ok_or_else(|| {
+        ArithmeticOverflowSnafu {
+            context: "full-attention token count",
+        }
+        .build()
+    })?;
     let allocations = FullAttentionWorkspaceAllocations::try_from_layout(layout, attention_tokens)?;
     let norm = read_f32(
         weights,
