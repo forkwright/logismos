@@ -1515,7 +1515,10 @@ impl Scheduler {
                 .ok_or(SchedulerError::UnknownAdmission {
                     location: error_location(),
                 })?;
-        let AdmissionLease::Native { resident } = &admission.lease else {
+        let AdmissionLease::Native {
+            resident: resident_lease,
+        } = &admission.lease
+        else {
             return Err(SchedulerError::AdmissionNotResident {
                 location: error_location(),
             });
@@ -1534,7 +1537,7 @@ impl Scheduler {
             use_id,
             next_use_id,
             next_host_reserved,
-            device_id: resident.device_id().to_owned(),
+            device_id: resident_lease.device_id().to_owned(),
             next_uses,
             resident,
         })
