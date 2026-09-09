@@ -65,6 +65,18 @@ __device__ void k_scale_min(const std::uint8_t* scales, std::size_t group, std::
         | ((scales[group] >> HIGH_TWO_BITS_SHIFT) << 4));
 }
 
+__device__ bool checked_row_index(int rows, std::size_t* row)
+{
+    const std::size_t candidate = static_cast<std::size_t>(blockIdx.x)
+        * static_cast<std::size_t>(blockDim.x)
+        + static_cast<std::size_t>(threadIdx.x);
+    if (candidate >= static_cast<std::size_t>(rows)) {
+        return false;
+    }
+    *row = candidate;
+    return true;
+}
+
 __device__ float dot_f32(const std::uint8_t* matrix, const float* activations, std::size_t row, std::size_t width)
 {
     const std::uint8_t* row_bytes = matrix + row * width * LOGISMOS_F32_VALUE_BYTES;
@@ -257,57 +269,57 @@ __device__ float dot_iq4_xs(const std::uint8_t* matrix, const float* activations
 
 extern "C" __global__ void logismos_f32_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
 {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row < rows) {
-        output[static_cast<std::size_t>(row)] = dot_f32(matrix, activations, static_cast<std::size_t>(row), static_cast<std::size_t>(width));
+    std::size_t row = 0;
+    if (checked_row_index(rows, &row)) {
+        output[row] = dot_f32(matrix, activations, row, static_cast<std::size_t>(width));
     }
 }
 
 extern "C" __global__ void logismos_q8_0_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
 {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row < rows) {
-        output[static_cast<std::size_t>(row)] = dot_q8_0(matrix, activations, static_cast<std::size_t>(row), static_cast<std::size_t>(width));
+    std::size_t row = 0;
+    if (checked_row_index(rows, &row)) {
+        output[row] = dot_q8_0(matrix, activations, row, static_cast<std::size_t>(width));
     }
 }
 
 extern "C" __global__ void logismos_q4_k_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
 {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row < rows) {
-        output[static_cast<std::size_t>(row)] = dot_q4_k(matrix, activations, static_cast<std::size_t>(row), static_cast<std::size_t>(width));
+    std::size_t row = 0;
+    if (checked_row_index(rows, &row)) {
+        output[row] = dot_q4_k(matrix, activations, row, static_cast<std::size_t>(width));
     }
 }
 
 extern "C" __global__ void logismos_q5_k_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
 {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row < rows) {
-        output[static_cast<std::size_t>(row)] = dot_q5_k(matrix, activations, static_cast<std::size_t>(row), static_cast<std::size_t>(width));
+    std::size_t row = 0;
+    if (checked_row_index(rows, &row)) {
+        output[row] = dot_q5_k(matrix, activations, row, static_cast<std::size_t>(width));
     }
 }
 
 extern "C" __global__ void logismos_q6_k_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
 {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row < rows) {
-        output[static_cast<std::size_t>(row)] = dot_q6_k(matrix, activations, static_cast<std::size_t>(row), static_cast<std::size_t>(width));
+    std::size_t row = 0;
+    if (checked_row_index(rows, &row)) {
+        output[row] = dot_q6_k(matrix, activations, row, static_cast<std::size_t>(width));
     }
 }
 
 extern "C" __global__ void logismos_iq4_nl_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
 {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row < rows) {
-        output[static_cast<std::size_t>(row)] = dot_iq4_nl(matrix, activations, static_cast<std::size_t>(row), static_cast<std::size_t>(width));
+    std::size_t row = 0;
+    if (checked_row_index(rows, &row)) {
+        output[row] = dot_iq4_nl(matrix, activations, row, static_cast<std::size_t>(width));
     }
 }
 
 extern "C" __global__ void logismos_iq4_xs_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
 {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row < rows) {
-        output[static_cast<std::size_t>(row)] = dot_iq4_xs(matrix, activations, static_cast<std::size_t>(row), static_cast<std::size_t>(width));
+    std::size_t row = 0;
+    if (checked_row_index(rows, &row)) {
+        output[row] = dot_iq4_xs(matrix, activations, row, static_cast<std::size_t>(width));
     }
 }
 
