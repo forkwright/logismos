@@ -111,9 +111,11 @@ impl<Resource: CompletionResource> InFlight<'_, Resource> {
     ) -> core::result::Result<&mut Resource, CompletionError<Resource::Error>> {
         match self.owner.state.as_mut() {
             Some(ResourceState::InFlight(resource)) => Ok(resource),
-            Some(ResourceState::Ready(_))
-            | Some(ResourceState::PoisonedIdle(_))
-            | Some(ResourceState::PoisonedUncertain(_))
+            Some(
+                ResourceState::Ready(_)
+                | ResourceState::PoisonedIdle(_)
+                | ResourceState::PoisonedUncertain(_),
+            )
             | None => Err(CompletionError::MissingResource),
         }
     }
@@ -268,14 +270,16 @@ mod tests {
         }
     }
 
+    struct OwnerFixture {
+        owner: ResourceOwner<TestResource>,
+        synchronizations: Rc<Cell<usize>>,
+        drops: Rc<Cell<usize>>,
+        publications: Rc<Cell<usize>>,
+    }
+
     fn owner(
         script: impl IntoIterator<Item = core::result::Result<(), TestError>>,
-    ) -> (
-        ResourceOwner<TestResource>,
-        Rc<Cell<usize>>,
-        Rc<Cell<usize>>,
-        Rc<Cell<usize>>,
-    ) {
+    ) -> OwnerFixture {
         let synchronizations = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
         let publications = Rc::new(Cell::new(0));
@@ -285,12 +289,22 @@ mod tests {
             Rc::clone(&publications),
             script,
         ));
-        (owner, synchronizations, drops, publications)
+        OwnerFixture {
+            owner,
+            synchronizations,
+            drops,
+            publications,
+        }
     }
 
     #[test]
     fn preflight_drop_returns_bundle_to_ready() -> core::result::Result<(), BeginError> {
-        let (mut owner, synchronizations, drops, _) = owner([]);
+        let OwnerFixture {
+            mut owner,
+            synchronizations,
+            drops,
+            ..
+        } = owner([]);
         let guard = owner.begin()?;
         drop(guard);
         assert!(matches!(owner.state(), Some(ResourceState::Ready(_))));
@@ -303,7 +317,12 @@ mod tests {
     #[test]
     fn synchronized_commit_publishes_then_returns_to_ready() -> core::result::Result<(), BeginError>
     {
-        let (mut owner, synchronizations, drops, publications) = owner([Ok(())]);
+        let OwnerFixture {
+            mut owner,
+            synchronizations,
+            drops,
+            publications,
+        } = owner([Ok(())]);
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         guard
@@ -322,7 +341,12 @@ mod tests {
 
     #[test]
     fn completion_requires_marking_before_submission() -> core::result::Result<(), BeginError> {
-        let (mut owner, synchronizations, drops, publications) = owner([]);
+        let OwnerFixture {
+            mut owner,
+            synchronizations,
+            drops,
+            publications,
+        } = owner([]);
         let guard = owner.begin()?;
         let error = guard
             .complete(|resource| {
@@ -343,7 +367,12 @@ mod tests {
     #[test]
     fn checked_prepublication_failure_is_known_idle_and_never_retries()
     -> core::result::Result<(), BeginError> {
-        let (mut owner, synchronizations, drops, publications) = owner([Ok(())]);
+        let OwnerFixture {
+            mut owner,
+            synchronizations,
+            drops,
+            publications,
+        } = owner([Ok(())]);
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         let error = guard
@@ -371,7 +400,12 @@ mod tests {
     #[test]
     fn submitted_drop_with_successful_sync_is_permanently_poisoned()
     -> core::result::Result<(), BeginError> {
-        let (mut owner, synchronizations, drops, publications) = owner([Ok(())]);
+        let OwnerFixture {
+            mut owner,
+            synchronizations,
+            drops,
+            publications,
+        } = owner([Ok(())]);
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         drop(guard);
@@ -390,8 +424,12 @@ mod tests {
     #[test]
     fn completion_sync_failure_never_publishes_and_remains_uncertain()
     -> core::result::Result<(), BeginError> {
-        let (mut owner, synchronizations, drops, publications) =
-            owner([Err(TestError::ScriptFailure), Ok(())]);
+        let OwnerFixture {
+            mut owner,
+            synchronizations,
+            drops,
+            publications,
+        } = owner([Err(TestError::ScriptFailure), Ok(())]);
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         let error = guard
@@ -422,8 +460,12 @@ mod tests {
     #[test]
     fn failed_sync_drop_retries_then_forgets_entire_bundle() -> core::result::Result<(), BeginError>
     {
-        let (mut owner, synchronizations, drops, publications) =
-            owner([Err(TestError::ScriptFailure), Err(TestError::ScriptFailure)]);
+        let OwnerFixture {
+            mut owner,
+            synchronizations,
+            drops,
+            publications,
+        } = owner([Err(TestError::ScriptFailure), Err(TestError::ScriptFailure)]);
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         drop(guard);
@@ -442,9 +484,18 @@ mod tests {
     struct ControlledUnwind;
 
     #[test]
+    #[expect(
+        clippy::panic,
+        reason = "test-only fault injection exercises the production guard Drop path under unwind"
+    )]
     fn commit_unwind_uses_production_drop_path_and_never_publishes()
     -> core::result::Result<(), BeginError> {
-        let (mut owner, synchronizations, drops, publications) = owner([Ok(()), Ok(())]);
+        let OwnerFixture {
+            mut owner,
+            synchronizations,
+            drops,
+            publications,
+        } = owner([Ok(()), Ok(())]);
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         // This controlled unwind proves the real guard's destructor synchronizes

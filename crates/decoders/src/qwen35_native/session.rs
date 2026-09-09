@@ -180,7 +180,7 @@ impl Qwen35NativeLayerSession {
             Some(ResourceState::PoisonedIdle(_)) => {
                 Qwen35NativeLayerSessionState::PoisonedKnownIdle
             }
-            Some(ResourceState::InFlight(_)) | Some(ResourceState::PoisonedUncertain(_)) | None => {
+            Some(ResourceState::InFlight(_) | ResourceState::PoisonedUncertain(_)) | None => {
                 Qwen35NativeLayerSessionState::PoisonedCompletionUncertain
             }
         }
