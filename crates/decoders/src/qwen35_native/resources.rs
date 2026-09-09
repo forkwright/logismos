@@ -8,7 +8,7 @@ use crate::error::{
     ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionPagedDecodePlanSnafu,
     NativeDeviceSnafu, NativePagedKvSnafu, NativeSessionStateSnafu,
 };
-use crate::qwen35_mrope::text_mrope_coefficient;
+use crate::qwen35_mrope::{TextMrope, text_mrope_coefficient};
 use crate::qwen35_native::finish::LayerFinishWorkspace;
 use crate::qwen35_native::plan::{DeviceFullAttentionPlan, WorkspacePlan};
 use crate::qwen35_native::weights::NativeWeights;
@@ -101,26 +101,11 @@ impl DeviceResources {
             }
             .fail();
         }
-        let pairs = self.plan.workspace.query_rotary.coefficient_elements();
-        let mut cosine = Vec::new();
-        let mut sine = Vec::new();
-        cosine
-            .try_reserve_exact(pairs)
-            .context(ExecutionAllocationSnafu {
-                target: "native cosine controls",
-                length: pairs,
-            })?;
-        sine.try_reserve_exact(pairs)
-            .context(ExecutionAllocationSnafu {
-                target: "native sine controls",
-                length: pairs,
-            })?;
-        for pair in 0..pairs {
-            let (c, s) =
-                text_mrope_coefficient(self.plan.layout.text_mrope(), self.position, pair)?;
-            cosine.push(c);
-            sine.push(s);
-        }
+        let (cosine, sine) = native_mrope_controls(
+            self.plan.layout.text_mrope(),
+            self.position,
+            self.plan.workspace.query_rotary.coefficient_elements(),
+        )?;
         let logical = kernels::PagedDecodePlan::try_from_dimensions(
             visible,
             self.plan.layout.heads,
@@ -161,7 +146,7 @@ impl StepBuffers {
 }
 
 impl NativeWorkspace {
-    fn new(plan: &WorkspacePlan, device: &Device) -> Result<Self> {
+    pub(super) fn new(plan: &WorkspacePlan, device: &Device) -> Result<Self> {
         macro_rules! buffer {
             ($field:ident) => {
                 DeviceBuffer::alloc(device, plan.$field).context(NativeDeviceSnafu)?
@@ -181,4 +166,30 @@ impl NativeWorkspace {
             output_projection: buffer!(output_projection),
         })
     }
+}
+
+pub(super) fn native_mrope_controls(
+    mrope: TextMrope,
+    position: usize,
+    pairs: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let mut cosine = Vec::new();
+    let mut sine = Vec::new();
+    cosine
+        .try_reserve_exact(pairs)
+        .context(ExecutionAllocationSnafu {
+            target: "native cosine controls",
+            length: pairs,
+        })?;
+    sine.try_reserve_exact(pairs)
+        .context(ExecutionAllocationSnafu {
+            target: "native sine controls",
+            length: pairs,
+        })?;
+    for pair in 0..pairs {
+        let (cosine_value, sine_value) = text_mrope_coefficient(mrope, position, pair)?;
+        cosine.push(cosine_value);
+        sine.push(sine_value);
+    }
+    Ok((cosine, sine))
 }
