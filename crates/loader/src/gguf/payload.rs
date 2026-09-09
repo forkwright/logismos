@@ -124,7 +124,7 @@ impl VerifiedArtifact {
     /// this verified artifact, or [`crate::Error::Gguf`] if an internal checked
     /// extent cannot be represented as a backing slice.
     pub fn tensor(&self, name: &str) -> Result<VerifiedTensor<'_>> {
-        let descriptor = self.observation.descriptor_by_name(name)?;
+        let descriptor = self.observation().descriptor_by_name(name)?;
         let serialized_bytes = u64::try_from(self.inner.backing.len()).map_err(|_| {
             GgufSnafu {
                 offset: 0u64,
@@ -136,7 +136,7 @@ impl VerifiedArtifact {
             .build()
         })?;
         let extent = self
-            .observation
+            .observation()
             .parsed
             .extent_for(descriptor, serialized_bytes)?;
         let start = usize::try_from(extent.start).map_err(|_| {
