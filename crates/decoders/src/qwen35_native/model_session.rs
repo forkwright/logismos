@@ -470,9 +470,16 @@ impl Qwen35NativeExecutionSession {
     /// quality, or serving safety.
     pub unsafe fn step(&mut self, token: u32) -> Result<DeviceBuffer<f32>> {
         let mut in_flight = self.owner.begin().map_err(begin_error)?;
-        {
+        let (preparation, requires_teardown) = {
             let resources = in_flight.resource().map_err(completion_error)?;
-            resources.prepare_step(token)?;
+            let preparation = resources.prepare_step(token);
+            (preparation, resources.requires_teardown())
+        };
+        if let Err(error) = preparation {
+            if requires_teardown {
+                in_flight.poison_known_idle();
+            }
+            return Err(error);
         }
         in_flight.mark_submitted();
         {

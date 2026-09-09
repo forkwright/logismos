@@ -73,6 +73,7 @@ pub(super) struct ModelSessionResources {
     final_normalized: DeviceBuffer<f32>,
     layers: Vec<NativeSessionLayer>,
     step: Option<ModelStep>,
+    failed_step: Option<NativeBufferParts>,
     position: usize,
 }
 
@@ -302,6 +303,7 @@ impl ModelSessionResources {
             final_normalized,
             layers,
             step: None,
+            failed_step: None,
             position: 0,
         })
     }
@@ -327,6 +329,7 @@ impl ModelSessionResources {
             final_normalized,
             layers,
             step,
+            failed_step,
             position: _,
         } = self;
         drop(plan);
@@ -354,6 +357,9 @@ impl ModelSessionResources {
         if let Some(step) = step {
             step.into_buffer_sink(&mut buffers);
         }
+        if let Some(failed_step) = failed_step {
+            failed_step.append_to(&mut buffers);
+        }
         ModelSessionTeardownParts {
             stream,
             buffers: buffers.into_buffers(),
@@ -368,16 +374,66 @@ impl ModelSessionResources {
             }
             .fail();
         }
+        if self.failed_step.is_some() {
+            return NativeSessionStateSnafu {
+                rule: "native session with failed step allocation requires explicit teardown",
+            }
+            .fail();
+        }
         let token = ModelTokenPlan::from_model(&self.plan, self.position, token)?;
-        let (cosine, sine) = self.prepare_attention_controls(token)?;
+        let controls = self.attention_control_values(token)?;
+        let mut failed_step = NativeBufferParts::new();
+        let (cosine, sine) = match controls {
+            Some((cosine, sine)) => {
+                let cosine =
+                    match copy_f32_to_device(self.stream.device(), &cosine, &mut failed_step) {
+                        Ok(cosine) => cosine,
+                        Err(error) => {
+                            self.failed_step = Some(failed_step);
+                            return Err(error);
+                        }
+                    };
+                let sine = match copy_f32_to_device(self.stream.device(), &sine, &mut failed_step) {
+                    Ok(sine) => sine,
+                    Err(error) => {
+                        failed_step.push_f32(cosine);
+                        self.failed_step = Some(failed_step);
+                        return Err(error);
+                    }
+                };
+                (Some(cosine), Some(sine))
+            }
+            None => (None, None),
+        };
+        let logits = match DeviceBuffer::alloc(self.stream.device(), self.model.output.shape.rows())
+        {
+            Ok(logits) => logits,
+            Err(source) => {
+                if let Some(cosine) = cosine {
+                    failed_step.push_f32(cosine);
+                }
+                if let Some(sine) = sine {
+                    failed_step.push_f32(sine);
+                }
+                if !failed_step.is_empty() {
+                    self.failed_step = Some(failed_step);
+                }
+                return NativeDeviceSnafu { source }.fail();
+            }
+        };
         self.step = Some(ModelStep {
             token,
-            logits: DeviceBuffer::alloc(self.stream.device(), self.model.output.shape.rows())
-                .context(NativeDeviceSnafu)?,
+            logits,
             cosine,
             sine,
         });
         Ok(())
+    }
+
+    /// True when a failed step allocation has already moved buffers into
+    /// explicit inert custody and the session must not dispatch again.
+    pub(super) const fn requires_teardown(&self) -> bool {
+        self.failed_step.is_some()
     }
 
     /// Submit one token through the complete artifact-ordered native main model.
@@ -582,12 +638,12 @@ impl ModelSessionResources {
         Ok(step.logits)
     }
 
-    fn prepare_attention_controls(
+    fn attention_control_values(
         &self,
         token: ModelTokenPlan,
-    ) -> Result<(Option<DeviceBuffer<f32>>, Option<DeviceBuffer<f32>>)> {
+    ) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
         if token.attention.is_none() {
-            return Ok((None, None));
+            return Ok(None);
         }
         let Some(workspace) = self.plan.full_workspace else {
             return NativeSessionStateSnafu {
@@ -600,13 +656,24 @@ impl ModelSessionResources {
             self.position,
             workspace.query_rotary.coefficient_elements(),
         )?;
-        Ok((
-            Some(
-                DeviceBuffer::from_host(self.stream.device(), &cosine)
-                    .context(NativeDeviceSnafu)?,
-            ),
-            Some(DeviceBuffer::from_host(self.stream.device(), &sine).context(NativeDeviceSnafu)?),
-        ))
+        Ok(Some((cosine, sine)))
+    }
+}
+
+/// Allocate then synchronously copy one host control vector without losing a
+/// successful allocation when HIP reports a copy failure.
+fn copy_f32_to_device(
+    device: &Device,
+    values: &[f32],
+    failed_step: &mut NativeBufferParts,
+) -> Result<DeviceBuffer<f32>> {
+    let mut buffer = DeviceBuffer::alloc(device, values.len()).context(NativeDeviceSnafu)?;
+    match buffer.copy_from_host(values) {
+        Ok(()) => Ok(buffer),
+        Err(source) => {
+            failed_step.push_f32(buffer);
+            NativeDeviceSnafu { source }.fail()
+        }
     }
 }
 

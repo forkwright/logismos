@@ -49,6 +49,16 @@ impl NativeBufferParts {
     pub(super) fn into_buffers(self) -> Vec<TeardownBuffer> {
         self.buffers
     }
+
+    /// Whether this custody contains no disarmed native allocation.
+    pub(super) fn is_empty(&self) -> bool {
+        self.buffers.is_empty()
+    }
+
+    /// Merge already-disarmed ownership without invoking HIP.
+    pub(super) fn append_to(self, destination: &mut Self) {
+        destination.buffers.extend(self.buffers);
+    }
 }
 
 impl NativeBufferSink for NativeBufferParts {
