@@ -3226,7 +3226,7 @@ mod tests {
     }
 
     #[test]
-    fn dropped_or_quarantined_native_use_keeps_all_charges() -> Result<(), SchedulerError> {
+    fn dropped_native_use_keeps_all_charges() -> Result<(), SchedulerError> {
         let grant = request("[]", 12)?;
         let mut scheduler = Scheduler::new(&grant, SchedulerLimits::default())?;
         let ticket = native_loaded(&mut scheduler, 4, "native-main")?;
@@ -3243,17 +3243,18 @@ mod tests {
             ),
             Err(SchedulerError::NativeDeviceBytes { .. })
         ));
+        assert_eq!(scheduler.native_uses.len(), 1);
+        Ok(())
+    }
 
+    #[test]
+    fn non_revoked_quarantined_native_use_refuses_new_use() -> Result<(), SchedulerError> {
         let grant = request("[]", 12)?;
         let mut quarantined = Scheduler::new(&grant, SchedulerLimits::default())?;
         let ticket = native_loaded(&mut quarantined, 4, "native-quarantine")?;
         let permit = quarantined.begin_native_use(
             &ticket,
             NativeUseRequest::new(requested_device_bytes(4)?, None, None),
-        )?;
-        let finished = quarantined.begin_native_use(
-            &ticket,
-            NativeUseRequest::new(requested_device_bytes(1)?, None, None),
         )?;
         quarantined.quarantine_native_use(&permit)?;
         assert!(matches!(
@@ -3264,22 +3265,61 @@ mod tests {
             Err(SchedulerError::AdmissionNotResident { .. })
         ));
         assert_eq!(quarantined.native_quarantined_uses.len(), 1);
-        quarantined.revoke(&quarantined.generation())?;
+        assert!(quarantined.native_uses.is_empty());
+        assert!(matches!(quarantined.poll_command()?, PollOutcome::Idle));
+        Ok(())
+    }
+
+    #[test]
+    fn revoked_quarantined_native_use_finishes_known_sibling() -> Result<(), SchedulerError> {
+        let grant = request("[]", 12)?;
+        let mut scheduler = Scheduler::new(&grant, SchedulerLimits::default())?;
+        let ticket = native_loaded(&mut scheduler, 4, "native-quarantine")?;
+        let parent = scheduler.begin_native_use(
+            &ticket,
+            NativeUseRequest::new(requested_device_bytes(4)?, None, None),
+        )?;
+        let sibling = scheduler.begin_native_use(
+            &ticket,
+            NativeUseRequest::new(requested_device_bytes(1)?, None, None),
+        )?;
+        scheduler.revoke(&scheduler.generation())?;
+        assert!(matches!(
+            scheduler.admissions.get(&ticket.admission_id).map(|admission| &admission.state),
+            Some(AdmissionState::Draining {
+                resident: Some(resident),
+                loading: false,
+            }) if resident.as_str() == "native-quarantine"
+        ));
+        scheduler.quarantine_native_use(&parent)?;
+        assert!(matches!(
+            scheduler.admissions.get(&ticket.admission_id).map(|admission| &admission.state),
+            Some(AdmissionState::Quarantined {
+                resident: Some(resident),
+            }) if resident.as_str() == "native-quarantine"
+        ));
+        assert_eq!(scheduler.native_quarantined_uses.len(), 1);
         assert!(
-            quarantined
-                .finish_native_use_after_teardown(&finished)?
+            scheduler
+                .finish_native_use_after_teardown(&sibling)?
                 .is_none(),
             "a known-finished sibling use releases only its mutable charge"
         );
         assert!(matches!(
-            quarantined.begin_native_use(
+            scheduler.admissions.get(&ticket.admission_id).map(|admission| &admission.state),
+            Some(AdmissionState::Quarantined {
+                resident: Some(resident),
+            }) if resident.as_str() == "native-quarantine"
+        ));
+        assert!(matches!(
+            scheduler.begin_native_use(
                 &ticket,
                 NativeUseRequest::new(requested_device_bytes(1)?, None, None),
             ),
             Err(SchedulerError::GrantRevoked { .. })
         ));
-        assert_eq!(quarantined.native_quarantined_uses.len(), 1);
-        assert!(matches!(quarantined.poll_command()?, PollOutcome::Idle));
+        assert_eq!(scheduler.native_quarantined_uses.len(), 1);
+        assert!(matches!(scheduler.poll_command()?, PollOutcome::Idle));
         Ok(())
     }
 
