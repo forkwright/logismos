@@ -50,8 +50,8 @@ pub enum Error {
         source: taxis::Error,
     },
 
-    /// Propagated checked Q8_0 row-format failure.
-    #[snafu(display("Q8_0 projection format failure: {source}"))]
+    /// Propagated checked serialized-row format failure.
+    #[snafu(display("serialized-row projection format failure: {source}"))]
     Quant {
         /// Source quantization error.
         source: quant::Error,

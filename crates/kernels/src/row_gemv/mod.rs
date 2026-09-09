@@ -2,7 +2,7 @@
 
 pub mod cpu;
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 use std::ffi::c_void;
 
 #[cfg(feature = "gpu")]
@@ -214,10 +214,11 @@ fn abi_error(label: &'static str, value: usize) -> crate::Error {
 ///
 /// # Safety
 ///
-/// `matrix`, `activations`, and `output` must name exact device allocations on
-/// `stream`'s device; each supplied length must describe that full allocation
-/// and equal the corresponding checked `shape` extent. Their contents must remain immutable through stream
-/// completion, while `output` requires exclusive access through completion.
+/// `matrix`, `activations`, and `output` must identify valid device spans on
+/// `stream`'s device whose supplied lengths exactly equal the checked `shape`
+/// extents. Inputs must remain immutable through stream completion; `output`
+/// requires exclusive access through completion. Every span must remain live,
+/// correctly aligned, and non-overlapping with the writable output.
 /// Every stored fp16 scale, f32 operand, decoded value, product, and accumulator
 /// must be finite and either zero or normal. This ABI has no device numerical
 /// status channel and cannot reproduce CPU arithmetic refusals.
@@ -449,7 +450,7 @@ mod tests {
     #[test]
     fn shape_refuses_zero_partial_and_overflowing_geometry() {
         assert!(matches!(
-            RowGemvShape::new(quant::RowFormat::F32, 0, 1, 4, 1, 0),
+            RowGemvShape::new(quant::RowFormat::F32, 0, 1, 0, 1, 0),
             Err(Error::UnsupportedShape { kernel: KERNEL, .. })
         ));
         assert!(matches!(

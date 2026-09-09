@@ -1,4 +1,4 @@
-//! Checked private device spans shared by staged dense-f32 launchers.
+//! Checked private byte and dense-f32 device spans shared by native launchers.
 
 use crate::error::{Result, UnsupportedShapeSnafu};
 

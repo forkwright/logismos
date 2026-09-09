@@ -127,6 +127,25 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn q4_logical_lane_order_preserves_dyadic_cancellation()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let fixture = q4_logical_order_fixture();
+        let shape = RowGemvShape::new(
+            quant::RowFormat::Q4K,
+            fixture.rows,
+            fixture.width,
+            fixture.matrix.len(),
+            fixture.activations.len(),
+            fixture.rows,
+        )?;
+        let actual = row_gemv_f32(&fixture.matrix, &fixture.activations, shape)?;
+        let packed_order = (fixture.activations[0] + fixture.activations[32]) + fixture.activations[1];
+        assert_eq!(actual, [0.0_f32], "logical Q4_K lane order");
+        assert_eq!(packed_order, 1.0_f32, "packed low/high interleaving discriminator");
+        Ok(())
+    }
+
     #[cfg(feature = "gpu")]
     #[test]
     #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
@@ -197,6 +216,46 @@ mod tests {
                 return Err(format!("{format} kernel modified immutable activations"));
             }
             assert_gpu_close(&actual, &expected, format.to_string().as_str())?;
+        }
+        let fixture = q4_logical_order_fixture();
+        let shape = RowGemvShape::new(
+            quant::RowFormat::Q4K,
+            fixture.rows,
+            fixture.width,
+            fixture.matrix.len(),
+            fixture.activations.len(),
+            fixture.rows,
+        )
+        .map_err(|error| format!("validate Q4_K order shape: {error}"))?;
+        let matrix = DeviceBuffer::<u8>::from_host(&device, &fixture.matrix)
+            .map_err(|error| format!("upload Q4_K order matrix: {error}"))?;
+        let activations = DeviceBuffer::<f32>::from_host(&device, &fixture.activations)
+            .map_err(|error| format!("upload Q4_K order activations: {error}"))?;
+        let output = DeviceBuffer::<f32>::alloc(&device, fixture.rows)
+            .map_err(|error| format!("allocate Q4_K order output: {error}"))?;
+        // SAFETY: the checked Q4_K shape exactly describes three distinct live buffers.
+        unsafe {
+            crate::row_gemv::launch_row_gemv_f32(
+                shape,
+                matrix.as_device_ptr(),
+                matrix.len(),
+                activations.as_device_ptr(),
+                activations.len(),
+                output.as_device_ptr(),
+                output.len(),
+                &stream,
+            )
+        }
+        .map_err(|error| format!("launch Q4_K order fixture: {error}"))?;
+        stream
+            .synchronize()
+            .map_err(|error| format!("synchronize Q4_K order fixture: {error}"))?;
+        let mut actual = [f32::NAN; 1];
+        output
+            .copy_to_host(&mut actual)
+            .map_err(|error| format!("read Q4_K order output: {error}"))?;
+        if actual != [0.0_f32] {
+            return Err(format!("Q4_K logical-order device result was {actual:?}, expected [0.0]"));
         }
         Ok(())
     }
@@ -321,6 +380,24 @@ mod tests {
         })
     }
 
+    fn q4_logical_order_fixture() -> Fixture {
+        let mut block = vec![0_u8; quant::Q4_K_BLOCK_BYTES];
+        block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        block[4] = 1;
+        block[5] = 1;
+        block[16..].fill(0x11);
+        let mut activations = vec![0.0_f32; quant::Q4_K_VALUES_PER_BLOCK];
+        activations[0] = 16_777_216.0_f32;
+        activations[1] = 1.0_f32;
+        activations[32] = -16_777_216.0_f32;
+        Fixture {
+            rows: 1,
+            width: quant::Q4_K_VALUES_PER_BLOCK,
+            matrix: block,
+            activations,
+        }
+    }
+
     fn ramp_i8(start: i8, step: i8) -> [i8; 32] {
         std::array::from_fn(|index| start.wrapping_add(step.wrapping_mul(index as i8)))
     }
@@ -335,8 +412,8 @@ mod tests {
         let mut block = Vec::new();
         block.extend(scale.to_le_bytes());
         block.extend(minimum.to_le_bytes());
-        block.extend((0..12).map(|index| pattern.wrapping_add(index as u8 * 19)));
-        block.extend((0..128).map(|index| pattern.wrapping_add(index as u8 * 7)));
+        block.extend((0..12).map(|index| pattern.wrapping_add((index as u8).wrapping_mul(19))));
+        block.extend((0..128).map(|index| pattern.wrapping_add((index as u8).wrapping_mul(7))));
         block
     }
 
@@ -359,15 +436,15 @@ mod tests {
 
     fn block_iq4_nl(scale: u16, pattern: u8) -> Vec<u8> {
         let mut block = scale.to_le_bytes().to_vec();
-        block.extend((0..16).map(|index| pattern.wrapping_add(index as u8 * 11)));
+        block.extend((0..16).map(|index| pattern.wrapping_add((index as u8).wrapping_mul(11))));
         block
     }
 
     fn block_iq4_xs(scale: u16, high: u8, pattern: u8) -> Vec<u8> {
         let mut block = scale.to_le_bytes().to_vec();
         block.extend([high, high.rotate_left(3)]);
-        block.extend((0..4).map(|index| pattern.wrapping_add(index as u8 * 17)));
-        block.extend((0..128).map(|index| pattern.wrapping_add(index as u8 * 13)));
+        block.extend((0..4).map(|index| pattern.wrapping_add((index as u8).wrapping_mul(17))));
+        block.extend((0..128).map(|index| pattern.wrapping_add((index as u8).wrapping_mul(13))));
         block
     }
 

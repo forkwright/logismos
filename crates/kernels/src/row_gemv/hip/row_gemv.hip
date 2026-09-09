@@ -16,13 +16,6 @@ constexpr std::size_t BITS_PER_BYTE = 8;
 constexpr std::uint8_t LOW_NIBBLE_MASK = 0x0f;
 constexpr std::uint8_t LOW_SIX_BITS_MASK = 0x3f;
 constexpr std::uint8_t HIGH_TWO_BITS_SHIFT = 6;
-constexpr std::size_t Q6_VALUES_PER_QUARTER = 32;
-constexpr std::size_t Q6_QUARTERS_PER_HALF = 4;
-constexpr std::size_t IQ4_NL_QUANT_OFFSET = 2;
-constexpr std::size_t IQ4_XS_SCALE_HIGH_OFFSET = 2;
-constexpr std::size_t IQ4_XS_SCALE_LOW_OFFSET = 4;
-constexpr std::size_t IQ4_XS_QUANT_OFFSET = 8;
-constexpr std::size_t IQ4_GROUP_VALUES = 32;
 
 __device__ std::uint16_t load_u16_le(const std::uint8_t* bytes)
 {
@@ -114,10 +107,10 @@ __device__ float dot_q4_k(const std::uint8_t* matrix, const float* activations, 
     for (std::size_t block_index = 0; block_index < blocks; ++block_index) {
         const std::uint8_t* block = row_bytes + block_index * LOGISMOS_Q4_K_BLOCK_BYTES;
         const float super_scale = load_f16_le(block);
-        const float super_minimum = load_f16_le(block + 2);
-        const std::uint8_t* scales = block + LOGISMOS_Q4_K_PREFIX_BYTES;
-        const std::uint8_t* quantized = scales + LOGISMOS_Q4_K_SCALE_BYTES;
-        for (std::size_t pair = 0; pair < 4; ++pair) {
+        const float super_minimum = load_f16_le(block + LOGISMOS_Q4_K_SUPER_MINIMUM_OFFSET);
+        const std::uint8_t* scales = block + LOGISMOS_Q4_K_SCALE_OFFSET;
+        const std::uint8_t* quantized = block + LOGISMOS_Q4_K_QUANT_OFFSET;
+        for (std::size_t pair = 0; pair < LOGISMOS_K_PAIR_COUNT; ++pair) {
             std::uint8_t low_scale = 0;
             std::uint8_t low_minimum = 0;
             std::uint8_t high_scale = 0;
@@ -133,6 +126,9 @@ __device__ float dot_q4_k(const std::uint8_t* matrix, const float* activations, 
                 const float low_decoded = low_scale_f32 * static_cast<float>(packed & LOW_NIBBLE_MASK) - low_minimum_f32;
                 const float low_product = low_decoded * activations[block_index * LOGISMOS_Q4_K_VALUES_PER_BLOCK + pair * LOGISMOS_K_GROUP_VALUES * 2 + lane];
                 accumulator = accumulator + low_product;
+            }
+            for (std::size_t lane = 0; lane < LOGISMOS_K_GROUP_VALUES; ++lane) {
+                const std::uint8_t packed = quantized[pair * LOGISMOS_K_GROUP_VALUES + lane];
                 const float high_decoded = high_scale_f32 * static_cast<float>(packed >> 4) - high_minimum_f32;
                 const float high_product = high_decoded * activations[block_index * LOGISMOS_Q4_K_VALUES_PER_BLOCK + pair * LOGISMOS_K_GROUP_VALUES * 2 + LOGISMOS_K_GROUP_VALUES + lane];
                 accumulator = accumulator + high_product;
@@ -150,11 +146,11 @@ __device__ float dot_q5_k(const std::uint8_t* matrix, const float* activations, 
     for (std::size_t block_index = 0; block_index < blocks; ++block_index) {
         const std::uint8_t* block = row_bytes + block_index * LOGISMOS_Q5_K_BLOCK_BYTES;
         const float super_scale = load_f16_le(block);
-        const float super_minimum = load_f16_le(block + 2);
-        const std::uint8_t* scales = block + LOGISMOS_Q5_K_PREFIX_BYTES;
-        const std::uint8_t* high_bits = scales + LOGISMOS_Q5_K_SCALE_BYTES;
-        const std::uint8_t* quantized = high_bits + LOGISMOS_Q5_K_HIGH_BITS_BYTES;
-        for (std::size_t pair = 0; pair < 4; ++pair) {
+        const float super_minimum = load_f16_le(block + LOGISMOS_Q5_K_SUPER_MINIMUM_OFFSET);
+        const std::uint8_t* scales = block + LOGISMOS_Q5_K_SCALE_OFFSET;
+        const std::uint8_t* high_bits = block + LOGISMOS_Q5_K_HIGH_BITS_OFFSET;
+        const std::uint8_t* quantized = block + LOGISMOS_Q5_K_QUANT_OFFSET;
+        for (std::size_t pair = 0; pair < LOGISMOS_K_PAIR_COUNT; ++pair) {
             std::uint8_t low_scale = 0;
             std::uint8_t low_minimum = 0;
             std::uint8_t high_scale = 0;
@@ -171,10 +167,14 @@ __device__ float dot_q5_k(const std::uint8_t* matrix, const float* activations, 
                 const std::uint8_t packed = quantized[pair * LOGISMOS_K_GROUP_VALUES + lane];
                 const std::uint8_t fifth = high_bits[lane];
                 const std::uint8_t low = static_cast<std::uint8_t>((packed & LOW_NIBBLE_MASK) + ((fifth & low_bit) == 0 ? 0 : 16));
-                const std::uint8_t high = static_cast<std::uint8_t>((packed >> 4) + ((fifth & high_bit) == 0 ? 0 : 16));
                 const float low_decoded = low_scale_f32 * static_cast<float>(low) - low_minimum_f32;
                 const float low_product = low_decoded * activations[block_index * LOGISMOS_Q5_K_VALUES_PER_BLOCK + pair * LOGISMOS_K_GROUP_VALUES * 2 + lane];
                 accumulator = accumulator + low_product;
+            }
+            for (std::size_t lane = 0; lane < LOGISMOS_K_GROUP_VALUES; ++lane) {
+                const std::uint8_t packed = quantized[pair * LOGISMOS_K_GROUP_VALUES + lane];
+                const std::uint8_t fifth = high_bits[lane];
+                const std::uint8_t high = static_cast<std::uint8_t>((packed >> 4) + ((fifth & high_bit) == 0 ? 0 : 16));
                 const float high_decoded = high_scale_f32 * static_cast<float>(high) - high_minimum_f32;
                 const float high_product = high_decoded * activations[block_index * LOGISMOS_Q5_K_VALUES_PER_BLOCK + pair * LOGISMOS_K_GROUP_VALUES * 2 + LOGISMOS_K_GROUP_VALUES + lane];
                 accumulator = accumulator + high_product;
@@ -192,20 +192,20 @@ __device__ float dot_q6_k(const std::uint8_t* matrix, const float* activations, 
     for (std::size_t block_index = 0; block_index < blocks; ++block_index) {
         const std::uint8_t* block = row_bytes + block_index * LOGISMOS_Q6_K_BLOCK_BYTES;
         const std::uint8_t* low = block;
-        const std::uint8_t* high = low + LOGISMOS_Q6_K_LOW_BITS_BYTES;
-        const std::uint8_t* scales = high + LOGISMOS_Q6_K_HIGH_BITS_BYTES;
-        const float super_scale = load_f16_le(scales + LOGISMOS_Q6_K_SCALE_BYTES);
-        for (std::size_t half = 0; half < 2; ++half) {
-            for (std::size_t lane = 0; lane < Q6_VALUES_PER_QUARTER; ++lane) {
-                const std::uint8_t packed_high = high[half * Q6_VALUES_PER_QUARTER + lane];
-                for (std::size_t quarter = 0; quarter < Q6_QUARTERS_PER_HALF; ++quarter) {
-                    const std::uint8_t low_byte = low[half * 64 + (quarter % 2) * Q6_VALUES_PER_QUARTER + lane];
+        const std::uint8_t* high = block + LOGISMOS_Q6_K_HIGH_BITS_OFFSET;
+        const std::uint8_t* scales = block + LOGISMOS_Q6_K_SCALE_OFFSET;
+        const float super_scale = load_f16_le(block + LOGISMOS_Q6_K_SUPER_SCALE_OFFSET);
+        for (std::size_t half = 0; half < LOGISMOS_Q6_K_HALF_BLOCK_COUNT; ++half) {
+            for (std::size_t quarter = 0; quarter < LOGISMOS_Q6_K_QUARTERS_PER_HALF_BLOCK; ++quarter) {
+                for (std::size_t lane = 0; lane < LOGISMOS_Q6_K_VALUES_PER_QUARTER; ++lane) {
+                    const std::uint8_t packed_high = high[half * LOGISMOS_Q6_K_HIGH_BYTES_PER_HALF + lane];
+                    const std::uint8_t low_byte = low[half * LOGISMOS_Q6_K_LOW_BYTES_PER_HALF + (quarter % 2) * LOGISMOS_Q6_K_VALUES_PER_QUARTER + lane];
                     const std::uint8_t lower = quarter < 2 ? low_byte & LOW_NIBBLE_MASK : low_byte >> 4;
                     const std::uint8_t upper = static_cast<std::uint8_t>((packed_high >> (quarter * 2)) & 0x03);
                     const int quantized = static_cast<int>((upper << 4) | lower) - 32;
-                    const std::size_t scale_index = half * 8 + quarter * 2 + lane / 16;
+                    const std::size_t scale_index = half * LOGISMOS_Q6_K_SCALES_PER_HALF + quarter * 2 + lane / LOGISMOS_Q6_K_VALUES_PER_SCALE;
                     const float decoded = super_scale * static_cast<float>(signed_i8(scales[scale_index])) * static_cast<float>(quantized);
-                    const std::size_t activation_index = block_index * LOGISMOS_Q6_K_VALUES_PER_BLOCK + half * 128 + quarter * Q6_VALUES_PER_QUARTER + lane;
+                    const std::size_t activation_index = block_index * LOGISMOS_Q6_K_VALUES_PER_BLOCK + half * LOGISMOS_Q6_K_VALUES_PER_HALF + quarter * LOGISMOS_Q6_K_VALUES_PER_QUARTER + lane;
                     const float product = decoded * activations[activation_index];
                     accumulator = accumulator + product;
                 }
@@ -223,13 +223,16 @@ __device__ float dot_iq4_nl(const std::uint8_t* matrix, const float* activations
     for (std::size_t block_index = 0; block_index < blocks; ++block_index) {
         const std::uint8_t* block = row_bytes + block_index * LOGISMOS_IQ4_NL_BLOCK_BYTES;
         const float scale = load_f16_le(block);
-        for (std::size_t lane = 0; lane < 16; ++lane) {
-            const std::uint8_t packed = block[IQ4_NL_QUANT_OFFSET + lane];
+        for (std::size_t lane = 0; lane < LOGISMOS_IQ4_NL_VALUES_PER_BLOCK / 2; ++lane) {
+            const std::uint8_t packed = block[LOGISMOS_IQ4_NL_QUANT_OFFSET + lane];
             const float low_decoded = scale * static_cast<float>(LOGISMOS_IQ4_RECONSTRUCTION_VALUES[packed & LOW_NIBBLE_MASK]);
             const float low_product = low_decoded * activations[block_index * LOGISMOS_IQ4_NL_VALUES_PER_BLOCK + lane];
             accumulator = accumulator + low_product;
+        }
+        for (std::size_t lane = 0; lane < LOGISMOS_IQ4_NL_VALUES_PER_BLOCK / 2; ++lane) {
+            const std::uint8_t packed = block[LOGISMOS_IQ4_NL_QUANT_OFFSET + lane];
             const float high_decoded = scale * static_cast<float>(LOGISMOS_IQ4_RECONSTRUCTION_VALUES[packed >> 4]);
-            const float high_product = high_decoded * activations[block_index * LOGISMOS_IQ4_NL_VALUES_PER_BLOCK + 16 + lane];
+            const float high_product = high_decoded * activations[block_index * LOGISMOS_IQ4_NL_VALUES_PER_BLOCK + LOGISMOS_IQ4_NL_VALUES_PER_BLOCK / 2 + lane];
             accumulator = accumulator + high_product;
         }
     }
@@ -244,20 +247,23 @@ __device__ float dot_iq4_xs(const std::uint8_t* matrix, const float* activations
     for (std::size_t block_index = 0; block_index < blocks; ++block_index) {
         const std::uint8_t* block = row_bytes + block_index * LOGISMOS_IQ4_XS_BLOCK_BYTES;
         const float block_scale = load_f16_le(block);
-        const std::uint16_t scale_high = load_u16_le(block + IQ4_XS_SCALE_HIGH_OFFSET);
-        for (std::size_t group = 0; group < 8; ++group) {
-            const std::uint8_t scale_low_byte = block[IQ4_XS_SCALE_LOW_OFFSET + group / 2];
+        const std::uint16_t scale_high = load_u16_le(block + LOGISMOS_IQ4_XS_SCALE_HIGH_OFFSET);
+        for (std::size_t group = 0; group < LOGISMOS_IQ4_XS_VALUES_PER_BLOCK / LOGISMOS_IQ4_XS_GROUP_VALUES; ++group) {
+            const std::uint8_t scale_low_byte = block[LOGISMOS_IQ4_XS_SCALE_LOW_OFFSET + group / 2];
             const std::uint8_t low_bits = group % 2 == 0 ? scale_low_byte & LOW_NIBBLE_MASK : scale_low_byte >> 4;
             const std::uint8_t high_bits = static_cast<std::uint8_t>((scale_high >> (group * 2)) & 0x03);
             const int group_scale = static_cast<int>(low_bits | (high_bits << 4)) - 32;
             const float value_scale = block_scale * static_cast<float>(group_scale);
-            for (std::size_t lane = 0; lane < 16; ++lane) {
-                const std::uint8_t packed = block[IQ4_XS_QUANT_OFFSET + group * 16 + lane];
+            for (std::size_t lane = 0; lane < LOGISMOS_IQ4_XS_GROUP_VALUES / 2; ++lane) {
+                const std::uint8_t packed = block[LOGISMOS_IQ4_XS_QUANT_OFFSET + group * (LOGISMOS_IQ4_XS_GROUP_VALUES / 2) + lane];
                 const float low_decoded = value_scale * static_cast<float>(LOGISMOS_IQ4_RECONSTRUCTION_VALUES[packed & LOW_NIBBLE_MASK]);
-                const float low_product = low_decoded * activations[block_index * LOGISMOS_IQ4_XS_VALUES_PER_BLOCK + group * IQ4_GROUP_VALUES + lane];
+                const float low_product = low_decoded * activations[block_index * LOGISMOS_IQ4_XS_VALUES_PER_BLOCK + group * LOGISMOS_IQ4_XS_GROUP_VALUES + lane];
                 accumulator = accumulator + low_product;
+            }
+            for (std::size_t lane = 0; lane < LOGISMOS_IQ4_XS_GROUP_VALUES / 2; ++lane) {
+                const std::uint8_t packed = block[LOGISMOS_IQ4_XS_QUANT_OFFSET + group * (LOGISMOS_IQ4_XS_GROUP_VALUES / 2) + lane];
                 const float high_decoded = value_scale * static_cast<float>(LOGISMOS_IQ4_RECONSTRUCTION_VALUES[packed >> 4]);
-                const float high_product = high_decoded * activations[block_index * LOGISMOS_IQ4_XS_VALUES_PER_BLOCK + group * IQ4_GROUP_VALUES + 16 + lane];
+                const float high_product = high_decoded * activations[block_index * LOGISMOS_IQ4_XS_VALUES_PER_BLOCK + group * LOGISMOS_IQ4_XS_GROUP_VALUES + LOGISMOS_IQ4_XS_GROUP_VALUES / 2 + lane];
                 accumulator = accumulator + high_product;
             }
         }

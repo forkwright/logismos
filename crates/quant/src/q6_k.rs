@@ -19,8 +19,10 @@ pub const Q6_K_SUPER_SCALE_BYTES: usize = 2;
 pub const Q6_K_BLOCK_BYTES: usize =
     Q6_K_LOW_BITS_BYTES + Q6_K_HIGH_BITS_BYTES + Q6_K_SCALE_BYTES + Q6_K_SUPER_SCALE_BYTES;
 
-const VALUES_PER_QUARTER: usize = 32;
-const QUARTERS_PER_HALF_BLOCK: usize = 4;
+/// Values represented by one Q6_K packed quarter.
+pub const Q6_K_VALUES_PER_QUARTER: usize = 32;
+/// Packed Q6_K quarters represented by one half block.
+pub const Q6_K_QUARTERS_PER_HALF_BLOCK: usize = 4;
 const GEOMETRY: Geometry = Geometry {
     format: RowFormat::Q6K,
     bytes_per_block: Q6_K_BLOCK_BYTES,
@@ -76,10 +78,10 @@ impl Q6KBlock {
             let low_base = half_block * 64;
             let high_base = half_block * 32;
             let scale_base = half_block * 8;
-            for lane in 0..VALUES_PER_QUARTER {
+            for lane in 0..Q6_K_VALUES_PER_QUARTER {
                 let packed_high = high[high_base + lane];
-                for quarter in 0..QUARTERS_PER_HALF_BLOCK {
-                    let low_byte = low[low_base + (quarter % 2) * VALUES_PER_QUARTER + lane];
+                for quarter in 0..Q6_K_QUARTERS_PER_HALF_BLOCK {
+                    let low_byte = low[low_base + (quarter % 2) * Q6_K_VALUES_PER_QUARTER + lane];
                     let lower = if quarter < 2 {
                         low_byte & 0x0f
                     } else {
@@ -88,7 +90,7 @@ impl Q6KBlock {
                     let upper = (packed_high >> (quarter * 2)) & 0x03;
                     let quantized = i16::from((upper << 4) | lower) - 32;
                     let scale_index = scale_base + quarter * 2 + lane / 16;
-                    decoded[half_block * 128 + quarter * VALUES_PER_QUARTER + lane] = super_scale
+                    decoded[half_block * 128 + quarter * Q6_K_VALUES_PER_QUARTER + lane] = super_scale
                         * f32::from(i8::from_le_bytes([scales[scale_index]]))
                         * f32::from(quantized);
                 }

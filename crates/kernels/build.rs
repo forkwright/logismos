@@ -131,6 +131,8 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
     let q5_quant = quant::q5_k::Q5_K_QUANT_BYTES;
     let q5_bytes = quant::Q5_K_BLOCK_BYTES;
     let q6_values = quant::Q6_K_VALUES_PER_BLOCK;
+    let q6_values_per_quarter = quant::q6_k::Q6_K_VALUES_PER_QUARTER;
+    let q6_quarters_per_half = quant::q6_k::Q6_K_QUARTERS_PER_HALF_BLOCK;
     let q6_low = quant::q6_k::Q6_K_LOW_BITS_BYTES;
     let q6_high = quant::q6_k::Q6_K_HIGH_BITS_BYTES;
     let q6_scales = quant::q6_k::Q6_K_SCALE_BYTES;
@@ -141,6 +143,7 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
     let iq4_nl_quant = quant::iq4_nl::IQ4_NL_QUANT_BYTES;
     let iq4_nl_bytes = quant::IQ4_NL_BLOCK_BYTES;
     let iq4_xs_values = quant::IQ4_XS_VALUES_PER_BLOCK;
+    let iq4_xs_group_values = quant::iq4_xs::IQ4_XS_GROUP_VALUES;
     let iq4_xs_scale = quant::iq4_xs::IQ4_XS_SCALE_BYTES;
     let iq4_xs_scale_low = quant::iq4_xs::IQ4_XS_SCALE_LOW_BYTES;
     let iq4_xs_scale_high = quant::iq4_xs::IQ4_XS_SCALE_HIGH_BYTES;
@@ -151,6 +154,42 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
+    let q4_scale_offset = q4_prefix;
+    let q4_super_minimum_offset = q4_prefix / 2;
+    let q4_quant_offset = checked_sum(&[q4_prefix, q4_scales], "Q4_K")?;
+    let q5_scale_offset = q5_prefix;
+    let q5_super_minimum_offset = q5_prefix / 2;
+    let q5_high_offset = checked_sum(&[q5_prefix, q5_scales], "Q5_K")?;
+    let q5_quant_offset = checked_sum(&[q5_high_offset, q5_high], "Q5_K")?;
+    let q6_high_offset = q6_low;
+    let q6_scale_offset = checked_sum(&[q6_low, q6_high], "Q6_K")?;
+    let q6_super_scale_offset = checked_sum(&[q6_scale_offset, q6_scales], "Q6_K")?;
+    let q6_half_block_count = q6_values / (q6_values_per_quarter * q6_quarters_per_half);
+    let q6_low_bytes_per_half = q6_low / q6_half_block_count;
+    let q6_high_bytes_per_half = q6_high / q6_half_block_count;
+    let q6_scales_per_half = q6_scales / q6_half_block_count;
+    let q6_values_per_half = q6_values / q6_half_block_count;
+    let q6_values_per_scale = q6_values / q6_scales;
+    let iq4_nl_quant_offset = iq4_nl_scale;
+    let iq4_xs_scale_high_offset = iq4_xs_scale;
+    let iq4_xs_scale_low_offset = checked_sum(&[iq4_xs_scale, iq4_xs_scale_high], "IQ4_XS")?;
+    let iq4_xs_quant_offset = checked_sum(&[iq4_xs_scale_low_offset, iq4_xs_scale_low], "IQ4_XS")?;
+    let k_pair_count = q4_values / (quant::K_GROUP_VALUES * 2);
+    if quant::f32_row::F32_ROW_VALUE_BYTES != std::mem::size_of::<u32>()
+        || q4_prefix != std::mem::size_of::<u16>() * 2
+        || q5_prefix != std::mem::size_of::<u16>() * 2
+        || q6_super_scale != std::mem::size_of::<u16>()
+        || iq4_nl_scale != std::mem::size_of::<u16>()
+        || iq4_xs_scale != std::mem::size_of::<u16>()
+        || iq4_xs_scale_high != std::mem::size_of::<u16>()
+        || q6_values_per_quarter * q6_quarters_per_half * q6_half_block_count != q6_values
+        || q6_low_bytes_per_half * q6_half_block_count != q6_low
+        || q6_high_bytes_per_half * q6_half_block_count != q6_high
+        || q6_scales_per_half * q6_half_block_count != q6_scales
+        || q6_values_per_scale * q6_scales != q6_values
+    {
+        return Err("quant constants violate serialized-row fixed-width field representation".to_string());
+    }
     let q4_derived = checked_sum(&[q4_prefix, q4_scales, q4_quant], "Q4_K")?;
     let q5_derived = checked_sum(&[q5_prefix, q5_scales, q5_high, q5_quant], "Q5_K")?;
     let q6_derived = checked_sum(&[q6_low, q6_high, q6_scales, q6_super_scale], "Q6_K")?;
@@ -178,6 +217,34 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         "#pragma once\n\n#include <cstddef>\n#include <cstdint>\n\ninline constexpr std::size_t LOGISMOS_F32_VALUE_BYTES = {f32_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUES_PER_BLOCK = {values_per_block};\ninline constexpr std::size_t LOGISMOS_Q8_0_SCALE_BYTES = {scale_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUE_BYTES = {value_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_BLOCK_BYTES = {block_bytes};\ninline constexpr std::size_t LOGISMOS_K_GROUP_VALUES = {k_group};\ninline constexpr std::size_t LOGISMOS_Q4_K_VALUES_PER_BLOCK = {q4_values};\ninline constexpr std::size_t LOGISMOS_Q4_K_PREFIX_BYTES = {q4_prefix};\ninline constexpr std::size_t LOGISMOS_Q4_K_SCALE_BYTES = {q4_scales};\ninline constexpr std::size_t LOGISMOS_Q4_K_BLOCK_BYTES = {q4_bytes};\ninline constexpr std::size_t LOGISMOS_Q5_K_VALUES_PER_BLOCK = {q5_values};\ninline constexpr std::size_t LOGISMOS_Q5_K_PREFIX_BYTES = {q5_prefix};\ninline constexpr std::size_t LOGISMOS_Q5_K_SCALE_BYTES = {q5_scales};\ninline constexpr std::size_t LOGISMOS_Q5_K_HIGH_BITS_BYTES = {q5_high};\ninline constexpr std::size_t LOGISMOS_Q5_K_BLOCK_BYTES = {q5_bytes};\ninline constexpr std::size_t LOGISMOS_Q6_K_VALUES_PER_BLOCK = {q6_values};\ninline constexpr std::size_t LOGISMOS_Q6_K_LOW_BITS_BYTES = {q6_low};\ninline constexpr std::size_t LOGISMOS_Q6_K_HIGH_BITS_BYTES = {q6_high};\ninline constexpr std::size_t LOGISMOS_Q6_K_SCALE_BYTES = {q6_scales};\ninline constexpr std::size_t LOGISMOS_Q6_K_BLOCK_BYTES = {q6_bytes};\ninline constexpr std::size_t LOGISMOS_IQ4_NL_VALUES_PER_BLOCK = {iq4_nl_values};\ninline constexpr std::size_t LOGISMOS_IQ4_NL_BLOCK_BYTES = {iq4_nl_bytes};\ninline constexpr std::size_t LOGISMOS_IQ4_XS_VALUES_PER_BLOCK = {iq4_xs_values};\ninline constexpr std::size_t LOGISMOS_IQ4_XS_BLOCK_BYTES = {iq4_xs_bytes};\ninline constexpr std::int8_t LOGISMOS_IQ4_RECONSTRUCTION_VALUES[16] = {{{iq4_values}}};\n",
         f32_bytes = quant::f32_row::F32_ROW_VALUE_BYTES,
         k_group = quant::K_GROUP_VALUES
+    );
+    let header = format!(
+        "{header}
+inline constexpr std::size_t LOGISMOS_K_PAIR_COUNT = {k_pair_count};
+inline constexpr std::size_t LOGISMOS_Q4_K_SUPER_MINIMUM_OFFSET = {q4_super_minimum_offset};
+inline constexpr std::size_t LOGISMOS_Q4_K_SCALE_OFFSET = {q4_scale_offset};
+inline constexpr std::size_t LOGISMOS_Q4_K_QUANT_OFFSET = {q4_quant_offset};
+inline constexpr std::size_t LOGISMOS_Q5_K_SUPER_MINIMUM_OFFSET = {q5_super_minimum_offset};
+inline constexpr std::size_t LOGISMOS_Q5_K_SCALE_OFFSET = {q5_scale_offset};
+inline constexpr std::size_t LOGISMOS_Q5_K_HIGH_BITS_OFFSET = {q5_high_offset};
+inline constexpr std::size_t LOGISMOS_Q5_K_QUANT_OFFSET = {q5_quant_offset};
+inline constexpr std::size_t LOGISMOS_Q6_K_HIGH_BITS_OFFSET = {q6_high_offset};
+inline constexpr std::size_t LOGISMOS_Q6_K_SCALE_OFFSET = {q6_scale_offset};
+inline constexpr std::size_t LOGISMOS_Q6_K_SUPER_SCALE_OFFSET = {q6_super_scale_offset};
+inline constexpr std::size_t LOGISMOS_Q6_K_VALUES_PER_QUARTER = {q6_values_per_quarter};
+inline constexpr std::size_t LOGISMOS_Q6_K_QUARTERS_PER_HALF_BLOCK = {q6_quarters_per_half};
+inline constexpr std::size_t LOGISMOS_Q6_K_HALF_BLOCK_COUNT = {q6_half_block_count};
+inline constexpr std::size_t LOGISMOS_Q6_K_LOW_BYTES_PER_HALF = {q6_low_bytes_per_half};
+inline constexpr std::size_t LOGISMOS_Q6_K_HIGH_BYTES_PER_HALF = {q6_high_bytes_per_half};
+inline constexpr std::size_t LOGISMOS_Q6_K_SCALES_PER_HALF = {q6_scales_per_half};
+inline constexpr std::size_t LOGISMOS_Q6_K_VALUES_PER_HALF = {q6_values_per_half};
+inline constexpr std::size_t LOGISMOS_Q6_K_VALUES_PER_SCALE = {q6_values_per_scale};
+inline constexpr std::size_t LOGISMOS_IQ4_NL_QUANT_OFFSET = {iq4_nl_quant_offset};
+inline constexpr std::size_t LOGISMOS_IQ4_XS_SCALE_HIGH_OFFSET = {iq4_xs_scale_high_offset};
+inline constexpr std::size_t LOGISMOS_IQ4_XS_SCALE_LOW_OFFSET = {iq4_xs_scale_low_offset};
+inline constexpr std::size_t LOGISMOS_IQ4_XS_QUANT_OFFSET = {iq4_xs_quant_offset};
+inline constexpr std::size_t LOGISMOS_IQ4_XS_GROUP_VALUES = {iq4_xs_group_values};
+"
     );
     std::fs::write(out_dir.join("row_format.h"), header)
         .map_err(|error| format!("write generated serialized-row format header: {error}"))
