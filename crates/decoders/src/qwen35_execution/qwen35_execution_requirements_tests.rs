@@ -26,6 +26,10 @@ fn named_owners_reconcile_a_large_nondegenerate_shape() -> std::result::Result<(
     assert_eq!(gdn.delta_elements(), 7);
     assert_eq!(gdn.workspace_elements(), 896);
 
+    let paged_decode = kernels::PagedDecodePlan::try_from_dimensions(257, 6, 2, 5)
+        .map_err(|error| error.to_string())?;
+    assert_eq!(paged_decode.workspace_elements(), 262);
+
     assert_eq!(
         kernels::cpu_f32::rms_norm_output_elements(6, 7).map_err(|error| error.to_string())?,
         42
@@ -275,7 +279,6 @@ fn demanding_layout() -> Layout {
         key_u64: 5,
         kv_width: 10,
         query_width: 30,
-        gqa_group: 3,
         vocabulary: 1_009,
         main_blocks: 5,
         full_interval: 3,
