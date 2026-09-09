@@ -42,24 +42,12 @@ enum BeginError {
     NotReady,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CompletionOutcome {
-    KnownIdle,
-    Uncertain,
-}
-
 #[derive(Debug)]
 enum CompletionError<Error> {
     MissingResource,
     NotSubmitted,
-    Commit {
-        source: Error,
-        outcome: CompletionOutcome,
-    },
-    Synchronization {
-        source: Error,
-        outcome: CompletionOutcome,
-    },
+    Commit { source: Error },
+    Synchronization { source: Error },
 }
 
 struct ResourceOwner<Resource: CompletionResource> {
@@ -89,17 +77,6 @@ impl<Resource: CompletionResource> ResourceOwner<Resource> {
 
     fn state(&self) -> Option<&ResourceState<Resource>> {
         self.state.as_ref()
-    }
-
-    fn completion_outcome(&self) -> Option<CompletionOutcome> {
-        self.state.as_ref().map(|state| match state {
-            ResourceState::Ready(_) | ResourceState::PoisonedIdle(_) => {
-                CompletionOutcome::KnownIdle
-            }
-            ResourceState::InFlight(_) | ResourceState::PoisonedUncertain(_) => {
-                CompletionOutcome::Uncertain
-            }
-        })
     }
 }
 
@@ -158,20 +135,14 @@ impl<Resource: CompletionResource> InFlight<'_, Resource> {
         let synchronization = self.resource()?.synchronize();
         if let Err(source) = synchronization {
             self.poison_uncertain();
-            return Err(CompletionError::Synchronization {
-                source,
-                outcome: CompletionOutcome::Uncertain,
-            });
+            return Err(CompletionError::Synchronization { source });
         }
 
         let value = match commit(self.resource()?) {
             Ok(value) => value,
             Err(source) => {
                 self.poison_known_idle();
-                return Err(CompletionError::Commit {
-                    source,
-                    outcome: CompletionOutcome::KnownIdle,
-                });
+                return Err(CompletionError::Commit { source });
             }
         };
         self.restore_ready()?;
@@ -242,10 +213,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
     use std::rc::Rc;
 
-    use super::{
-        BeginError, CompletionError, CompletionOutcome, CompletionResource, ResourceOwner,
-        ResourceState,
-    };
+    use super::{BeginError, CompletionError, CompletionResource, ResourceOwner, ResourceState};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum TestError {
@@ -275,14 +243,9 @@ mod tests {
             }
         }
 
-        fn publish(&self) -> core::result::Result<(), TestError> {
+        fn publish(&self) {
             self.publications
                 .set(self.publications.get().saturating_add(1));
-            Ok(())
-        }
-
-        fn reject_publication(&self) -> core::result::Result<(), TestError> {
-            Err(TestError::ScriptFailure)
         }
     }
 
@@ -344,13 +307,12 @@ mod tests {
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         guard
-            .complete(TestResource::publish)
+            .complete(|resource| {
+                resource.publish();
+                Ok(())
+            })
             .map_err(|_| BeginError::MissingResource)?;
         assert!(matches!(owner.state(), Some(ResourceState::Ready(_))));
-        assert_eq!(
-            owner.completion_outcome(),
-            Some(CompletionOutcome::KnownIdle)
-        );
         assert_eq!(synchronizations.get(), 1);
         assert_eq!(publications.get(), 1);
         drop(owner);
@@ -363,7 +325,10 @@ mod tests {
         let (mut owner, synchronizations, drops, publications) = owner([]);
         let guard = owner.begin()?;
         let error = guard
-            .complete(TestResource::publish)
+            .complete(|resource| {
+                resource.publish();
+                Ok(())
+            })
             .err()
             .ok_or(BeginError::MissingResource)?;
         assert!(matches!(error, CompletionError::NotSubmitted));
@@ -382,14 +347,13 @@ mod tests {
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         let error = guard
-            .complete(TestResource::reject_publication)
+            .complete(|_| Err(TestError::ScriptFailure))
             .err()
             .ok_or(BeginError::MissingResource)?;
         assert!(matches!(
             error,
             CompletionError::Commit {
                 source: TestError::ScriptFailure,
-                outcome: CompletionOutcome::KnownIdle,
             }
         ));
         assert!(matches!(
@@ -416,10 +380,6 @@ mod tests {
             Some(ResourceState::PoisonedIdle(_))
         ));
         assert!(matches!(owner.begin(), Err(BeginError::NotReady)));
-        assert_eq!(
-            owner.completion_outcome(),
-            Some(CompletionOutcome::KnownIdle)
-        );
         assert_eq!(synchronizations.get(), 1);
         assert_eq!(publications.get(), 0);
         drop(owner);
@@ -435,24 +395,22 @@ mod tests {
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         let error = guard
-            .complete(TestResource::publish)
+            .complete(|resource| {
+                resource.publish();
+                Ok(())
+            })
             .err()
             .ok_or(BeginError::MissingResource)?;
         assert!(matches!(
             error,
             CompletionError::Synchronization {
                 source: TestError::ScriptFailure,
-                outcome: CompletionOutcome::Uncertain,
             }
         ));
         assert!(matches!(
             owner.state(),
             Some(ResourceState::PoisonedUncertain(_))
         ));
-        assert_eq!(
-            owner.completion_outcome(),
-            Some(CompletionOutcome::Uncertain)
-        );
         assert_eq!(publications.get(), 0);
         assert_eq!(synchronizations.get(), 1);
         drop(owner);

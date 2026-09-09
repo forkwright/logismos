@@ -1119,10 +1119,11 @@ impl NativePagedAppend<'_> {
     ///
     /// # Safety
     ///
-    /// Source rows must be live device allocations of the declared width on
-    /// this pool's device. `stream` must be the same ordered pool-device stream
-    /// passed to [`NativePagedKvPool::begin_append`]. The caller owns completion
-    /// and must poison its whole session if submission completion becomes
+    /// Source rows must be correctly aligned device allocations of the declared
+    /// width on this pool's device and remain live and immutable through stream
+    /// completion. `stream` must be the same ordered pool-device stream passed
+    /// to [`NativePagedKvPool::begin_append`]. The caller owns completion and
+    /// must poison its whole session if submission completion becomes
     /// uncertain.
     pub unsafe fn write_layer_row(
         &mut self,
