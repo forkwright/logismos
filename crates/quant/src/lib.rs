@@ -41,9 +41,9 @@ mod row_tests;
 
 pub use crate::error::{Error, Result};
 pub use crate::format::RowFormat;
+pub use crate::iq4::RECONSTRUCTION_VALUES as IQ4_RECONSTRUCTION_VALUES;
 pub use crate::iq4_nl::{IQ4_NL_BLOCK_BYTES, IQ4_NL_VALUES_PER_BLOCK, Iq4NlBlock};
 pub use crate::iq4_xs::{IQ4_XS_BLOCK_BYTES, IQ4_XS_VALUES_PER_BLOCK, Iq4XsBlock};
-pub use crate::iq4::RECONSTRUCTION_VALUES as IQ4_RECONSTRUCTION_VALUES;
 pub use crate::k::K_GROUP_VALUES;
 pub use crate::q4_k::{Q4_K_BLOCK_BYTES, Q4_K_VALUES_PER_BLOCK, Q4KBlock};
 pub use crate::q5_k::{Q5_K_BLOCK_BYTES, Q5_K_VALUES_PER_BLOCK, Q5KBlock};

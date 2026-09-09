@@ -156,7 +156,12 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
     let q6_derived = checked_sum(&[q6_low, q6_high, q6_scales, q6_super_scale], "Q6_K")?;
     let iq4_nl_derived = checked_sum(&[iq4_nl_scale, iq4_nl_quant], "IQ4_NL")?;
     let iq4_xs_derived = checked_sum(
-        &[iq4_xs_scale, iq4_xs_scale_low, iq4_xs_scale_high, iq4_xs_quant],
+        &[
+            iq4_xs_scale,
+            iq4_xs_scale_low,
+            iq4_xs_scale_high,
+            iq4_xs_quant,
+        ],
         "IQ4_XS",
     )?;
     if q4_bytes != q4_derived
@@ -165,11 +170,14 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         || iq4_nl_bytes != iq4_nl_derived
         || iq4_xs_bytes != iq4_xs_derived
     {
-        return Err("quant constants violate an executable serialized-row layout relation".to_string());
+        return Err(
+            "quant constants violate an executable serialized-row layout relation".to_string(),
+        );
     }
     let header = format!(
-        "#pragma once\n\n#include <cstddef>\n#include <cstdint>\n\ninline constexpr std::size_t LOGISMOS_F32_VALUE_BYTES = {f32_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUES_PER_BLOCK = {values_per_block};\ninline constexpr std::size_t LOGISMOS_Q8_0_SCALE_BYTES = {scale_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUE_BYTES = {value_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_BLOCK_BYTES = {block_bytes};\ninline constexpr std::size_t LOGISMOS_K_GROUP_VALUES = {k_group};\ninline constexpr std::size_t LOGISMOS_Q4_K_VALUES_PER_BLOCK = {q4_values};\ninline constexpr std::size_t LOGISMOS_Q4_K_PREFIX_BYTES = {q4_prefix};\ninline constexpr std::size_t LOGISMOS_Q4_K_SCALE_BYTES = {q4_scales};\ninline constexpr std::size_t LOGISMOS_Q4_K_BLOCK_BYTES = {q4_bytes};\ninline constexpr std::size_t LOGISMOS_Q5_K_VALUES_PER_BLOCK = {q5_values};\ninline constexpr std::size_t LOGISMOS_Q5_K_PREFIX_BYTES = {q5_prefix};\ninline constexpr std::size_t LOGISMOS_Q5_K_SCALE_BYTES = {q5_scales};\ninline constexpr std::size_t LOGISMOS_Q5_K_HIGH_BITS_BYTES = {q5_high};\ninline constexpr std::size_t LOGISMOS_Q5_K_BLOCK_BYTES = {q5_bytes};\ninline constexpr std::size_t LOGISMOS_Q6_K_VALUES_PER_BLOCK = {q6_values};\ninline constexpr std::size_t LOGISMOS_Q6_K_LOW_BITS_BYTES = {q6_low};\ninline constexpr std::size_t LOGISMOS_Q6_K_HIGH_BITS_BYTES = {q6_high};\ninline constexpr std::size_t LOGISMOS_Q6_K_SCALE_BYTES = {q6_scales};\ninline constexpr std::size_t LOGISMOS_Q6_K_BLOCK_BYTES = {q6_bytes};\ninline constexpr std::size_t LOGISMOS_IQ4_NL_VALUES_PER_BLOCK = {iq4_nl_values};\ninline constexpr std::size_t LOGISMOS_IQ4_NL_BLOCK_BYTES = {iq4_nl_bytes};\ninline constexpr std::size_t LOGISMOS_IQ4_XS_VALUES_PER_BLOCK = {iq4_xs_values};\ninline constexpr std::size_t LOGISMOS_IQ4_XS_BLOCK_BYTES = {iq4_xs_bytes};\ninline constexpr std::int8_t LOGISMOS_IQ4_RECONSTRUCTION_VALUES[16] = {{{iq4_values}}};\n"
-        , f32_bytes = quant::f32_row::F32_ROW_VALUE_BYTES, k_group = quant::K_GROUP_VALUES
+        "#pragma once\n\n#include <cstddef>\n#include <cstdint>\n\ninline constexpr std::size_t LOGISMOS_F32_VALUE_BYTES = {f32_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUES_PER_BLOCK = {values_per_block};\ninline constexpr std::size_t LOGISMOS_Q8_0_SCALE_BYTES = {scale_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUE_BYTES = {value_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_BLOCK_BYTES = {block_bytes};\ninline constexpr std::size_t LOGISMOS_K_GROUP_VALUES = {k_group};\ninline constexpr std::size_t LOGISMOS_Q4_K_VALUES_PER_BLOCK = {q4_values};\ninline constexpr std::size_t LOGISMOS_Q4_K_PREFIX_BYTES = {q4_prefix};\ninline constexpr std::size_t LOGISMOS_Q4_K_SCALE_BYTES = {q4_scales};\ninline constexpr std::size_t LOGISMOS_Q4_K_BLOCK_BYTES = {q4_bytes};\ninline constexpr std::size_t LOGISMOS_Q5_K_VALUES_PER_BLOCK = {q5_values};\ninline constexpr std::size_t LOGISMOS_Q5_K_PREFIX_BYTES = {q5_prefix};\ninline constexpr std::size_t LOGISMOS_Q5_K_SCALE_BYTES = {q5_scales};\ninline constexpr std::size_t LOGISMOS_Q5_K_HIGH_BITS_BYTES = {q5_high};\ninline constexpr std::size_t LOGISMOS_Q5_K_BLOCK_BYTES = {q5_bytes};\ninline constexpr std::size_t LOGISMOS_Q6_K_VALUES_PER_BLOCK = {q6_values};\ninline constexpr std::size_t LOGISMOS_Q6_K_LOW_BITS_BYTES = {q6_low};\ninline constexpr std::size_t LOGISMOS_Q6_K_HIGH_BITS_BYTES = {q6_high};\ninline constexpr std::size_t LOGISMOS_Q6_K_SCALE_BYTES = {q6_scales};\ninline constexpr std::size_t LOGISMOS_Q6_K_BLOCK_BYTES = {q6_bytes};\ninline constexpr std::size_t LOGISMOS_IQ4_NL_VALUES_PER_BLOCK = {iq4_nl_values};\ninline constexpr std::size_t LOGISMOS_IQ4_NL_BLOCK_BYTES = {iq4_nl_bytes};\ninline constexpr std::size_t LOGISMOS_IQ4_XS_VALUES_PER_BLOCK = {iq4_xs_values};\ninline constexpr std::size_t LOGISMOS_IQ4_XS_BLOCK_BYTES = {iq4_xs_bytes};\ninline constexpr std::int8_t LOGISMOS_IQ4_RECONSTRUCTION_VALUES[16] = {{{iq4_values}}};\n",
+        f32_bytes = quant::f32_row::F32_ROW_VALUE_BYTES,
+        k_group = quant::K_GROUP_VALUES
     );
     std::fs::write(out_dir.join("row_format.h"), header)
         .map_err(|error| format!("write generated serialized-row format header: {error}"))
@@ -177,9 +185,9 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
 
 fn checked_sum(fields: &[usize], format: &str) -> Result<usize, String> {
     fields.iter().try_fold(0usize, |total, field| {
-        total
-            .checked_add(*field)
-            .ok_or_else(|| format!("quant {format} header fields overflow while deriving block bytes"))
+        total.checked_add(*field).ok_or_else(|| {
+            format!("quant {format} header fields overflow while deriving block bytes")
+        })
     })
 }
 

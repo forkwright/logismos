@@ -206,33 +206,73 @@ mod tests {
         activations: Vec<f32>,
     }
 
-    fn fixture(format: quant::RowFormat) -> core::result::Result<Fixture, Box<dyn std::error::Error>> {
+    fn fixture(
+        format: quant::RowFormat,
+    ) -> core::result::Result<Fixture, Box<dyn std::error::Error>> {
         let rows = 2;
         let (width, first, second) = match format {
             quant::RowFormat::F32 => (
                 4,
-                [0.0_f32; 4].into_iter().flat_map(f32::to_le_bytes).collect(),
-                [-1.0_f32, 2.5, -0.75, 0.0].into_iter().flat_map(f32::to_le_bytes).collect(),
+                [0.0_f32; 4]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+                [-1.0_f32, 2.5, -0.75, 0.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
             ),
             quant::RowFormat::Q8_0 => (
                 64,
-                [block_q8(0x0000, ramp_i8(-17, 3)), block_q8(0x0000, ramp_i8(39, -2))].concat(),
-                [block_q8(0x3800, ramp_i8(7, 5)), block_q8(0x3c00, ramp_i8(-41, 4))].concat(),
+                [
+                    block_q8(0x0000, ramp_i8(-17, 3)),
+                    block_q8(0x0000, ramp_i8(39, -2)),
+                ]
+                .concat(),
+                [
+                    block_q8(0x3800, ramp_i8(7, 5)),
+                    block_q8(0x3c00, ramp_i8(-41, 4)),
+                ]
+                .concat(),
             ),
             quant::RowFormat::Q4K => (
                 512,
-                [block_q4(0x0000, 0x0000, 0x51), block_q4(0x0000, 0x0000, 0xa7)].concat(),
-                [block_q4(0xbc00, 0x3c00, 0x2e), block_q4(0x3c00, 0x3800, 0xd4)].concat(),
+                [
+                    block_q4(0x0000, 0x0000, 0x51),
+                    block_q4(0x0000, 0x0000, 0xa7),
+                ]
+                .concat(),
+                [
+                    block_q4(0xbc00, 0x3c00, 0x2e),
+                    block_q4(0x3c00, 0x3800, 0xd4),
+                ]
+                .concat(),
             ),
             quant::RowFormat::Q5K => (
                 512,
-                [block_q5(0x0000, 0x0000, 0x03, 0x51), block_q5(0x0000, 0x0000, 0x54, 0xa7)].concat(),
-                [block_q5(0xbc00, 0x3c00, 0x9a, 0x2e), block_q5(0x3c00, 0x3800, 0xc3, 0xd4)].concat(),
+                [
+                    block_q5(0x0000, 0x0000, 0x03, 0x51),
+                    block_q5(0x0000, 0x0000, 0x54, 0xa7),
+                ]
+                .concat(),
+                [
+                    block_q5(0xbc00, 0x3c00, 0x9a, 0x2e),
+                    block_q5(0x3c00, 0x3800, 0xc3, 0xd4),
+                ]
+                .concat(),
             ),
             quant::RowFormat::Q6K => (
                 512,
-                [block_q6(0xe4, 0x10, 3, 0x0000), block_q6(0x1b, 0xa5, -2, 0x0000)].concat(),
-                [block_q6(0x6c, 0x3e, 5, 0xbc00), block_q6(0x93, 0xc1, -4, 0x3c00)].concat(),
+                [
+                    block_q6(0xe4, 0x10, 3, 0x0000),
+                    block_q6(0x1b, 0xa5, -2, 0x0000),
+                ]
+                .concat(),
+                [
+                    block_q6(0x6c, 0x3e, 5, 0xbc00),
+                    block_q6(0x93, 0xc1, -4, 0x3c00),
+                ]
+                .concat(),
             ),
             quant::RowFormat::IQ4NL => (
                 64,
@@ -241,8 +281,16 @@ mod tests {
             ),
             quant::RowFormat::IQ4XS => (
                 512,
-                [block_iq4_xs(0x0000, 0x1b, 0x51), block_iq4_xs(0x0000, 0xe4, 0xa7)].concat(),
-                [block_iq4_xs(0x3800, 0x6c, 0x2e), block_iq4_xs(0x3c00, 0x93, 0xd4)].concat(),
+                [
+                    block_iq4_xs(0x0000, 0x1b, 0x51),
+                    block_iq4_xs(0x0000, 0xe4, 0xa7),
+                ]
+                .concat(),
+                [
+                    block_iq4_xs(0x3800, 0x6c, 0x2e),
+                    block_iq4_xs(0x3c00, 0x93, 0xd4),
+                ]
+                .concat(),
             ),
             _ => return Err("unknown executable row format".into()),
         };
@@ -251,7 +299,12 @@ mod tests {
         let activations = (0..width)
             .map(|index| (index as f32 - 91.0) / 29.0)
             .collect();
-        Ok(Fixture { rows, width, matrix, activations })
+        Ok(Fixture {
+            rows,
+            width,
+            matrix,
+            activations,
+        })
     }
 
     fn ramp_i8(start: i8, step: i8) -> [i8; 32] {
@@ -275,7 +328,10 @@ mod tests {
 
     fn block_q5(scale: u16, minimum: u16, high: u8, pattern: u8) -> Vec<u8> {
         let mut block = block_q4(scale, minimum, pattern);
-        block.splice(16..16, (0..32).map(|index| high.rotate_left(index as u32 % 8)));
+        block.splice(
+            16..16,
+            (0..32).map(|index| high.rotate_left(index as u32 % 8)),
+        );
         block
     }
 
@@ -328,7 +384,9 @@ mod tests {
         match format {
             quant::RowFormat::F32 => {
                 let offset = index * 4;
-                Ok(f64::from(f32::from_le_bytes(row[offset..offset + 4].try_into()?)))
+                Ok(f64::from(f32::from_le_bytes(
+                    row[offset..offset + 4].try_into()?,
+                )))
             }
             quant::RowFormat::Q8_0 => {
                 let block = &row[index / 32 * 34..];
@@ -354,30 +412,51 @@ mod tests {
         }
     }
 
-    fn oracle_q4(row: &[u8], index: usize) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+    fn oracle_q4(
+        row: &[u8],
+        index: usize,
+    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
         let block = &row[index / 256 * 144..];
         let group = index % 256 / 32;
         let lane = index % 32;
         let (scale, minimum) = q_scale_min(&block[4..16], group);
         let packed = block[16 + group / 2 * 32 + lane];
-        let quant = if group.is_multiple_of(2) { packed & 0x0f } else { packed >> 4 };
+        let quant = if group.is_multiple_of(2) {
+            packed & 0x0f
+        } else {
+            packed >> 4
+        };
         Ok(f16(block)? * f64::from(scale) * f64::from(quant)
             - f16(&block[2..])? * f64::from(minimum))
     }
 
-    fn oracle_q5(row: &[u8], index: usize) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+    fn oracle_q5(
+        row: &[u8],
+        index: usize,
+    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
         let block = &row[index / 256 * 176..];
         let group = index % 256 / 32;
         let lane = index % 32;
         let (scale, minimum) = q_scale_min(&block[4..16], group);
         let packed = block[48 + group / 2 * 32 + lane];
-        let fifth = if block[16 + lane] & (1 << group) == 0 { 0 } else { 16 };
-        let quant = (if group.is_multiple_of(2) { packed & 0x0f } else { packed >> 4 }) + fifth;
+        let fifth = if block[16 + lane] & (1 << group) == 0 {
+            0
+        } else {
+            16
+        };
+        let quant = (if group.is_multiple_of(2) {
+            packed & 0x0f
+        } else {
+            packed >> 4
+        }) + fifth;
         Ok(f16(block)? * f64::from(scale) * f64::from(quant)
             - f16(&block[2..])? * f64::from(minimum))
     }
 
-    fn oracle_q6(row: &[u8], index: usize) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+    fn oracle_q6(
+        row: &[u8],
+        index: usize,
+    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
         let block = &row[index / 256 * 210..];
         let local = index % 256;
         let half = local / 128;
@@ -391,24 +470,42 @@ mod tests {
         Ok(f16(&block[208..])? * f64::from(scale) * f64::from(quant))
     }
 
-    fn oracle_iq4_nl(row: &[u8], index: usize) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+    fn oracle_iq4_nl(
+        row: &[u8],
+        index: usize,
+    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
         let block = &row[index / 32 * 18..];
         let lane = index % 32;
         let packed = block[2 + lane % 16];
-        let code = if lane < 16 { packed & 0x0f } else { packed >> 4 };
+        let code = if lane < 16 {
+            packed & 0x0f
+        } else {
+            packed >> 4
+        };
         Ok(f16(block)? * f64::from(iq4_value(code)))
     }
 
-    fn oracle_iq4_xs(row: &[u8], index: usize) -> core::result::Result<f64, Box<dyn std::error::Error>> {
+    fn oracle_iq4_xs(
+        row: &[u8],
+        index: usize,
+    ) -> core::result::Result<f64, Box<dyn std::error::Error>> {
         let block = &row[index / 256 * 136..];
         let local = index % 256;
         let group = local / 32;
         let lane = local % 32;
-        let low = if group.is_multiple_of(2) { block[4 + group / 2] & 0x0f } else { block[4 + group / 2] >> 4 };
+        let low = if group.is_multiple_of(2) {
+            block[4 + group / 2] & 0x0f
+        } else {
+            block[4 + group / 2] >> 4
+        };
         let high = (u16::from_le_bytes([block[2], block[3]]) >> (group * 2)) & 0x03;
         let group_scale = i16::from(low | ((high as u8) << 4)) - 32;
         let packed = block[8 + group * 16 + lane % 16];
-        let code = if lane < 16 { packed & 0x0f } else { packed >> 4 };
+        let code = if lane < 16 {
+            packed & 0x0f
+        } else {
+            packed >> 4
+        };
         Ok(f16(block)? * f64::from(group_scale) * f64::from(iq4_value(code)))
     }
 
@@ -442,7 +539,11 @@ mod tests {
     }
 
     #[cfg(feature = "gpu")]
-    fn assert_gpu_close(actual: &[f32], expected: &[f32], label: &str) -> core::result::Result<(), String> {
+    fn assert_gpu_close(
+        actual: &[f32],
+        expected: &[f32],
+        label: &str,
+    ) -> core::result::Result<(), String> {
         if actual.len() != expected.len() {
             return Err(format!("{label} device result length differs"));
         }
