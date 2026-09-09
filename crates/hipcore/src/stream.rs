@@ -6,6 +6,10 @@ use std::ptr;
 use crate::device::Device;
 use crate::error::{Result, check, hipError_t_code};
 use crate::ffi;
+use crate::teardown::{
+    PendingOwner, ReleaseAttempt, ReleaseOwner, ReleaseReceipt, ResourceKind, ResourceMetadata,
+    TeardownError, TeardownPhase, TeardownTombstone,
+};
 
 /// Handle to a HIP stream.
 ///
@@ -97,6 +101,18 @@ impl Stream {
         )
     }
 
+    /// Consume this stream and prove that its queued work has completed.
+    ///
+    /// HIP documents that `hipStreamDestroy` may destroy a queue while work is
+    /// still inflight. Explicit teardown therefore has no direct stream
+    /// destructor from this state: callers must first receive a
+    /// [`QuiescentStream`], then destroy it after every buffer touched by the
+    /// stream has been released.
+    #[must_use]
+    pub fn begin_quiesce(self) -> StreamQuiesce {
+        quiesce_stream_owner(self.into_release_owner())
+    }
+
     /// Queue `event` on this stream.
     ///
     /// # Errors
@@ -112,6 +128,147 @@ impl Stream {
             unsafe { ffi::hipEventRecord(event.handle, self.handle) },
             "hipEventRecord",
         )
+    }
+
+    pub(crate) fn into_release_owner(self) -> ReleaseOwner<Self> {
+        let metadata = ResourceMetadata::new(ResourceKind::Stream, 0, self.device.clone());
+        ReleaseOwner::new(self, metadata)
+    }
+}
+
+/// Outcome of consuming a stream for explicit synchronization.
+#[non_exhaustive]
+pub enum StreamQuiesce {
+    /// Synchronization proved that submitted stream work completed.
+    Quiescent(QuiescentStream),
+    /// Preflight or synchronization failed without invoking a destructor.
+    Pending(PendingStreamQuiesce),
+}
+
+/// A stream proven quiescent but not yet destroyed.
+pub struct QuiescentStream {
+    pub(crate) owner: ReleaseOwner<Stream>,
+}
+
+impl QuiescentStream {
+    /// Explicitly destroy this already-quiescent stream.
+    #[must_use]
+    pub fn destroy(self) -> StreamRelease {
+        release_stream_owner(self.owner)
+    }
+}
+
+/// Non-usable stream retained after a failed quiescence transition.
+pub struct PendingStreamQuiesce {
+    pub(crate) pending: PendingOwner<Stream>,
+}
+
+impl PendingStreamQuiesce {
+    /// Recorded preflight or synchronization failure and resource facts.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.pending.error()
+    }
+
+    /// Retry the explicit quiescence transition.
+    #[must_use]
+    pub fn retry(self) -> StreamQuiesce {
+        quiesce_stream_owner(self.pending.into_owner())
+    }
+}
+
+/// Outcome of destroying a quiescent stream.
+#[non_exhaustive]
+pub enum StreamRelease {
+    /// HIP acknowledged `hipStreamDestroy`, or the stream was the non-owned NULL stream.
+    Released(ReleaseReceipt),
+    /// Device selection failed before `hipStreamDestroy` was invoked.
+    Pending(PendingStreamDestroy),
+    /// `hipStreamDestroy` returned non-success, leaving ownership indeterminate.
+    Quarantined(StreamTeardownQuarantine),
+}
+
+/// Non-usable quiescent stream retained after a pre-destruction failure.
+pub struct PendingStreamDestroy {
+    pending: PendingOwner<Stream>,
+}
+
+impl PendingStreamDestroy {
+    /// Recorded preflight failure and resource facts.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.pending.error()
+    }
+
+    /// Retry the explicit stream destruction.
+    #[must_use]
+    pub fn retry(self) -> StreamRelease {
+        release_stream_owner(self.pending.into_owner())
+    }
+}
+
+/// Opaque terminal stream record after an indeterminate destroy outcome.
+#[derive(Debug)]
+pub struct StreamTeardownQuarantine {
+    tombstone: TeardownTombstone,
+}
+
+impl StreamTeardownQuarantine {
+    /// Indeterminate destructor failure retained for accounting.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.tombstone.error()
+    }
+}
+
+pub(crate) fn quiesce_stream_owner(owner: ReleaseOwner<Stream>) -> StreamQuiesce {
+    let owner = match owner.prepare(TeardownPhase::Preflight, |stream| {
+        stream.device.make_current()
+    }) {
+        Ok(owner) => owner,
+        Err(pending) => return StreamQuiesce::Pending(PendingStreamQuiesce { pending }),
+    };
+    match owner.prepare(TeardownPhase::Synchronization, |stream| {
+        // SAFETY: preflight selected the owner device and `handle` is retained
+        // by the disarmed stream owner for the full synchronization call.
+        check(
+            unsafe { ffi::hipStreamSynchronize(stream.handle) },
+            "hipStreamSynchronize",
+        )
+    }) {
+        Ok(owner) => StreamQuiesce::Quiescent(QuiescentStream { owner }),
+        Err(pending) => StreamQuiesce::Pending(PendingStreamQuiesce { pending }),
+    }
+}
+
+pub(crate) fn attempt_stream_release(owner: ReleaseOwner<Stream>) -> ReleaseAttempt<Stream> {
+    owner.attempt(
+        TeardownPhase::Preflight,
+        |stream| stream.device.make_current(),
+        |stream| {
+            if stream.owns_handle && !stream.handle.is_null() {
+                // SAFETY: the stream owner is consuming and disarmed ordinary
+                // Drop; quiescence was established before this state existed.
+                check(
+                    unsafe { ffi::hipStreamDestroy(stream.handle) },
+                    "hipStreamDestroy",
+                )
+            } else {
+                Ok(())
+            }
+        },
+    )
+}
+
+fn release_stream_owner(owner: ReleaseOwner<Stream>) -> StreamRelease {
+    match attempt_stream_release(owner) {
+        ReleaseAttempt::Released(receipt) => StreamRelease::Released(receipt),
+        ReleaseAttempt::Pending(pending) => {
+            StreamRelease::Pending(PendingStreamDestroy { pending })
+        }
+        ReleaseAttempt::Quarantined { tombstone, .. } => {
+            StreamRelease::Quarantined(StreamTeardownQuarantine { tombstone })
+        }
     }
 }
 

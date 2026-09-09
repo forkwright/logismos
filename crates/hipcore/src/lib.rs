@@ -43,12 +43,23 @@ pub mod ffi;
 pub mod memory;
 pub mod pod;
 pub mod stream;
+pub mod teardown;
 
 pub use crate::device::{
     Device, DeviceIdentity, DeviceInfo, DeviceProps, DeviceSelector, DeviceUuid, MemoryBudget,
     PciBusId, enumerate_devices,
 };
 pub use crate::error::{Error, ErrorKind, Result, check};
-pub use crate::memory::{DeviceBuffer, PendingCopy};
+pub use crate::memory::{
+    BufferRelease, BufferTeardownQuarantine, DeviceBuffer, PendingBufferTeardown, PendingCopy,
+};
 pub use crate::pod::BytePod;
-pub use crate::stream::{Event, Stream};
+pub use crate::stream::{
+    Event, PendingStreamDestroy, PendingStreamQuiesce, QuiescentStream, Stream, StreamQuiesce,
+    StreamRelease, StreamTeardownQuarantine,
+};
+pub use crate::teardown::{
+    InventoryQuarantine, InventoryReceipt, InventoryRelease, PendingInventory, ReleaseReceipt,
+    ResourceKind, ResourceMetadata, TeardownError, TeardownInventory, TeardownPhase,
+    TeardownTombstone,
+};

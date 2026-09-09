@@ -11,6 +11,10 @@ use crate::error::{Error, InternalSnafu, OutOfMemorySnafu, Result, check, hipErr
 use crate::ffi;
 use crate::pod::BytePod;
 use crate::stream::Stream;
+use crate::teardown::{
+    PendingOwner, ReleaseAttempt, ReleaseOwner, ReleaseReceipt, ResourceKind, ResourceMetadata,
+    TeardownError, TeardownPhase, TeardownTombstone,
+};
 
 /// Owned allocation in device memory.
 ///
@@ -96,6 +100,29 @@ impl<T: BytePod> DeviceBuffer<T> {
         let mut buf = Self::alloc(device, data.len())?;
         buf.copy_from_host(data)?;
         Ok(buf)
+    }
+
+    /// Start explicit, one-way release of this allocation.
+    ///
+    /// This consumes and disarms the ordinary destructor before selecting the
+    /// owning device or calling `hipFree`. A preflight failure returns a
+    /// non-usable [`PendingBufferTeardown`] that can only be retried
+    /// explicitly. A `hipFree` failure produces a terminal accounting
+    /// tombstone: HIP did not establish whether the allocation remains live,
+    /// so no retry or raw-pointer access is available.
+    ///
+    /// Callers that submitted work touching this buffer must establish stream
+    /// quiescence first. [`crate::TeardownInventory`] encodes that order for a
+    /// stream and all of its registered buffers.
+    #[must_use]
+    pub fn begin_release(self) -> BufferRelease<T> {
+        map_buffer_release(self.into_release_owner())
+    }
+
+    pub(crate) fn into_release_owner(self) -> ReleaseOwner<Self> {
+        let metadata =
+            ResourceMetadata::new(ResourceKind::Buffer, self.byte_len(), self.device.clone());
+        ReleaseOwner::new(self, metadata)
     }
 
     /// Number of `T` elements.
@@ -290,6 +317,79 @@ impl<T: BytePod> DeviceBuffer<T> {
             stream,
             synced: false,
         })
+    }
+}
+
+/// Explicit outcome of releasing a device allocation.
+#[non_exhaustive]
+pub enum BufferRelease<T: BytePod> {
+    /// HIP acknowledged the `hipFree` request.
+    Released(ReleaseReceipt),
+    /// A preflight failure retained the allocation without calling `hipFree`.
+    Pending(PendingBufferTeardown<T>),
+    /// `hipFree` returned non-success, leaving ownership indeterminate.
+    Quarantined(BufferTeardownQuarantine),
+}
+
+/// Non-usable allocation retained after a pre-`hipFree` failure.
+pub struct PendingBufferTeardown<T: BytePod> {
+    pending: PendingOwner<DeviceBuffer<T>>,
+}
+
+impl<T: BytePod> PendingBufferTeardown<T> {
+    /// Recorded preflight failure and resource accounting facts.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.pending.error()
+    }
+
+    /// Retry the previously unstarted release exactly once per call.
+    #[must_use]
+    pub fn retry(self) -> BufferRelease<T> {
+        map_buffer_release(self.pending.into_owner())
+    }
+}
+
+/// Opaque terminal allocation record after an indeterminate `hipFree` outcome.
+#[derive(Debug)]
+pub struct BufferTeardownQuarantine {
+    tombstone: TeardownTombstone,
+}
+
+impl BufferTeardownQuarantine {
+    /// Indeterminate destructor failure retained for accounting.
+    #[must_use]
+    pub fn error(&self) -> &TeardownError {
+        self.tombstone.error()
+    }
+}
+
+pub(crate) fn attempt_buffer_release<T: BytePod>(
+    owner: ReleaseOwner<DeviceBuffer<T>>,
+) -> ReleaseAttempt<DeviceBuffer<T>> {
+    owner.attempt(
+        TeardownPhase::Preflight,
+        |buffer| buffer.device.make_current(),
+        |buffer| {
+            // SAFETY: the consuming owner disarmed `DeviceBuffer::drop`, the
+            // pointer came from `hipMalloc`, and preflight selected its device.
+            check(
+                unsafe { ffi::hipFree(buffer.ptr.as_ptr().cast::<c_void>()) },
+                "hipFree",
+            )
+        },
+    )
+}
+
+fn map_buffer_release<T: BytePod>(owner: ReleaseOwner<DeviceBuffer<T>>) -> BufferRelease<T> {
+    match attempt_buffer_release(owner) {
+        ReleaseAttempt::Released(receipt) => BufferRelease::Released(receipt),
+        ReleaseAttempt::Pending(pending) => {
+            BufferRelease::Pending(PendingBufferTeardown { pending })
+        }
+        ReleaseAttempt::Quarantined { tombstone, .. } => {
+            BufferRelease::Quarantined(BufferTeardownQuarantine { tombstone })
+        }
     }
 }
 
