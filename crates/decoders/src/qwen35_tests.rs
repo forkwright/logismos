@@ -502,6 +502,33 @@ fn mixed_quantized_hybrid_execution_matches_independent_f64_oracle_and_rolls_bac
 }
 
 #[test]
+fn canonical_full_block_oracle_falsifies_native_layer_mutations()
+-> std::result::Result<(), String> {
+    let fixture = canonical_hybrid_fixture_with_context(16)?;
+    let input = vec![0.25_f64; OracleLayout::from_fixture(&fixture)?.hidden];
+    let mut canonical = CanonicalHybridOracle::from_fixture(&fixture)?;
+    let mut without_ffn = CanonicalHybridOracle::from_fixture(&fixture)?.without_ffn();
+    let mut without_attention = CanonicalHybridOracle::from_fixture(&fixture)?.without_full_attention();
+    let mut contiguous = CanonicalHybridOracle::from_fixture(&fixture)?.with_contiguous_q_gate_halves();
+    let mut modulo = CanonicalHybridOracle::from_fixture(&fixture)?.with_modulo_gqa();
+    let mut adjacent = CanonicalHybridOracle::from_fixture(&fixture)?.with_adjacent_pairs();
+    let full_block = 3;
+    for _ in 0..9 {
+        let expected = canonical.full_block_step(full_block, &input)?;
+        for (label, alternate) in [
+            ("FFN", without_ffn.full_block_step(full_block, &input)?),
+            ("full attention", without_attention.full_block_step(full_block, &input)?),
+            ("Q/gate", contiguous.full_block_step(full_block, &input)?),
+            ("GQA", modulo.full_block_step(full_block, &input)?),
+            ("rotary", adjacent.full_block_step(full_block, &input)?),
+        ] {
+            assert_oracle_difference(&expected, &alternate, label)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn execution_uses_source_defined_rope_defaults_and_refuses_effective_scaling()
 -> std::result::Result<(), String> {
     let mut missing_scaling = fixture(1)?;
@@ -1838,34 +1865,7 @@ impl CanonicalHybridOracle {
                 .ok_or_else(|| "canonical oracle token must be in vocabulary".to_string())?
                 .to_vec();
             for block in 0..self.layout.main_blocks {
-                let mut attention = if (block + 1).is_multiple_of(self.layout.full_interval) {
-                    self.full_attention(block, &hidden)?
-                } else {
-                    self.recurrent_attention(block, &hidden)?
-                };
-                if (block + 1).is_multiple_of(self.layout.full_interval) {
-                    if !self.include_full_attention {
-                        attention.fill(0.0);
-                    }
-                } else if !self.include_recurrent_attention {
-                    attention.fill(0.0);
-                }
-                add_f64(&mut hidden, &attention)?;
-                let normalized = oracle_rms_with_epsilon(
-                    &hidden,
-                    self.vector(
-                        &format!("blk.{block}.post_attention_norm.weight"),
-                        self.layout.hidden,
-                    )?,
-                    1,
-                    self.layout.hidden,
-                    self.layout.epsilon,
-                )?;
-                let mut ffn = self.ffn(block, &normalized)?;
-                if !self.include_ffn {
-                    ffn.fill(0.0);
-                }
-                add_f64(&mut hidden, &ffn)?;
+                hidden = self.block(block, &hidden)?;
             }
             let normalized = oracle_rms_with_epsilon(
                 &hidden,
@@ -1890,6 +1890,32 @@ impl CanonicalHybridOracle {
                 .ok_or_else(|| "canonical position overflowed".to_string())?;
         }
         Ok(logits)
+    }
+
+    pub(crate) fn full_block_step(
+        &mut self,
+        block: usize,
+        input: &[f64],
+    ) -> std::result::Result<Vec<f64>, String> {
+        if block >= self.layout.main_blocks || input.len() != self.layout.hidden {
+            return Err("canonical full-block input is outside the main-block hidden shape".to_string());
+        }
+        let output = self.block(block, input)?;
+        self.position = self.position.checked_add(1).ok_or_else(|| "canonical position overflowed".to_string())?;
+        Ok(output)
+    }
+
+    fn block(&mut self, block: usize, input: &[f64]) -> std::result::Result<Vec<f64>, String> {
+        let mut hidden = input.to_vec();
+        let full = (block + 1).is_multiple_of(self.layout.full_interval);
+        let mut attention = if full { self.full_attention(block, &hidden)? } else { self.recurrent_attention(block, &hidden)? };
+        if (full && !self.include_full_attention) || (!full && !self.include_recurrent_attention) { attention.fill(0.0); }
+        add_f64(&mut hidden, &attention)?;
+        let normalized = oracle_rms_with_epsilon(&hidden, self.vector(&format!("blk.{block}.post_attention_norm.weight"), self.layout.hidden)?, 1, self.layout.hidden, self.layout.epsilon)?;
+        let mut ffn = self.ffn(block, &normalized)?;
+        if !self.include_ffn { ffn.fill(0.0); }
+        add_f64(&mut hidden, &ffn)?;
+        Ok(hidden)
     }
 
     fn ffn(&self, block: usize, input: &[f64]) -> std::result::Result<Vec<f64>, String> {
