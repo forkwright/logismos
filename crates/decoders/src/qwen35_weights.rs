@@ -104,6 +104,11 @@ impl<'artifact> Qwen35Weights<'artifact> {
         CheckedMatrix::from_payload(self.payload, name)
     }
 
+    #[cfg(feature = "gpu")]
+    pub(crate) fn checked_matrix(&self, name: &str) -> Result<CheckedMatrix<'_>> {
+        self.matrix(name)
+    }
+
     /// Prepare one stateful recurrent-attention trunk for a recurrent main block.
     ///
     /// WHY: state construction remains bound to this digest-verified payload and

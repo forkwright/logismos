@@ -44,12 +44,16 @@
 pub mod attention;
 pub mod causal_conv;
 pub mod cpu_f32;
+#[cfg(feature = "gpu")]
+pub mod decoder_ops;
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 mod device_span;
 pub mod error;
 pub mod gdn;
 #[cfg(feature = "gpu")]
 pub mod matmul;
+#[cfg(feature = "gpu")]
+pub mod paged_kv;
 #[cfg(feature = "gpu")]
 pub mod rms_norm;
 #[cfg(feature = "gpu")]

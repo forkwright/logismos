@@ -432,6 +432,50 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// A checked native full-attention device resource operation failed.
+    #[cfg(feature = "gpu")]
+    #[snafu(display("qwen35 native full-attention device operation failed: {source}"))]
+    NativeDevice {
+        /// Device allocation, copy, stream, or synchronization failure.
+        source: hipcore::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A checked native full-attention kernel operation failed.
+    #[cfg(feature = "gpu")]
+    #[snafu(display("qwen35 native full-attention kernel operation failed: {source}"))]
+    NativeKernel {
+        /// Checked native kernel plan or launch failure.
+        source: kernels::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The native paged-KV owner rejected a full-attention operation.
+    #[cfg(feature = "gpu")]
+    #[snafu(display("qwen35 native full-attention paged KV operation failed: {source}"))]
+    NativePagedKv {
+        /// Native paged-KV owner failure.
+        source: cache::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The one-token native full-attention session was not ready to submit work.
+    #[cfg(feature = "gpu")]
+    #[snafu(display("qwen35 native full-attention session refused operation: {rule}"))]
+    NativeSessionState {
+        /// State-machine relation that prevented submission or completion.
+        rule: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// A Qwen3 profile metadata value is missing, mistyped, or unsupported.
     #[snafu(display("qwen3 profile metadata `{key}` violates {rule}"))]
     Qwen3Metadata {

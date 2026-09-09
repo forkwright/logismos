@@ -48,6 +48,10 @@ use taxis::Tensor;
 pub use crate::error::{Error, Result};
 #[cfg(feature = "flat")]
 pub use crate::flat::{CacheLayout, FlatKvCache};
+#[cfg(feature = "gpu")]
+pub use crate::paged::{
+    NativePagedAppend, NativePagedKvPlan, NativePagedKvPool, NativePagedLayerKv,
+};
 pub use crate::paged::{PagedAppend, PagedKvGeometry, PagedKvPlan, PagedKvPool, PagedLayerKv};
 
 /// Legacy unshared tensor KV-cache contract.

@@ -33,6 +33,7 @@
 
 pub use cache;
 pub use decode;
+pub use decoders;
 pub use embed;
 pub use encoders;
 pub use loader;

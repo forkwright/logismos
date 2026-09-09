@@ -27,7 +27,18 @@ The [single-query paged-attention](crates/kernels/src/attention/mod.rs) operatio
 is consumed by the CPU hybrid decoder through borrowed KV rows. Its checked plan
 also owns the decoder's attention-workspace accounting. A separate native
 descriptor and wave32 HIP kernel support explicit 8/16/32-token physical pages;
-they are not yet a GPU model executor or a qualified device-cache policy.
+they are not a whole-model GPU executor or a qualified device-cache policy.
+
+The opt-in `decoders/gpu` surface composes one complete Qwen3.5-family
+full-attention block for one token, including normalization, mixed-row
+projections, text mRoPE, paged KV, gating, FFN and residuals. Its artifact-bound
+`Qwen35NativeLayerPlan` derives named allocation extents; its explicitly unsafe,
+blocking session owns device weights, input, workspace, cache, stream and output.
+It publishes KV only after successful completion and permanently poisons on a
+submitted failure, retaining the entire bundle if completion remains uncertain.
+The `logismos` facade selects this surface; direct CPU consumers keep it off.
+This is a qualification boundary, not native hybrid text generation, serving,
+a resource grant, or evidence of W7900/XTX numerical or performance parity.
 
 ## Why
 
@@ -85,8 +96,9 @@ Each call commits all layer state only after every input token and output projec
 Full-attention history uses execution-private CPU pages: complete committed pages stay
 immutable, partial tails are copied before writing, and attention reads paged rows directly.
 Failed calls publish neither KV history nor recurrent state. This is not cross-session
-prefix sharing, eviction or a GPU model path; the standalone native attention
-primitive does not move this CPU cache onto a device.
+prefix sharing, eviction or a GPU hybrid-model path. The separate native
+one-block session shares the logical paged ledger but owns its own device
+backing; it does not migrate this CPU session onto a GPU.
 Other unsupported formats or execution configurations fail explicitly.
 `execution_plan` additionally bounds tokens per step and selects all-token or last-token
 logits; prefill for generation need not retain a vocabulary row for every prompt token.

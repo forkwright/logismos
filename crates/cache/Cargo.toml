@@ -4,14 +4,17 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "KV cache layouts (flat only in Phase 2; paged + radix in Phases 6 + 12)."
+description = "Transactional paged KV ownership with CPU and opt-in native backing, plus legacy flat tensor storage."
 publish = false
 
 [features]
 default = ["flat"]
 flat = ["dep:half", "dep:taxis"]
+gpu = ["dep:hipcore", "dep:kernels", "kernels/gpu"]
 
 [dependencies]
+hipcore = { workspace = true, optional = true }
+kernels = { workspace = true, optional = true, default-features = false }
 taxis = { workspace = true, optional = true }
 half = { workspace = true, optional = true }
 snafu = { workspace = true }

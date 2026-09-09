@@ -10,6 +10,22 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
+    /// Underlying HIP ownership or synchronization failure for the optional native cache.
+    #[cfg(feature = "gpu")]
+    #[snafu(transparent)]
+    Hip {
+        /// Source HIP failure.
+        source: hipcore::Error,
+    },
+
+    /// Underlying cache-agnostic native copy or append kernel failure.
+    #[cfg(feature = "gpu")]
+    #[snafu(transparent)]
+    Kernel {
+        /// Source kernel failure.
+        source: kernels::Error,
+    },
+
     /// Underlying tensor-layer failure.
     #[cfg(feature = "flat")]
     #[snafu(transparent)]
@@ -273,6 +289,48 @@ pub enum Error {
     PagedLayout {
         /// Failed internal layout operation.
         operation: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A submitted native cache operation made completion uncertain.
+    #[cfg(feature = "gpu")]
+    #[snafu(display("cache: native paged-KV backing is poisoned after submitted device work"))]
+    PagedNativePoisoned {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A native append has already been prepared and awaits completion proof.
+    #[cfg(any(feature = "gpu", test))]
+    #[snafu(display("cache: native paged-KV commit is already prepared"))]
+    PagedNativeCommitPrepared {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Native publication was requested without a prepared all-layer append.
+    #[cfg(any(feature = "gpu", test))]
+    #[snafu(display("cache: native paged-KV commit was not prepared"))]
+    PagedNativeCommitNotPrepared {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A stream does not belong to this native cache pool's process-local device.
+    #[cfg(feature = "gpu")]
+    #[snafu(display(
+        "cache: native paged-KV stream device {actual} does not match pool device {expected}"
+    ))]
+    PagedNativeDeviceMismatch {
+        /// Process-local ordinal of the pool's device.
+        expected: std::ffi::c_int,
+        /// Process-local ordinal of the supplied stream's device.
+        actual: std::ffi::c_int,
         /// Source code location where the error was reported.
         #[snafu(implicit)]
         location: snafu::Location,

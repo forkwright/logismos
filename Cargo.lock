@@ -108,6 +108,8 @@ name = "cache"
 version = "1.0.11"
 dependencies = [
  "half",
+ "hipcore",
+ "kernels",
  "snafu",
  "taxis",
 ]
@@ -291,6 +293,7 @@ name = "decoders"
 version = "1.0.11"
 dependencies = [
  "cache",
+ "hipcore",
  "kernels",
  "loader",
  "num-traits",
@@ -630,6 +633,7 @@ dependencies = [
  "cache",
  "core",
  "decode",
+ "decoders",
  "embed",
  "encoders",
  "kernels",

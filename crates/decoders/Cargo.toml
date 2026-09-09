@@ -10,9 +10,14 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+gpu = ["cache/gpu", "kernels/gpu", "dep:hipcore"]
+
 [dependencies]
 # WHY: the workspace cache default enables the legacy tensor-backed flat API.
 cache = { path = "../cache", default-features = false }
+hipcore = { workspace = true, optional = true }
 # Metadata-only observation keeps structural preflight independent of HIP/tensor decoding.
 loader = { path = "../loader", default-features = false }
 kernels = { workspace = true, default-features = false }

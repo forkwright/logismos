@@ -82,7 +82,7 @@ unsafe extern "C" {
 }
 
 /// Validated serialized matrix/vector extents shared by CPU execution and HIP launch.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RowGemvShape {
     format: quant::RowFormat,
     rows: usize,
@@ -444,6 +444,20 @@ mod tests {
             assert_eq!(shape.row_bytes(), row_bytes);
             assert_eq!(shape.matrix_bytes(), row_bytes * 2);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn shape_equality_retains_format_width_and_row_identity()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let baseline = RowGemvShape::new(quant::RowFormat::F32, 1, 2, 8, 2, 1)?;
+        let other_format = RowGemvShape::new(quant::RowFormat::Q8_0, 1, 32, 34, 32, 1)?;
+        let other_width = RowGemvShape::new(quant::RowFormat::F32, 1, 3, 12, 3, 1)?;
+        let other_rows = RowGemvShape::new(quant::RowFormat::F32, 2, 2, 16, 2, 2)?;
+        assert_eq!(baseline, baseline);
+        assert_ne!(baseline, other_format);
+        assert_ne!(baseline, other_width);
+        assert_ne!(baseline, other_rows);
         Ok(())
     }
 

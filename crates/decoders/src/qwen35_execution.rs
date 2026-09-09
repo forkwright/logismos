@@ -2,7 +2,6 @@
 
 use cache::{PagedAppend, PagedKvGeometry, PagedKvPlan, PagedKvPool};
 use loader::gguf::{GgmlType, MetaValue, MetaValueType};
-use num_traits::ToPrimitive;
 use quant::f32_row::F32Row;
 use snafu::ResultExt;
 
@@ -15,6 +14,7 @@ use crate::error::{
     RecurrentRmsNormSnafu, TensorShapeSnafu,
 };
 use crate::qwen35::recurrent_layernorm_rms_epsilon;
+use crate::qwen35_mrope::{TextMrope, text_mrope_coefficient};
 use crate::qwen35_requirements::Qwen35CpuRequirements;
 use crate::{Qwen35RecurrentExecution, Qwen35Weights, Result};
 
@@ -654,47 +654,10 @@ fn full_attention(
 }
 
 fn apply_text_mrope(layout: Layout, position: usize, values: &mut [f32]) -> Result<()> {
-    // The Qwen3.5 text position contract is component-major `[p,p,p,0]`.
-    // The validated sections select which rotary pairs use each component.
-    let position = f64::from(i32::try_from(position).map_err(|_| {
-        ArithmeticOverflowSnafu {
-            context: "text MRoPE position",
-        }
-        .build()
-    })?);
     for row in values.chunks_exact_mut(layout.key) {
         for pair in 0..(layout.n_rot / 2) {
             let left_index = pair;
-            let pair_f64 = pair.to_f64().ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "text MRoPE pair",
-                }
-                .build()
-            })?;
-            let key_f64 = layout.n_rot.to_f64().ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "text MRoPE rotary width",
-                }
-                .build()
-            })?;
-            let exponent = (2.0 * pair_f64) / key_f64;
-            let axis = layout.rope_axis(pair)?;
-            let text_position = if axis == 3 { 0.0 } else { position };
-            let angle = text_position / layout.rope_base.powf(exponent);
-            let cos = angle.cos().to_f32().ok_or_else(|| {
-                ExecutionArithmeticSnafu {
-                    stage: "text MRoPE cosine",
-                    index: pair,
-                }
-                .build()
-            })?;
-            let sin = angle.sin().to_f32().ok_or_else(|| {
-                ExecutionArithmeticSnafu {
-                    stage: "text MRoPE sine",
-                    index: pair,
-                }
-                .build()
-            })?;
+            let (cos, sin) = text_mrope_coefficient(layout.text_mrope(), position, pair)?;
             let right_index = left_index.checked_add(layout.n_rot / 2).ok_or_else(|| {
                 ArithmeticOverflowSnafu {
                     context: "RoPE half-split pair end",
@@ -976,21 +939,21 @@ fn paged_decode(
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Layout {
-    hidden: usize,
+    pub(crate) hidden: usize,
     hidden_u64: u64,
-    feed_forward: usize,
-    heads: usize,
-    kv_heads: usize,
-    key: usize,
+    pub(crate) feed_forward: usize,
+    pub(crate) heads: usize,
+    pub(crate) kv_heads: usize,
+    pub(crate) key: usize,
     n_rot: usize,
     key_u64: u64,
-    kv_width: usize,
-    query_width: usize,
+    pub(crate) kv_width: usize,
+    pub(crate) query_width: usize,
     vocabulary: usize,
     main_blocks: usize,
     full_interval: usize,
     max_context: usize,
-    epsilon: f32,
+    pub(crate) epsilon: f32,
     rope_base: f64,
     rope_sections: [usize; 4],
 }
@@ -1023,7 +986,7 @@ impl Layout {
         clippy::too_many_lines,
         reason = "execution-only metadata is admitted at one artifact-bound boundary"
     )]
-    fn from_metadata(weights: &Qwen35Weights<'_>, max_context: usize) -> Result<Self> {
+    pub(crate) fn from_metadata(weights: &Qwen35Weights<'_>, max_context: usize) -> Result<Self> {
         if max_context == 0 {
             return ExecutionContextSnafu {
                 requested: max_context,
@@ -1285,33 +1248,19 @@ impl Layout {
             rope_sections,
         })
     }
-    fn is_full(self, block: usize) -> bool {
+    pub(crate) fn is_full(self, block: usize) -> bool {
         (block + 1).is_multiple_of(self.full_interval)
     }
-    fn rope_axis(self, pair: usize) -> Result<usize> {
-        let total = self.rope_sections.iter().try_fold(0usize, |sum, section| {
-            sum.checked_add(*section).ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "MRoPE section total",
-                }
-                .build()
-            })
-        })?;
-        let sector = pair % total;
-        if sector % 3 == 1 && sector < 3 * self.rope_sections[1] {
-            return Ok(1);
-        }
-        if sector % 3 == 2 && sector < 3 * self.rope_sections[2] {
-            return Ok(2);
-        }
-        if sector.is_multiple_of(3) && sector < 3 * self.rope_sections[0] {
-            return Ok(0);
-        }
-        Ok(3)
+
+    pub(crate) fn is_admitted_full_block(self, block: usize) -> bool {
+        block < self.main_blocks && self.is_full(block)
+    }
+    pub(crate) const fn text_mrope(self) -> TextMrope {
+        TextMrope::new(self.n_rot, self.rope_base, self.rope_sections)
     }
 }
 
-fn read_f32(
+pub(crate) fn read_f32(
     weights: &Qwen35Weights<'_>,
     name: &str,
     expected_dims: &[u64],
@@ -1488,7 +1437,7 @@ fn rope_sections(
     }
     Ok(sections)
 }
-fn block_name(block: usize, role: &str) -> String {
+pub(crate) fn block_name(block: usize, role: &str) -> String {
     format!("blk.{block}.{role}")
 }
 fn reserve<T>(target: &'static str, length: usize) -> Result<Vec<T>> {
