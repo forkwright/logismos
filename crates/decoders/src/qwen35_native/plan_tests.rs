@@ -44,16 +44,33 @@ fn verified_full_block_plan_accepts_each_explicit_native_page_size()
 -> std::result::Result<(), String> {
     let artifact = verify_fixture(&canonical_hybrid_fixture()?)?;
     let weights = Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
-    for page_tokens in [
-        kernels::attention::NativePageTokens::B8,
-        kernels::attention::NativePageTokens::B16,
-        kernels::attention::NativePageTokens::B32,
+    for (page_tokens, key_values, total) in [
+        (kernels::attention::NativePageTokens::B8, 32_768, 76_384),
+        (kernels::attention::NativePageTokens::B16, 65_536, 109_152),
+        (kernels::attention::NativePageTokens::B32, 131_072, 174_688),
     ] {
         let plan = DeviceFullAttentionPlan::from_weights(&weights, 3, 4, page_tokens)
             .map_err(|error| error.to_string())?;
-        assert!(
-            plan.bytes.total().map_err(|error| error.to_string())? > 0,
-            "verified full block must derive a nonzero owned device demand"
+        assert_eq!(plan.bytes.weights, 25_804, "seven matrices plus four norms");
+        assert_eq!(
+            plan.bytes.scratch, 17_528,
+            "seventeen named workspace buffers"
+        );
+        assert_eq!(plan.bytes.input, 12, "one hidden f32 input row");
+        assert_eq!(plan.bytes.output, 12, "one hidden f32 output row");
+        assert_eq!(plan.bytes.controls, 256, "64 rotary f32 controls");
+        assert_eq!(
+            plan.bytes.table, 4,
+            "four-token context uses one table entry"
+        );
+        assert_eq!(
+            plan.bytes.key_values, key_values,
+            "page selector changes only K/V backing"
+        );
+        assert_eq!(
+            plan.bytes.total().map_err(|error| error.to_string())?,
+            total,
+            "hand-derived native byte total"
         );
     }
     Ok(())
@@ -73,5 +90,36 @@ fn verified_plan_refuses_a_recurrent_main_block() -> std::result::Result<(), Str
         .is_err(),
         "a recurrent main block cannot be presented as native full attention"
     );
+    assert!(
+        DeviceFullAttentionPlan::from_weights(
+            &weights,
+            4,
+            4,
+            kernels::attention::NativePageTokens::B8
+        )
+        .is_err(),
+        "a nonexistent block cannot form a native plan"
+    );
+    assert!(
+        DeviceFullAttentionPlan::from_weights(
+            &weights,
+            3,
+            0,
+            kernels::attention::NativePageTokens::B8
+        )
+        .is_err(),
+        "zero context must be refused"
+    );
+    assert!(
+        DeviceFullAttentionPlan::from_weights(
+            &weights,
+            3,
+            5,
+            kernels::attention::NativePageTokens::B8
+        )
+        .is_err(),
+        "context beyond verified metadata must be refused"
+    );
     Ok(())
 }
+
