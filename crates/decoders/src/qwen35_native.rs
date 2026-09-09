@@ -2,6 +2,8 @@
 
 #[cfg(feature = "gpu")]
 mod plan;
+#[cfg(test)]
+mod plan_tests;
 #[cfg(feature = "gpu")]
 mod resources;
 #[cfg(feature = "gpu")]
