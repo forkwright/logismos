@@ -2,10 +2,7 @@
 
 use cache::NativePagedKvPool;
 use core::mem::ManuallyDrop;
-use hipcore::{
-    Device, DeviceBuffer, InventoryRelease, NonOwnedStream, Stream, TeardownBuffer,
-    TeardownInventory,
-};
+use hipcore::{Device, DeviceBuffer, InventoryRelease, Stream, TeardownBuffer, TeardownInventory};
 use snafu::ResultExt;
 use std::sync::Arc;
 
@@ -332,10 +329,8 @@ impl NativeResidentTeardownParts {
         let mut inventory = match TeardownInventory::try_new(stream) {
             Ok(inventory) => inventory,
             Err(stream) => {
-                return NativeResidentTeardown::Unadmitted(Self {
-                    device: stream.device().clone(),
-                    buffers,
-                });
+                drop(stream);
+                return NativeResidentTeardown::Unadmitted(Self { device, buffers });
             }
         };
         while let Some(buffer) = buffers.pop() {
@@ -346,10 +341,6 @@ impl NativeResidentTeardownParts {
         }
         NativeResidentTeardown::Releasing(inventory.begin_release())
     }
-}
-
-fn recover_non_owned_stream(stream: NonOwnedStream) -> Stream {
-    stream.into_stream()
 }
 
 impl NativeResidentModelResources {
@@ -581,7 +572,7 @@ impl ModelSessionResources {
                 if !failed_step.is_empty() {
                     self.failed_step = Some(failed_step);
                 }
-                return NativeDeviceSnafu { source }.fail();
+                return Err(source).context(NativeDeviceSnafu);
             }
         };
         self.step = Some(ModelStep {
@@ -835,7 +826,7 @@ fn copy_f32_to_device(
         Ok(()) => Ok(buffer),
         Err(source) => {
             failed_step.push_f32(buffer);
-            NativeDeviceSnafu { source }.fail()
+            Err(source).context(NativeDeviceSnafu)
         }
     }
 }
