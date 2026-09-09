@@ -402,6 +402,26 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// Checked paged-decode planning rejected the execution geometry.
+    #[snafu(display("qwen35 execution paged decode plan failed: {source}"))]
+    ExecutionPagedDecodePlan {
+        /// Checked attention geometry or allocation failure.
+        source: kernels::PagedDecodeError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The checked paged-decode operation or paged-KV row borrow failed.
+    #[snafu(display("qwen35 execution paged decode operation failed: {source}"))]
+    ExecutionPagedDecode {
+        /// Checked operation or typed caller-owned row-borrow failure.
+        source: kernels::PagedDecodeRowsError<cache::Error>,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// The private paged KV owner rejected a checked execution operation.
     #[snafu(display("qwen35 execution paged KV operation failed: {source}"))]
     ExecutionPagedKv {

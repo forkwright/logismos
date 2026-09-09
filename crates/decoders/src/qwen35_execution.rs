@@ -1,6 +1,6 @@
 //! Bounded CPU token-to-logits execution for a verified Qwen3.5 payload.
 
-use cache::{PagedAppend, PagedKvGeometry, PagedKvPlan, PagedKvPool, PagedLayerKv};
+use cache::{PagedAppend, PagedKvGeometry, PagedKvPlan, PagedKvPool};
 use loader::gguf::{GgmlType, MetaValue, MetaValueType};
 use num_traits::ToPrimitive;
 use quant::f32_row::F32Row;
@@ -8,7 +8,8 @@ use snafu::ResultExt;
 
 use crate::error::{
     ArithmeticOverflowSnafu, ExecutionAllocationPlanSnafu, ExecutionAllocationSnafu,
-    ExecutionArithmeticSnafu, ExecutionContextSnafu, ExecutionCpuSnafu, ExecutionPagedKvSnafu,
+    ExecutionArithmeticSnafu, ExecutionContextSnafu, ExecutionCpuSnafu,
+    ExecutionPagedDecodePlanSnafu, ExecutionPagedDecodeSnafu, ExecutionPagedKvSnafu,
     ExecutionTokenSnafu, MetadataRelationSnafu, MetadataTypeSnafu, MissingMetadataSnafu,
     PayloadTensorSnafu, ProjectionBytesSnafu, ProjectionDtypeSnafu, ProjectionRowSnafu,
     RecurrentRmsNormSnafu, TensorShapeSnafu,
@@ -612,7 +613,6 @@ fn full_attention(
     }
     let mut merged = reserve("full-attention merged output", allocations.merged_output)?;
     for head in 0..layout.heads {
-        let kv_head = head / layout.gqa_group;
         let query_start = head.checked_mul(layout.key).ok_or_else(|| {
             ArithmeticOverflowSnafu {
                 context: "attention query offset",
@@ -628,7 +628,7 @@ fn full_attention(
                 }
                 .build()
             })?;
-        let attended = attend(&kv, query, kv_head, &layout, allocations)?;
+        let attended = paged_decode(allocations.paged_decode, head, query, &kv)?;
         let gate_row = gate
             .get(query_start..query_start + layout.key)
             .ok_or_else(|| {
@@ -736,8 +736,7 @@ struct FullAttentionWorkspaceAllocations {
     normalized_query: usize,
     normalized_key: usize,
     merged_output: usize,
-    attention_scores: usize,
-    attention_head_output: usize,
+    paged_decode: kernels::PagedDecodePlan,
     output_projection: usize,
     workspace_elements: usize,
 }
@@ -767,8 +766,13 @@ impl FullAttentionWorkspaceAllocations {
             kernels::cpu_f32::rms_norm_output_elements(layout.kv_heads, layout.key)
                 .context(RecurrentRmsNormSnafu)?;
         let merged_output = layout.query_width;
-        let attention_scores = attention_tokens;
-        let attention_head_output = layout.key;
+        let paged_decode = kernels::PagedDecodePlan::try_from_dimensions(
+            attention_tokens,
+            layout.heads,
+            layout.kv_heads,
+            layout.key,
+        )
+        .context(ExecutionPagedDecodePlanSnafu)?;
         let output_projection = Qwen35Weights::projection_output_elements(layout.hidden);
         let core = sum_elements(
             &[
@@ -788,7 +792,7 @@ impl FullAttentionWorkspaceAllocations {
             "full-attention core workspace",
         )?;
         let attention_phase = sum_elements(
-            &[core, attention_scores, attention_head_output],
+            &[core, paged_decode.workspace_elements()],
             "full-attention score phase",
         )?;
         let output_phase = checked_add(
@@ -809,8 +813,7 @@ impl FullAttentionWorkspaceAllocations {
             normalized_query,
             normalized_key,
             merged_output,
-            attention_scores,
-            attention_head_output,
+            paged_decode,
             output_projection,
             workspace_elements: attention_phase.max(output_phase),
         })
@@ -955,83 +958,20 @@ pub(crate) fn returned_logits_elements(
     })
 }
 
-fn attend(
-    kv: &PagedLayerKv<'_>,
+fn paged_decode(
+    plan: kernels::PagedDecodePlan,
+    query_head: usize,
     query: &[f32],
-    kv_head: usize,
-    layout: &Layout,
-    allocations: FullAttentionWorkspaceAllocations,
+    kv: &cache::PagedLayerKv<'_>,
 ) -> Result<Vec<f32>> {
-    ensure_execution_plan(
-        "attention scores",
-        kv.tokens(),
-        allocations.attention_scores,
-    )?;
-    let mut scores = reserve("attention scores", allocations.attention_scores)?;
-    let scale = layout
-        .key
-        .to_f32()
-        .ok_or_else(|| {
-            ArithmeticOverflowSnafu {
-                context: "attention key width",
-            }
-            .build()
-        })?
-        .sqrt()
-        .recip();
-    for token in 0..kv.tokens() {
-        let head_start = kv_head.checked_mul(layout.key).ok_or_else(|| {
-            ArithmeticOverflowSnafu {
-                context: "KV key head offset",
-            }
-            .build()
-        })?;
-        let row = kv.key_row(token).context(ExecutionPagedKvSnafu)?;
-        let key = row
-            .get(head_start..head_start + layout.key)
-            .ok_or_else(|| {
-                ExecutionContextSnafu {
-                    requested: head_start,
-                    rule: "KV key range must fit retained state",
-                }
-                .build()
-            })?;
-        let score = query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>() * scale;
-        finite_one(score, "attention score", token)?;
-        scores.push(score);
-    }
-    let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let normalizer = scores
-        .iter()
-        .map(|score| (*score - maximum).exp())
-        .sum::<f32>();
-    finite_one(normalizer, "attention softmax normalizer", 0)?;
-    let mut output = reserve("attention head output", allocations.attention_head_output)?;
-    output.resize(allocations.attention_head_output, 0.0);
-    for (token, score) in scores.iter().enumerate() {
-        let probability = (*score - maximum).exp() / normalizer;
-        let head_start = kv_head.checked_mul(layout.key).ok_or_else(|| {
-            ArithmeticOverflowSnafu {
-                context: "KV value head offset",
-            }
-            .build()
-        })?;
-        let row = kv.value_row(token).context(ExecutionPagedKvSnafu)?;
-        let value = row
-            .get(head_start..head_start + layout.key)
-            .ok_or_else(|| {
-                ExecutionContextSnafu {
-                    requested: head_start,
-                    rule: "KV value range must fit retained state",
-                }
-                .build()
-            })?;
-        for (index, (destination, source)) in output.iter_mut().zip(value).enumerate() {
-            *destination += probability * source;
-            finite_one(*destination, "attention value", index)?;
-        }
-    }
-    Ok(output)
+    kernels::paged_decode_cpu(
+        plan,
+        query_head,
+        query,
+        |token| kv.key_row(token),
+        |token| kv.value_row(token),
+    )
+    .context(ExecutionPagedDecodeSnafu)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1046,7 +986,6 @@ pub(crate) struct Layout {
     key_u64: u64,
     kv_width: usize,
     query_width: usize,
-    gqa_group: usize,
     vocabulary: usize,
     main_blocks: usize,
     full_interval: usize,
@@ -1337,7 +1276,6 @@ impl Layout {
                 }
                 .build()
             })?,
-            gqa_group: heads / kv_heads,
             vocabulary,
             main_blocks,
             full_interval,

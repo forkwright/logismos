@@ -26,6 +26,10 @@ fn named_owners_reconcile_a_large_nondegenerate_shape() -> std::result::Result<(
     assert_eq!(gdn.delta_elements(), 7);
     assert_eq!(gdn.workspace_elements(), 896);
 
+    let paged_decode = kernels::PagedDecodePlan::try_from_dimensions(257, 6, 2, 5)
+        .map_err(|error| error.to_string())?;
+    assert_eq!(paged_decode.workspace_elements(), 262);
+
     assert_eq!(
         kernels::cpu_f32::rms_norm_output_elements(6, 7).map_err(|error| error.to_string())?,
         42
@@ -239,7 +243,7 @@ fn artifact_plan_report_and_all_last_execution_agree() -> std::result::Result<()
 }
 
 #[test]
-fn owner_arithmetic_overflow_is_rejected_before_execution() -> std::result::Result<(), String> {
+fn owner_overflows_are_rejected_before_execution() -> std::result::Result<(), String> {
     assert!(kernels::CausalConvAllocationPlan::try_from_dimensions(usize::MAX, 2, 4).is_err());
     assert!(
         kernels::MultiHeadRecurrentAllocationPlan::try_from_dimensions(usize::MAX, 2, 2, 2, 2,)
@@ -259,7 +263,39 @@ fn owner_arithmetic_overflow_is_rejected_before_execution() -> std::result::Resu
     )
     .err()
     .ok_or_else(|| "overflowing owner plan unexpectedly succeeded".to_string())?;
-    assert!(matches!(error, crate::Error::ArithmeticOverflow { .. }));
+    assert!(
+        matches!(
+            error,
+            crate::Error::ExecutionPagedDecodePlan {
+                source: kernels::PagedDecodeError::WorkspaceOverflow { .. },
+                ..
+            }
+        ),
+        "the eager paged-decode owner must refuse its score-plus-output workspace before execution"
+    );
+
+    let logits_overflow = Qwen35RequirementElements::try_from_layout(
+        Layout {
+            vocabulary: usize::MAX / 2 + 1,
+            ..demanding_layout()
+        },
+        demanding_recurrent_layout(),
+        2,
+        Qwen35LogitSelection::AllTokens,
+        paged_kv_plan(demanding_layout()).map_err(|error| error.to_string())?,
+    )
+    .err()
+    .ok_or_else(|| "overflowing returned-logit owner unexpectedly succeeded".to_string())?;
+    assert!(
+        matches!(
+            logits_overflow,
+            crate::Error::ArithmeticOverflow {
+                context: "returned logits allocation",
+                ..
+            }
+        ),
+        "the decoder-owned returned-logit product must retain its typed arithmetic overflow"
+    );
     Ok(())
 }
 
@@ -275,7 +311,6 @@ fn demanding_layout() -> Layout {
         key_u64: 5,
         kv_width: 10,
         query_width: 30,
-        gqa_group: 3,
         vocabulary: 1_009,
         main_blocks: 5,
         full_interval: 3,
