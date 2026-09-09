@@ -57,7 +57,7 @@ mod tests {
                 &fixture.activations,
             )?;
             assert_close(&actual, &expected, format.to_string().as_str());
-            assert_eq!(actual[0], 0.0_f32, "{format} zero row");
+            assert_eq!(actual[0].to_bits(), 0.0_f32.to_bits(), "{format} zero row");
         }
         Ok(())
     }
@@ -147,14 +147,17 @@ mod tests {
             let packed_order = (order_fixture.fixture.activations[0]
                 + order_fixture.fixture.activations[order_fixture.high_lane])
                 + order_fixture.fixture.activations[1];
+            assert_eq!(actual.len(), 1, "{} output length", order_fixture.label);
+            // WHY: these dyadic witnesses require exact rounded values, not a tolerance change.
             assert_eq!(
-                actual,
-                [0.0_f32],
+                actual[0].to_bits(),
+                0.0_f32.to_bits(),
                 "{} logical lane order",
                 order_fixture.label
             );
             assert_eq!(
-                packed_order, 1.0_f32,
+                packed_order.to_bits(),
+                1.0_f32.to_bits(),
                 "{} packed interleaving discriminator",
                 order_fixture.label
             );
@@ -582,8 +585,8 @@ mod tests {
         let mut results = Vec::new();
         for row in matrix.chunks_exact(row_bytes).take(rows) {
             let mut total = 0.0_f64;
-            for index in 0..width {
-                total += oracle_weight(format, row, index)? * f64::from(activations[index]);
+            for (index, &activation) in activations[..width].iter().enumerate() {
+                total += oracle_weight(format, row, index)? * f64::from(activation);
             }
             results.push(total);
         }
