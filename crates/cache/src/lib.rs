@@ -50,7 +50,8 @@ pub use crate::error::{Error, Result};
 pub use crate::flat::{CacheLayout, FlatKvCache};
 #[cfg(feature = "gpu")]
 pub use crate::paged::{
-    NativePagedAppend, NativePagedKvPlan, NativePagedKvPool, NativePagedLayerKv,
+    NativePagedAppend, NativePagedKvBuffers, NativePagedKvPlan, NativePagedKvPool,
+    NativePagedKvPoolBindingError, NativePagedLayerKv,
 };
 pub use crate::paged::{PagedAppend, PagedKvGeometry, PagedKvPlan, PagedKvPool, PagedLayerKv};
 

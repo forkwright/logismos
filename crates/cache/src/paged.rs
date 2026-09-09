@@ -955,6 +955,18 @@ impl NativePagedKvPlan {
     pub const fn head_width(self) -> usize {
         self.head_width
     }
+
+    /// Return the exact f32 elements in each key or value backing.
+    #[must_use]
+    pub const fn key_value_elements(self) -> usize {
+        self.layout.backing_elements()
+    }
+
+    /// Return the exact u32 elements in the native page table.
+    #[must_use]
+    pub const fn page_table_elements(self) -> usize {
+        self.logical.allocation.page_count
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -984,6 +996,63 @@ pub struct NativePagedKvPool {
     poisoned: bool,
 }
 
+/// Caller-owned native K/V buffers awaiting one checked pool binding.
+///
+/// This is an ownership carrier only. It performs no allocation, upload, or
+/// device work; [`NativePagedKvPool::try_from_buffers`] validates its exact
+/// geometry and device identity while returning these same owners on refusal.
+#[cfg(feature = "gpu")]
+pub struct NativePagedKvBuffers {
+    keys: DeviceBuffer<f32>,
+    values: DeviceBuffer<f32>,
+    table: DeviceBuffer<u32>,
+}
+
+#[cfg(feature = "gpu")]
+impl NativePagedKvBuffers {
+    /// Assemble caller-owned native K/V and page-table buffers without validation.
+    #[must_use]
+    pub fn new(
+        keys: DeviceBuffer<f32>,
+        values: DeviceBuffer<f32>,
+        table: DeviceBuffer<u32>,
+    ) -> Self {
+        Self {
+            keys,
+            values,
+            table,
+        }
+    }
+
+    /// Consume this carrier and return its original typed buffer owners.
+    #[must_use]
+    pub fn into_parts(self) -> (DeviceBuffer<f32>, DeviceBuffer<f32>, DeviceBuffer<u32>) {
+        (self.keys, self.values, self.table)
+    }
+}
+
+/// A rejected native K/V buffer binding that still owns every caller buffer.
+#[cfg(feature = "gpu")]
+pub struct NativePagedKvPoolBindingError {
+    error: crate::Error,
+    buffers: NativePagedKvBuffers,
+}
+
+#[cfg(feature = "gpu")]
+impl NativePagedKvPoolBindingError {
+    /// Borrow the checked reason the binding was refused.
+    #[must_use]
+    pub fn error(&self) -> &crate::Error {
+        &self.error
+    }
+
+    /// Consume this rejection and recover the error and original buffer owners.
+    #[must_use]
+    pub fn into_parts(self) -> (crate::Error, NativePagedKvBuffers) {
+        (self.error, self.buffers)
+    }
+}
+
 #[cfg(feature = "gpu")]
 impl NativePagedKvPool {
     /// Allocate native K/V and table mirrors before any append is admitted.
@@ -994,9 +1063,9 @@ impl NativePagedKvPool {
     /// geometry and metadata-allocation errors, without publishing an append.
     pub fn new(plan: NativePagedKvPlan, device: &Device) -> Result<Self> {
         let ledger = PagedKvLedger::new(plan.logical)?;
-        let keys = DeviceBuffer::alloc(device, plan.layout.backing_elements())?;
-        let values = DeviceBuffer::alloc(device, plan.layout.backing_elements())?;
-        let table = DeviceBuffer::alloc(device, plan.logical.allocation.page_count)?;
+        let keys = DeviceBuffer::alloc(device, plan.key_value_elements())?;
+        let values = DeviceBuffer::alloc(device, plan.key_value_elements())?;
+        let table = DeviceBuffer::alloc(device, plan.page_table_elements())?;
         Ok(Self {
             ledger,
             prepared: NativePreparedCommit::default(),
@@ -1006,6 +1075,71 @@ impl NativePagedKvPool {
             table,
             poisoned: false,
         })
+    }
+
+    /// Bind caller-owned exact native buffers to this checked pool plan.
+    ///
+    /// On refusal this consumes no buffer: the returned
+    /// [`NativePagedKvPoolBindingError`] retains the same typed owners for an
+    /// explicit construction-failure teardown path.
+    pub fn try_from_buffers(
+        plan: NativePagedKvPlan,
+        buffers: NativePagedKvBuffers,
+    ) -> core::result::Result<Self, NativePagedKvPoolBindingError> {
+        let binding = (|| -> Result<PagedKvLedger> {
+            if buffers.keys.len() != plan.key_value_elements()
+                || buffers.values.len() != plan.key_value_elements()
+                || buffers.table.len() != plan.page_table_elements()
+            {
+                return PagedLayoutSnafu {
+                    operation: "native paged-K/V caller buffer length",
+                }
+                .fail();
+            }
+            ensure_same_process_device(
+                buffers.keys.device().ordinal(),
+                buffers.values.device().ordinal(),
+            )?;
+            ensure_same_process_device(
+                buffers.keys.device().ordinal(),
+                buffers.table.device().ordinal(),
+            )?;
+            PagedKvLedger::new(plan.logical)
+        })();
+        let ledger = match binding {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                return Err(NativePagedKvPoolBindingError { error, buffers });
+            }
+        };
+        let NativePagedKvBuffers {
+            keys,
+            values,
+            table,
+        } = buffers;
+        Ok(Self {
+            ledger,
+            prepared: NativePreparedCommit::default(),
+            plan,
+            keys,
+            values,
+            table,
+            poisoned: false,
+        })
+    }
+
+    /// Consume this pool and return its original typed device buffers.
+    ///
+    /// This performs no synchronization, HIP release, or eviction
+    /// acknowledgement. A caller handling submitted work must retain the
+    /// returned owners in a quiescing teardown path before they can drop.
+    #[must_use]
+    pub fn into_buffers(self) -> NativePagedKvBuffers {
+        NativePagedKvBuffers {
+            keys: self.keys,
+            values: self.values,
+            table: self.table,
+        }
     }
 
     /// Stage a native append and mirror its required COW/table mutations.
@@ -1910,6 +2044,8 @@ mod tests {
             native.layout().backing_elements(),
             LAYERS * 2 * 32 * ROW_WIDTH
         );
+        assert_eq!(native.key_value_elements(), LAYERS * 2 * 32 * ROW_WIDTH);
+        assert_eq!(native.page_table_elements(), 1);
         assert!(
             NativePagedKvPlan::try_from_geometry(geometry, 2, ROW_WIDTH, NativePageTokens::B8,)
                 .is_err()
