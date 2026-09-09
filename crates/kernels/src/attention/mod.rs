@@ -968,6 +968,9 @@ fn checked_product(
         .ok_or_else(|| DimensionOverflowSnafu { dimensions }.build())
 }
 
+#[cfg(all(test, feature = "gpu"))]
+mod native_tests;
+
 #[cfg(test)]
 mod tests {
     use approx::assert_relative_eq;
@@ -1217,43 +1220,6 @@ mod tests {
 
     #[cfg(feature = "gpu")]
     #[test]
-    fn independent_f64_paged_witness_observes_table_indirection_and_partial_tail()
-    -> core::result::Result<(), Box<dyn std::error::Error>> {
-        let logical = PagedDecodePlan::try_from_dimensions(9, 2, 1, 2)?;
-        let native = NativePagedDecodePlan::try_from_paged_decode(logical, 8, 2)?;
-        let query = [1.0_f32, 0.0, 0.0, 1.0];
-        let table = [1_u32, 0];
-        let mut keys = vec![0.0_f32; native.key_value_elements()];
-        let mut values = vec![0.0_f32; native.key_value_elements()];
-        for token in 0..logical.visible_tokens() {
-            let physical_page = usize::try_from(table[token / native.page_tokens().get()])?;
-            let in_page = token % native.page_tokens().get();
-            let start =
-                (physical_page * native.page_tokens().get() + in_page) * logical.head_width();
-            keys[start] = token as f32;
-            keys[start + 1] = -(token as f32);
-            values[start] = (token + 1) as f32;
-            values[start + 1] = ((token + 1) * 10) as f32;
-        }
-
-        let actual = f64_paged_online_oracle(native, &query, &keys, &values, &table)?;
-        let expected_first = f64_dense_logical_oracle(&query[..2], 9)?;
-        let expected_second = f64_dense_logical_oracle(&query[2..], 9)?;
-        for (actual, expected) in actual[..2].iter().zip(expected_first) {
-            assert_relative_eq!(*actual, expected, epsilon = 1.0e-6);
-        }
-        for (actual, expected) in actual[2..].iter().zip(expected_second) {
-            assert_relative_eq!(*actual, expected, epsilon = 1.0e-6);
-        }
-
-        let wrong_table = [0_u32, 1];
-        let wrong_order = f64_paged_online_oracle(native, &query, &keys, &values, &wrong_table)?;
-        assert_ne!(actual, wrong_order, "table order must select physical rows");
-        Ok(())
-    }
-
-    #[cfg(feature = "gpu")]
-    #[test]
     fn native_descriptor_is_explicit_and_span_validation_refuses_bad_extents()
     -> core::result::Result<(), Box<dyn std::error::Error>> {
         let logical = PagedDecodePlan::try_from_dimensions(9, 2, 1, 3)?;
@@ -1408,82 +1374,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "gpu")]
-    #[test]
-    #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
-    fn reserved_device_q1_paged_attention_matches_independent_f64_oracle()
-    -> core::result::Result<(), String> {
-        use hipcore::{Device, DeviceBuffer, Stream};
-
-        let logical = PagedDecodePlan::try_from_dimensions(2, 2, 1, 2)
-            .map_err(|error| format!("build logical plan: {error}"))?;
-        let native = NativePagedDecodePlan::try_from_paged_decode(logical, 8, 1)
-            .map_err(|error| format!("build native plan: {error}"))?;
-        let query = [1.0_f32, 0.0, 0.0, 1.0];
-        let logical_keys = [vec![1.0_f32, 0.0], vec![0.0, 1.0]];
-        let logical_values = [vec![2.0_f32, 20.0], vec![4.0, 40.0]];
-        let mut native_keys = vec![0.0_f32; native.key_value_elements()];
-        let mut native_values = vec![0.0_f32; native.key_value_elements()];
-        for token in 0..logical.visible_tokens() {
-            let start = token * logical.head_width();
-            let end = start + logical.head_width();
-            native_keys[start..end].copy_from_slice(&logical_keys[token]);
-            native_values[start..end].copy_from_slice(&logical_values[token]);
-        }
-        let expected_first =
-            f64_materialized_oracle(&query[..2], 0, &logical_keys, &logical_values)
-                .map_err(|error| format!("first f64 oracle: {error}"))?;
-        let expected_second =
-            f64_materialized_oracle(&query[2..], 0, &logical_keys, &logical_values)
-                .map_err(|error| format!("second f64 oracle: {error}"))?;
-
-        let device = Device::new(0).map_err(|error| format!("open reserved device 0: {error}"))?;
-        let stream = Stream::new(&device).map_err(|error| format!("create stream: {error}"))?;
-        let query = DeviceBuffer::from_host(&device, &query)
-            .map_err(|error| format!("upload query: {error}"))?;
-        let keys = DeviceBuffer::from_host(&device, &native_keys)
-            .map_err(|error| format!("upload keys: {error}"))?;
-        let values = DeviceBuffer::from_host(&device, &native_values)
-            .map_err(|error| format!("upload values: {error}"))?;
-        let table = DeviceBuffer::from_host(&device, &[0_u32])
-            .map_err(|error| format!("upload page table: {error}"))?;
-        let output = DeviceBuffer::<f32>::alloc(&device, native.output_elements())
-            .map_err(|error| format!("allocate output: {error}"))?;
-        // SAFETY: each device allocation is distinct, has the descriptor's
-        // exact extent, and remains live until stream synchronization.
-        unsafe {
-            launch_paged_decode_q1_f32(
-                native,
-                query.as_device_ptr(),
-                query.len(),
-                keys.as_device_ptr(),
-                keys.len(),
-                values.as_device_ptr(),
-                values.len(),
-                table.as_device_ptr(),
-                table.len(),
-                output.as_device_ptr(),
-                output.len(),
-                &stream,
-            )
-        }
-        .map_err(|error| format!("launch paged decode: {error}"))?;
-        stream
-            .synchronize()
-            .map_err(|error| format!("synchronize paged decode: {error}"))?;
-        let mut actual = vec![0.0_f32; output.len()];
-        output
-            .copy_to_host(&mut actual)
-            .map_err(|error| format!("read output: {error}"))?;
-        for (actual, expected) in actual[..2].iter().zip(expected_first) {
-            assert_relative_eq!(*actual, expected as f32, epsilon = 1.0e-3);
-        }
-        for (actual, expected) in actual[2..].iter().zip(expected_second) {
-            assert_relative_eq!(*actual, expected as f32, epsilon = 1.0e-3);
-        }
-        Ok(())
-    }
-
     fn f64_materialized_oracle(
         query: &[f32],
         kv_head: usize,
@@ -1555,87 +1445,5 @@ mod tests {
             *result /= normalizer;
         }
         Ok(output)
-    }
-
-    #[cfg(feature = "gpu")]
-    fn f64_paged_online_oracle(
-        native: NativePagedDecodePlan,
-        query: &[f32],
-        keys: &[f32],
-        values: &[f32],
-        table: &[u32],
-    ) -> core::result::Result<Vec<f64>, Box<dyn std::error::Error>> {
-        let logical = native.logical();
-        if query.len() != native.query_elements()
-            || keys.len() != native.key_value_elements()
-            || values.len() != native.key_value_elements()
-            || table.len() != native.page_table_entries()
-        {
-            return Err("independent paged oracle shape mismatch".into());
-        }
-        let mut output = vec![0.0_f64; native.output_elements()];
-        for query_head in 0..logical.query_heads() {
-            let kv_head = query_head / logical.gqa_group();
-            let query_start = query_head * logical.head_width();
-            let query_end = query_start + logical.head_width();
-            let mut maximum = f64::NEG_INFINITY;
-            let mut normalizer = 0.0_f64;
-            let mut head_output = vec![0.0_f64; logical.head_width()];
-            for token in 0..logical.visible_tokens() {
-                let page = token / native.page_tokens().get();
-                let physical_page = usize::try_from(table[page])?;
-                if physical_page >= native.physical_pages() {
-                    return Err("independent paged oracle page entry out of range".into());
-                }
-                let in_page = token % native.page_tokens().get();
-                let row_start = ((physical_page * native.page_tokens().get() + in_page)
-                    * logical.kv_heads()
-                    + kv_head)
-                    * logical.head_width();
-                let row_end = row_start + logical.head_width();
-                let mut dot = 0.0_f64;
-                for (query_value, key_value) in query[query_start..query_end]
-                    .iter()
-                    .zip(&keys[row_start..row_end])
-                {
-                    dot += f64::from(*query_value) * f64::from(*key_value);
-                }
-                let score = dot * f64::from(logical.scale());
-                let next_maximum = maximum.max(score);
-                let prior_rescale = if maximum.is_infinite() {
-                    0.0_f64
-                } else {
-                    (maximum - next_maximum).exp()
-                };
-                let token_weight = (score - next_maximum).exp();
-                for (result, value) in head_output.iter_mut().zip(&values[row_start..row_end]) {
-                    *result = prior_rescale * *result + token_weight * f64::from(*value);
-                }
-                maximum = next_maximum;
-                normalizer = prior_rescale * normalizer + token_weight;
-            }
-            for (column, value) in head_output.into_iter().enumerate() {
-                output[query_start + column] = value / normalizer;
-            }
-        }
-        Ok(output)
-    }
-
-    #[cfg(feature = "gpu")]
-    fn f64_dense_logical_oracle(
-        query: &[f32],
-        visible_tokens: usize,
-    ) -> core::result::Result<Vec<f64>, Box<dyn std::error::Error>> {
-        let width = query.len();
-        let mut keys = Vec::new();
-        let mut values = Vec::new();
-        keys.try_reserve_exact(visible_tokens)?;
-        values.try_reserve_exact(visible_tokens)?;
-        for token in 0..visible_tokens {
-            let value = token as f32;
-            keys.push(vec![value, -value]);
-            values.push(vec![(token + 1) as f32, ((token + 1) * 10) as f32]);
-        }
-        f64_materialized_oracle(query, 0, &keys, &values)
     }
 }
