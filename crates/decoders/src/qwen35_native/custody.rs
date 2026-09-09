@@ -285,6 +285,10 @@ mod tests {
         retained: Arc<AtomicUsize>,
     }
 
+    struct FakeAggregate {
+        owners: [FakeOwner; 2],
+    }
+
     impl Drop for FakeOwner {
         fn drop(&mut self) {
             self.ordinary_drops.fetch_add(1, Ordering::SeqCst);
@@ -294,6 +298,12 @@ mod tests {
     fn retain_fake(owner: FakeOwner, _: &mut NativeBufferParts) {
         owner.retained.fetch_add(1, Ordering::SeqCst);
         core::mem::forget(owner);
+    }
+
+    fn retain_fake_aggregate(aggregate: FakeAggregate, parts: &mut NativeBufferParts) {
+        for owner in aggregate.owners {
+            retain_fake(owner, parts);
+        }
     }
 
     fn fake_owner(ordinary_drops: &Arc<AtomicUsize>, retained: &Arc<AtomicUsize>) -> FakeOwner {
@@ -352,6 +362,28 @@ mod tests {
         assert_eq!(retained.load(Ordering::SeqCst), 0);
         drop(committed);
         assert_eq!(ordinary_drops.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn committed_leaves_remain_guarded_by_their_recursive_aggregate() -> Result<(), String> {
+        let ordinary_drops = Arc::new(AtomicUsize::new(0));
+        let retained = Arc::new(AtomicUsize::new(0));
+        let scope = NativeBuildScope::new();
+        let first = scope.guard(fake_owner(&ordinary_drops, &retained), retain_fake);
+        let second = scope.guard(fake_owner(&ordinary_drops, &retained), retain_fake);
+        let aggregate = scope.guard(
+            FakeAggregate {
+                owners: [first.commit(), second.commit()],
+            },
+            retain_fake_aggregate,
+        );
+        drop(aggregate);
+        let _parts = scope
+            .try_into_parts()
+            .map_err(|_| "aggregate guard remained after explicit drop".to_string())?;
+        assert_eq!(ordinary_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(retained.load(Ordering::SeqCst), 2);
         Ok(())
     }
 }
