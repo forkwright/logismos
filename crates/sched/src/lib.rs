@@ -1680,7 +1680,7 @@ mod tests {
             resident: ResidentHandle::try_new("resident-second")?,
         })?;
         let permit = scheduler.begin_use(&second)?;
-        scheduler.finish_use(permit)?;
+        scheduler.finish_use(&permit)?;
         assert!(matches!(
             scheduler
                 .admissions
