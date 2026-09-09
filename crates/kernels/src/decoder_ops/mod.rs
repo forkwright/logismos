@@ -4,6 +4,7 @@
 use std::ffi::c_void;
 
 use hipcore::Stream;
+#[cfg(test)]
 use num_traits::ToPrimitive;
 #[cfg(test)]
 use snafu::ResultExt;
