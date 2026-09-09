@@ -178,7 +178,7 @@ fn build_device_fields(
     scope: &NativeBuildScope,
 ) -> NativeBuildResult<DeviceBuildFields> {
     let numerical_status = scope.guard(build_numerical_status(device, scope)?, |status, sink| {
-        sink.push_u32(status.into_buffer())
+        sink.push_u32(status.into_buffer());
     });
     let owned_weights = scope.guard(
         NativeWeights::upload(weights, plan, device, scope)?,

@@ -88,7 +88,6 @@ impl NativeBuildFailure {
     }
 
     /// Borrow the exact failure that stopped native construction.
-    #[must_use]
     pub fn source_error(&self) -> &NativeBuildSource {
         self.source.as_ref()
     }
@@ -213,7 +212,6 @@ impl NativeBuildRelease {
     }
 
     /// Borrow the exact source that stopped construction.
-    #[must_use]
     pub fn source_error(&self) -> &NativeBuildSource {
         self.source.as_ref()
     }

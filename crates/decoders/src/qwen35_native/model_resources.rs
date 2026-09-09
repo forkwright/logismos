@@ -264,8 +264,8 @@ impl ModelSessionTeardown {
             Self::PartiallyAdmitted {
                 _creation_failure: creation_failure,
                 ..
-            } => creation_failure.is_some(),
-            Self::Releasing {
+            }
+            | Self::Releasing {
                 creation_failure, ..
             } => creation_failure.is_some(),
         }
@@ -682,11 +682,7 @@ impl NativeResidentModelResources {
         device: &Device,
         scope: &NativeBuildScope,
     ) -> NativeBuildResult<Self> {
-        let built = build_resident_fields(weights, &plan, device, scope);
-        let fields = match built {
-            Ok(fields) => fields,
-            Err(source) => return Err(source),
-        };
+        let fields = build_resident_fields(weights, &plan, device, scope)?;
         let ResidentBuildFields {
             embedding,
             output,
