@@ -138,6 +138,20 @@ fn native_f32_matches_independent_logical_oracle_for_all_page_sizes_and_widths()
                 "native reference must retain well-conditioned logical attention",
             )?;
 
+            let wrong_query = query_reusing_head_zero(&fixture)?;
+            let wrong_query_head = native_f32_reference(
+                &fixture.native,
+                &wrong_query,
+                &fixture.keys,
+                &fixture.values,
+                &fixture.table,
+            )?;
+            assert_f32_separated(
+                &actual,
+                &wrong_query_head,
+                "query heads in one GQA group must retain their own query rows",
+            )?;
+
             let mut wrong_table = fixture.table.clone();
             swap_first_two(&mut wrong_table)?;
             let wrong_page = native_f32_reference(
@@ -463,6 +477,68 @@ fn native_f32_reference_refuses_malformed_extents_table_and_nonfinite_arithmetic
 }
 
 #[test]
+fn native_f32_reference_refuses_masked_online_subnormal_boundaries()
+-> Result<(), NativeReferenceError> {
+    let logical = PagedDecodePlan::try_from_dimensions(2, 1, 1, 1).map_err(|_| {
+        NativeReferenceError::ArithmeticOverflow {
+            operation: "online subnormal logical plan",
+        }
+    })?;
+    let native = NativePagedDecodePlan::try_from_paged_decode(logical, 8, 1).map_err(|_| {
+        NativeReferenceError::ArithmeticOverflow {
+            operation: "online subnormal native plan",
+        }
+    })?;
+    let query = [1.0_f32];
+    let mut keys = vec![0.0_f32; native.key_value_elements()];
+    let mut values = vec![0.0_f32; native.key_value_elements()];
+    assign(&mut keys, 1, 80.0, "online subnormal key")?;
+    assign(&mut values, 0, 1.0e-5, "online subnormal prior value")?;
+    assign(&mut values, 1, 1.0, "online subnormal next value")?;
+    assert!(
+        matches!(
+            native_f32_reference(&native, &query, &keys, &values, &[0_u32]),
+            Err(NativeReferenceError::NonNormalArithmetic {
+                stage: "prior output product",
+                ..
+            })
+        ),
+        "a subnormal rescaled prior output must not be masked by the next token output"
+    );
+
+    let first_score = f32::MIN_POSITIVE;
+    let second_score = f32::from_bits(first_score.to_bits().checked_add(1).ok_or(
+        NativeReferenceError::ArithmeticOverflow {
+            operation: "adjacent normal score bits",
+        },
+    )?);
+    let mut delta_keys = vec![0.0_f32; native.key_value_elements()];
+    assign(
+        &mut delta_keys,
+        0,
+        first_score,
+        "first adjacent normal score",
+    )?;
+    assign(
+        &mut delta_keys,
+        1,
+        second_score,
+        "second adjacent normal score",
+    )?;
+    assert!(
+        matches!(
+            native_f32_reference(&native, &query, &delta_keys, &values, &[0_u32]),
+            Err(NativeReferenceError::NonNormalArithmetic {
+                stage: "maximum delta",
+                ..
+            })
+        ),
+        "a subnormal maximum subtraction must be rejected before exponentiation"
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
 fn reserved_device_q1_paged_attention_matches_native_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -548,9 +624,9 @@ fn qualified_fixture(
             operation: "qualified native plan",
         })?;
     let mut query = reserve("query", native.query_elements())?;
-    for _head in 0..QUERY_HEADS {
+    for query_head in 0..QUERY_HEADS {
         for column in 0..head_width {
-            query.push(fixture_query_component(column, head_width));
+            query.push(fixture_query_component(query_head, column, head_width));
         }
     }
 
@@ -806,6 +882,7 @@ fn native_f32_head(
     mode: NativeReferenceMode,
 ) -> Result<(), NativeReferenceError> {
     let logical = native.logical();
+    let output_elements = output.len();
     let mut maximum = f32::NEG_INFINITY;
     let mut normalizer = 0.0_f32;
     for token in 0..logical.visible_tokens() {
@@ -837,18 +914,26 @@ fn native_f32_head(
         let prior_rescale = if maximum.is_infinite() {
             0.0
         } else if mode.rescale_prior_output {
-            (maximum - next_maximum).exp()
+            let maximum_delta = maximum - next_maximum;
+            ensure_finite(maximum_delta, "maximum delta", token)?;
+            let rescale = maximum_delta.exp();
+            ensure_finite(rescale, "prior rescale", token)?;
+            rescale
         } else {
             1.0
         };
         ensure_finite(prior_rescale, "prior rescale", token)?;
-        let token_weight = (score - next_maximum).exp();
+        let score_delta = score - next_maximum;
+        ensure_finite(score_delta, "score delta", token)?;
+        let token_weight = score_delta.exp();
         ensure_finite(token_weight, "token weight", token)?;
-        normalizer = prior_rescale * normalizer + token_weight;
+        let prior_normalizer = prior_rescale * normalizer;
+        ensure_finite(prior_normalizer, "prior normalizer product", token)?;
+        normalizer = prior_normalizer + token_weight;
         ensure_finite(normalizer, "running normalizer", token)?;
         for lane in 0..WAVE_LANES {
             let mut column = lane;
-            while column < output.len() {
+            while column < output_elements {
                 let destination =
                     output
                         .get_mut(column)
@@ -857,10 +942,14 @@ fn native_f32_head(
                         })?;
                 let source = value.get(column).ok_or(NativeReferenceError::Extent {
                     input: "value head",
-                    expected: output.len(),
+                    expected: output_elements,
                     actual: value.len(),
                 })?;
-                *destination = prior_rescale * *destination + token_weight * *source;
+                let prior_output = prior_rescale * *destination;
+                ensure_finite(prior_output, "prior output product", column)?;
+                let token_output = token_weight * *source;
+                ensure_finite(token_output, "token output product", column)?;
+                *destination = prior_output + token_output;
                 ensure_finite(*destination, "running output", column)?;
                 column = column.checked_add(WAVE_LANES).ok_or(
                     NativeReferenceError::ArithmeticOverflow {
@@ -873,7 +962,7 @@ fn native_f32_head(
     }
     for lane in 0..WAVE_LANES {
         let mut column = lane;
-        while column < output.len() {
+        while column < output_elements {
             let destination =
                 output
                     .get_mut(column)
@@ -1213,6 +1302,38 @@ fn fixture_physical_row_start(
         })
 }
 
+fn query_reusing_head_zero(fixture: &NativeFixture) -> Result<Vec<f32>, NativeReferenceError> {
+    let width = fixture.native.logical().head_width();
+    let source = fixture
+        .query
+        .get(..width)
+        .ok_or(NativeReferenceError::Extent {
+            input: "query head zero",
+            expected: width,
+            actual: fixture.query.len(),
+        })?
+        .to_vec();
+    let mut wrong_query = fixture.query.clone();
+    let wrong_query_elements = wrong_query.len();
+    let reused_start = width;
+    let reused_end =
+        reused_start
+            .checked_add(width)
+            .ok_or(NativeReferenceError::ArithmeticOverflow {
+                operation: "reused query end",
+            })?;
+    let destination =
+        wrong_query
+            .get_mut(reused_start..reused_end)
+            .ok_or(NativeReferenceError::Extent {
+                input: "query head one",
+                expected: fixture.native.query_elements(),
+                actual: wrong_query_elements,
+            })?;
+    destination.copy_from_slice(&source);
+    Ok(wrong_query)
+}
+
 fn assert_close_to_f64(
     actual: &[f32],
     expected: &[f64],
@@ -1359,13 +1480,20 @@ fn score_signal(token: usize) -> f32 {
     }
 }
 
-fn fixture_query_component(column: usize, head_width: usize) -> f32 {
+fn fixture_query_component(query_head: usize, column: usize, head_width: usize) -> f32 {
+    let head_scale = match query_head {
+        0 => 1.0,
+        1 => 0.5,
+        2 => 1.25,
+        3 => 0.75,
+        _ => 0.0,
+    };
     if column == 0 {
-        1.0
+        head_scale
     } else if column == WAVE_LANES && head_width > WAVE_LANES {
-        0.5
+        head_scale * 0.5
     } else if column.checked_add(1) == Some(head_width) {
-        -0.25
+        head_scale * -0.25
     } else {
         0.0
     }
