@@ -33,6 +33,7 @@ mod weights;
 pub use model_session::{
     Qwen35NativeExecutionDeviceDemand, Qwen35NativeExecutionModel, Qwen35NativeExecutionPlan,
     Qwen35NativeExecutionSession, Qwen35NativeExecutionSessionPlan,
+    Qwen35NativeExecutionSessionTeardown, Qwen35NativeExecutionSessionTeardownState,
 };
 #[cfg(feature = "gpu")]
 pub use session::{
@@ -105,6 +106,21 @@ impl<Resource: CompletionResource> ResourceOwner<Resource> {
 
     fn state(&self) -> Option<&ResourceState<Resource>> {
         self.state.as_ref()
+    }
+
+    /// Consume the complete bundle without invoking its ordinary drop path.
+    ///
+    /// Explicit native teardown consumes this only to transfer the original
+    /// stream and buffers into inert custody. `None` is possible only if an
+    /// internal in-flight guard already removed the state; safe session APIs do
+    /// not expose such a guard across a consuming close.
+    fn into_resource(mut self) -> Option<Resource> {
+        self.state.take().map(|state| match state {
+            ResourceState::Ready(resource)
+            | ResourceState::InFlight(resource)
+            | ResourceState::PoisonedIdle(resource)
+            | ResourceState::PoisonedUncertain(resource) => resource,
+        })
     }
 }
 

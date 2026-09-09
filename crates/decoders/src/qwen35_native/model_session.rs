@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use super::ResourceOwner;
 use super::model_plan::{DeviceModelPlan, ModelDeviceByteDemand};
-use super::model_resources::{ModelSessionResources, NativeResidentModelResources};
+use super::model_resources::{
+    ModelSessionResources, ModelSessionTeardown, ModelSessionTeardownState,
+    NativeResidentModelResources,
+};
 use super::session::{Qwen35NativeSessionState, begin_error, completion_error, session_state};
 use crate::{Qwen35Weights, Result};
 
@@ -332,11 +335,115 @@ pub struct Qwen35NativeExecutionSession {
     owner: ResourceOwner<ModelSessionResources>,
 }
 
+/// Explicit teardown custody for a native main-model session.
+///
+/// This is a thin owner around the HIP aggregate teardown result, not a second
+/// release protocol. It retains the shared immutable resident model alongside
+/// HIP pending, synchronization-unconfirmed, and quarantined custody so a
+/// stream cannot outlive immutable uploads it may still reference. Dropping it
+/// makes no HIP call and never acknowledges release.
+#[must_use = "native teardown outcomes retain explicit HIP custody"]
+pub struct Qwen35NativeExecutionSessionTeardown {
+    inner: ModelSessionTeardown,
+}
+
+/// Observable state of explicit native session teardown custody.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Qwen35NativeExecutionSessionTeardownState {
+    /// HIP acknowledged every captured session buffer and its ordered stream.
+    Released,
+    /// The session stream was not eligible for aggregate HIP teardown.
+    Unadmitted,
+    /// Checked aggregate accounting retained admitted and unadmitted ownership.
+    PartiallyAdmitted,
+    /// HIP preflight retained the aggregate before a destructor call.
+    Pending,
+    /// Stream completion is unproved; only explicit reconciliation is sound.
+    SynchronizationUnconfirmed,
+    /// A destructor outcome is indeterminate and remains conservatively held.
+    Quarantined,
+}
+
+impl Qwen35NativeExecutionSessionTeardown {
+    /// Return the exact custody class; this is never evidence of physical eviction.
+    #[must_use]
+    pub fn state(&self) -> Qwen35NativeExecutionSessionTeardownState {
+        match self.inner.state() {
+            ModelSessionTeardownState::Released => {
+                Qwen35NativeExecutionSessionTeardownState::Released
+            }
+            ModelSessionTeardownState::Unadmitted => {
+                Qwen35NativeExecutionSessionTeardownState::Unadmitted
+            }
+            ModelSessionTeardownState::PartiallyAdmitted => {
+                Qwen35NativeExecutionSessionTeardownState::PartiallyAdmitted
+            }
+            ModelSessionTeardownState::Pending => {
+                Qwen35NativeExecutionSessionTeardownState::Pending
+            }
+            ModelSessionTeardownState::SynchronizationUnconfirmed => {
+                Qwen35NativeExecutionSessionTeardownState::SynchronizationUnconfirmed
+            }
+            ModelSessionTeardownState::Quarantined => {
+                Qwen35NativeExecutionSessionTeardownState::Quarantined
+            }
+        }
+    }
+
+    /// Retry HIP aggregate teardown only after its preflight-pending outcome.
+    ///
+    /// Other outcomes retain their exact custody unchanged. In particular, a
+    /// synchronization-unconfirmed result requires [`Self::reconcile`], never
+    /// an ordinary destructor retry.
+    #[must_use]
+    pub fn retry(self) -> Self {
+        Self {
+            inner: self.inner.retry_pending(),
+        }
+    }
+
+    /// Deliberately retry only stream synchronization after completion was unproved.
+    ///
+    /// This leaves every other teardown outcome unchanged and never retries a
+    /// destructor after a quarantined result.
+    #[must_use]
+    pub fn reconcile(self) -> Self {
+        Self {
+            inner: self.inner.reconcile_synchronization(),
+        }
+    }
+}
+
 impl Qwen35NativeExecutionSession {
     /// Return the externally observable completion state.
     #[must_use]
     pub fn state(&self) -> Qwen35NativeSessionState {
         session_state(&self.owner)
+    }
+
+    /// Consume this session into explicit aggregate native teardown.
+    ///
+    /// Every mutable allocation is disarmed before the owned stream is
+    /// admitted to HIP teardown. The result retains the resident immutable
+    /// model through all non-released outcomes; it does not turn an `Arc` drop
+    /// into an eviction acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns only if an internal guard had already removed this session's
+    /// owner. Safe callers cannot retain such a guard across this consuming
+    /// operation.
+    pub fn close(self) -> Result<Qwen35NativeExecutionSessionTeardown> {
+        let resources = self.owner.into_resource().ok_or_else(|| {
+            crate::error::NativeSessionStateSnafu {
+                rule: "native session close requires its complete owned resource bundle",
+            }
+            .build()
+        })?;
+        Ok(Qwen35NativeExecutionSessionTeardown {
+            inner: resources.into_teardown_parts().begin_release(),
+        })
     }
 
     /// Execute one token through all native main blocks and return its logits.
