@@ -21,12 +21,16 @@ pub const IQ4_XS_QUANT_BYTES: usize = IQ4_XS_VALUES_PER_BLOCK / 2;
 pub const IQ4_XS_BLOCK_BYTES: usize =
     IQ4_XS_SCALE_BYTES + IQ4_XS_SCALE_LOW_BYTES + IQ4_XS_SCALE_HIGH_BYTES + IQ4_XS_QUANT_BYTES;
 
-const GROUP_VALUES: usize = 32;
-const GROUP_COUNT: usize = IQ4_XS_VALUES_PER_BLOCK / GROUP_VALUES;
-const SCALE_OFFSET: usize = 0;
-const SCALE_HIGH_OFFSET: usize = SCALE_OFFSET + IQ4_XS_SCALE_BYTES;
-const SCALE_LOW_OFFSET: usize = SCALE_HIGH_OFFSET + IQ4_XS_SCALE_HIGH_BYTES;
-const QUANT_OFFSET: usize = SCALE_LOW_OFFSET + IQ4_XS_SCALE_LOW_BYTES;
+/// Values represented by one `IQ4_XS` packed scale group.
+pub const IQ4_XS_GROUP_VALUES: usize = 32;
+const GROUP_COUNT: usize = IQ4_XS_VALUES_PER_BLOCK / IQ4_XS_GROUP_VALUES;
+const IQ4_XS_SCALE_OFFSET: usize = 0;
+/// Offset of the high two-bit group-scale field.
+pub const IQ4_XS_SCALE_HIGH_OFFSET: usize = IQ4_XS_SCALE_OFFSET + IQ4_XS_SCALE_BYTES;
+/// Offset of the low four-bit group-scale field.
+pub const IQ4_XS_SCALE_LOW_OFFSET: usize = IQ4_XS_SCALE_HIGH_OFFSET + IQ4_XS_SCALE_HIGH_BYTES;
+/// Offset of the packed reconstruction indices.
+pub const IQ4_XS_QUANT_OFFSET: usize = IQ4_XS_SCALE_LOW_OFFSET + IQ4_XS_SCALE_LOW_BYTES;
 const GEOMETRY: Geometry = Geometry {
     format: RowFormat::IQ4XS,
     bytes_per_block: IQ4_XS_BLOCK_BYTES,
@@ -56,7 +60,10 @@ impl Iq4XsBlock {
         }
         let mut stored = [0; IQ4_XS_BLOCK_BYTES];
         stored.copy_from_slice(bytes);
-        let _ = finite_scale(RowFormat::IQ4XS, [stored[0], stored[1]])?;
+        let _ = finite_scale(
+            RowFormat::IQ4XS,
+            [stored[IQ4_XS_SCALE_OFFSET], stored[IQ4_XS_SCALE_OFFSET + 1]],
+        )?;
         Ok(Self { bytes: stored })
     }
 
@@ -64,16 +71,16 @@ impl Iq4XsBlock {
     #[must_use]
     pub fn decode_f32(&self) -> [f32; IQ4_XS_VALUES_PER_BLOCK] {
         let block_scale = f16::from_bits(u16::from_le_bytes([
-            self.bytes[SCALE_OFFSET],
-            self.bytes[SCALE_OFFSET + 1],
+            self.bytes[IQ4_XS_SCALE_OFFSET],
+            self.bytes[IQ4_XS_SCALE_OFFSET + 1],
         ]))
         .to_f32();
-        let scale_low = &self.bytes[SCALE_LOW_OFFSET..QUANT_OFFSET];
+        let scale_low = &self.bytes[IQ4_XS_SCALE_LOW_OFFSET..IQ4_XS_QUANT_OFFSET];
         let scale_high = u16::from_le_bytes([
-            self.bytes[SCALE_HIGH_OFFSET],
-            self.bytes[SCALE_HIGH_OFFSET + 1],
+            self.bytes[IQ4_XS_SCALE_HIGH_OFFSET],
+            self.bytes[IQ4_XS_SCALE_HIGH_OFFSET + 1],
         ]);
-        let quantized = &self.bytes[QUANT_OFFSET..];
+        let quantized = &self.bytes[IQ4_XS_QUANT_OFFSET..];
         let mut decoded = [0.0; IQ4_XS_VALUES_PER_BLOCK];
         for group in 0..GROUP_COUNT {
             let low_bits = if group.is_multiple_of(2) {
@@ -84,12 +91,12 @@ impl Iq4XsBlock {
             let high_bits = ((scale_high >> (group * 2)) & 0x03) as u8;
             let group_scale = i16::from(low_bits | (high_bits << 4)) - 32;
             let value_scale = block_scale * f32::from(group_scale);
-            let group_start = group * GROUP_VALUES;
-            for lane in 0..(GROUP_VALUES / 2) {
-                let packed = quantized[group * (GROUP_VALUES / 2) + lane];
+            let group_start = group * IQ4_XS_GROUP_VALUES;
+            for lane in 0..(IQ4_XS_GROUP_VALUES / 2) {
+                let packed = quantized[group * (IQ4_XS_GROUP_VALUES / 2) + lane];
                 decoded[group_start + lane] =
                     value_scale * f32::from(RECONSTRUCTION_VALUES[usize::from(packed & 0x0f)]);
-                decoded[group_start + GROUP_VALUES / 2 + lane] =
+                decoded[group_start + IQ4_XS_GROUP_VALUES / 2 + lane] =
                     value_scale * f32::from(RECONSTRUCTION_VALUES[usize::from(packed >> 4)]);
             }
         }

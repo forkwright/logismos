@@ -80,11 +80,11 @@ semantically respects that boundary.
   `transformers` selects that CPU-only graph, while `praxis` explicitly enables
   GPU launchers. Direct `kernels` users retain the default GPU feature. The
   crate does not depend on `core`.
-- `kernels::q8_0_gemv` depends on `quant` as the lower format owner. Its checked
-  shape and CPU reference reuse Q8_0 row geometry and execution; its build
-  dependency generates HIP layout constants from that same authority. This
-  within-tier edge replaces duplicate format definitions and remains HIP-free
-  when GPU features are disabled.
+- `kernels::row_gemv` depends on `quant` as the lower format owner. Its checked
+  shape and CPU reference reuse serialized-row geometry and execution; its
+  build dependency generates HIP layout and reconstruction constants from
+  that same authority. This within-tier edge replaces duplicate format
+  definitions and remains HIP-free when GPU features are disabled.
 - Cross-tier deps must be justified. Within-tier deps are code smell.
 
 ## Key invariants
@@ -123,10 +123,13 @@ and outside the inference runtime's authority.
 
 ## Native payload ownership
 
-The standalone Q8_0 GEMV primitive accepts raw row-major quantized matrix bytes
-and f32 activations/output. A checked opaque shape owns exact extents and ABI
-bounds. The CPU reference delegates each row to `quant`; the HIP implementation
-uses one sequential thread per row with source-specific floating-point controls.
+The standalone serialized-row GEMV primitive consumes `quant::RowFormat`, raw
+row-major matrix bytes and f32 activations/output. Serialized F32 weights stay
+f32; they do not pass through the separate fp16 WMMA operation. A checked opaque
+shape owns exact extents and ABI bounds. The CPU reference delegates each row
+to `quant`; private format-specific HIP entrypoints use one sequential thread
+per row with source-specific floating-point controls and little-endian byte
+decoding. Format identity remains the Rust enum, not a second numeric wire schema.
 Its unsafe asynchronous launcher requires valid device buffers, lifetimes,
 nonaliasing and admitted finite arithmetic. CPU typed nonfinite refusals do not
 imply device-result validation. Its GPU domain requires zero-or-normal scales,
@@ -136,9 +139,9 @@ whole-model GPU path, performance result or hardware qualification.
 
 The grouped-GDN and causal-convolution native decode steps reuse their CPU
 allocation plans as geometry owners. Their raw asynchronous launchers read
-immutable prior state/history and write distinct staged results; a private
-dense-f32 span owner checks extents and writable aliases for both. Empty
-convolution history has no memory footprint. Decoder transactions, persistent
+immutable prior state/history and write distinct staged results. They share a
+private span owner with row GEMV for checked byte/f32 extents and writable
+aliases. Empty convolution history has no memory footprint. Decoder transactions, persistent
 residency and grant handling remain above these operations. Their precise
 numerical domains and refusal rules live in the operation rustdoc; standalone
 kernels do not establish native hybrid-model execution or device qualification.

@@ -7,7 +7,8 @@ use crate::{Result, RowFormat};
 
 pub(crate) const K_VALUES_PER_BLOCK: usize = 256;
 pub(crate) const K_SCALE_BYTES: usize = 12;
-pub(crate) const K_GROUP_VALUES: usize = 32;
+/// Values represented by one packed K-quant scale group.
+pub const K_GROUP_VALUES: usize = 32;
 
 pub(crate) fn finite_half(format: RowFormat, field: &'static str, bytes: [u8; 2]) -> Result<f32> {
     let bits = u16::from_le_bytes(bytes);

@@ -50,8 +50,8 @@ pub enum Error {
         source: taxis::Error,
     },
 
-    /// Propagated checked Q8_0 row-format failure.
-    #[snafu(display("Q8_0 projection format failure: {source}"))]
+    /// Propagated checked serialized-row format failure.
+    #[snafu(display("serialized-row projection format failure: {source}"))]
     Quant {
         /// Source quantization error.
         source: quant::Error,
@@ -201,9 +201,9 @@ pub enum Error {
         location: snafu::Location,
     },
 
-    /// CPU Q8_0 GEMV could not reserve its checked output backing.
-    #[snafu(display("Q8_0 GEMV output allocation for {requested_len} rows failed"))]
-    Q8GemvAllocation {
+    /// CPU serialized-row GEMV could not reserve its checked output backing.
+    #[snafu(display("serialized-row GEMV output allocation for {requested_len} rows failed"))]
+    RowGemvAllocation {
         /// Exact requested output row count.
         requested_len: usize,
         /// Allocation failure.

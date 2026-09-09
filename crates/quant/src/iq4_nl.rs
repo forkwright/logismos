@@ -13,6 +13,9 @@ pub const IQ4_NL_VALUES_PER_BLOCK: usize = 32;
 pub const IQ4_NL_SCALE_BYTES: usize = SCALE_BYTES;
 /// Bytes storing two four-bit reconstruction indices per byte.
 pub const IQ4_NL_QUANT_BYTES: usize = IQ4_NL_VALUES_PER_BLOCK / 2;
+const IQ4_NL_SCALE_OFFSET: usize = 0;
+/// Offset of the packed reconstruction indices.
+pub const IQ4_NL_QUANT_OFFSET: usize = IQ4_NL_SCALE_OFFSET + IQ4_NL_SCALE_BYTES;
 /// Exact serialized width of an `IQ4_NL` block.
 pub const IQ4_NL_BLOCK_BYTES: usize = IQ4_NL_SCALE_BYTES + IQ4_NL_QUANT_BYTES;
 
@@ -45,16 +48,23 @@ impl Iq4NlBlock {
         }
         let mut stored = [0; IQ4_NL_BLOCK_BYTES];
         stored.copy_from_slice(bytes);
-        let _ = finite_scale(RowFormat::IQ4NL, [stored[0], stored[1]])?;
+        let _ = finite_scale(
+            RowFormat::IQ4NL,
+            [stored[IQ4_NL_SCALE_OFFSET], stored[IQ4_NL_SCALE_OFFSET + 1]],
+        )?;
         Ok(Self { bytes: stored })
     }
 
     /// Decode this block into 32 f32 values.
     #[must_use]
     pub fn decode_f32(&self) -> [f32; IQ4_NL_VALUES_PER_BLOCK] {
-        let scale = f16::from_bits(u16::from_le_bytes([self.bytes[0], self.bytes[1]])).to_f32();
+        let scale = f16::from_bits(u16::from_le_bytes([
+            self.bytes[IQ4_NL_SCALE_OFFSET],
+            self.bytes[IQ4_NL_SCALE_OFFSET + 1],
+        ]))
+        .to_f32();
         let mut decoded = [0.0; IQ4_NL_VALUES_PER_BLOCK];
-        for (lane, packed) in self.bytes[IQ4_NL_SCALE_BYTES..].iter().enumerate() {
+        for (lane, packed) in self.bytes[IQ4_NL_QUANT_OFFSET..].iter().enumerate() {
             decoded[lane] = scale * f32::from(RECONSTRUCTION_VALUES[usize::from(*packed & 0x0f)]);
             decoded[lane + IQ4_NL_QUANT_BYTES] =
                 scale * f32::from(RECONSTRUCTION_VALUES[usize::from(*packed >> 4)]);

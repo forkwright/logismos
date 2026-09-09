@@ -15,6 +15,15 @@ pub const Q5_K_SCALE_BYTES: usize = K_SCALE_BYTES;
 pub const Q5_K_HIGH_BITS_BYTES: usize = Q5_K_VALUES_PER_BLOCK / 8;
 /// Bytes storing low four-bit values.
 pub const Q5_K_QUANT_BYTES: usize = Q5_K_VALUES_PER_BLOCK / 2;
+const Q5_K_SUPER_SCALE_OFFSET: usize = 0;
+/// Offset of the fp16 super-minimum field.
+pub const Q5_K_SUPER_MINIMUM_OFFSET: usize = Q5_K_SUPER_SCALE_OFFSET + 2;
+/// Offset of the packed group scale/minimum fields.
+pub const Q5_K_SCALE_OFFSET: usize = Q5_K_PREFIX_BYTES;
+/// Offset of the fifth-bit planes.
+pub const Q5_K_HIGH_BITS_OFFSET: usize = Q5_K_SCALE_OFFSET + Q5_K_SCALE_BYTES;
+/// Offset of the packed low-four-bit values.
+pub const Q5_K_QUANT_OFFSET: usize = Q5_K_HIGH_BITS_OFFSET + Q5_K_HIGH_BITS_BYTES;
 /// Exact serialized width of a `Q5_K` block.
 pub const Q5_K_BLOCK_BYTES: usize =
     Q5_K_PREFIX_BYTES + Q5_K_SCALE_BYTES + Q5_K_HIGH_BITS_BYTES + Q5_K_QUANT_BYTES;
@@ -48,23 +57,42 @@ impl Q5KBlock {
         }
         let mut stored = [0; Q5_K_BLOCK_BYTES];
         stored.copy_from_slice(bytes);
-        let _ = finite_half(RowFormat::Q5K, "scale", [stored[0], stored[1]])?;
-        let _ = finite_half(RowFormat::Q5K, "minimum scale", [stored[2], stored[3]])?;
+        let _ = finite_half(
+            RowFormat::Q5K,
+            "scale",
+            [
+                stored[Q5_K_SUPER_SCALE_OFFSET],
+                stored[Q5_K_SUPER_SCALE_OFFSET + 1],
+            ],
+        )?;
+        let _ = finite_half(
+            RowFormat::Q5K,
+            "minimum scale",
+            [
+                stored[Q5_K_SUPER_MINIMUM_OFFSET],
+                stored[Q5_K_SUPER_MINIMUM_OFFSET + 1],
+            ],
+        )?;
         Ok(Self { bytes: stored })
     }
 
     /// Decode this block into 256 f32 values.
     #[must_use]
     pub fn decode_f32(&self) -> [f32; Q5_K_VALUES_PER_BLOCK] {
-        let super_scale =
-            half::f16::from_bits(u16::from_le_bytes([self.bytes[0], self.bytes[1]])).to_f32();
-        let super_minimum =
-            half::f16::from_bits(u16::from_le_bytes([self.bytes[2], self.bytes[3]])).to_f32();
+        let super_scale = half::f16::from_bits(u16::from_le_bytes([
+            self.bytes[Q5_K_SUPER_SCALE_OFFSET],
+            self.bytes[Q5_K_SUPER_SCALE_OFFSET + 1],
+        ]))
+        .to_f32();
+        let super_minimum = half::f16::from_bits(u16::from_le_bytes([
+            self.bytes[Q5_K_SUPER_MINIMUM_OFFSET],
+            self.bytes[Q5_K_SUPER_MINIMUM_OFFSET + 1],
+        ]))
+        .to_f32();
         let mut scales = [0; K_SCALE_BYTES];
-        scales.copy_from_slice(&self.bytes[Q5_K_PREFIX_BYTES..Q5_K_PREFIX_BYTES + K_SCALE_BYTES]);
-        let high_bits_start = Q5_K_PREFIX_BYTES + K_SCALE_BYTES;
-        let high_bits = &self.bytes[high_bits_start..high_bits_start + Q5_K_HIGH_BITS_BYTES];
-        let quantized = &self.bytes[high_bits_start + Q5_K_HIGH_BITS_BYTES..];
+        scales.copy_from_slice(&self.bytes[Q5_K_SCALE_OFFSET..Q5_K_HIGH_BITS_OFFSET]);
+        let high_bits = &self.bytes[Q5_K_HIGH_BITS_OFFSET..Q5_K_QUANT_OFFSET];
+        let quantized = &self.bytes[Q5_K_QUANT_OFFSET..];
         let mut decoded = [0.0; Q5_K_VALUES_PER_BLOCK];
         for pair in 0..(Q5_K_VALUES_PER_BLOCK / (K_GROUP_VALUES * 2)) {
             let (scale_low, minimum_low) = scale_min(&scales, pair * 2);

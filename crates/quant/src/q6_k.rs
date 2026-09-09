@@ -19,8 +19,17 @@ pub const Q6_K_SUPER_SCALE_BYTES: usize = 2;
 pub const Q6_K_BLOCK_BYTES: usize =
     Q6_K_LOW_BITS_BYTES + Q6_K_HIGH_BITS_BYTES + Q6_K_SCALE_BYTES + Q6_K_SUPER_SCALE_BYTES;
 
-const VALUES_PER_QUARTER: usize = 32;
-const QUARTERS_PER_HALF_BLOCK: usize = 4;
+/// Values represented by one `Q6_K` packed quarter.
+pub const Q6_K_VALUES_PER_QUARTER: usize = 32;
+/// Packed `Q6_K` quarters represented by one half block.
+pub const Q6_K_QUARTERS_PER_HALF_BLOCK: usize = 4;
+const Q6_K_LOW_BITS_OFFSET: usize = 0;
+/// Offset of the high two-bit value planes.
+pub const Q6_K_HIGH_BITS_OFFSET: usize = Q6_K_LOW_BITS_OFFSET + Q6_K_LOW_BITS_BYTES;
+/// Offset of the signed scale bytes.
+pub const Q6_K_SCALE_OFFSET: usize = Q6_K_HIGH_BITS_OFFSET + Q6_K_HIGH_BITS_BYTES;
+/// Offset of the fp16 super-scale.
+pub const Q6_K_SUPER_SCALE_OFFSET: usize = Q6_K_SCALE_OFFSET + Q6_K_SCALE_BYTES;
 const GEOMETRY: Geometry = Geometry {
     format: RowFormat::Q6K,
     bytes_per_block: Q6_K_BLOCK_BYTES,
@@ -50,11 +59,13 @@ impl Q6KBlock {
         }
         let mut stored = [0; Q6_K_BLOCK_BYTES];
         stored.copy_from_slice(bytes);
-        let scale_start = Q6_K_LOW_BITS_BYTES + Q6_K_HIGH_BITS_BYTES + Q6_K_SCALE_BYTES;
         let _ = finite_half(
             RowFormat::Q6K,
             "scale",
-            [stored[scale_start], stored[scale_start + 1]],
+            [
+                stored[Q6_K_SUPER_SCALE_OFFSET],
+                stored[Q6_K_SUPER_SCALE_OFFSET + 1],
+            ],
         )?;
         Ok(Self { bytes: stored })
     }
@@ -62,13 +73,12 @@ impl Q6KBlock {
     /// Decode this block into 256 f32 values.
     #[must_use]
     pub fn decode_f32(&self) -> [f32; Q6_K_VALUES_PER_BLOCK] {
-        let low = &self.bytes[..Q6_K_LOW_BITS_BYTES];
-        let high = &self.bytes[Q6_K_LOW_BITS_BYTES..Q6_K_LOW_BITS_BYTES + Q6_K_HIGH_BITS_BYTES];
-        let scale_start = Q6_K_LOW_BITS_BYTES + Q6_K_HIGH_BITS_BYTES;
-        let scales = &self.bytes[scale_start..scale_start + Q6_K_SCALE_BYTES];
+        let low = &self.bytes[Q6_K_LOW_BITS_OFFSET..Q6_K_HIGH_BITS_OFFSET];
+        let high = &self.bytes[Q6_K_HIGH_BITS_OFFSET..Q6_K_SCALE_OFFSET];
+        let scales = &self.bytes[Q6_K_SCALE_OFFSET..Q6_K_SUPER_SCALE_OFFSET];
         let super_scale = half::f16::from_bits(u16::from_le_bytes([
-            self.bytes[scale_start + Q6_K_SCALE_BYTES],
-            self.bytes[scale_start + Q6_K_SCALE_BYTES + 1],
+            self.bytes[Q6_K_SUPER_SCALE_OFFSET],
+            self.bytes[Q6_K_SUPER_SCALE_OFFSET + 1],
         ]))
         .to_f32();
         let mut decoded = [0.0; Q6_K_VALUES_PER_BLOCK];
@@ -76,10 +86,10 @@ impl Q6KBlock {
             let low_base = half_block * 64;
             let high_base = half_block * 32;
             let scale_base = half_block * 8;
-            for lane in 0..VALUES_PER_QUARTER {
+            for lane in 0..Q6_K_VALUES_PER_QUARTER {
                 let packed_high = high[high_base + lane];
-                for quarter in 0..QUARTERS_PER_HALF_BLOCK {
-                    let low_byte = low[low_base + (quarter % 2) * VALUES_PER_QUARTER + lane];
+                for quarter in 0..Q6_K_QUARTERS_PER_HALF_BLOCK {
+                    let low_byte = low[low_base + (quarter % 2) * Q6_K_VALUES_PER_QUARTER + lane];
                     let lower = if quarter < 2 {
                         low_byte & 0x0f
                     } else {
@@ -88,9 +98,10 @@ impl Q6KBlock {
                     let upper = (packed_high >> (quarter * 2)) & 0x03;
                     let quantized = i16::from((upper << 4) | lower) - 32;
                     let scale_index = scale_base + quarter * 2 + lane / 16;
-                    decoded[half_block * 128 + quarter * VALUES_PER_QUARTER + lane] = super_scale
-                        * f32::from(i8::from_le_bytes([scales[scale_index]]))
-                        * f32::from(quantized);
+                    decoded[half_block * 128 + quarter * Q6_K_VALUES_PER_QUARTER + lane] =
+                        super_scale
+                            * f32::from(i8::from_le_bytes([scales[scale_index]]))
+                            * f32::from(quantized);
                 }
             }
         }
