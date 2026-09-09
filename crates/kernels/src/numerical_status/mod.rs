@@ -86,6 +86,25 @@ pub struct NativeNumericalStatus {
     bits: DeviceBuffer<u32>,
 }
 
+/// Caller-owned native-status storage with validated geometry and device identity.
+///
+/// This carrier does not claim that its status word has been initialized. A
+/// construction transaction must explicitly initialize the retained owner
+/// before it becomes a [`NativeNumericalStatus`].
+#[cfg(feature = "gpu")]
+pub struct NativeNumericalStatusBuffer {
+    bits: DeviceBuffer<u32>,
+}
+
+#[cfg(feature = "gpu")]
+impl NativeNumericalStatusBuffer {
+    /// Consume this carrier and return its original typed device-buffer owner.
+    #[must_use]
+    pub fn into_buffer(self) -> DeviceBuffer<u32> {
+        self.bits
+    }
+}
+
 /// Reason a caller-owned numerical-status buffer could not become a status owner.
 #[cfg(feature = "gpu")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,15 +113,12 @@ pub enum NativeNumericalStatusBufferErrorKind {
     DeviceMismatch,
     /// The buffer does not contain exactly one native-status word.
     LengthMismatch,
-    /// Initializing the validated status word to zero failed.
-    InitializationFailed,
 }
 
 /// Rejected caller-owned numerical-status buffer retaining its original owner.
 #[cfg(feature = "gpu")]
 pub struct NativeNumericalStatusBufferError {
     kind: NativeNumericalStatusBufferErrorKind,
-    source: Option<hipcore::Error>,
     buffer: DeviceBuffer<u32>,
 }
 
@@ -114,28 +130,16 @@ impl NativeNumericalStatusBufferError {
         self.kind
     }
 
-    /// Borrow the HIP initialization failure when initialization was attempted.
-    #[must_use]
-    pub fn source(&self) -> Option<&hipcore::Error> {
-        self.source.as_ref()
-    }
-
     /// Consume this rejection and recover its original typed buffer owner.
     #[must_use]
     pub fn into_buffer(self) -> DeviceBuffer<u32> {
         self.buffer
     }
 
-    /// Consume this rejection and recover its category, HIP source, and buffer.
+    /// Consume this rejection and recover its category and original buffer.
     #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (
-        NativeNumericalStatusBufferErrorKind,
-        Option<hipcore::Error>,
-        DeviceBuffer<u32>,
-    ) {
-        (self.kind, self.source, self.buffer)
+    pub fn into_parts(self) -> (NativeNumericalStatusBufferErrorKind, DeviceBuffer<u32>) {
+        (self.kind, self.buffer)
     }
 }
 
@@ -143,43 +147,33 @@ impl NativeNumericalStatusBufferError {
 impl NativeNumericalStatus {
     /// Allocate one initialized sticky native-status word on `device`.
     pub fn new(device: &Device) -> Result<Self> {
-        let mut bits = DeviceBuffer::alloc(device, 1)?;
-        bits.zero_fill()?;
-        Ok(Self { bits })
+        Ok(Self {
+            bits: DeviceBuffer::from_host(device, &[0])?,
+        })
     }
 
-    /// Validate and initialize one caller-owned status buffer.
+    /// Validate one caller-owned raw status buffer without initializing it.
     ///
-    /// This performs no allocation. A rejected buffer is returned inside
-    /// [`NativeNumericalStatusBufferError`] unchanged, including when the
-    /// fallible zero initialization fails, so a construction transaction can
-    /// retain it for explicit teardown.
-    pub fn try_from_buffer(
+    /// This performs no allocation or device write. A rejected buffer remains
+    /// owned by [`NativeNumericalStatusBufferError`] for explicit construction
+    /// teardown; its device contents and completion state are not interpreted.
+    pub fn try_bind_buffer(
         device: &Device,
-        mut bits: DeviceBuffer<u32>,
-    ) -> core::result::Result<Self, NativeNumericalStatusBufferError> {
+        bits: DeviceBuffer<u32>,
+    ) -> core::result::Result<NativeNumericalStatusBuffer, NativeNumericalStatusBufferError> {
         if bits.len() != 1 {
             return Err(NativeNumericalStatusBufferError {
                 kind: NativeNumericalStatusBufferErrorKind::LengthMismatch,
-                source: None,
                 buffer: bits,
             });
         }
         if bits.device().ordinal() != device.ordinal() {
             return Err(NativeNumericalStatusBufferError {
                 kind: NativeNumericalStatusBufferErrorKind::DeviceMismatch,
-                source: None,
                 buffer: bits,
             });
         }
-        if let Err(source) = bits.zero_fill() {
-            return Err(NativeNumericalStatusBufferError {
-                kind: NativeNumericalStatusBufferErrorKind::InitializationFailed,
-                source: Some(source),
-                buffer: bits,
-            });
-        }
-        Ok(Self { bits })
+        Ok(NativeNumericalStatusBuffer { bits })
     }
 
     /// Consume this status and return its original typed device-buffer owner.
