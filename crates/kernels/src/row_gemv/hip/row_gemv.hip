@@ -6,6 +6,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "numerical_status.h"
 #include "row_format.h"
 
 #pragma clang fp contract(off)
@@ -23,18 +24,20 @@ __device__ std::uint16_t load_u16_le(const std::uint8_t* bytes)
         | (static_cast<std::uint16_t>(bytes[1]) << BITS_PER_BYTE);
 }
 
-__device__ float load_f16_le(const std::uint8_t* bytes)
+__device__ float load_f16_le(const std::uint8_t* bytes, std::uint32_t* status)
 {
-    return __half2float(__ushort_as_half(load_u16_le(bytes)));
+    const std::uint16_t bits = load_u16_le(bytes);
+    logismos_status_f16_input_bits(bits, status);
+    return logismos_status_result(__half2float(__ushort_as_half(bits)), status);
 }
 
-__device__ float load_f32_le(const std::uint8_t* bytes)
+__device__ float load_f32_le(const std::uint8_t* bytes, std::uint32_t* status)
 {
     const std::uint32_t bits = static_cast<std::uint32_t>(bytes[0])
         | (static_cast<std::uint32_t>(bytes[1]) << BITS_PER_BYTE)
         | (static_cast<std::uint32_t>(bytes[2]) << (BITS_PER_BYTE * 2))
         | (static_cast<std::uint32_t>(bytes[3]) << (BITS_PER_BYTE * 3));
-    return __uint_as_float(bits);
+    return logismos_status_input(__uint_as_float(bits), status);
 }
 
 __device__ int signed_i8(std::uint8_t value)
@@ -60,18 +63,30 @@ __device__ void k_scale_min(const std::uint8_t* scales, std::size_t group, std::
 
 // WHY: GEMV and selected-row lookup must not drift into distinct serialized
 // format decoders; both paths consume these generated-layout reconstruction owners.
-__device__ float decode_f32_element(const std::uint8_t* row_bytes, std::size_t lane)
+__device__ float decode_f32_element(
+    const std::uint8_t* row_bytes,
+    std::size_t lane,
+    std::uint32_t* status)
 {
-    return load_f32_le(row_bytes + lane * LOGISMOS_F32_VALUE_BYTES);
+    return load_f32_le(row_bytes + lane * LOGISMOS_F32_VALUE_BYTES, status);
 }
 
-__device__ float decode_q8_0_element(const std::uint8_t* block, std::size_t lane)
+__device__ float decode_q8_0_element(
+    const std::uint8_t* block,
+    std::size_t lane,
+    std::uint32_t* status)
 {
-    const float scale = load_f16_le(block);
-    return scale * static_cast<float>(signed_i8(block[LOGISMOS_Q8_0_SCALE_BYTES + lane]));
+    const float scale = load_f16_le(block, status);
+    return logismos_status_mul(
+        scale,
+        static_cast<float>(signed_i8(block[LOGISMOS_Q8_0_SCALE_BYTES + lane])),
+        status);
 }
 
-__device__ float decode_q4_k_element(const std::uint8_t* block, std::size_t lane)
+__device__ float decode_q4_k_element(
+    const std::uint8_t* block,
+    std::size_t lane,
+    std::uint32_t* status)
 {
     const std::size_t group = lane / LOGISMOS_K_GROUP_VALUES;
     const std::size_t pair = group / 2;
@@ -84,13 +99,21 @@ __device__ float decode_q4_k_element(const std::uint8_t* block, std::size_t lane
     const std::uint8_t quantized = group % 2 == 0
         ? packed & LOW_NIBBLE_MASK
         : packed >> 4;
-    const float value_scale = load_f16_le(block) * static_cast<float>(scale);
-    const float value_minimum = load_f16_le(block + LOGISMOS_Q4_K_SUPER_MINIMUM_OFFSET)
-        * static_cast<float>(minimum);
-    return value_scale * static_cast<float>(quantized) - value_minimum;
+    const float value_scale = logismos_status_mul(
+        load_f16_le(block, status), static_cast<float>(scale), status);
+    const float value_minimum = logismos_status_mul(
+        load_f16_le(block + LOGISMOS_Q4_K_SUPER_MINIMUM_OFFSET, status),
+        static_cast<float>(minimum),
+        status);
+    const float scaled_quant = logismos_status_mul(
+        value_scale, static_cast<float>(quantized), status);
+    return logismos_status_sub(scaled_quant, value_minimum, status);
 }
 
-__device__ float decode_q5_k_element(const std::uint8_t* block, std::size_t lane)
+__device__ float decode_q5_k_element(
+    const std::uint8_t* block,
+    std::size_t lane,
+    std::uint32_t* status)
 {
     const std::size_t group = lane / LOGISMOS_K_GROUP_VALUES;
     const std::size_t pair = group / 2;
@@ -107,13 +130,21 @@ __device__ float decode_q5_k_element(const std::uint8_t* block, std::size_t lane
     const std::uint8_t high =
         (block[LOGISMOS_Q5_K_HIGH_BITS_OFFSET + group_lane] & fifth_bit) == 0 ? 0 : 16;
     const std::uint8_t quantized = static_cast<std::uint8_t>(low + high);
-    const float value_scale = load_f16_le(block) * static_cast<float>(scale);
-    const float value_minimum = load_f16_le(block + LOGISMOS_Q5_K_SUPER_MINIMUM_OFFSET)
-        * static_cast<float>(minimum);
-    return value_scale * static_cast<float>(quantized) - value_minimum;
+    const float value_scale = logismos_status_mul(
+        load_f16_le(block, status), static_cast<float>(scale), status);
+    const float value_minimum = logismos_status_mul(
+        load_f16_le(block + LOGISMOS_Q5_K_SUPER_MINIMUM_OFFSET, status),
+        static_cast<float>(minimum),
+        status);
+    const float scaled_quant = logismos_status_mul(
+        value_scale, static_cast<float>(quantized), status);
+    return logismos_status_sub(scaled_quant, value_minimum, status);
 }
 
-__device__ float decode_q6_k_element(const std::uint8_t* block, std::size_t lane)
+__device__ float decode_q6_k_element(
+    const std::uint8_t* block,
+    std::size_t lane,
+    std::uint32_t* status)
 {
     const std::size_t half = lane / LOGISMOS_Q6_K_VALUES_PER_HALF;
     const std::size_t remainder = lane % LOGISMOS_Q6_K_VALUES_PER_HALF;
@@ -137,23 +168,33 @@ __device__ float decode_q6_k_element(const std::uint8_t* block, std::size_t lane
     const std::size_t scale_index = half * LOGISMOS_Q6_K_SCALES_PER_HALF
         + quarter * 2
         + quarter_lane / LOGISMOS_Q6_K_VALUES_PER_SCALE;
-    const float value_scale = load_f16_le(block + LOGISMOS_Q6_K_SUPER_SCALE_OFFSET)
-        * static_cast<float>(signed_i8(block[LOGISMOS_Q6_K_SCALE_OFFSET + scale_index]));
-    return value_scale * static_cast<float>(quantized);
+    const float value_scale = logismos_status_mul(
+        load_f16_le(block + LOGISMOS_Q6_K_SUPER_SCALE_OFFSET, status),
+        static_cast<float>(signed_i8(block[LOGISMOS_Q6_K_SCALE_OFFSET + scale_index])),
+        status);
+    return logismos_status_mul(value_scale, static_cast<float>(quantized), status);
 }
 
-__device__ float decode_iq4_nl_element(const std::uint8_t* block, std::size_t lane)
+__device__ float decode_iq4_nl_element(
+    const std::uint8_t* block,
+    std::size_t lane,
+    std::uint32_t* status)
 {
     const std::size_t half_width = LOGISMOS_IQ4_NL_VALUES_PER_BLOCK / 2;
     const std::uint8_t packed = block[LOGISMOS_IQ4_NL_QUANT_OFFSET + lane % half_width];
     const std::uint8_t index = lane < half_width
         ? packed & LOW_NIBBLE_MASK
         : packed >> 4;
-    return load_f16_le(block)
-        * static_cast<float>(LOGISMOS_IQ4_RECONSTRUCTION_VALUES[index]);
+    return logismos_status_mul(
+        load_f16_le(block, status),
+        static_cast<float>(LOGISMOS_IQ4_RECONSTRUCTION_VALUES[index]),
+        status);
 }
 
-__device__ float decode_iq4_xs_element(const std::uint8_t* block, std::size_t lane)
+__device__ float decode_iq4_xs_element(
+    const std::uint8_t* block,
+    std::size_t lane,
+    std::uint32_t* status)
 {
     const std::size_t group = lane / LOGISMOS_IQ4_XS_GROUP_VALUES;
     const std::size_t group_lane = lane % LOGISMOS_IQ4_XS_GROUP_VALUES;
@@ -173,8 +214,12 @@ __device__ float decode_iq4_xs_element(const std::uint8_t* block, std::size_t la
     const std::uint8_t index = group_lane < half_width
         ? packed & LOW_NIBBLE_MASK
         : packed >> 4;
-    const float value_scale = load_f16_le(block) * static_cast<float>(group_scale);
-    return value_scale * static_cast<float>(LOGISMOS_IQ4_RECONSTRUCTION_VALUES[index]);
+    const float value_scale = logismos_status_mul(
+        load_f16_le(block, status), static_cast<float>(group_scale), status);
+    return logismos_status_mul(
+        value_scale,
+        static_cast<float>(LOGISMOS_IQ4_RECONSTRUCTION_VALUES[index]),
+        status);
 }
 
 __device__ bool checked_row_index(int rows, std::size_t* row)
@@ -215,19 +260,39 @@ __device__ const std::uint8_t* selected_block(
     return matrix + row_offset + block_offset;
 }
 
-__device__ float dot_f32(const std::uint8_t* matrix, const float* activations, std::size_t row, std::size_t width)
+__device__ float accumulate_dot_term(
+    float accumulator,
+    float decoded,
+    float activation,
+    std::uint32_t* status)
+{
+    const float checked_activation = logismos_status_input(activation, status);
+    const float product = logismos_status_mul(decoded, checked_activation, status);
+    return logismos_status_add(accumulator, product, status);
+}
+
+__device__ float dot_f32(
+    const std::uint8_t* matrix,
+    const float* activations,
+    std::size_t row,
+    std::size_t width,
+    std::uint32_t* status)
 {
     const std::uint8_t* row_bytes = matrix + row * width * LOGISMOS_F32_VALUE_BYTES;
     float accumulator = 0.0f;
     for (std::size_t lane = 0; lane < width; ++lane) {
-        const float decoded = decode_f32_element(row_bytes, lane);
-        const float product = decoded * activations[lane];
-        accumulator = accumulator + product;
+        const float decoded = decode_f32_element(row_bytes, lane, status);
+        accumulator = accumulate_dot_term(accumulator, decoded, activations[lane], status);
     }
     return accumulator;
 }
 
-__device__ float dot_q8_0(const std::uint8_t* matrix, const float* activations, std::size_t row, std::size_t width)
+__device__ float dot_q8_0(
+    const std::uint8_t* matrix,
+    const float* activations,
+    std::size_t row,
+    std::size_t width,
+    std::uint32_t* status)
 {
     const std::size_t blocks = width / LOGISMOS_Q8_0_VALUES_PER_BLOCK;
     const std::uint8_t* row_bytes = matrix + row * blocks * LOGISMOS_Q8_0_BLOCK_BYTES;
@@ -235,15 +300,22 @@ __device__ float dot_q8_0(const std::uint8_t* matrix, const float* activations, 
     for (std::size_t block_index = 0; block_index < blocks; ++block_index) {
         const std::uint8_t* block = row_bytes + block_index * LOGISMOS_Q8_0_BLOCK_BYTES;
         for (std::size_t lane = 0; lane < LOGISMOS_Q8_0_VALUES_PER_BLOCK; ++lane) {
-            const float decoded = decode_q8_0_element(block, lane);
-            const float product = decoded * activations[block_index * LOGISMOS_Q8_0_VALUES_PER_BLOCK + lane];
-            accumulator = accumulator + product;
+            const float decoded = decode_q8_0_element(block, lane, status);
+            const std::size_t activation_index =
+                block_index * LOGISMOS_Q8_0_VALUES_PER_BLOCK + lane;
+            accumulator = accumulate_dot_term(
+                accumulator, decoded, activations[activation_index], status);
         }
     }
     return accumulator;
 }
 
-__device__ float dot_q4_k(const std::uint8_t* matrix, const float* activations, std::size_t row, std::size_t width)
+__device__ float dot_q4_k(
+    const std::uint8_t* matrix,
+    const float* activations,
+    std::size_t row,
+    std::size_t width,
+    std::uint32_t* status)
 {
     const std::size_t blocks = width / LOGISMOS_Q4_K_VALUES_PER_BLOCK;
     const std::uint8_t* row_bytes = matrix + row * blocks * LOGISMOS_Q4_K_BLOCK_BYTES;
@@ -251,15 +323,22 @@ __device__ float dot_q4_k(const std::uint8_t* matrix, const float* activations, 
     for (std::size_t block_index = 0; block_index < blocks; ++block_index) {
         const std::uint8_t* block = row_bytes + block_index * LOGISMOS_Q4_K_BLOCK_BYTES;
         for (std::size_t lane = 0; lane < LOGISMOS_Q4_K_VALUES_PER_BLOCK; ++lane) {
-            const float decoded = decode_q4_k_element(block, lane);
-            const float product = decoded * activations[block_index * LOGISMOS_Q4_K_VALUES_PER_BLOCK + lane];
-            accumulator = accumulator + product;
+            const float decoded = decode_q4_k_element(block, lane, status);
+            const std::size_t activation_index =
+                block_index * LOGISMOS_Q4_K_VALUES_PER_BLOCK + lane;
+            accumulator = accumulate_dot_term(
+                accumulator, decoded, activations[activation_index], status);
         }
     }
     return accumulator;
 }
 
-__device__ float dot_q5_k(const std::uint8_t* matrix, const float* activations, std::size_t row, std::size_t width)
+__device__ float dot_q5_k(
+    const std::uint8_t* matrix,
+    const float* activations,
+    std::size_t row,
+    std::size_t width,
+    std::uint32_t* status)
 {
     const std::size_t blocks = width / LOGISMOS_Q5_K_VALUES_PER_BLOCK;
     const std::uint8_t* row_bytes = matrix + row * blocks * LOGISMOS_Q5_K_BLOCK_BYTES;
@@ -267,15 +346,22 @@ __device__ float dot_q5_k(const std::uint8_t* matrix, const float* activations, 
     for (std::size_t block_index = 0; block_index < blocks; ++block_index) {
         const std::uint8_t* block = row_bytes + block_index * LOGISMOS_Q5_K_BLOCK_BYTES;
         for (std::size_t lane = 0; lane < LOGISMOS_Q5_K_VALUES_PER_BLOCK; ++lane) {
-            const float decoded = decode_q5_k_element(block, lane);
-            const float product = decoded * activations[block_index * LOGISMOS_Q5_K_VALUES_PER_BLOCK + lane];
-            accumulator = accumulator + product;
+            const float decoded = decode_q5_k_element(block, lane, status);
+            const std::size_t activation_index =
+                block_index * LOGISMOS_Q5_K_VALUES_PER_BLOCK + lane;
+            accumulator = accumulate_dot_term(
+                accumulator, decoded, activations[activation_index], status);
         }
     }
     return accumulator;
 }
 
-__device__ float dot_q6_k(const std::uint8_t* matrix, const float* activations, std::size_t row, std::size_t width)
+__device__ float dot_q6_k(
+    const std::uint8_t* matrix,
+    const float* activations,
+    std::size_t row,
+    std::size_t width,
+    std::uint32_t* status)
 {
     const std::size_t blocks = width / LOGISMOS_Q6_K_VALUES_PER_BLOCK;
     const std::uint8_t* row_bytes = matrix + row * blocks * LOGISMOS_Q6_K_BLOCK_BYTES;
@@ -283,15 +369,22 @@ __device__ float dot_q6_k(const std::uint8_t* matrix, const float* activations, 
     for (std::size_t block_index = 0; block_index < blocks; ++block_index) {
         const std::uint8_t* block = row_bytes + block_index * LOGISMOS_Q6_K_BLOCK_BYTES;
         for (std::size_t lane = 0; lane < LOGISMOS_Q6_K_VALUES_PER_BLOCK; ++lane) {
-            const float decoded = decode_q6_k_element(block, lane);
-            const float product = decoded * activations[block_index * LOGISMOS_Q6_K_VALUES_PER_BLOCK + lane];
-            accumulator = accumulator + product;
+            const float decoded = decode_q6_k_element(block, lane, status);
+            const std::size_t activation_index =
+                block_index * LOGISMOS_Q6_K_VALUES_PER_BLOCK + lane;
+            accumulator = accumulate_dot_term(
+                accumulator, decoded, activations[activation_index], status);
         }
     }
     return accumulator;
 }
 
-__device__ float dot_iq4_nl(const std::uint8_t* matrix, const float* activations, std::size_t row, std::size_t width)
+__device__ float dot_iq4_nl(
+    const std::uint8_t* matrix,
+    const float* activations,
+    std::size_t row,
+    std::size_t width,
+    std::uint32_t* status)
 {
     const std::size_t blocks = width / LOGISMOS_IQ4_NL_VALUES_PER_BLOCK;
     const std::uint8_t* row_bytes = matrix + row * blocks * LOGISMOS_IQ4_NL_BLOCK_BYTES;
@@ -299,15 +392,22 @@ __device__ float dot_iq4_nl(const std::uint8_t* matrix, const float* activations
     for (std::size_t block_index = 0; block_index < blocks; ++block_index) {
         const std::uint8_t* block = row_bytes + block_index * LOGISMOS_IQ4_NL_BLOCK_BYTES;
         for (std::size_t lane = 0; lane < LOGISMOS_IQ4_NL_VALUES_PER_BLOCK; ++lane) {
-            const float decoded = decode_iq4_nl_element(block, lane);
-            const float product = decoded * activations[block_index * LOGISMOS_IQ4_NL_VALUES_PER_BLOCK + lane];
-            accumulator = accumulator + product;
+            const float decoded = decode_iq4_nl_element(block, lane, status);
+            const std::size_t activation_index =
+                block_index * LOGISMOS_IQ4_NL_VALUES_PER_BLOCK + lane;
+            accumulator = accumulate_dot_term(
+                accumulator, decoded, activations[activation_index], status);
         }
     }
     return accumulator;
 }
 
-__device__ float dot_iq4_xs(const std::uint8_t* matrix, const float* activations, std::size_t row, std::size_t width)
+__device__ float dot_iq4_xs(
+    const std::uint8_t* matrix,
+    const float* activations,
+    std::size_t row,
+    std::size_t width,
+    std::uint32_t* status)
 {
     const std::size_t blocks = width / LOGISMOS_IQ4_XS_VALUES_PER_BLOCK;
     const std::uint8_t* row_bytes = matrix + row * blocks * LOGISMOS_IQ4_XS_BLOCK_BYTES;
@@ -315,9 +415,11 @@ __device__ float dot_iq4_xs(const std::uint8_t* matrix, const float* activations
     for (std::size_t block_index = 0; block_index < blocks; ++block_index) {
         const std::uint8_t* block = row_bytes + block_index * LOGISMOS_IQ4_XS_BLOCK_BYTES;
         for (std::size_t lane = 0; lane < LOGISMOS_IQ4_XS_VALUES_PER_BLOCK; ++lane) {
-            const float decoded = decode_iq4_xs_element(block, lane);
-            const float product = decoded * activations[block_index * LOGISMOS_IQ4_XS_VALUES_PER_BLOCK + lane];
-            accumulator = accumulator + product;
+            const float decoded = decode_iq4_xs_element(block, lane, status);
+            const std::size_t activation_index =
+                block_index * LOGISMOS_IQ4_XS_VALUES_PER_BLOCK + lane;
+            accumulator = accumulate_dot_term(
+                accumulator, decoded, activations[activation_index], status);
         }
     }
     return accumulator;
@@ -325,63 +427,117 @@ __device__ float dot_iq4_xs(const std::uint8_t* matrix, const float* activations
 
 }
 
-extern "C" __global__ void logismos_f32_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
+extern "C" __global__ void logismos_f32_row_gemv_f32_kernel(
+    const std::uint8_t* matrix,
+    const float* activations,
+    float* output,
+    int rows,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t row = 0;
     if (checked_row_index(rows, &row)) {
-        output[row] = dot_f32(matrix, activations, row, static_cast<std::size_t>(width));
+        output[row] = dot_f32(
+            matrix, activations, row, static_cast<std::size_t>(width), status);
     }
 }
 
-extern "C" __global__ void logismos_q8_0_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
+extern "C" __global__ void logismos_q8_0_row_gemv_f32_kernel(
+    const std::uint8_t* matrix,
+    const float* activations,
+    float* output,
+    int rows,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t row = 0;
     if (checked_row_index(rows, &row)) {
-        output[row] = dot_q8_0(matrix, activations, row, static_cast<std::size_t>(width));
+        output[row] = dot_q8_0(
+            matrix, activations, row, static_cast<std::size_t>(width), status);
     }
 }
 
-extern "C" __global__ void logismos_q4_k_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
+extern "C" __global__ void logismos_q4_k_row_gemv_f32_kernel(
+    const std::uint8_t* matrix,
+    const float* activations,
+    float* output,
+    int rows,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t row = 0;
     if (checked_row_index(rows, &row)) {
-        output[row] = dot_q4_k(matrix, activations, row, static_cast<std::size_t>(width));
+        output[row] = dot_q4_k(
+            matrix, activations, row, static_cast<std::size_t>(width), status);
     }
 }
 
-extern "C" __global__ void logismos_q5_k_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
+extern "C" __global__ void logismos_q5_k_row_gemv_f32_kernel(
+    const std::uint8_t* matrix,
+    const float* activations,
+    float* output,
+    int rows,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t row = 0;
     if (checked_row_index(rows, &row)) {
-        output[row] = dot_q5_k(matrix, activations, row, static_cast<std::size_t>(width));
+        output[row] = dot_q5_k(
+            matrix, activations, row, static_cast<std::size_t>(width), status);
     }
 }
 
-extern "C" __global__ void logismos_q6_k_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
+extern "C" __global__ void logismos_q6_k_row_gemv_f32_kernel(
+    const std::uint8_t* matrix,
+    const float* activations,
+    float* output,
+    int rows,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t row = 0;
     if (checked_row_index(rows, &row)) {
-        output[row] = dot_q6_k(matrix, activations, row, static_cast<std::size_t>(width));
+        output[row] = dot_q6_k(
+            matrix, activations, row, static_cast<std::size_t>(width), status);
     }
 }
 
-extern "C" __global__ void logismos_iq4_nl_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
+extern "C" __global__ void logismos_iq4_nl_row_gemv_f32_kernel(
+    const std::uint8_t* matrix,
+    const float* activations,
+    float* output,
+    int rows,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t row = 0;
     if (checked_row_index(rows, &row)) {
-        output[row] = dot_iq4_nl(matrix, activations, row, static_cast<std::size_t>(width));
+        output[row] = dot_iq4_nl(
+            matrix, activations, row, static_cast<std::size_t>(width), status);
     }
 }
 
-extern "C" __global__ void logismos_iq4_xs_row_gemv_f32_kernel(const std::uint8_t* matrix, const float* activations, float* output, int rows, int width)
+extern "C" __global__ void logismos_iq4_xs_row_gemv_f32_kernel(
+    const std::uint8_t* matrix,
+    const float* activations,
+    float* output,
+    int rows,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t row = 0;
     if (checked_row_index(rows, &row)) {
-        output[row] = dot_iq4_xs(matrix, activations, row, static_cast<std::size_t>(width));
+        output[row] = dot_iq4_xs(
+            matrix, activations, row, static_cast<std::size_t>(width), status);
     }
 }
 
-extern "C" __global__ void logismos_f32_row_decode_f32_kernel(const std::uint8_t* matrix, float* output, int row, int width)
+extern "C" __global__ void logismos_f32_row_decode_f32_kernel(
+    const std::uint8_t* matrix,
+    float* output,
+    int row,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t lane = 0;
     if (!checked_value_index(width, &lane)) {
@@ -390,10 +546,15 @@ extern "C" __global__ void logismos_f32_row_decode_f32_kernel(const std::uint8_t
     const std::uint8_t* row_bytes = matrix
         + static_cast<std::size_t>(row) * static_cast<std::size_t>(width)
             * LOGISMOS_F32_VALUE_BYTES;
-    output[lane] = decode_f32_element(row_bytes, lane);
+    output[lane] = decode_f32_element(row_bytes, lane, status);
 }
 
-extern "C" __global__ void logismos_q8_0_row_decode_f32_kernel(const std::uint8_t* matrix, float* output, int row, int width)
+extern "C" __global__ void logismos_q8_0_row_decode_f32_kernel(
+    const std::uint8_t* matrix,
+    float* output,
+    int row,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t lane = 0;
     if (!checked_value_index(width, &lane)) {
@@ -406,10 +567,16 @@ extern "C" __global__ void logismos_q8_0_row_decode_f32_kernel(const std::uint8_
         lane,
         LOGISMOS_Q8_0_VALUES_PER_BLOCK,
         LOGISMOS_Q8_0_BLOCK_BYTES);
-    output[lane] = decode_q8_0_element(block, lane % LOGISMOS_Q8_0_VALUES_PER_BLOCK);
+    output[lane] = decode_q8_0_element(
+        block, lane % LOGISMOS_Q8_0_VALUES_PER_BLOCK, status);
 }
 
-extern "C" __global__ void logismos_q4_k_row_decode_f32_kernel(const std::uint8_t* matrix, float* output, int row, int width)
+extern "C" __global__ void logismos_q4_k_row_decode_f32_kernel(
+    const std::uint8_t* matrix,
+    float* output,
+    int row,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t lane = 0;
     if (!checked_value_index(width, &lane)) {
@@ -422,10 +589,16 @@ extern "C" __global__ void logismos_q4_k_row_decode_f32_kernel(const std::uint8_
         lane,
         LOGISMOS_Q4_K_VALUES_PER_BLOCK,
         LOGISMOS_Q4_K_BLOCK_BYTES);
-    output[lane] = decode_q4_k_element(block, lane % LOGISMOS_Q4_K_VALUES_PER_BLOCK);
+    output[lane] = decode_q4_k_element(
+        block, lane % LOGISMOS_Q4_K_VALUES_PER_BLOCK, status);
 }
 
-extern "C" __global__ void logismos_q5_k_row_decode_f32_kernel(const std::uint8_t* matrix, float* output, int row, int width)
+extern "C" __global__ void logismos_q5_k_row_decode_f32_kernel(
+    const std::uint8_t* matrix,
+    float* output,
+    int row,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t lane = 0;
     if (!checked_value_index(width, &lane)) {
@@ -438,10 +611,16 @@ extern "C" __global__ void logismos_q5_k_row_decode_f32_kernel(const std::uint8_
         lane,
         LOGISMOS_Q5_K_VALUES_PER_BLOCK,
         LOGISMOS_Q5_K_BLOCK_BYTES);
-    output[lane] = decode_q5_k_element(block, lane % LOGISMOS_Q5_K_VALUES_PER_BLOCK);
+    output[lane] = decode_q5_k_element(
+        block, lane % LOGISMOS_Q5_K_VALUES_PER_BLOCK, status);
 }
 
-extern "C" __global__ void logismos_q6_k_row_decode_f32_kernel(const std::uint8_t* matrix, float* output, int row, int width)
+extern "C" __global__ void logismos_q6_k_row_decode_f32_kernel(
+    const std::uint8_t* matrix,
+    float* output,
+    int row,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t lane = 0;
     if (!checked_value_index(width, &lane)) {
@@ -454,10 +633,16 @@ extern "C" __global__ void logismos_q6_k_row_decode_f32_kernel(const std::uint8_
         lane,
         LOGISMOS_Q6_K_VALUES_PER_BLOCK,
         LOGISMOS_Q6_K_BLOCK_BYTES);
-    output[lane] = decode_q6_k_element(block, lane % LOGISMOS_Q6_K_VALUES_PER_BLOCK);
+    output[lane] = decode_q6_k_element(
+        block, lane % LOGISMOS_Q6_K_VALUES_PER_BLOCK, status);
 }
 
-extern "C" __global__ void logismos_iq4_nl_row_decode_f32_kernel(const std::uint8_t* matrix, float* output, int row, int width)
+extern "C" __global__ void logismos_iq4_nl_row_decode_f32_kernel(
+    const std::uint8_t* matrix,
+    float* output,
+    int row,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t lane = 0;
     if (!checked_value_index(width, &lane)) {
@@ -470,10 +655,16 @@ extern "C" __global__ void logismos_iq4_nl_row_decode_f32_kernel(const std::uint
         lane,
         LOGISMOS_IQ4_NL_VALUES_PER_BLOCK,
         LOGISMOS_IQ4_NL_BLOCK_BYTES);
-    output[lane] = decode_iq4_nl_element(block, lane % LOGISMOS_IQ4_NL_VALUES_PER_BLOCK);
+    output[lane] = decode_iq4_nl_element(
+        block, lane % LOGISMOS_IQ4_NL_VALUES_PER_BLOCK, status);
 }
 
-extern "C" __global__ void logismos_iq4_xs_row_decode_f32_kernel(const std::uint8_t* matrix, float* output, int row, int width)
+extern "C" __global__ void logismos_iq4_xs_row_decode_f32_kernel(
+    const std::uint8_t* matrix,
+    float* output,
+    int row,
+    int width,
+    std::uint32_t* status)
 {
     std::size_t lane = 0;
     if (!checked_value_index(width, &lane)) {
@@ -486,7 +677,8 @@ extern "C" __global__ void logismos_iq4_xs_row_decode_f32_kernel(const std::uint
         lane,
         LOGISMOS_IQ4_XS_VALUES_PER_BLOCK,
         LOGISMOS_IQ4_XS_BLOCK_BYTES);
-    output[lane] = decode_iq4_xs_element(block, lane % LOGISMOS_IQ4_XS_VALUES_PER_BLOCK);
+    output[lane] = decode_iq4_xs_element(
+        block, lane % LOGISMOS_IQ4_XS_VALUES_PER_BLOCK, status);
 }
 
 namespace {
@@ -501,16 +693,24 @@ unsigned int row_decode_blocks(int width)
 }
 
 #define LOGISMOS_ROW_DECODE_LAUNCHER(NAME) \
-extern "C" hipError_t logismos_launch_##NAME##_row_decode_f32( \
-    const void* matrix, void* output, int row, int width, hipStream_t stream) \
+extern "C" hipError_t logismos_launch_##NAME##_row_decode_f32_checked( \
+    const void* matrix, void* output, int row, int width, \
+    void* numerical_status, hipStream_t stream) \
 { \
     const dim3 block(ROW_DECODE_THREADS_PER_BLOCK, 1, 1); \
     const dim3 grid(row_decode_blocks(width), 1, 1); \
-    /* SAFETY: Rust validates exact device spans; the caller retains inputs and output through completion. */ \
+    /* SAFETY: Rust validates exact spans; its caller retains them plus status through completion. */ \
     logismos_##NAME##_row_decode_f32_kernel<<<grid, block, 0, stream>>>( \
         reinterpret_cast<const std::uint8_t*>(matrix), \
-        reinterpret_cast<float*>(output), row, width); \
+        reinterpret_cast<float*>(output), row, width, \
+        reinterpret_cast<std::uint32_t*>(numerical_status)); \
     return hipGetLastError(); \
+} \
+extern "C" hipError_t logismos_launch_##NAME##_row_decode_f32( \
+    const void* matrix, void* output, int row, int width, hipStream_t stream) \
+{ \
+    return logismos_launch_##NAME##_row_decode_f32_checked( \
+        matrix, output, row, width, nullptr, stream); \
 }
 
 LOGISMOS_ROW_DECODE_LAUNCHER(f32)
