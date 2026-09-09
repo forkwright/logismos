@@ -45,11 +45,7 @@ impl PageTokens {
 pub struct PagedKvPlan {
     geometry: PagedKvGeometry,
     page_tokens: PageTokens,
-    page_count: usize,
-    bundle_count: usize,
-    requested_f32: usize,
-    tail_copy_bytes: usize,
-    total_requested_bytes: usize,
+    allocation: PagedKvAllocation,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -83,11 +79,7 @@ impl PagedKvPlan {
         Ok(Self {
             geometry,
             page_tokens,
-            page_count: allocation.page_count,
-            bundle_count: allocation.bundle_count,
-            requested_f32: allocation.requested_f32,
-            tail_copy_bytes: allocation.tail_copy_bytes,
-            total_requested_bytes: allocation.total_requested_bytes,
+            allocation,
         })
     }
     fn validate_geometry(geometry: PagedKvGeometry) -> Result<()> {
@@ -185,12 +177,12 @@ impl PagedKvPlan {
     /// Exact f32 backing, including padding and spare.
     #[must_use]
     pub const fn requested_f32_elements(self) -> usize {
-        self.requested_f32
+        self.allocation.requested_f32
     }
     fn cost(self) -> (usize, usize, usize) {
         (
-            self.total_requested_bytes,
-            self.tail_copy_bytes,
+            self.allocation.total_requested_bytes,
+            self.allocation.tail_copy_bytes,
             self.page_tokens.count(),
         )
     }
@@ -224,14 +216,14 @@ pub struct PagedKvPool {
 impl PagedKvPool {
     /// Allocate every f32 and persistent metadata capacity up front.
     pub fn new(plan: PagedKvPlan) -> Result<Self> {
-        let mut storage = reserve(plan.requested_f32, "paged-KV f32 backing")?;
-        storage.resize(plan.requested_f32, 0.0);
-        let table = reserve(plan.page_count, "paged-KV page table")?;
-        let fills = reserve(plan.page_count, "paged-KV page fills")?;
-        let mut free = reserve(plan.bundle_count, "paged-KV free bundles")?;
+        let mut storage = reserve(plan.allocation.requested_f32, "paged-KV f32 backing")?;
+        storage.resize(plan.allocation.requested_f32, 0.0);
+        let table = reserve(plan.allocation.page_count, "paged-KV page table")?;
+        let fills = reserve(plan.allocation.page_count, "paged-KV page fills")?;
+        let mut free = reserve(plan.allocation.bundle_count, "paged-KV free bundles")?;
         let mut staged_rows = reserve(plan.geometry.layers, "paged-KV transaction rows")?;
         staged_rows.resize(plan.geometry.layers, 0);
-        for bundle in (0..plan.bundle_count).rev() {
+        for bundle in (0..plan.allocation.bundle_count).rev() {
             free.push(bundle);
         }
         Ok(Self {
@@ -384,7 +376,7 @@ impl PagedKvPool {
         rows: usize,
     ) -> Result<Range<usize>> {
         let page_tokens = self.plan.page_tokens.count();
-        if bundle >= self.plan.bundle_count
+        if bundle >= self.plan.allocation.bundle_count
             || layer >= self.plan.geometry.layers
             || token >= page_tokens
             || rows > page_tokens - token
@@ -854,21 +846,21 @@ mod tests {
         assert_eq!(pool.table.len(), pool.fills.len());
         let mut seen = BTreeSet::new();
         for bundle in &pool.table {
-            assert!(*bundle < pool.plan.bundle_count);
+            assert!(*bundle < pool.plan.allocation.bundle_count);
             assert!(seen.insert(*bundle));
         }
         for bundle in &pool.free {
-            assert!(*bundle < pool.plan.bundle_count);
+            assert!(*bundle < pool.plan.allocation.bundle_count);
             assert!(seen.insert(*bundle));
         }
         if let Some(bundle) = held_old_tail {
-            assert!(bundle < pool.plan.bundle_count);
+            assert!(bundle < pool.plan.allocation.bundle_count);
             assert!(seen.insert(bundle));
         }
-        assert_eq!(seen.len(), pool.plan.bundle_count);
+        assert_eq!(seen.len(), pool.plan.allocation.bundle_count);
         assert_eq!(
             pool.table.len() + pool.free.len() + usize::from(held_old_tail.is_some()),
-            pool.plan.bundle_count
+            pool.plan.allocation.bundle_count
         );
     }
 
@@ -1178,6 +1170,6 @@ mod tests {
         let metadata_bytes = (page_count * 2 + bundle_count + geometry.layers) * size_of::<usize>();
         let total_requested_bytes = requested_f32 * size_of::<f32>() + metadata_bytes;
         assert_eq!(plan.requested_f32_elements(), requested_f32);
-        assert_eq!(plan.total_requested_bytes, total_requested_bytes);
+        assert_eq!(plan.allocation.total_requested_bytes, total_requested_bytes);
     }
 }
