@@ -41,9 +41,14 @@ semantically respects that boundary.
   without linking the device runtime.
 - `decoders` consumes `loader` without its tensor adapter and consumes `quant`
   for explicit CPU row projection, without linking HIP. Its recurrent-attention
-  path uses the standalone CPU `kernels` graph. Structural profiles remain
+  path uses the standalone CPU `kernels` graph; full-attention history consumes
+  `cache` with its legacy tensor-backed flat feature disabled. Structural profiles remain
   distinct from payload-bound execution. The lower-level `quant` crate owns
   executable block and row geometry; inspection and projection reuse that owner.
+- `cache::paged` owns private CPU KV allocation, borrowed row views and atomic
+  append transactions. It does not own model semantics, shared-prefix identity,
+  scheduling or host grants. Legacy flat tensor callers retain their default
+  feature; their `KvCache` trait is not a shared-paging lifecycle contract.
 - `emulation` is a CPU test aid, not a production device backend.
 - `decode` owns checked logit processing and token selection over CPU slices.
   It has no tensor/device-runtime dependency; a pipeline can consume it without
@@ -165,23 +170,38 @@ arithmetic instead of concealing overflow behind finite zero outputs.
 
 `Qwen35Execution` composes the main recurrent/full-attention blocks, residuals,
 dense FFN, final normalization and vocabulary projection from token IDs. One
-ordered layer-state enum owns recurrent or KV history, never parallel optional
-states. Its caller-supplied context bound is capped by artifact and signed-position
-limits. Whole-call staging is fallible and commits only after all token logits
-succeed. Its text-only interleaved RoPE supports checked full or partial rotary
+ordered layer-state enum associates each main block with its recurrent state
+or its full-attention layer in one execution-private paged KV pool. Its
+caller-supplied context bound is capped by artifact and signed-position limits.
+The paged transaction borrows the pool, retains immutable committed full pages,
+and copy-on-writes only a partial tail. Attention reads borrowed logical rows
+without rebuilding flat history. Recurrent state is staged separately; the
+whole call publishes KV, recurrent state and position only after all selected
+logits succeed and all-layer append completeness is validated. Its text-only
+interleaved RoPE supports checked full or partial rotary
 dimensions; unsupported effective scaling fails explicitly.
 
 `Qwen35ExecutionPlan` validates caller context and step bounds and chooses
-all-token or last-token logits. Its precomputed `Qwen35CpuRequirements` derives
+all-token or last-token logits. It retains the exact private CPU page plan
+selected from 8/16/32-token candidates using allocation-owner costs. This is
+not a qualified GPU alignment, shared-prefix or performance choice.
+Its precomputed `Qwen35CpuRequirements` derives
 logical `f32` backing from allocation owners, not a separate estimator.
 Causal-convolution and grouped-GDN plans are consumed by their kernels;
 recurrent, full-attention, FFN and LM-head owners compose named allocation
-phases. The report separates retained state, its transaction clone, transient
-workspace upper bound, and returned logits. Serialized verified backing is
+phases. The report separates retained state, separately allocated recurrent
+transaction copies, transient workspace upper bound, and returned logits.
+The complete preallocated KV pool, including page padding and its tail-copy
+spare, belongs to retained backing; transaction accounting does not charge the
+same pages twice. Serialized verified backing is
 reported separately. Structure/stack storage, allocator overhead and capacity,
 template/tokenizer allocations, process RSS, physical residency and GPU memory
 are outside this report. It is neither an allocation guarantee nor device
 admission input.
+
+Private paging provides no cross-session sharing, prefix index, eviction,
+device allocation or admission lease. Those require their actual consumers
+and additional identity, lifecycle and qualification contracts.
 
 Independent synthetic f64 witnesses cover the composed mixed-quantized model,
 retained recurrent/KV/position state, continuation and rollback. Deliberately
