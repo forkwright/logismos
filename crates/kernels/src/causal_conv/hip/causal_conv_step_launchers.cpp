@@ -8,6 +8,10 @@ extern "C" __global__ void logismos_causal_conv_step_f32_kernel(
     const float*, const float*, const float*, float*, float*, std::uint32_t, std::uint32_t,
     std::uint32_t*);
 
+namespace {
+constexpr std::uint32_t THREADS_PER_BLOCK = 256U;
+}
+
 extern "C" hipError_t logismos_launch_causal_conv_step_f32_checked(
     const void* input_f32, const void* weights_f32, const void* history_in_f32,
     void* history_out_f32, void* output_f32, std::uint32_t channel_count,
