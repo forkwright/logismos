@@ -1034,7 +1034,7 @@ impl NativePagedKvBuffers {
 /// A rejected native K/V buffer binding that still owns every caller buffer.
 #[cfg(feature = "gpu")]
 pub struct NativePagedKvPoolBindingError {
-    error: crate::Error,
+    error: Box<crate::Error>,
     buffers: NativePagedKvBuffers,
 }
 
@@ -1049,7 +1049,7 @@ impl NativePagedKvPoolBindingError {
     /// Consume this rejection and recover the error and original buffer owners.
     #[must_use]
     pub fn into_parts(self) -> (crate::Error, NativePagedKvBuffers) {
-        (self.error, self.buffers)
+        (*self.error, self.buffers)
     }
 }
 
@@ -1109,7 +1109,10 @@ impl NativePagedKvPool {
         let ledger = match binding {
             Ok(ledger) => ledger,
             Err(error) => {
-                return Err(NativePagedKvPoolBindingError { error, buffers });
+                return Err(NativePagedKvPoolBindingError {
+                    error: Box::new(error),
+                    buffers,
+                });
             }
         };
         let NativePagedKvBuffers {
