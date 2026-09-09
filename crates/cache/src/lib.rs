@@ -22,6 +22,11 @@
 //! sliced views.
 //! Paged geometry and transaction ownership are separate from this legacy
 //! tensor layout and do not initialize a device runtime.
+//!
+//! Legacy flat geometry is constructed only through [`CacheLayout::new`], and
+//! [`FlatKvCache::new`] remains fallible because its validated K/V backing
+//! still requires allocator reservations. This is the intentional migration
+//! from public field literals and infallible flat-cache allocation.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -114,6 +119,24 @@ mod tests {
     #[test]
     fn cache_layout_rejects_overflowing_row() {
         let result = CacheLayout::new(1, usize::MAX, 2, 1, taxis::DType::F16);
+        assert!(matches!(result, Err(Error::FlatArithmetic { .. })));
+    }
+
+    #[test]
+    fn cache_layout_rejects_overflowing_dtype_bytes() {
+        let result = CacheLayout::new(1, usize::MAX, 1, 1, taxis::DType::F32);
+        assert!(matches!(result, Err(Error::Taxis { .. })));
+    }
+
+    #[test]
+    fn cache_layout_rejects_overflowing_per_layer_context() {
+        let result = CacheLayout::new(1, 1, 1, usize::MAX, taxis::DType::F32);
+        assert!(matches!(result, Err(Error::FlatArithmetic { .. })));
+    }
+
+    #[test]
+    fn cache_layout_rejects_overflowing_all_layer_backing() {
+        let result = CacheLayout::new(usize::MAX, 1, 1, 1, taxis::DType::F32);
         assert!(matches!(result, Err(Error::FlatArithmetic { .. })));
     }
 }

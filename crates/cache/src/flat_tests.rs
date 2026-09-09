@@ -257,6 +257,12 @@ fn overflow_errors_cleanly() -> Result<()> {
 }
 
 #[test]
+fn append_span_rejects_checked_length_overflow() {
+    let result = append_span(0, usize::MAX, 1, 1, usize::MAX);
+    assert!(matches!(result, Err(Error::FlatArithmetic { .. })));
+}
+
+#[test]
 fn failed_second_operand_preserves_written_rows() -> Result<()> {
     let layout = CacheLayout::new(1, 1, 2, 4, DType::F32)?;
     let mut cache = FlatKvCache::new(layout)?;

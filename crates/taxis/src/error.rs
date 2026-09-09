@@ -32,6 +32,16 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// Empty layout starts beyond its zero-length storage span.
+    #[snafu(display("empty layout must start at offset 0, got {start_offset}"))]
+    LayoutEmptyOffset {
+        /// Supplied offset for an empty layout.
+        start_offset: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// Underlying HIP failure (allocation, copy, etc.).
     #[snafu(transparent)]
     Hip {

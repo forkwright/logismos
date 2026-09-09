@@ -7,6 +7,13 @@
 //! backing. No const generics, no backend trait. Two storage variants:
 //! CPU and HIP. Every HIP storage-backed tensor pins a
 //! `hipcore::Device` for kernel dispatch.
+//!
+//! ## Geometry construction
+//!
+//! Shapes remain descriptive, but every layout and storage binding is now
+//! fallible: use [`Layout::from_parts`] for explicit checked spans and
+//! [`Tensor::from_cpu`] for exact CPU storage compatibility. This migration
+//! intentionally leaves no safe unchecked tensor-construction path.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]

@@ -2,7 +2,9 @@
 
 use smallvec::SmallVec;
 
-use crate::error::{GeometryOverflowSnafu, LayoutRankMismatchSnafu, Result};
+use crate::error::{
+    GeometryOverflowSnafu, LayoutEmptyOffsetSnafu, LayoutRankMismatchSnafu, Result,
+};
 use crate::shape::Shape;
 
 /// Layout describing how tensor elements sit in storage.
@@ -41,8 +43,10 @@ impl Layout {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::LayoutRankMismatch`] for incoherent ranks or
-    /// [`crate::Error::GeometryOverflow`] for an unrepresentable span.
+    /// Returns [`crate::Error::LayoutRankMismatch`] for incoherent ranks,
+    /// [`crate::Error::LayoutEmptyOffset`] for an empty layout with a nonzero
+    /// offset, or [`crate::Error::GeometryOverflow`] for an unrepresentable
+    /// full reachable storage span.
     pub fn from_parts(
         shape: Shape,
         stride: SmallVec<[usize; 6]>,
@@ -55,13 +59,20 @@ impl Layout {
             }
             .fail();
         }
-        shape.checked_elem_count()?;
-        let _span = shape.dims().iter().zip(&stride).try_fold(
+        let elements = shape.checked_elem_count()?;
+        if elements == 0 {
+            if start_offset != 0 {
+                return LayoutEmptyOffsetSnafu { start_offset }.fail();
+            }
+            return Ok(Self {
+                shape,
+                stride,
+                start_offset,
+            });
+        }
+        let max_index = shape.dims().iter().zip(&stride).try_fold(
             start_offset,
             |end, (&dimension, &step)| {
-                if dimension == 0 {
-                    return Ok(end);
-                }
                 dimension
                     .checked_sub(1)
                     .and_then(|width| width.checked_mul(step))
@@ -74,6 +85,12 @@ impl Layout {
                     })
             },
         )?;
+        max_index.checked_add(1).ok_or_else(|| {
+            GeometryOverflowSnafu {
+                operation: "layout storage element span",
+            }
+            .build()
+        })?;
         Ok(Self {
             shape,
             stride,
@@ -106,6 +123,11 @@ impl Layout {
     }
 
     /// Return this layout's exact logical element count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::GeometryOverflow`] if the shape product cannot
+    /// be represented.
     pub fn checked_elem_count(&self) -> Result<usize> {
         self.shape.checked_elem_count()
     }
@@ -144,6 +166,24 @@ mod tests {
     }
 
     #[test]
+    fn singleton_dimension_layout_is_contiguous() -> Result<()> {
+        let layout =
+            Layout::from_parts(Shape::new(&[2, 1, 4]), SmallVec::from_slice(&[4, 4, 1]), 0)?;
+        assert!(layout.is_contiguous());
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_and_empty_layouts_have_explicit_spans() -> Result<()> {
+        let scalar = Layout::from_parts(Shape::scalar(), SmallVec::new(), 0)?;
+        assert_eq!(scalar.checked_elem_count()?, 1);
+        let empty = Layout::from_parts(Shape::new(&[0, 3]), SmallVec::from_slice(&[3, 1]), 0)?;
+        assert_eq!(empty.checked_elem_count()?, 0);
+        assert!(empty.is_contiguous());
+        Ok(())
+    }
+
+    #[test]
     fn valid_strided_layout_is_not_contiguous() -> Result<()> {
         let layout = Layout::from_parts(Shape::new(&[2, 2]), SmallVec::from_slice(&[3, 1]), 0)?;
         assert!(!layout.is_contiguous());
@@ -164,8 +204,26 @@ mod tests {
     }
 
     #[test]
+    fn explicit_layout_rejects_excess_stride_rank() {
+        let err = Layout::from_parts(Shape::new(&[2]), SmallVec::from_slice(&[1, 1]), 0);
+        assert!(matches!(err, Err(crate::Error::LayoutRankMismatch { .. })));
+    }
+
+    #[test]
+    fn empty_layout_rejects_nonzero_offset() {
+        let err = Layout::from_parts(Shape::new(&[0]), SmallVec::from_slice(&[1]), 1);
+        assert!(matches!(err, Err(crate::Error::LayoutEmptyOffset { .. })));
+    }
+
+    #[test]
     fn explicit_layout_rejects_overflowing_span() {
         let err = Layout::from_parts(Shape::new(&[2]), SmallVec::from_slice(&[usize::MAX]), 1);
+        assert!(matches!(err, Err(crate::Error::GeometryOverflow { .. })));
+    }
+
+    #[test]
+    fn scalar_layout_rejects_overflowing_full_span() {
+        let err = Layout::from_parts(Shape::scalar(), SmallVec::new(), usize::MAX);
         assert!(matches!(err, Err(crate::Error::GeometryOverflow { .. })));
     }
 }

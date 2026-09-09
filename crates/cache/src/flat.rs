@@ -48,6 +48,13 @@ pub struct CacheLayout {
 
 impl CacheLayout {
     /// Construct checked immutable cache geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::FlatZeroDimension`] for a zero configured
+    /// dimension, [`crate::Error::FlatArithmetic`] when any row, per-layer,
+    /// or all-layer K/V backing extent overflows, and [`crate::Error::Taxis`]
+    /// when the dtype byte extent cannot be represented.
     pub fn new(
         num_layers: usize,
         num_kv_heads: usize,
@@ -80,6 +87,15 @@ impl CacheLayout {
             }
             .build()
         })?;
+        buffer_bytes
+            .checked_mul(num_layers)
+            .and_then(|per_kind| per_kind.checked_mul(2))
+            .ok_or_else(|| {
+                FlatArithmeticSnafu {
+                    operation: "all-layer K/V backing bytes",
+                }
+                .build()
+            })?;
         Ok(Self {
             num_layers,
             max_seq_len,
@@ -122,6 +138,59 @@ struct TensorBytes<'t> {
     bytes: Cow<'t, [u8]>,
 }
 
+struct AppendSpan {
+    next_len: usize,
+    offset: usize,
+    end: usize,
+}
+
+fn append_span(
+    layer_idx: usize,
+    current: usize,
+    append: usize,
+    row_bytes: usize,
+    max_seq_len: usize,
+) -> Result<AppendSpan> {
+    let next_len = current.checked_add(append).ok_or_else(|| {
+        FlatArithmeticSnafu {
+            operation: "append length",
+        }
+        .build()
+    })?;
+    if next_len > max_seq_len {
+        return LenOverflowSnafu {
+            layer_idx,
+            current,
+            n_new: append,
+            max_seq_len,
+        }
+        .fail();
+    }
+    let offset = current.checked_mul(row_bytes).ok_or_else(|| {
+        FlatArithmeticSnafu {
+            operation: "append offset",
+        }
+        .build()
+    })?;
+    let append_bytes = append.checked_mul(row_bytes).ok_or_else(|| {
+        FlatArithmeticSnafu {
+            operation: "append byte count",
+        }
+        .build()
+    })?;
+    let end = offset.checked_add(append_bytes).ok_or_else(|| {
+        FlatArithmeticSnafu {
+            operation: "append end offset",
+        }
+        .build()
+    })?;
+    Ok(AppendSpan {
+        next_len,
+        offset,
+        end,
+    })
+}
+
 fn allocate_buffers(count: usize, bytes: usize, target: &'static str) -> Result<Vec<Vec<u8>>> {
     let mut buffers = Vec::new();
     buffers
@@ -154,6 +223,12 @@ pub struct FlatKvCache {
 
 impl FlatKvCache {
     /// Allocate a cache sized according to `layout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::FlatAllocation`] when any K, V, or length
+    /// backing reservation fails. `layout` has already checked the aggregate
+    /// K/V extent before this method begins allocating.
     pub fn new(layout: CacheLayout) -> Result<Self> {
         let buffer_bytes = layout.buffer_bytes();
         let k_buffers = allocate_buffers(layout.num_layers, buffer_bytes, "K")?;
@@ -279,40 +354,13 @@ impl KvCache for FlatKvCache {
             }
             .build()
         })?;
-        let next = current.checked_add(n_k).ok_or_else(|| {
-            FlatArithmeticSnafu {
-                operation: "append length",
-            }
-            .build()
-        })?;
-        if next > self.layout.max_seq_len {
-            return LenOverflowSnafu {
-                layer_idx,
-                current,
-                n_new: n_k,
-                max_seq_len: self.layout.max_seq_len,
-            }
-            .fail();
-        }
         let row_bytes = self.layout.row_bytes();
-        let off = current.checked_mul(row_bytes).ok_or_else(|| {
-            FlatArithmeticSnafu {
-                operation: "append offset",
-            }
-            .build()
-        })?;
-        let append_bytes = n_k.checked_mul(row_bytes).ok_or_else(|| {
-            FlatArithmeticSnafu {
-                operation: "append byte count",
-            }
-            .build()
-        })?;
-        let end = off.checked_add(append_bytes).ok_or_else(|| {
-            FlatArithmeticSnafu {
-                operation: "append end offset",
-            }
-            .build()
-        })?;
+        let span = append_span(layer_idx, current, n_k, row_bytes, self.layout.max_seq_len)?;
+        let AppendSpan {
+            next_len: next,
+            offset: off,
+            end,
+        } = span;
         let buffer_bytes = self.layout.buffer_bytes();
         let shape_err = || {
             ShapeMismatchSnafu {

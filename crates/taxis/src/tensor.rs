@@ -35,7 +35,9 @@ impl Tensor {
     ///
     /// # Errors
     ///
-    /// [`Error::ShapeMismatch`] when storage length disagrees with shape.
+    /// [`Error::ShapeMismatch`] when storage length disagrees with shape, or
+    /// [`Error::GeometryOverflow`] when the shape or canonical layout cannot
+    /// be represented.
     pub fn from_cpu(storage: CpuStorage, shape: Shape) -> Result<Self> {
         let elem_count = shape.checked_elem_count()?;
         if storage.len() != elem_count {
@@ -64,6 +66,8 @@ impl Tensor {
     /// # Errors
     ///
     /// [`Error::ShapeMismatch`] when data length disagrees with shape.
+    /// [`Error::GeometryOverflow`] before any device operation when the shape
+    /// or canonical layout cannot be represented.
     /// [`Error::Hip`] on device allocation or copy failure.
     pub fn from_host_f32(device: &Device, data: &[f32], shape: Shape) -> Result<Self> {
         Self::from_host_typed(device, data, shape, DType::F32)
@@ -104,8 +108,8 @@ impl Tensor {
             }
             .fail();
         }
-        let storage = HipStorage::from_host(device, dtype, data)?;
         let layout = Layout::contiguous(shape)?;
+        let storage = HipStorage::from_host(device, dtype, data)?;
         Ok(Self {
             inner: Arc::new(TensorInner {
                 dtype,
@@ -119,11 +123,13 @@ impl Tensor {
     ///
     /// # Errors
     ///
+    /// [`Error::GeometryOverflow`] before allocation when the shape or
+    /// canonical layout cannot be represented.
     /// [`Error::Hip`] on allocation or zero-fill failure.
     pub fn zeros_hip(device: &Device, dtype: DType, shape: Shape) -> Result<Self> {
         let elem = shape.checked_elem_count()?;
-        let storage = HipStorage::alloc(device, dtype, elem)?;
         let layout = Layout::contiguous(shape)?;
+        let storage = HipStorage::alloc(device, dtype, elem)?;
         Ok(Self {
             inner: Arc::new(TensorInner {
                 dtype,
@@ -157,8 +163,12 @@ impl Tensor {
         self.inner.layout.dims()
     }
 
-    /// Element count.
-    #[must_use]
+    /// Return this tensor's exact element count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::GeometryOverflow`] if the tensor shape cannot be
+    /// represented.
     pub fn checked_elem_count(&self) -> Result<usize> {
         self.inner.layout.checked_elem_count()
     }
@@ -330,5 +340,14 @@ mod tests {
         // storage/shape validation boundary.
         let result = Tensor::from_cpu(CpuStorage::F32(vec![1.0, 2.0, 3.0]), Shape::new(&[2, 2]));
         assert!(matches!(result, Err(Error::ShapeMismatch { .. })));
+    }
+
+    #[test]
+    fn from_cpu_rejects_empty_shape_with_overflowing_reverse_stride() {
+        let result = Tensor::from_cpu(
+            CpuStorage::F32(Vec::new()),
+            Shape::new(&[0, usize::MAX, usize::MAX]),
+        );
+        assert!(matches!(result, Err(Error::GeometryOverflow { .. })));
     }
 }
