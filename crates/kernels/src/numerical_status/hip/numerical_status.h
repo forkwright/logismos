@@ -27,7 +27,7 @@ __device__ inline void logismos_status_or(std::uint32_t* status, std::uint32_t b
     }
 }
 
-__device__ inline void logismos_status_input(float value, std::uint32_t* status)
+__device__ inline float logismos_status_input(float value, std::uint32_t* status)
 {
     if (logismos_status_is_subnormal(value)) {
         logismos_status_or(status, LOGISMOS_NUMERICAL_STATUS_INPUT_SUBNORMAL);
@@ -35,6 +35,7 @@ __device__ inline void logismos_status_input(float value, std::uint32_t* status)
     if (logismos_status_is_nonfinite(value)) {
         logismos_status_or(status, LOGISMOS_NUMERICAL_STATUS_INPUT_NONFINITE);
     }
+    return value;
 }
 
 __device__ inline void logismos_status_f16_input_bits(std::uint16_t bits, std::uint32_t* status)
@@ -49,7 +50,7 @@ __device__ inline void logismos_status_f16_input_bits(std::uint16_t bits, std::u
     }
 }
 
-__device__ inline void logismos_status_result(float value, std::uint32_t* status)
+__device__ inline float logismos_status_result(float value, std::uint32_t* status)
 {
     if (logismos_status_is_subnormal(value)) {
         logismos_status_or(status, LOGISMOS_NUMERICAL_STATUS_ARITHMETIC_SUBNORMAL);
@@ -57,11 +58,12 @@ __device__ inline void logismos_status_result(float value, std::uint32_t* status
     if (logismos_status_is_nonfinite(value)) {
         logismos_status_or(status, LOGISMOS_NUMERICAL_STATUS_ARITHMETIC_NONFINITE);
     }
+    return value;
 }
 
-__device__ inline void logismos_status_arithmetic_operand(float value, std::uint32_t* status)
+__device__ inline float logismos_status_arithmetic_operand(float value, std::uint32_t* status)
 {
-    logismos_status_result(value, status);
+    return logismos_status_result(value, status);
 }
 
 __device__ inline float logismos_status_add(float left, float right, std::uint32_t* status)

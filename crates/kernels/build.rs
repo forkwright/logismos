@@ -40,6 +40,8 @@ struct HipBuildConfiguration {
 fn main() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(logismos_no_gpu_kernels)");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/numerical_status/codes.rs");
+    println!("cargo:rerun-if-changed=src/numerical_status/hip/numerical_status.h");
     // Re-run on any .hip or .cpp change under src/.
     for entry in walk_sources(&PathBuf::from("src")) {
         println!("cargo:rerun-if-changed={}", entry.display());
