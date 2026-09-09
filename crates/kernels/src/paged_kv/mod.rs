@@ -559,6 +559,9 @@ mod tests {
         assert_eq!(&keys[row_start..row_start + key.len()], key);
         assert_eq!(&values[row_start..row_start + value.len()], value);
 
+        let signed_zero = reference_offset(0, 2, 0, 0, layout);
+        keys[signed_zero] = -0.0;
+        values[signed_zero] = -0.0;
         let before_tail_keys = keys.clone();
         let before_tail_values = values.clone();
         reference_copy_tail(&mut keys, &mut values, layout, 2, 3, 6);
@@ -567,14 +570,26 @@ mod tests {
                 for column in 0..layout.row_width() {
                     let source = reference_offset(layer, 2, token, column, layout);
                     let destination = reference_offset(layer, 3, token, column, layout);
-                    assert_eq!(keys[destination], before_tail_keys[source]);
-                    assert_eq!(values[destination], before_tail_values[source]);
+                    assert_eq!(
+                        keys[destination].to_bits(),
+                        before_tail_keys[source].to_bits()
+                    );
+                    assert_eq!(
+                        values[destination].to_bits(),
+                        before_tail_values[source].to_bits()
+                    );
                 }
             }
         }
         let untouched = reference_offset(1, 3, 6, 0, layout);
-        assert_eq!(keys[untouched], before_tail_keys[untouched]);
-        assert_eq!(values[untouched], before_tail_values[untouched]);
+        assert_eq!(
+            keys[untouched].to_bits(),
+            before_tail_keys[untouched].to_bits()
+        );
+        assert_eq!(
+            values[untouched].to_bits(),
+            before_tail_values[untouched].to_bits()
+        );
         let mut table = vec![0_u32; 3];
         reference_write_table(&mut table, 1, 3);
         assert_eq!(table, [0, 3, 0]);
@@ -582,11 +597,9 @@ mod tests {
     }
 
     #[test]
-    fn layout_refuses_noncanonical_page_and_overflowing_backing()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn layout_refuses_noncanonical_page_and_overflowing_backing() {
         assert!(PagedKvNativeLayout::try_from_dimensions(1, 1, 12, 1).is_err());
         assert!(PagedKvNativeLayout::try_from_dimensions(usize::MAX, 1, 8, 1).is_err());
-        Ok(())
     }
 
     #[test]
