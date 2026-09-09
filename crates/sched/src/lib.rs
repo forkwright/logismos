@@ -494,10 +494,7 @@ struct Admission {
 #[derive(Debug)]
 enum AdmissionLease {
     Legacy(ReservationLease),
-    Native {
-        resident: DeviceByteLease,
-        device_id: String,
-    },
+    Native { resident: DeviceByteLease },
 }
 
 #[derive(Debug)]
@@ -512,6 +509,26 @@ struct NativeUseRecord {
 struct NativeResultRecord {
     retained_device: Option<DeviceByteLease>,
     retained_host: Option<HostResultLease>,
+}
+
+#[derive(Debug)]
+struct PreparedNativeUse {
+    admission_id: u64,
+    use_id: u64,
+    next_use_id: u64,
+    next_host_reserved: u64,
+    device_id: String,
+    next_uses: usize,
+    resident: ResidentHandle,
+}
+
+#[derive(Debug)]
+struct PreparedNativeFinish {
+    admission_id: u64,
+    next_uses: usize,
+    next_state: AdmissionState,
+    result_id: Option<u64>,
+    next_result_id: u64,
 }
 
 #[derive(Debug)]
@@ -800,10 +817,7 @@ impl Scheduler {
         self.admissions.insert(
             admission_id,
             Admission {
-                lease: AdmissionLease::Native {
-                    resident,
-                    device_id: request.device_id,
-                },
+                lease: AdmissionLease::Native { resident },
                 state: AdmissionState::Loading,
                 active_uses: 0,
             },
@@ -1270,83 +1284,31 @@ impl Scheduler {
         self.ensure_current(ticket.generation)?;
         self.ensure_not_revoked()?;
         self.ensure_custody_capacity()?;
-        let use_id = self.next_native_use_id;
-        let next_use_id = use_id
-            .checked_add(1)
-            .ok_or(SchedulerError::IdentifierOverflow {
-                kind: "native use permit",
-                location: error_location(),
-            })?;
-        let requested_host_bytes = request
-            .retained_host_bytes
-            .map_or(0, RequestedHostBytes::get);
-        let next_host_reserved = self
-            .host_result_reserved
-            .checked_add(requested_host_bytes)
-            .ok_or(SchedulerError::NativeHostResultArithmeticOverflow {
-                location: error_location(),
-            })?;
-        if next_host_reserved > self.host_result_envelope.retained_bytes {
-            return Err(SchedulerError::NativeHostResultExhausted {
-                required_bytes: requested_host_bytes,
-                available_bytes: self
-                    .host_result_envelope
-                    .retained_bytes
-                    .saturating_sub(self.host_result_reserved),
-                location: error_location(),
-            });
-        }
-        let (device_id, next_uses, resident) =
-            {
-                let admission = self.admissions.get(&ticket.admission_id).ok_or(
-                    SchedulerError::UnknownAdmission {
-                        location: error_location(),
-                    },
-                )?;
-                let AdmissionLease::Native { device_id, .. } = &admission.lease else {
-                    return Err(SchedulerError::AdmissionNotResident {
-                        location: error_location(),
-                    });
-                };
-                let resident = match &admission.state {
-                    AdmissionState::Resident(resident) | AdmissionState::InUse(resident) => {
-                        resident.clone()
-                    }
-                    _ => {
-                        return Err(SchedulerError::AdmissionNotResident {
-                            location: error_location(),
-                        });
-                    }
-                };
-                let next_uses = admission.active_uses.checked_add(1).ok_or(
-                    SchedulerError::IdentifierOverflow {
-                        kind: "active native use",
-                        location: error_location(),
-                    },
-                )?;
-                (device_id.clone(), next_uses, resident)
-            };
-        let (mutable_device, retained_device) = self
-            .ledger
-            .reserve_bytes_batch(
-                &device_id,
-                request.mutable_device_bytes,
-                request
-                    .retained_device_bytes
-                    .map(|bytes| (device_id.as_str(), bytes)),
-            )
-            .map_err(native_device_error)?;
-        let admission = self.admissions.get_mut(&ticket.admission_id).ok_or(
-            SchedulerError::UnknownAdmission {
-                location: error_location(),
-            },
-        )?;
-        admission.active_uses = next_uses;
-        admission.state = AdmissionState::InUse(resident);
+        let prepared = self.prepare_native_use(ticket, request)?;
+        let (mutable_device, retained_device) = {
+            let (admissions, ledger) = (&mut self.admissions, &mut self.ledger);
+            let admission = admissions.get_mut(&prepared.admission_id).ok_or(
+                SchedulerError::UnknownAdmission {
+                    location: error_location(),
+                },
+            )?;
+            let leases = ledger
+                .reserve_bytes_batch(
+                    &prepared.device_id,
+                    request.mutable_device_bytes,
+                    request
+                        .retained_device_bytes
+                        .map(|bytes| (prepared.device_id.as_str(), bytes)),
+                )
+                .map_err(native_device_error)?;
+            admission.active_uses = prepared.next_uses;
+            admission.state = AdmissionState::InUse(prepared.resident);
+            leases
+        };
         self.native_uses.insert(
-            use_id,
+            prepared.use_id,
             NativeUseRecord {
-                admission_id: ticket.admission_id,
+                admission_id: prepared.admission_id,
                 mutable_device,
                 retained_device,
                 retained_host: request
@@ -1354,11 +1316,11 @@ impl Scheduler {
                     .map(|requested| HostResultLease { requested }),
             },
         );
-        self.host_result_reserved = next_host_reserved;
-        self.next_native_use_id = next_use_id;
+        self.host_result_reserved = prepared.next_host_reserved;
+        self.next_native_use_id = prepared.next_use_id;
         Ok(NativeUsePermit {
             brand: Arc::clone(&self.brand),
-            value: use_id,
+            value: prepared.use_id,
         })
     }
 
@@ -1379,80 +1341,50 @@ impl Scheduler {
         permit: &NativeUsePermit,
     ) -> Result<Option<NativeResultLease>, SchedulerError> {
         self.ensure_local(&permit.brand, "native use permit")?;
-        let record =
-            self.native_uses
-                .get(&permit.value)
-                .ok_or(SchedulerError::UnknownUsePermit {
+        let prepared = self.prepare_native_finish(permit.value)?;
+        let brand = Arc::clone(&self.brand);
+        let result = {
+            let (admissions, native_uses, native_results, ledger) = (
+                &mut self.admissions,
+                &mut self.native_uses,
+                &mut self.native_results,
+                &mut self.ledger,
+            );
+            let admission = admissions.get_mut(&prepared.admission_id).ok_or(
+                SchedulerError::UnknownAdmission {
                     location: error_location(),
-                })?;
-        let creates_result = record.retained_device.is_some() || record.retained_host.is_some();
-        let result_id = if creates_result {
-            Some(self.next_native_result_id)
-        } else {
-            None
-        };
-        let next_result_id = if creates_result {
-            self.next_native_result_id
-                .checked_add(1)
-                .ok_or(SchedulerError::IdentifierOverflow {
-                    kind: "native result lease",
-                    location: error_location(),
-                })?
-        } else {
-            self.next_native_result_id
-        };
-        let admission =
-            self.admissions
-                .get(&record.admission_id)
-                .ok_or(SchedulerError::UnknownAdmission {
-                    location: error_location(),
-                })?;
-        let next_uses =
-            admission
-                .active_uses
-                .checked_sub(1)
-                .ok_or(SchedulerError::UnknownUsePermit {
-                    location: error_location(),
-                })?;
-        let next_state = native_finished_state(&admission.state, next_uses, self.revoked)?;
-        let mut record =
-            self.native_uses
-                .remove(&permit.value)
-                .ok_or(SchedulerError::UnknownUsePermit {
-                    location: error_location(),
-                })?;
-        match self.ledger.release_bytes(record.mutable_device) {
-            Ok(()) => {}
-            Err(failure) => {
+                },
+            )?;
+            let mut record =
+                native_uses
+                    .remove(&permit.value)
+                    .ok_or(SchedulerError::UnknownUsePermit {
+                        location: error_location(),
+                    })?;
+            if let Err(failure) = ledger.release_bytes(record.mutable_device) {
                 let (reason, lease) = failure.into_parts();
                 record.mutable_device = lease;
-                self.native_uses.insert(permit.value, record);
+                native_uses.insert(permit.value, record);
                 return Err(native_device_error(reason));
             }
-        }
-        let admission = self.admissions.get_mut(&record.admission_id).ok_or(
-            SchedulerError::UnknownAdmission {
-                location: error_location(),
-            },
-        )?;
-        admission.active_uses = next_uses;
-        admission.state = next_state;
-        self.next_native_result_id = next_result_id;
-        if let Some(result_id) = result_id {
-            self.native_results.insert(
-                result_id,
-                NativeResultRecord {
-                    retained_device: record.retained_device,
-                    retained_host: record.retained_host,
-                },
-            );
-            Ok(Some(NativeResultLease {
-                brand: Arc::clone(&self.brand),
-                value: result_id,
-            }))
-        } else {
-            Ok(None)
-        }
+            admission.active_uses = prepared.next_uses;
+            admission.state = prepared.next_state;
+            prepared.result_id.map(|result_id| {
+                native_results.insert(
+                    result_id,
+                    NativeResultRecord {
+                        retained_device: record.retained_device,
+                        retained_host: record.retained_host,
+                    },
+                );
+                NativeResultLease {
+                    brand,
+                    value: result_id,
+                }
+            })
+        };
+        self.next_native_result_id = prepared.next_result_id;
+        Ok(result)
     }
 
     /// Retain all native-use charges after a teardown outcome becomes uncertain.
@@ -1562,6 +1494,119 @@ impl Scheduler {
         }
         self.host_result_reserved = next_host_reserved;
         Ok(())
+    }
+
+    fn prepare_native_use(
+        &self,
+        ticket: &AdmissionTicket,
+        request: NativeUseRequest,
+    ) -> Result<PreparedNativeUse, SchedulerError> {
+        let use_id = self.next_native_use_id;
+        let next_use_id = use_id
+            .checked_add(1)
+            .ok_or(SchedulerError::IdentifierOverflow {
+                kind: "native use permit",
+                location: error_location(),
+            })?;
+        let next_host_reserved = self.next_host_result_reservation(request.retained_host_bytes)?;
+        let admission =
+            self.admissions
+                .get(&ticket.admission_id)
+                .ok_or(SchedulerError::UnknownAdmission {
+                    location: error_location(),
+                })?;
+        let AdmissionLease::Native { resident } = &admission.lease else {
+            return Err(SchedulerError::AdmissionNotResident {
+                location: error_location(),
+            });
+        };
+        let resident = native_active_resident(&admission.state)?;
+        let next_uses =
+            admission
+                .active_uses
+                .checked_add(1)
+                .ok_or(SchedulerError::IdentifierOverflow {
+                    kind: "active native use",
+                    location: error_location(),
+                })?;
+        Ok(PreparedNativeUse {
+            admission_id: ticket.admission_id,
+            use_id,
+            next_use_id,
+            next_host_reserved,
+            device_id: resident.device_id().to_owned(),
+            next_uses,
+            resident,
+        })
+    }
+
+    fn next_host_result_reservation(
+        &self,
+        retained_host: Option<RequestedHostBytes>,
+    ) -> Result<u64, SchedulerError> {
+        let requested_bytes = retained_host.map_or(0, RequestedHostBytes::get);
+        let next_reserved = self
+            .host_result_reserved
+            .checked_add(requested_bytes)
+            .ok_or(SchedulerError::NativeHostResultArithmeticOverflow {
+                location: error_location(),
+            })?;
+        if next_reserved > self.host_result_envelope.retained_bytes {
+            return Err(SchedulerError::NativeHostResultExhausted {
+                required_bytes: requested_bytes,
+                available_bytes: self
+                    .host_result_envelope
+                    .retained_bytes
+                    .saturating_sub(self.host_result_reserved),
+                location: error_location(),
+            });
+        }
+        Ok(next_reserved)
+    }
+
+    fn prepare_native_finish(
+        &self,
+        permit_id: u64,
+    ) -> Result<PreparedNativeFinish, SchedulerError> {
+        let record = self
+            .native_uses
+            .get(&permit_id)
+            .ok_or(SchedulerError::UnknownUsePermit {
+                location: error_location(),
+            })?;
+        let result_id = (record.retained_device.is_some() || record.retained_host.is_some())
+            .then_some(self.next_native_result_id);
+        let next_result_id = match result_id {
+            Some(identifier) => {
+                identifier
+                    .checked_add(1)
+                    .ok_or(SchedulerError::IdentifierOverflow {
+                        kind: "native result lease",
+                        location: error_location(),
+                    })?
+            }
+            None => self.next_native_result_id,
+        };
+        let admission =
+            self.admissions
+                .get(&record.admission_id)
+                .ok_or(SchedulerError::UnknownAdmission {
+                    location: error_location(),
+                })?;
+        let next_uses =
+            admission
+                .active_uses
+                .checked_sub(1)
+                .ok_or(SchedulerError::UnknownUsePermit {
+                    location: error_location(),
+                })?;
+        Ok(PreparedNativeFinish {
+            admission_id: record.admission_id,
+            next_uses,
+            next_state: native_finished_state(&admission.state, next_uses, self.revoked)?,
+            result_id,
+            next_result_id,
+        })
     }
 
     fn ensure_native_loading(&self, admission_id: u64) -> Result<(), SchedulerError> {
@@ -1871,20 +1916,14 @@ impl Scheduler {
                     Err(placement_error(reason))
                 }
             },
-            AdmissionLease::Native {
-                resident,
-                device_id,
-            } => match self.ledger.release_bytes(resident) {
+            AdmissionLease::Native { resident } => match self.ledger.release_bytes(resident) {
                 Ok(()) => Ok(()),
                 Err(failure) => {
                     let (reason, resident) = failure.into_parts();
                     self.admissions.insert(
                         admission_id,
                         Admission {
-                            lease: AdmissionLease::Native {
-                                resident,
-                                device_id,
-                            },
+                            lease: AdmissionLease::Native { resident },
                             state,
                             active_uses,
                         },
@@ -1930,6 +1969,17 @@ fn native_finished_state(
         AdmissionState::Quarantined { resident } => Ok(AdmissionState::Quarantined {
             resident: resident.clone(),
         }),
+        _ => Err(SchedulerError::AdmissionNotResident {
+            location: error_location(),
+        }),
+    }
+}
+
+fn native_active_resident(state: &AdmissionState) -> Result<ResidentHandle, SchedulerError> {
+    match state {
+        AdmissionState::Resident(resident) | AdmissionState::InUse(resident) => {
+            Ok(resident.clone())
+        }
         _ => Err(SchedulerError::AdmissionNotResident {
             location: error_location(),
         }),
@@ -1999,18 +2049,18 @@ mod tests {
     }
 
     fn requested_device_bytes(bytes: u64) -> Result<RequestedDeviceBytes, SchedulerError> {
-        let bytes =
-            NonZeroU64::new(bytes).ok_or(SchedulerError::NativeHostResultArithmeticOverflow {
-                location: error_location(),
-            })?;
+        let bytes = NonZeroU64::new(bytes).ok_or(SchedulerError::InvalidLimit {
+            field: "requested_device_bytes",
+            location: error_location(),
+        })?;
         Ok(RequestedDeviceBytes::new(bytes))
     }
 
     fn requested_host_bytes(bytes: u64) -> Result<RequestedHostBytes, SchedulerError> {
-        let bytes =
-            NonZeroU64::new(bytes).ok_or(SchedulerError::NativeHostResultArithmeticOverflow {
-                location: error_location(),
-            })?;
+        let bytes = NonZeroU64::new(bytes).ok_or(SchedulerError::InvalidLimit {
+            field: "requested_host_bytes",
+            location: error_location(),
+        })?;
         Ok(RequestedHostBytes::new(bytes))
     }
 
