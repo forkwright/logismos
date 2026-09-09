@@ -3,8 +3,8 @@
 use hipcore::{Device, DeviceBuffer};
 
 use crate::qwen35::tests::{
-    CanonicalHybridOracle, assert_f32_matches_f64, canonical_hybrid_fixture_with_context,
-    verify_fixture,
+    CanonicalHybridOracle, assert_f32_matches_f64,
+    canonical_hybrid_fixture_with_context_and_rotary, verify_fixture,
 };
 use crate::{Qwen35NativeLayerPlan, Qwen35NativeLayerSessionState, Qwen35Weights};
 
@@ -14,10 +14,10 @@ const WITNESS_STEPS: usize = 9;
 
 /// Build deterministic, varied full-block rows without leaving the native f32 domain.
 ///
-/// The canonical fixture stores bounded finite normal-or-zero f32 weights; these
-/// small normal inputs and its bounded mRoPE positions keep this reserved
-/// witness within the unsafe kernels' declared numerical domain. This is a
-/// fixture precondition, not a production final-value scan or a hardware claim.
+/// The canonical fixture explicitly uses bounded finite normal-or-zero f32
+/// weights, partial mRoPE, and positions below sixteen; these small normal
+/// inputs are the reviewed bounded fixture precondition for the unsafe kernel
+/// domain. They are not a production final-value scan or a hardware claim.
 fn witness_input(position: usize, width: usize) -> Vec<f32> {
     const VALUES: [f32; 3] = [0.25, -0.5, 0.75];
     (0..width)
@@ -26,14 +26,14 @@ fn witness_input(position: usize, width: usize) -> Vec<f32> {
 }
 
 #[test]
-#[ignore = "requires an operator-reserved HIP device; source tests do not qualify hardware"]
+#[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
 fn reserved_device_native_full_block_matches_independent_oracle() -> core::result::Result<(), String>
 {
-    let fixture = canonical_hybrid_fixture_with_context(FIXTURE_CONTEXT)?;
+    let fixture = canonical_hybrid_fixture_with_context_and_rotary(FIXTURE_CONTEXT, Some(64))?;
     let payload = verify_fixture(&fixture)?;
     let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
     let mut oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
-    let width = oracle.hidden_width()?;
+    let width = oracle.hidden_width();
 
     let plan = Qwen35NativeLayerPlan::try_from_weights(
         &weights,
@@ -43,8 +43,10 @@ fn reserved_device_native_full_block_matches_independent_oracle() -> core::resul
     )
     .map_err(|error| error.to_string())?;
     let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
-    // SAFETY: this ignored operator-only witness supplies the plan's verified
-    // weights and bounded fixture values to its qualified native device.
+    // SAFETY: the operator reserves visible gfx1100 device 0 before explicitly
+    // invoking this ignored witness. The plan uses verified weights and the
+    // bounded fixture supplies its numerical-domain preconditions; this test
+    // does not establish device qualification.
     let mut session = unsafe { plan.into_session(&device) }.map_err(|error| error.to_string())?;
 
     for position in 0..WITNESS_STEPS {
@@ -57,8 +59,8 @@ fn reserved_device_native_full_block_matches_independent_oracle() -> core::resul
         let input = DeviceBuffer::from_host(&device, &input)
             .map_err(|error| format!("upload native full-block input {position}: {error}"))?;
         // SAFETY: the fresh input is a live one-row allocation on the session
-        // device. Fixture construction establishes the declared finite
-        // normal-or-zero input, weight, control, and intermediate domain.
+        // device. The bounded fixture supplies the declared finite
+        // normal-or-zero numerical-domain preconditions.
         let output = unsafe { session.step(input) }
             .map_err(|error| format!("native full-block step {position}: {error}"))?;
         let mut actual = vec![0.0_f32; width];

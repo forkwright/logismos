@@ -505,8 +505,8 @@ fn mixed_quantized_hybrid_execution_matches_independent_f64_oracle_and_rolls_bac
 fn canonical_full_block_oracle_falsifies_native_layer_mutations() -> std::result::Result<(), String>
 {
     let fixture = canonical_hybrid_fixture_with_context(16)?;
-    let width = OracleLayout::from_fixture(&fixture)?.hidden;
     let mut canonical = CanonicalHybridOracle::from_fixture(&fixture)?;
+    let width = canonical.hidden_width();
     let mut without_ffn = CanonicalHybridOracle::from_fixture(&fixture)?.without_ffn();
     let mut without_attention =
         CanonicalHybridOracle::from_fixture(&fixture)?.without_full_attention();
@@ -1363,7 +1363,14 @@ pub(crate) fn canonical_hybrid_fixture() -> std::result::Result<Fixture, String>
 pub(crate) fn canonical_hybrid_fixture_with_context(
     context: usize,
 ) -> std::result::Result<Fixture, String> {
-    let mut fixture = canonical_hybrid_fixture()?;
+    canonical_hybrid_fixture_with_context_and_rotary(context, None)
+}
+
+pub(crate) fn canonical_hybrid_fixture_with_context_and_rotary(
+    context: usize,
+    n_rot: Option<u64>,
+) -> std::result::Result<Fixture, String> {
+    let mut fixture = canonical_hybrid_fixture_with_n_rot(n_rot)?;
     set_u32(
         &mut fixture,
         "qwen35.context_length",
