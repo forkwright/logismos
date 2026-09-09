@@ -302,4 +302,19 @@ pub enum Error {
         #[snafu(implicit)]
         location: snafu::Location,
     },
+
+    /// A stream does not belong to this native cache pool's process-local device.
+    #[cfg(feature = "gpu")]
+    #[snafu(display(
+        "cache: native paged-KV stream device {actual} does not match pool device {expected}"
+    ))]
+    PagedNativeDeviceMismatch {
+        /// Process-local ordinal of the pool's device.
+        expected: std::ffi::c_int,
+        /// Process-local ordinal of the supplied stream's device.
+        actual: std::ffi::c_int,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }

@@ -9,8 +9,6 @@ use hipcore::{Device, DeviceBuffer, Stream};
 #[cfg(feature = "gpu")]
 use kernels::attention::{NativePageTokens, NativePagedDecodePlan};
 
-#[cfg(feature = "gpu")]
-use crate::error::PagedNativePoisonedSnafu;
 use crate::error::{
     PagedAllocationSnafu, PagedAppendTokenOutOfRangeSnafu, PagedArithmeticSnafu,
     PagedCapacitySnafu, PagedContextOverflowSnafu, PagedEmptyAppendSnafu,
@@ -18,6 +16,8 @@ use crate::error::{
     PagedReadBeyondVisibleSnafu, PagedRowWidthSnafu, PagedWriteOrderSnafu, PagedZeroDimensionSnafu,
     Result,
 };
+#[cfg(feature = "gpu")]
+use crate::error::{PagedNativeDeviceMismatchSnafu, PagedNativePoisonedSnafu};
 
 /// Geometry shared by an execution plan and its private KV allocation.
 #[derive(Clone, Copy, Debug)]
@@ -971,6 +971,7 @@ impl NativePagedKvPool {
         stream: &Stream,
     ) -> Result<NativePagedAppend<'_>> {
         self.ensure_not_poisoned()?;
+        self.ensure_stream_device(stream)?;
         let reservation = self.ledger.begin_append(append_tokens)?;
         let prepared = unsafe { self.prepare_device_append(&reservation, stream) };
         if let Err(error) = prepared {
@@ -993,6 +994,10 @@ impl NativePagedKvPool {
             return PagedNativePoisonedSnafu.fail();
         }
         Ok(())
+    }
+
+    fn ensure_stream_device(&self, stream: &Stream) -> Result<()> {
+        ensure_same_process_device(self.keys.device().ordinal(), stream.device().ordinal())
     }
 
     unsafe fn prepare_device_append(
@@ -1078,6 +1083,7 @@ impl NativePagedAppend<'_> {
         stream: &Stream,
     ) -> Result<()> {
         self.pool.ensure_not_poisoned()?;
+        self.pool.ensure_stream_device(stream)?;
         let location = self
             .pool
             .ledger
@@ -1190,6 +1196,7 @@ impl NativePagedLayerKv<'_> {
         output_elements: usize,
         stream: &Stream,
     ) -> Result<()> {
+        self.pool.ensure_stream_device(stream)?;
         validate_native_attention_binding(self.pool.plan, self.tokens, plan)?;
         let layer_offset = self
             .layer
@@ -1221,6 +1228,14 @@ impl NativePagedLayerKv<'_> {
         };
         Ok(())
     }
+}
+
+#[cfg(feature = "gpu")]
+fn ensure_same_process_device(expected: std::ffi::c_int, actual: std::ffi::c_int) -> Result<()> {
+    if expected != actual {
+        return PagedNativeDeviceMismatchSnafu { expected, actual }.fail();
+    }
+    Ok(())
 }
 
 #[cfg(feature = "gpu")]
@@ -1725,6 +1740,20 @@ mod tests {
             Err(Error::PagedLayout { .. })
         ));
         Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn native_stream_preflight_rejects_other_process_local_device() {
+        assert!(ensure_same_process_device(3, 3).is_ok());
+        assert!(matches!(
+            ensure_same_process_device(3, 4),
+            Err(Error::PagedNativeDeviceMismatch {
+                expected: 3,
+                actual: 4,
+                ..
+            })
+        ));
     }
     #[test]
     fn boundary_capacity_and_shape_are_typed() -> Result<()> {
