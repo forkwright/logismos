@@ -38,6 +38,7 @@ extern "C" __global__ void logismos_paged_decode_q1_f32_kernel(
     const std::uint32_t heads_per_kv = query_heads / kv_heads;
     const std::uint32_t kv_head = query_head / heads_per_kv;
     const std::size_t width = static_cast<std::size_t>(head_width);
+    const std::size_t lane_index = static_cast<std::size_t>(lane);
     const std::size_t query_start = static_cast<std::size_t>(query_head) * width;
     const std::size_t output_start = query_start;
     float running_maximum = -INFINITY;
@@ -45,8 +46,11 @@ extern "C" __global__ void logismos_paged_decode_q1_f32_kernel(
 
     // INVARIANT: all lanes execute every shuffle, including lanes without an
     // output coordinate when `head_width < 32` or the width has a tail.
-    for (std::uint32_t column = lane; column < head_width; column += WAVE_WIDTH) {
-        output_f32[output_start + static_cast<std::size_t>(column)] = 0.0f;
+    // INVARIANT: `head_width` crosses the ABI as u32 but coordinates promote
+    // before every stride. On the supported 64-bit device index domain, the
+    // final `+ WAVE_WIDTH` therefore cannot wrap near u32::MAX.
+    for (std::size_t column = lane_index; column < width; column += WAVE_WIDTH) {
+        output_f32[output_start + column] = 0.0f;
     }
 
     for (std::uint32_t token = 0; token < visible_tokens; ++token) {
@@ -60,9 +64,8 @@ extern "C" __global__ void logismos_paged_decode_q1_f32_kernel(
         const std::size_t kv_start = page_base + static_cast<std::size_t>(kv_head) * width;
 
         float partial_dot = 0.0f;
-        for (std::uint32_t column = lane; column < head_width; column += WAVE_WIDTH) {
-            const std::size_t offset = static_cast<std::size_t>(column);
-            const float product = query_f32[query_start + offset] * keys_f32[kv_start + offset];
+        for (std::size_t column = lane_index; column < width; column += WAVE_WIDTH) {
+            const float product = query_f32[query_start + column] * keys_f32[kv_start + column];
             partial_dot = partial_dot + product;
         }
         // INVARIANT: the fixed tree is the native dot-reduction order.
@@ -76,18 +79,17 @@ extern "C" __global__ void logismos_paged_decode_q1_f32_kernel(
         const float prior_rescale = isinf(running_maximum) ? 0.0f : expf(running_maximum - next_maximum);
         const float token_weight = expf(score - next_maximum);
         const float next_normalizer = prior_rescale * running_normalizer + token_weight;
-        for (std::uint32_t column = lane; column < head_width; column += WAVE_WIDTH) {
-            const std::size_t offset = static_cast<std::size_t>(column);
-            const std::size_t output_index = output_start + offset;
+        for (std::size_t column = lane_index; column < width; column += WAVE_WIDTH) {
+            const std::size_t output_index = output_start + column;
             output_f32[output_index] = prior_rescale * output_f32[output_index]
-                + token_weight * values_f32[kv_start + offset];
+                + token_weight * values_f32[kv_start + column];
         }
         running_maximum = next_maximum;
         running_normalizer = next_normalizer;
     }
 
-    for (std::uint32_t column = lane; column < head_width; column += WAVE_WIDTH) {
-        const std::size_t output_index = output_start + static_cast<std::size_t>(column);
+    for (std::size_t column = lane_index; column < width; column += WAVE_WIDTH) {
+        const std::size_t output_index = output_start + column;
         output_f32[output_index] = output_f32[output_index] / running_normalizer;
     }
 }

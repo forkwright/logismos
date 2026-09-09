@@ -257,14 +257,14 @@ pub enum PagedDecodeError {
         location: snafu::Location,
     },
 
-    /// An exact f32 span or allocation extent cannot form a Rust layout.
+    /// An exact span or allocation extent cannot form a Rust layout.
     #[snafu(display(
-        "{PAGED_DECODE}: {allocation} layout for {elements} f32 elements is unrepresentable"
+        "{PAGED_DECODE}: {allocation} layout for {elements} elements is unrepresentable"
     ))]
     AllocationLayout {
         /// Span or allocation role.
         allocation: &'static str,
-        /// Exact requested f32 element count.
+        /// Exact requested element count.
         elements: usize,
         /// Layout failure reported by the standard library.
         source: std::alloc::LayoutError,
@@ -525,7 +525,11 @@ fn reserve_f32(allocation: &'static str, elements: usize) -> PagedDecodeResult<V
 }
 
 fn validate_f32_layout(allocation: &'static str, elements: usize) -> PagedDecodeResult<()> {
-    std::alloc::Layout::array::<f32>(elements).context(AllocationLayoutSnafu {
+    validate_layout::<f32>(allocation, elements)
+}
+
+fn validate_layout<T>(allocation: &'static str, elements: usize) -> PagedDecodeResult<()> {
+    std::alloc::Layout::array::<T>(elements).context(AllocationLayoutSnafu {
         allocation,
         elements,
     })?;
@@ -614,9 +618,9 @@ impl NativePageTokens {
 ///
 /// Keys and values are separate dense `f32` arrays with logical layout
 /// `[physical_page][in_page_token][kv_head][head_width]`. `page_table` has
-/// one `u32` physical-page index per logical page. The descriptor checks
-/// pointer extents and ABI dimensions, but cannot inspect device table values
-/// or scalar contents.
+/// one `u32` physical-page index per logical page. The descriptor eagerly
+/// checks dense K/V and table allocation layouts plus ABI dimensions, but
+/// cannot inspect device table values or scalar contents.
 #[cfg(feature = "gpu")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NativePagedDecodePlan {
@@ -636,7 +640,8 @@ impl NativePagedDecodePlan {
     /// # Errors
     ///
     /// Returns [`PagedDecodeError`] when the requested native page size is not
-    /// B8/B16/B32, physical-page count is zero, or any native extent overflows.
+    /// B8/B16/B32, physical-page count is zero, a native extent overflows, or
+    /// a dense K/V or table allocation layout is unrepresentable.
     pub fn try_from_paged_decode(
         logical: PagedDecodePlan,
         page_tokens: usize,
@@ -665,6 +670,9 @@ impl NativePagedDecodePlan {
             logical.row_elements(),
             "physical_pages * page_tokens * kv_heads * head_width",
         )?;
+        validate_f32_layout("native keys", key_value_elements)?;
+        validate_f32_layout("native values", key_value_elements)?;
+        validate_layout::<u32>("native page table", logical_pages)?;
         Ok(Self {
             logical,
             page_tokens,
@@ -1256,6 +1264,20 @@ mod tests {
             NativePagedDecodePlan::try_from_paged_decode(logical, 12, 1),
             Err(PagedDecodeError::NativePageTokensUnsupported { .. })
         ));
+        let native_layout_overflow =
+            isize::MAX as usize / (core::mem::size_of::<f32>() * NativePageTokens::B8.get()) + 1;
+        let small_logical = PagedDecodePlan::try_from_dimensions(1, 1, 1, 1)?;
+        assert!(matches!(
+            NativePagedDecodePlan::try_from_paged_decode(
+                small_logical,
+                NativePageTokens::B8.get(),
+                native_layout_overflow,
+            ),
+            Err(PagedDecodeError::AllocationLayout {
+                allocation: "native keys",
+                ..
+            })
+        ));
 
         let query = 0x1000_usize as *const f32;
         let keys = 0x2000_usize as *const f32;
@@ -1294,6 +1316,27 @@ mod tests {
             ),
             Err(crate::Error::UnsupportedShape { .. })
         ));
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn wide_native_coordinate_stride_reaches_max_admitted_width_without_wrap()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        const WAVE_WIDTH: u64 = 32;
+        let width = u64::from(u32::MAX);
+        let max_width = usize::try_from(u32::MAX)?;
+        let logical = PagedDecodePlan::try_from_dimensions(1, 1, 1, max_width)?;
+        let native = NativePagedDecodePlan::try_from_paged_decode(logical, 8, 1)?;
+        assert_eq!(native.logical().head_width(), max_width);
+        for lane in [0_u64, WAVE_WIDTH - 1] {
+            let last = lane + ((width - 1 - lane) / WAVE_WIDTH) * WAVE_WIDTH;
+            let next = last
+                .checked_add(WAVE_WIDTH)
+                .ok_or("wide native coordinate stride overflowed")?;
+            assert!(last < width);
+            assert!(next >= width);
+        }
         Ok(())
     }
 
