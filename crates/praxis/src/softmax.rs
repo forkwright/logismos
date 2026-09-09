@@ -78,7 +78,10 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
     } else {
         let x_host = x.to_host_f16()?;
         let y = kernels::softmax::cpu::softmax_fp16_ref(&x_host, m, n)?;
-        Ok(Tensor::from_cpu(taxis::CpuStorage::F16(y), x.shape().clone())?)
+        Ok(Tensor::from_cpu(
+            taxis::CpuStorage::F16(y),
+            x.shape().clone(),
+        )?)
     }
 }
 
