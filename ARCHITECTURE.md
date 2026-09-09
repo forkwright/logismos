@@ -48,6 +48,9 @@ semantically respects that boundary.
   Opt-in `decoders/gpu` adds optional `hipcore`, `kernels/gpu` and `cache/gpu`
   for owned native one-block and main-model consumers; the GPU-capable facade selects it.
   Default CPU consumers and package-isolated CPU checks do not select it.
+- `hermeneus` defaults to a HIP-free graph. Its optional `gpu` feature joins
+  the existing text and native decoder owners; the GPU facade enables and
+  re-exports that execution boundary. It adds no transport or host-grant issuer.
 - `cache::paged` owns one logical KV ledger, CPU backing with borrowed row views
   and atomic append transactions, and optional separate native K/V/table backing.
   It does not own model semantics, shared-prefix identity,
@@ -381,6 +384,21 @@ it does not reconstruct identity from equal shapes or totals and does not mint
 authority. Its borrowed execution profile exposes the same weights and configured
 context ceiling for a separate shared execution owner. Cancellation is cooperative,
 so preparation may finish inertly if cancellation arrives during tokenization.
+
+`hermeneus::NativeTextResident` binds that exact pipeline to reusable immutable
+native uploads. Its effective context ceiling derives from both configured
+limits and the artifact's execution capacity. Planning consumes one prepared
+request, checks the shared profile owner, and retains a fresh exact-context
+session plan. The caller can inspect its native demand and logits-storage plan
+before acquiring request storage; equal vocabulary width is not profile identity.
+Explicit qualified execution delegates generation semantics to `text` and
+token execution to `decoders`, with per-token output release and per-use session
+teardown. Unconfirmed cleanup withholds publication and retains typed custody.
+Resident abandonment is inert, not eviction; explicit close owns its teardown.
+This lower-level boundary does not bind scheduler leases to physical owners,
+verify a current host grant, or expose a serving endpoint. Those remain separate
+integration and qualification obligations, including allocator and runtime
+overhead beyond requested extents.
 The decoder report excludes rendered text, u32 prompt/generated IDs, tokenizer
 and decoded strings; it is not a whole-request estimate or admission grant.
 
