@@ -42,11 +42,13 @@
 
 pub mod error;
 pub mod flat;
+pub mod paged;
 
 use taxis::Tensor;
 
 pub use crate::error::{Error, Result};
 pub use crate::flat::{CacheLayout, FlatKvCache};
+pub use crate::paged::{PagedKvGeometry, PagedKvPlan, PagedKvPool};
 
 /// Abstract KV-cache contract.
 ///
