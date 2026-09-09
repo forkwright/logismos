@@ -38,22 +38,16 @@ __global__ void decoder_recurrent_qk_l2_f32_kernel(
 
     float query_sum = 0.0f;
     float key_sum = 0.0f;
-    for (std::size_t column = lane; column < width; column += kWaveSize) {
-        const float query_value = convolved[source_start + column];
-        const float key_value = convolved[source_elements + source_start + column];
-        query_sum = query_sum + query_value * query_value;
-        key_sum = key_sum + key_value * key_value;
+    if (lane == 0) {
+        for (std::size_t column = 0; column < width; ++column) {
+            const float query_value = convolved[source_start + column];
+            const float key_value = convolved[source_elements + source_start + column];
+            query_sum = query_sum + query_value * query_value;
+            key_sum = key_sum + key_value * key_value;
+        }
     }
-    query_sum += __shfl_down(query_sum, 16, kWaveSize);
-    key_sum += __shfl_down(key_sum, 16, kWaveSize);
-    query_sum += __shfl_down(query_sum, 8, kWaveSize);
-    key_sum += __shfl_down(key_sum, 8, kWaveSize);
-    query_sum += __shfl_down(query_sum, 4, kWaveSize);
-    key_sum += __shfl_down(key_sum, 4, kWaveSize);
-    query_sum += __shfl_down(query_sum, 2, kWaveSize);
-    key_sum += __shfl_down(key_sum, 2, kWaveSize);
-    query_sum += __shfl_down(query_sum, 1, kWaveSize);
-    key_sum += __shfl_down(key_sum, 1, kWaveSize);
+    query_sum = __shfl(query_sum, 0, kWaveSize);
+    key_sum = __shfl(key_sum, 0, kWaveSize);
     const float query_denominator = fmaxf(sqrtf(query_sum), epsilon);
     const float key_denominator = fmaxf(sqrtf(key_sum), epsilon);
     for (std::size_t column = lane; column < width; column += kWaveSize) {

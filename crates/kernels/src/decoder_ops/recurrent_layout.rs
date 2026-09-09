@@ -22,8 +22,6 @@ use crate::error::NoGpuBuildSnafu;
 use crate::error::{Result, UnsupportedShapeSnafu};
 
 const RECURRENT_QK_L2_KERNEL: &str = "decoder_recurrent_qk_l2_f32";
-#[cfg(test)]
-const WAVE_SIZE: usize = 32;
 
 #[cfg(not(logismos_no_gpu_kernels))]
 unsafe extern "C" {
@@ -422,7 +420,7 @@ fn native_order_reference(
             .build()
         })?;
         let (query_denominator, key_denominator) =
-            native_denominators(query_source, key_source, plan.epsilon)?;
+            native_denominators(query_source, key_source, plan.epsilon);
         for value in query_source {
             query.push(*value / query_denominator);
         }
@@ -434,128 +432,19 @@ fn native_order_reference(
 }
 
 #[cfg(test)]
-fn native_denominators(query: &[f32], key: &[f32], epsilon: f32) -> Result<(f32, f32)> {
-    let mut query_lanes = [0.0_f32; WAVE_SIZE];
-    let mut key_lanes = [0.0_f32; WAVE_SIZE];
-    for lane in 0..WAVE_SIZE {
-        let mut column = lane;
-        while column < query.len() {
-            let query_value = query.get(column).copied().ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "checked Q lane source access failed".to_owned(),
-                }
-                .build()
-            })?;
-            let key_value = key.get(column).copied().ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "checked K lane source access failed".to_owned(),
-                }
-                .build()
-            })?;
-            let query_lane = query_lanes.get(lane).copied().ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "checked Q lane accumulation access failed".to_owned(),
-                }
-                .build()
-            })?;
-            let key_lane = key_lanes.get(lane).copied().ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "checked K lane accumulation access failed".to_owned(),
-                }
-                .build()
-            })?;
-            let query_slot = query_lanes.get_mut(lane).ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "checked Q lane accumulation mutation failed".to_owned(),
-                }
-                .build()
-            })?;
-            *query_slot = query_lane + query_value * query_value;
-            let key_slot = key_lanes.get_mut(lane).ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "checked K lane accumulation mutation failed".to_owned(),
-                }
-                .build()
-            })?;
-            *key_slot = key_lane + key_value * key_value;
-            column = column.checked_add(WAVE_SIZE).ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "lane-strided column overflows usize".to_owned(),
-                }
-                .build()
-            })?;
-        }
+fn native_denominators(query: &[f32], key: &[f32], epsilon: f32) -> (f32, f32) {
+    let query_sum = serial_sum_squares(query);
+    let key_sum = serial_sum_squares(key);
+    (query_sum.sqrt().max(epsilon), key_sum.sqrt().max(epsilon))
+}
+
+#[cfg(test)]
+fn serial_sum_squares(values: &[f32]) -> f32 {
+    let mut sum = 0.0_f32;
+    for value in values {
+        sum = sum + value * value;
     }
-    for offset in [16_usize, 8, 4, 2, 1] {
-        for lane in 0..offset {
-            let query_lane = query_lanes.get(lane).copied().ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "checked Q reduction access failed".to_owned(),
-                }
-                .build()
-            })?;
-            let query_peer = query_lanes.get(lane + offset).copied().ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "checked Q reduction peer access failed".to_owned(),
-                }
-                .build()
-            })?;
-            let key_lane = key_lanes.get(lane).copied().ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "checked K reduction access failed".to_owned(),
-                }
-                .build()
-            })?;
-            let key_peer = key_lanes.get(lane + offset).copied().ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "checked K reduction peer access failed".to_owned(),
-                }
-                .build()
-            })?;
-            let query_slot = query_lanes.get_mut(lane).ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "checked Q reduction mutation failed".to_owned(),
-                }
-                .build()
-            })?;
-            *query_slot = query_lane + query_peer;
-            let key_slot = key_lanes.get_mut(lane).ok_or_else(|| {
-                UnsupportedShapeSnafu {
-                    kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "checked K reduction mutation failed".to_owned(),
-                }
-                .build()
-            })?;
-            *key_slot = key_lane + key_peer;
-        }
-    }
-    let query_sum = query_lanes.first().copied().ok_or_else(|| {
-        UnsupportedShapeSnafu {
-            kernel: RECURRENT_QK_L2_KERNEL,
-            msg: "fixed Q wave has no lane zero".to_owned(),
-        }
-        .build()
-    })?;
-    let key_sum = key_lanes.first().copied().ok_or_else(|| {
-        UnsupportedShapeSnafu {
-            kernel: RECURRENT_QK_L2_KERNEL,
-            msg: "fixed K wave has no lane zero".to_owned(),
-        }
-        .build()
-    })?;
-    Ok((query_sum.sqrt().max(epsilon), key_sum.sqrt().max(epsilon)))
+    sum
 }
 
 #[cfg(test)]
@@ -631,31 +520,81 @@ mod tests {
     }
 
     #[test]
-    fn native_order_reference_covers_wave_tail_and_plan_rejects_invalid_geometry() -> Result<()> {
+    fn native_order_reference_broadcasts_serial_denominators_to_every_output_column() -> Result<()>
+    {
         let plan = RecurrentQkL2F32Plan::try_from_dimensions(77, 1, 1, 37, 1e-5)?;
         let mut convolved = vec![0.0_f32; plan.convolved_elements()];
-        for (index, value) in [1.0_f32, 2.0, 3.0].into_iter().enumerate() {
-            let column = [0_usize, 32, 36]
-                .get(index)
+        let values = [1.0_f32, 1.25, 1.5, 1.75];
+        for column in 0..plan.key_width() {
+            let value = values
+                .get(column % values.len())
                 .copied()
-                .ok_or_else(|| missing_test_slice("tail column"))?;
+                .ok_or_else(|| missing_test_slice("nonzero tail value"))?;
             let query_slot = convolved
                 .get_mut(column)
-                .ok_or_else(|| missing_test_slice("Q tail slot"))?;
+                .ok_or_else(|| missing_test_slice("Q output-tail slot"))?;
             *query_slot = value;
             let key_column = plan
                 .source_elements()
                 .checked_add(column)
-                .ok_or_else(|| missing_test_slice("K tail column"))?;
+                .ok_or_else(|| missing_test_slice("K output-tail column"))?;
             let key_slot = convolved
                 .get_mut(key_column)
-                .ok_or_else(|| missing_test_slice("K tail slot"))?;
+                .ok_or_else(|| missing_test_slice("K output-tail slot"))?;
             *key_slot = value + 1.0;
         }
         let (query, key) = native_order_reference(plan, &convolved)?;
         let (expected_query, expected_key) = f64_logical_oracle(plan, &convolved)?;
-        assert_close_f64(&query, &expected_query, "Q wave-tail native order");
-        assert_close_f64(&key, &expected_key, "K wave-tail native order");
+        assert_close_f64(&query, &expected_query, "Q output-tail native order");
+        assert_close_f64(&key, &expected_key, "K output-tail native order");
+        let query_source = convolved
+            .get(..plan.source_elements())
+            .ok_or_else(|| missing_test_slice("Q serial source"))?;
+        let key_source = convolved
+            .get(plan.source_elements()..plan.source_elements() * 2)
+            .ok_or_else(|| missing_test_slice("K serial source"))?;
+        let query_denominator = serial_sum_squares(query_source).sqrt().max(plan.epsilon());
+        let key_denominator = serial_sum_squares(key_source).sqrt().max(plan.epsilon());
+        for column in 0..plan.key_width() {
+            let query_input = query_source
+                .get(column)
+                .copied()
+                .ok_or_else(|| missing_test_slice("Q broadcast input"))?;
+            let key_input = key_source
+                .get(column)
+                .copied()
+                .ok_or_else(|| missing_test_slice("K broadcast input"))?;
+            let query_output = query
+                .get(column)
+                .copied()
+                .ok_or_else(|| missing_test_slice("Q broadcast output"))?;
+            let key_output = key
+                .get(column)
+                .copied()
+                .ok_or_else(|| missing_test_slice("K broadcast output"))?;
+            assert!(
+                (query_output - query_input / query_denominator).abs() <= f32::EPSILON,
+                "Q column {column} must use lane-zero's serial denominator"
+            );
+            assert!(
+                (key_output - key_input / key_denominator).abs() <= f32::EPSILON,
+                "K column {column} must use lane-zero's serial denominator"
+            );
+        }
+        let tail_column = plan.key_width() - 1;
+        let tail_input = query_source
+            .get(tail_column)
+            .copied()
+            .ok_or_else(|| missing_test_slice("Q tail input"))?;
+        let tail_output = query
+            .get(tail_column)
+            .copied()
+            .ok_or_else(|| missing_test_slice("Q tail output"))?;
+        let old_lane_local = tail_input / tail_input.abs();
+        assert!(
+            (tail_output - old_lane_local).abs() > F32_TOLERANCE,
+            "a tail lane must not use its local suffix denominator"
+        );
         assert!(
             RecurrentQkL2F32Plan::try_from_dimensions(4, 0, 1, 1, 1e-5).is_err(),
             "zero source head count must be rejected"
@@ -677,6 +616,20 @@ mod tests {
             "unrepresentable f32 layouts must be rejected"
         );
         Ok(())
+    }
+
+    #[test]
+    fn serial_f32_sum_preserves_the_lane_zero_accumulation_order() {
+        let values = [4_096.0_f32, 1.0, 1.0];
+        let serial = serial_sum_squares(&values);
+        let regrouped = values[1] * values[1] + values[2] * values[2] + values[0] * values[0];
+        assert_eq!(serial.to_bits(), 16_777_216.0_f32.to_bits());
+        assert_eq!(regrouped.to_bits(), 16_777_218.0_f32.to_bits());
+        assert_ne!(
+            serial.to_bits(),
+            regrouped.to_bits(),
+            "the native baseline deliberately retains serial f32 accumulation"
+        );
     }
 
     #[cfg(logismos_no_gpu_kernels)]
