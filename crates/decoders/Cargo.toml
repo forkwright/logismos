@@ -11,6 +11,8 @@ publish = false
 workspace = true
 
 [dependencies]
+# WHY: the workspace cache default enables the legacy tensor-backed flat API.
+cache = { path = "../cache", default-features = false }
 # Metadata-only observation keeps structural preflight independent of HIP/tensor decoding.
 loader = { path = "../loader", default-features = false }
 kernels = { workspace = true, default-features = false }

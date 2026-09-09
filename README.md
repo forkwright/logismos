@@ -76,11 +76,16 @@ only after a successful step. `Qwen35Weights::execution(max_context)` constructs
 token-ID session over the main hybrid blocks, with causal grouped attention, full or partial
 interleaved RoPE, recurrent state, residual/FFN composition and token-major vocabulary logits.
 Each call commits all layer state only after every input token and output projection succeeds.
+Full-attention history uses execution-private CPU pages: complete committed pages stay
+immutable, partial tails are copied before writing, and attention reads paged rows directly.
+Failed calls publish neither KV history nor recurrent state. This is not cross-session
+prefix sharing, eviction or GPU attention.
 Other unsupported formats or execution configurations fail explicitly.
 `execution_plan` additionally bounds tokens per step and selects all-token or last-token
 logits; prefill for generation need not retain a vocabulary row for every prompt token.
-Its `cpu_requirements()` reports artifact-bound logical `f32` backing: retained state,
-transaction copies, a conservative workspace upper bound, and returned logits. The allocation
+Its `cpu_requirements()` reports artifact-bound logical `f32` backing: retained state
+(including padded KV pages and the preallocated tail-copy spare), separately allocated
+recurrent transaction copies, a conservative workspace upper bound, and returned logits. The allocation
 owners consume the same named sizes. Serialized artifact bytes are separate; neither value is
 an allocation guarantee, whole-process memory estimate, GPU requirement or physical reservation.
 This CPU path does not provide NextN, serving, real-artifact quality or GPU

@@ -1,5 +1,6 @@
 //! Executor-owned logical CPU allocation requirements for Qwen3.5.
 
+use cache::PagedKvPlan;
 use loader::gguf::ArtifactDigest;
 
 use crate::error::ArithmeticOverflowSnafu;
@@ -39,12 +40,14 @@ impl Qwen35CpuRequirements {
         layout: Layout,
         max_step_tokens: usize,
         selection: Qwen35LogitSelection,
+        paged_kv_plan: Option<PagedKvPlan>,
     ) -> Result<Self> {
         let elements = Qwen35RequirementElements::try_from_layout(
             layout,
             weights.recurrent_layout(),
             max_step_tokens,
             selection,
+            paged_kv_plan,
         )?;
         Ok(Self {
             artifact_digest: weights.payload().observation().inspection().digest,
@@ -80,14 +83,19 @@ impl Qwen35CpuRequirements {
 
     /// Return retained executor `f32` backing, excluding artifact bytes.
     ///
-    /// This includes decoded recurrent parameters as well as mutable recurrent
-    /// history/state and full-attention KV state.
+    /// This includes decoded recurrent parameters, mutable recurrent history
+    /// and state, and the selected KV pool's padded maximum-context backing
+    /// plus its preallocated tail-copy spare.
     #[must_use]
     pub const fn retained_bytes(self) -> u64 {
         self.retained_bytes
     }
 
-    /// Return the staged transaction's cloned retained `f32` backing.
+    /// Return separately allocated recurrent transaction-copy `f32` backing.
+    ///
+    /// Paged KV copy-on-write uses the already-retained spare, so it adds no
+    /// allocation here. A mixed recurrent/full-attention plan therefore has
+    /// less transaction-copy backing than retained backing.
     #[must_use]
     pub const fn transaction_copy_bytes(self) -> u64 {
         self.transaction_copy_bytes
@@ -110,8 +118,9 @@ impl Qwen35CpuRequirements {
 
     /// Return the complete executor-owned logical `f32` upper bound.
     ///
-    /// This is retained state plus its staged copy, transient workspace, and
-    /// returned logits. Serialized artifact backing is deliberately separate.
+    /// This is retained backing plus separately allocated recurrent copies,
+    /// transient workspace, and returned logits. The KV pool is counted once;
+    /// serialized artifact backing is deliberately separate.
     #[must_use]
     pub const fn logical_f32_upper_bound_bytes(self) -> u64 {
         self.logical_f32_upper_bound_bytes
@@ -139,7 +148,7 @@ impl Qwen35CpuRequirements {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Qwen35RequirementElements {
     pub(crate) recurrent_layer_retained: usize,
-    pub(crate) full_layer_retained: usize,
+    pub(crate) full_attention_pool_retained: usize,
     pub(crate) retained: usize,
     pub(crate) transaction_copy: usize,
     pub(crate) recurrent_workspace: usize,
@@ -161,6 +170,7 @@ impl Qwen35RequirementElements {
         recurrent_layout: Qwen35RecurrentLayout,
         max_step_tokens: usize,
         selection: Qwen35LogitSelection,
+        paged_kv_plan: Option<PagedKvPlan>,
     ) -> Result<Self> {
         let full_layers = layout.full_layer_count();
         let recurrent_layers = layout.recurrent_layer_count()?;
@@ -169,10 +179,21 @@ impl Qwen35RequirementElements {
         } else {
             Qwen35RecurrentExecution::retained_elements(recurrent_layout, layout.epsilon())?
         };
-        let full_layer_retained = if full_layers == 0 {
-            0
-        } else {
-            full_attention_retained_elements(layout)?
+        let full_attention_pool_retained = match (full_layers, paged_kv_plan) {
+            (0, None) => 0,
+            (0, Some(_)) => {
+                return ArithmeticOverflowSnafu {
+                    context: "paged KV plan without full-attention layers",
+                }
+                .fail();
+            }
+            (_, Some(plan)) => full_attention_retained_elements(plan),
+            (_, None) => {
+                return ArithmeticOverflowSnafu {
+                    context: "full-attention layers without a paged KV plan",
+                }
+                .fail();
+            }
         };
         let retained = checked_add(
             checked_product(
@@ -180,14 +201,14 @@ impl Qwen35RequirementElements {
                 recurrent_layer_retained,
                 "all recurrent retained allocations",
             )?,
-            checked_product(
-                full_layers,
-                full_layer_retained,
-                "all full-attention retained allocations",
-            )?,
+            full_attention_pool_retained,
             "all retained executor allocations",
         )?;
-        let transaction_copy = retained;
+        let transaction_copy = checked_product(
+            recurrent_layers,
+            recurrent_layer_retained,
+            "staged recurrent transaction allocations",
+        )?;
 
         // The model executor feeds one hidden row at a time through every
         // block, even when the public step accepts several token ids.
@@ -253,7 +274,7 @@ impl Qwen35RequirementElements {
         )?;
         Ok(Self {
             recurrent_layer_retained,
-            full_layer_retained,
+            full_attention_pool_retained,
             retained,
             transaction_copy,
             recurrent_workspace,

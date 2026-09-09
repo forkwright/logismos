@@ -402,6 +402,16 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// The private paged KV owner rejected a checked execution operation.
+    #[snafu(display("qwen35 execution paged KV operation failed: {source}"))]
+    ExecutionPagedKv {
+        /// Checked private paged-KV failure.
+        source: cache::Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// A Qwen3 profile metadata value is missing, mistyped, or unsupported.
     #[snafu(display("qwen3 profile metadata `{key}` violates {rule}"))]
     Qwen3Metadata {

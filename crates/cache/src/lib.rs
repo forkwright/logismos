@@ -2,29 +2,26 @@
 //!
 //! KV cache layouts for decoder inference.
 //!
-//! Phase 2 ships a single implementation: [`FlatKvCache`] — a
+//! The legacy `flat` default feature ships `FlatKvCache` — a
 //! layer-indexed ring of CPU-backed `taxis::Tensor` slots with an
 //! append-style `put` + a `get` that slices the whole cached range
 //! for a given layer. No eviction, no sharing, no prefix reuse.
 //!
-//! The paged allocator (vLLM-style) + radix cache (SGLang-style) land
-//! in Phases 6 and 12 respectively; both are behind the same public
-//! [`KvCache`] trait so callers can swap layouts without touching the
-//! forward-pass code.
+//! [`PagedKvPool`] is a separate private CPU transaction owner for native
+//! decoder execution. It does not implement the legacy tensor trait because
+//! its borrowed append lifecycle is the correctness boundary.
 //!
 //! ## Shape model
 //!
-//! [`CacheLayout`] carries the invariants a decoder needs:
+//! The flat feature's `CacheLayout` carries its tensor geometry:
 //! `{ num_layers, num_kv_heads, head_dim, max_seq_len, dtype }`.
-//! Phase 2 stores K and V separately per layer, as CPU tensors with
+//! It stores K and V separately per layer, as CPU tensors with
 //! shape `[max_seq_len, num_kv_heads * head_dim]`. Per-layer
 //! "written-length" state (`lens[layer]`) tracks how many rows have
 //! been appended. A subsequent `get_kv(layer, 0..len)` returns two
 //! sliced views.
-//!
-//! Phase 3 (Stella) runs on CPU at first. Phase 4 moves onto HIP.
-//! Switching the storage kind is a one-liner on `alloc_slot` once
-//! `taxis::Tensor` grows a device-side allocator backend.
+//! Paged geometry and transaction ownership are separate from this legacy
+//! tensor layout and do not initialize a device runtime.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -41,19 +38,24 @@
 )]
 
 pub mod error;
+#[cfg(feature = "flat")]
 pub mod flat;
+mod paged;
 
+#[cfg(feature = "flat")]
 use taxis::Tensor;
 
 pub use crate::error::{Error, Result};
+#[cfg(feature = "flat")]
 pub use crate::flat::{CacheLayout, FlatKvCache};
+pub use crate::paged::{PagedAppend, PagedKvGeometry, PagedKvPlan, PagedKvPool, PagedLayerKv};
 
-/// Abstract KV-cache contract.
+/// Legacy unshared tensor KV-cache contract.
 ///
-/// Kept as a trait so Phase 6 / 12 layouts can be substituted without
-/// touching the forward-pass code. Every concrete impl lives behind
-/// the same two primitive operations (put + get); the paged + radix
-/// variants add sharing / eviction as implementation details.
+/// Paged append transactions use their own explicit lifecycle, not this
+/// tensor-oriented put/get/reset interface. Sharing and eviction are not
+/// hidden implementation details of this trait.
+#[cfg(feature = "flat")]
 pub trait KvCache {
     /// Append `k` and `v` tensors to the given `layer_idx` slot.
     ///
@@ -81,7 +83,7 @@ pub trait KvCache {
     fn reset(&mut self);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "flat"))]
 mod tests {
     use super::*;
 

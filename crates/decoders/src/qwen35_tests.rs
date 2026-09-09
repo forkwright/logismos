@@ -1323,6 +1323,18 @@ pub(crate) fn canonical_hybrid_fixture() -> std::result::Result<Fixture, String>
     canonical_hybrid_fixture_with_n_rot(None)
 }
 
+pub(crate) fn canonical_hybrid_fixture_with_context(
+    context: usize,
+) -> std::result::Result<Fixture, String> {
+    let mut fixture = canonical_hybrid_fixture()?;
+    set_u32(
+        &mut fixture,
+        "qwen35.context_length",
+        u32::try_from(context).map_err(|error| error.to_string())?,
+    )?;
+    Ok(fixture)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the mixed fixture names every hybrid tensor shape and quantized path explicitly"

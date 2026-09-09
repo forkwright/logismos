@@ -38,6 +38,7 @@ fn named_owners_reconcile_a_large_nondegenerate_shape() -> std::result::Result<(
         recurrent_layout,
         17,
         Qwen35LogitSelection::AllTokens,
+        paged_kv_plan(layout).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
 
@@ -45,26 +46,27 @@ fn named_owners_reconcile_a_large_nondegenerate_shape() -> std::result::Result<(
     // recurrent KxV state, convolution history, context, FFN, and vocabulary
     // distinct so no hidden-width coefficient can accidentally satisfy it.
     assert_eq!(elements.recurrent_layer_retained, 1_510);
-    assert_eq!(elements.full_layer_retained, 5_140);
-    assert_eq!(elements.retained, 11_180);
-    assert_eq!(elements.transaction_copy, 11_180);
+    assert_eq!(elements.full_attention_pool_retained, 5_440);
+    assert_eq!(elements.retained, 11_480);
+    assert_eq!(elements.transaction_copy, 6_040);
     assert_eq!(elements.recurrent_workspace, 2_704);
     assert_eq!(elements.full_attention_workspace, 496);
     assert_eq!(elements.layer_finish_workspace, 104);
     assert_eq!(elements.lm_head_workspace, 1_023);
     assert_eq!(elements.workspace_upper_bound, 2_711);
     assert_eq!(elements.returned_logits, 17_153);
-    assert_eq!(elements.logical_upper_bound, 42_224);
+    assert_eq!(elements.logical_upper_bound, 37_384);
 
     let last = Qwen35RequirementElements::try_from_layout(
         layout,
         recurrent_layout,
         17,
         Qwen35LogitSelection::LastToken,
+        paged_kv_plan(layout).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
     assert_eq!(last.returned_logits, 1_009);
-    assert_eq!(last.logical_upper_bound, 26_080);
+    assert_eq!(last.logical_upper_bound, 21_240);
     assert_eq!(last.retained, elements.retained);
     assert_eq!(last.transaction_copy, elements.transaction_copy);
     assert_eq!(last.workspace_upper_bound, elements.workspace_upper_bound);
@@ -133,7 +135,7 @@ fn independent_shape_axes_change_their_named_owner_components() -> std::result::
         },
         recurrent,
     )?;
-    assert!(context.full_layer_retained > baseline.full_layer_retained);
+    assert!(context.full_attention_pool_retained > baseline.full_attention_pool_retained);
     assert!(context.full_attention_workspace > baseline.full_attention_workspace);
     Ok(())
 }
@@ -185,6 +187,10 @@ fn artifact_plan_report_and_all_last_execution_agree() -> std::result::Result<()
     assert_eq!(
         all_requirements.workspace_upper_bound_bytes(),
         last_requirements.workspace_upper_bound_bytes()
+    );
+    assert!(
+        all_requirements.transaction_copy_bytes() < all_requirements.retained_bytes(),
+        "paged KV backing is retained once and must not be cloned into the recurrent transaction"
     );
     assert_eq!(
         all_requirements.returned_logits_bytes(),
@@ -249,6 +255,7 @@ fn owner_arithmetic_overflow_is_rejected_before_execution() -> std::result::Resu
         demanding_recurrent_layout(),
         1,
         Qwen35LogitSelection::AllTokens,
+        paged_kv_plan(demanding_layout()).map_err(|error| error.to_string())?,
     )
     .err()
     .ok_or_else(|| "overflowing owner plan unexpectedly succeeded".to_string())?;
@@ -301,6 +308,7 @@ fn requirement_elements(
         recurrent,
         17,
         Qwen35LogitSelection::AllTokens,
+        paged_kv_plan(layout).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
 }
@@ -317,23 +325,49 @@ fn report_component_sum(
 }
 
 fn assert_same_execution_state(
-    left: &Qwen35Execution<'_, '_>,
-    right: &Qwen35Execution<'_, '_>,
+    left_execution: &Qwen35Execution<'_, '_>,
+    right_execution: &Qwen35Execution<'_, '_>,
 ) -> std::result::Result<(), String> {
-    assert_eq!(left.position, right.position);
-    assert_eq!(left.layers.len(), right.layers.len());
-    for (left, right) in left.layers.iter().zip(&right.layers) {
-        match (left, right) {
+    assert_eq!(left_execution.position, right_execution.position);
+    assert_eq!(left_execution.layers.len(), right_execution.layers.len());
+    for (left_layer, right_layer) in left_execution.layers.iter().zip(&right_execution.layers) {
+        match (left_layer, right_layer) {
             (LayerState::Recurrent(left), LayerState::Recurrent(right)) => {
                 assert_eq!(
                     left.transaction_state_for_test(),
                     right.transaction_state_for_test()
                 );
             }
-            (LayerState::Full(left), LayerState::Full(right)) => {
-                assert_eq!(left.tokens, right.tokens);
-                assert_eq!(left.keys, right.keys);
-                assert_eq!(left.values, right.values);
+            (LayerState::Full(left_layer), LayerState::Full(right_layer)) => {
+                let left_pool = left_execution
+                    .paged_kv_pool
+                    .as_ref()
+                    .ok_or_else(|| "left execution is missing paged KV backing".to_string())?;
+                let right_pool = right_execution
+                    .paged_kv_pool
+                    .as_ref()
+                    .ok_or_else(|| "right execution is missing paged KV backing".to_string())?;
+                let left_kv = left_pool
+                    .layer_kv(*left_layer)
+                    .map_err(|error| error.to_string())?;
+                let right_kv = right_pool
+                    .layer_kv(*right_layer)
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(left_kv.tokens(), right_kv.tokens());
+                for token in 0..left_kv.tokens() {
+                    assert_eq!(
+                        left_kv.key_row(token).map_err(|error| error.to_string())?,
+                        right_kv.key_row(token).map_err(|error| error.to_string())?
+                    );
+                    assert_eq!(
+                        left_kv
+                            .value_row(token)
+                            .map_err(|error| error.to_string())?,
+                        right_kv
+                            .value_row(token)
+                            .map_err(|error| error.to_string())?
+                    );
+                }
             }
             _ => return Err("execution plans disagreed on the layer kind".to_string()),
         }
