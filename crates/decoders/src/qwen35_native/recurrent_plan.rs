@@ -1,11 +1,8 @@
 //! Checked native recurrent-block allocation and verified-weight descriptors.
 
-use core::mem::size_of;
-
-use kernels;
 use snafu::ResultExt;
 
-use super::plan::{F32Parameter, ProjectionWeight, f32_parameter, projection};
+use super::plan::{F32Parameter, ProjectionWeight, elements_bytes, f32_parameter, projection, sum};
 use crate::Qwen35Weights;
 use crate::Result;
 use crate::error::{
@@ -17,57 +14,57 @@ use crate::qwen35_recurrent::{ExecutionLayout, RecurrentTensorRole, recurrent_te
 
 /// One verified matrix descriptor used by a native recurrent block.
 #[derive(Debug)]
-pub(crate) struct RecurrentProjectionWeights {
-    pub(crate) qkv: ProjectionWeight,
-    pub(crate) gate: ProjectionWeight,
-    pub(crate) alpha: ProjectionWeight,
-    pub(crate) beta: ProjectionWeight,
-    pub(crate) output: ProjectionWeight,
+pub(super) struct RecurrentProjectionWeights {
+    pub(super) qkv: ProjectionWeight,
+    pub(super) gate: ProjectionWeight,
+    pub(super) alpha: ProjectionWeight,
+    pub(super) beta: ProjectionWeight,
+    pub(super) output: ProjectionWeight,
 }
 
 /// One verified F32 descriptor used by a native recurrent block.
 #[derive(Debug)]
-pub(crate) struct RecurrentF32Parameters {
-    pub(crate) attention_norm: F32Parameter,
-    pub(crate) a: F32Parameter,
-    pub(crate) dt: F32Parameter,
-    pub(crate) convolution: F32Parameter,
-    pub(crate) output_norm: F32Parameter,
+pub(super) struct RecurrentF32Parameters {
+    pub(super) attention_norm: F32Parameter,
+    pub(super) a: F32Parameter,
+    pub(super) dt: F32Parameter,
+    pub(super) convolution: F32Parameter,
+    pub(super) output_norm: F32Parameter,
 }
 
 /// Checked native recurrent operation geometry and named workspace extents.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RecurrentWorkspacePlan {
-    pub(crate) input_norm: kernels::decoder_ops::RmsNormF32Plan,
-    pub(crate) convolution_silu: kernels::decoder_ops::ElementwiseF32Plan,
-    pub(crate) qk_l2: kernels::decoder_ops::RecurrentQkL2F32Plan,
-    pub(crate) scalars: kernels::decoder_ops::RecurrentScalarsF32Plan,
-    pub(crate) output_norm: kernels::decoder_ops::RmsNormF32Plan,
-    pub(crate) output_silu_product: kernels::decoder_ops::ElementwiseF32Plan,
-    pub(crate) normalized_hidden: usize,
-    pub(crate) qkv: usize,
-    pub(crate) z: usize,
-    pub(crate) alpha: usize,
-    pub(crate) beta_projection: usize,
-    pub(crate) raw_convolution: usize,
-    pub(crate) activated_convolution: usize,
-    pub(crate) tiled_query: usize,
-    pub(crate) tiled_key: usize,
-    pub(crate) beta: usize,
-    pub(crate) log_decay: usize,
-    pub(crate) recurrence_output: usize,
-    pub(crate) normalized_output: usize,
-    pub(crate) gated_output: usize,
-    pub(crate) projected_attention: usize,
-    pub(crate) value_tail_offset: usize,
-    pub(crate) value_tail_elements: usize,
+pub(super) struct RecurrentWorkspacePlan {
+    pub(super) input_norm: kernels::decoder_ops::RmsNormF32Plan,
+    pub(super) convolution_silu: kernels::decoder_ops::ElementwiseF32Plan,
+    pub(super) qk_l2: kernels::decoder_ops::RecurrentQkL2F32Plan,
+    pub(super) scalars: kernels::decoder_ops::RecurrentScalarsF32Plan,
+    pub(super) output_norm: kernels::decoder_ops::RmsNormF32Plan,
+    pub(super) output_silu_product: kernels::decoder_ops::ElementwiseF32Plan,
+    pub(super) normalized_hidden: usize,
+    pub(super) qkv: usize,
+    pub(super) z: usize,
+    pub(super) alpha: usize,
+    pub(super) beta_projection: usize,
+    pub(super) raw_convolution: usize,
+    pub(super) activated_convolution: usize,
+    pub(super) tiled_query: usize,
+    pub(super) tiled_key: usize,
+    pub(super) beta: usize,
+    pub(super) log_decay: usize,
+    pub(super) recurrence_output: usize,
+    pub(super) normalized_output: usize,
+    pub(super) gated_output: usize,
+    pub(super) projected_attention: usize,
+    pub(super) value_tail_offset: usize,
+    pub(super) value_tail_elements: usize,
     elements: usize,
 }
 
 impl RecurrentWorkspacePlan {
     /// Return the exact simultaneously allocated recurrent workspace extent.
     #[must_use]
-    pub(crate) const fn elements(self) -> usize {
+    pub(super) const fn elements(self) -> usize {
         self.elements
     }
 }
@@ -79,14 +76,14 @@ impl RecurrentWorkspacePlan {
 /// a device demand. A future model resource owner supplies active and staged
 /// state buffers separately and owns their atomic publication.
 #[derive(Debug)]
-pub(crate) struct DeviceRecurrentPlan {
-    pub(crate) block: usize,
-    pub(crate) layout: ExecutionLayout,
-    pub(crate) matrices: RecurrentProjectionWeights,
-    pub(crate) parameters: RecurrentF32Parameters,
-    pub(crate) workspace: RecurrentWorkspacePlan,
-    pub(crate) convolution: kernels::CausalConvAllocationPlan,
-    pub(crate) recurrence: kernels::MultiHeadRecurrentAllocationPlan,
+pub(super) struct DeviceRecurrentPlan {
+    pub(super) block: usize,
+    pub(super) layout: ExecutionLayout,
+    pub(super) matrices: RecurrentProjectionWeights,
+    pub(super) parameters: RecurrentF32Parameters,
+    pub(super) workspace: RecurrentWorkspacePlan,
+    pub(super) convolution: kernels::CausalConvAllocationPlan,
+    pub(super) recurrence: kernels::MultiHeadRecurrentAllocationPlan,
     weight_bytes: usize,
 }
 
@@ -95,7 +92,7 @@ impl DeviceRecurrentPlan {
     ///
     /// No device allocation, upload, submission, state mutation, or cache
     /// publication occurs here.
-    pub(crate) fn from_weights(weights: &Qwen35Weights<'_>, block: usize) -> Result<Self> {
+    pub(super) fn from_weights(weights: &Qwen35Weights<'_>, block: usize) -> Result<Self> {
         let block_index = u64::try_from(block).map_err(|_| ArithmeticOverflowSnafu {
             context: "native recurrent block index",
         })?;
@@ -128,14 +125,31 @@ impl DeviceRecurrentPlan {
                 matrices.alpha.serialized_bytes,
                 matrices.beta.serialized_bytes,
                 matrices.output.serialized_bytes,
-                elements_bytes(layout.hidden(), "native recurrent attention norm bytes")?,
-                elements_bytes(layout.value_head_count(), "native recurrent A bytes")?,
-                elements_bytes(layout.value_head_count(), "native recurrent dt bytes")?,
+                elements_bytes(
+                    layout.hidden(),
+                    core::mem::size_of::<f32>(),
+                    "native recurrent attention norm bytes",
+                )?,
+                elements_bytes(
+                    layout.value_head_count(),
+                    core::mem::size_of::<f32>(),
+                    "native recurrent A bytes",
+                )?,
+                elements_bytes(
+                    layout.value_head_count(),
+                    core::mem::size_of::<f32>(),
+                    "native recurrent dt bytes",
+                )?,
                 elements_bytes(
                     convolution.weight_elements(),
+                    core::mem::size_of::<f32>(),
                     "native recurrent convolution bytes",
                 )?,
-                elements_bytes(layout.value_dim(), "native recurrent output norm bytes")?,
+                elements_bytes(
+                    layout.value_dim(),
+                    core::mem::size_of::<f32>(),
+                    "native recurrent output norm bytes",
+                )?,
             ],
             "native recurrent weight bytes",
         )?;
@@ -154,19 +168,19 @@ impl DeviceRecurrentPlan {
 
     /// Return the checked immutable-weight upload extent for this block.
     #[must_use]
-    pub(crate) const fn weight_bytes(&self) -> usize {
+    pub(super) const fn weight_bytes(&self) -> usize {
         self.weight_bytes
     }
 
     /// Return the checked active-or-staged convolution-history extent.
     #[must_use]
-    pub(crate) const fn convolution_history_elements(&self) -> usize {
+    pub(super) const fn convolution_history_elements(&self) -> usize {
         self.convolution.history_elements()
     }
 
     /// Return the checked active-or-staged GDN-state extent.
     #[must_use]
-    pub(crate) const fn recurrent_state_elements(&self) -> usize {
+    pub(super) const fn recurrent_state_elements(&self) -> usize {
         self.recurrence.state_elements()
     }
 }
@@ -281,8 +295,33 @@ impl RecurrentWorkspacePlan {
             kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(output_norm.elements())
                 .context(NativeKernelSnafu)?;
 
+        Self::from_operations(
+            input_norm,
+            convolution,
+            recurrence,
+            convolution_silu,
+            qk_l2,
+            scalars,
+            output_norm,
+            output_silu_product,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the checked kernel plans are the single native recurrent workspace contract"
+    )]
+    fn from_operations(
+        input_norm: kernels::decoder_ops::RmsNormF32Plan,
+        convolution: kernels::CausalConvAllocationPlan,
+        recurrence: kernels::MultiHeadRecurrentAllocationPlan,
+        convolution_silu: kernels::decoder_ops::ElementwiseF32Plan,
+        qk_l2: kernels::decoder_ops::RecurrentQkL2F32Plan,
+        scalars: kernels::decoder_ops::RecurrentScalarsF32Plan,
+        output_norm: kernels::decoder_ops::RmsNormF32Plan,
+        output_silu_product: kernels::decoder_ops::ElementwiseF32Plan,
+    ) -> Result<Self> {
         if qk_l2.output_elements() != recurrence.query_and_key_elements()
-            || qk_l2.output_elements() != recurrence.output_elements()
             || scalars.value_heads() != recurrence.scalar_elements()
             || output_norm.elements() != recurrence.output_elements()
         {
@@ -327,7 +366,7 @@ impl RecurrentWorkspacePlan {
         let recurrence_output = recurrence.output_elements();
         let normalized_output = output_norm.elements();
         let gated_output = output_silu_product.elements();
-        let projected_attention = layout.hidden();
+        let projected_attention = input_norm.elements();
         let elements = sum(
             &[
                 normalized_hidden,
@@ -378,23 +417,9 @@ impl RecurrentWorkspacePlan {
     }
 }
 
-fn elements_bytes(elements: usize, context: &'static str) -> Result<usize> {
-    elements
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| ArithmeticOverflowSnafu { context }.build())
-}
-
-fn sum(values: &[usize], context: &'static str) -> Result<usize> {
-    values.iter().try_fold(0_usize, |total, value| {
-        total
-            .checked_add(*value)
-            .ok_or_else(|| ArithmeticOverflowSnafu { context }.build())
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{DeviceRecurrentPlan, sum};
+    use super::{DeviceRecurrentPlan, RecurrentWorkspacePlan, sum};
     use crate::Qwen35Weights;
     use crate::qwen35::tests::{canonical_hybrid_fixture, verify_fixture};
 
@@ -449,5 +474,49 @@ mod tests {
             sum(&[usize::MAX, 1], "native recurrent workspace elements").is_err(),
             "native workspace demand must reject overflow before device allocation"
         );
+    }
+
+    #[test]
+    fn recurrent_workspace_keeps_unequal_key_and_value_widths_distinct()
+    -> core::result::Result<(), String> {
+        let convolution = kernels::CausalConvAllocationPlan::try_from_dimensions(1, 14, 1)
+            .map_err(|error| error.to_string())?;
+        let recurrence =
+            kernels::MultiHeadRecurrentAllocationPlan::try_from_dimensions(1, 2, 2, 3, 4)
+                .map_err(|error| error.to_string())?;
+        let input_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(1, 7, 0.5)
+            .map_err(|error| error.to_string())?;
+        let convolution_silu = kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(14)
+            .map_err(|error| error.to_string())?;
+        let qk_l2 =
+            kernels::decoder_ops::RecurrentQkL2F32Plan::try_from_dimensions(14, 1, 2, 3, 0.5)
+                .map_err(|error| error.to_string())?;
+        let scalars = kernels::decoder_ops::RecurrentScalarsF32Plan::try_from_value_heads(2)
+            .map_err(|error| error.to_string())?;
+        let output_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(2, 4, 0.5)
+            .map_err(|error| error.to_string())?;
+        let output_silu_product =
+            kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(output_norm.elements())
+                .map_err(|error| error.to_string())?;
+
+        let workspace = RecurrentWorkspacePlan::from_operations(
+            input_norm,
+            convolution,
+            recurrence,
+            convolution_silu,
+            qk_l2,
+            scalars,
+            output_norm,
+            output_silu_product,
+        )
+        .map_err(|error| error.to_string())?;
+
+        assert_eq!(workspace.tiled_query, 6);
+        assert_eq!(workspace.recurrence_output, 8);
+        assert_eq!(
+            workspace.value_tail_offset + workspace.value_tail_elements,
+            14
+        );
+        Ok(())
     }
 }
