@@ -52,8 +52,7 @@ unsafe extern "C" {
 pub type PagedDecodeResult<T> = core::result::Result<T, PagedDecodeError>;
 
 /// Result alias for a logical paged-decode operation with caller-owned rows.
-pub type PagedDecodeRowsResult<T, E: std::fmt::Display + std::error::Error + 'static> =
-    core::result::Result<T, PagedDecodeRowsError<E>>;
+pub type PagedDecodeRowsResult<T, E> = core::result::Result<T, PagedDecodeRowsError<E>>;
 
 /// Checked concurrent allocation requests for one CPU query-head operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,7 +376,7 @@ pub enum PagedDecodeError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 #[non_exhaustive]
-pub enum PagedDecodeRowsError<E: std::fmt::Display + std::error::Error + 'static> {
+pub enum PagedDecodeRowsError<E: std::error::Error + 'static> {
     /// The checked operation rejected its geometry, input, or arithmetic.
     #[snafu(display("{PAGED_DECODE}: operation failure: {source}"))]
     Kernel {
@@ -428,7 +427,7 @@ pub fn paged_decode_cpu<'rows, E, KeyRow, ValueRow>(
     mut value_row: ValueRow,
 ) -> PagedDecodeRowsResult<Vec<f32>, E>
 where
-    E: std::fmt::Display + std::error::Error + 'static,
+    E: std::error::Error + 'static,
     KeyRow: FnMut(usize) -> core::result::Result<&'rows [f32], E>,
     ValueRow: FnMut(usize) -> core::result::Result<&'rows [f32], E>,
 {
