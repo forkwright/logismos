@@ -1,4 +1,4 @@
-// One-token dense-f32 causal-convolution correctness kernel.
+// NOTE: one-token dense-f32 causal-convolution correctness kernel.
 //
 // One thread owns one channel and serializes oldest-to-newest tap products and
 // additions. This is a staged primitive, not model or decoder integration.

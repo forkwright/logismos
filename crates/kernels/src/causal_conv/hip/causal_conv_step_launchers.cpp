@@ -1,4 +1,4 @@
-// Rust-callable launch shim for the staged causal-convolution step.
+// NOTE: private Rust-callable shim for the staged causal-convolution step.
 
 #include <cstdint>
 
@@ -21,7 +21,7 @@ extern "C" hipError_t logismos_launch_causal_conv_step_f32(
     std::uint32_t width,
     hipStream_t stream)
 {
-    // `channel_count` is positive by the allocation-plan admission. Subtract
+    // WHY: `channel_count` is positive by the allocation-plan admission. Subtract
     // before division, so the ceil division cannot overflow at u32::MAX.
     const std::uint32_t grid_x = (channel_count - 1U) / THREADS_PER_BLOCK + 1U;
     const dim3 block(THREADS_PER_BLOCK, 1U, 1U);
