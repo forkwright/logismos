@@ -33,7 +33,7 @@ const MAX_GDN_VALUE_DIM: usize = 1024;
 
 #[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 unsafe extern "C" {
-    fn logismos_launch_gdn_grouped_step_f32(
+    fn logismos_launch_gdn_grouped_step_f32_checked(
         q_f32: *const c_void,
         k_f32: *const c_void,
         v_f32: *const c_void,
@@ -47,6 +47,7 @@ unsafe extern "C" {
         value_head_count: u32,
         key_dim: u32,
         value_dim: u32,
+        numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 }
@@ -801,9 +802,130 @@ pub unsafe fn launch_multi_head_recurrent_step_f32(
     output_elements: usize,
     stream: &Stream,
 ) -> Result<()> {
+    // SAFETY: the raw caller retains the documented allocation and numerical obligations.
+    unsafe {
+        launch_multi_head_recurrent_step_f32_impl(
+            plan,
+            q_f32,
+            q_elements,
+            k_f32,
+            k_elements,
+            v_f32,
+            v_elements,
+            beta_f32,
+            beta_elements,
+            g_f32,
+            g_elements,
+            scale,
+            state_in_f32,
+            state_in_elements,
+            state_out_f32,
+            state_out_elements,
+            output_f32,
+            output_elements,
+            stream,
+            None,
+        )
+    }
+}
+
+#[cfg(feature = "gpu")]
+/// Submit the staged operation with sticky input and intermediate numerical checks.
+///
+/// Submission success does not validate arithmetic. Read `status` after proven
+/// stream completion before publishing any staged state or output.
+///
+/// # Safety
+///
+/// The allocation, lifetime, aliasing and stream requirements of [`launch_multi_head_recurrent_step_f32`]
+/// still apply. `status` must be on the same device, nonaliasing and retained
+/// through completion. The execution environment must qualify the checked
+/// kernel's denorm-preserving compiler and math-library behavior; caller
+/// prequalification of each explicit arithmetic intermediate is not required.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the checked operation retains the exact staged-buffer ABI"
+)]
+pub unsafe fn launch_multi_head_recurrent_step_f32_checked(
+    plan: MultiHeadRecurrentAllocationPlan,
+    q_f32: *const f32,
+    q_elements: usize,
+    k_f32: *const f32,
+    k_elements: usize,
+    v_f32: *const f32,
+    v_elements: usize,
+    beta_f32: *const f32,
+    beta_elements: usize,
+    g_f32: *const f32,
+    g_elements: usize,
+    scale: f32,
+    state_in_f32: *const f32,
+    state_in_elements: usize,
+    state_out_f32: *mut f32,
+    state_out_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &crate::numerical_status::NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: the checked caller retains all device and status allocation obligations.
+    unsafe {
+        launch_multi_head_recurrent_step_f32_impl(
+            plan,
+            q_f32,
+            q_elements,
+            k_f32,
+            k_elements,
+            v_f32,
+            v_elements,
+            beta_f32,
+            beta_elements,
+            g_f32,
+            g_elements,
+            scale,
+            state_in_f32,
+            state_in_elements,
+            state_out_f32,
+            state_out_elements,
+            output_f32,
+            output_elements,
+            stream,
+            Some(status),
+        )
+    }
+}
+
+#[cfg(feature = "gpu")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one launch owner validates both raw and checked staged-buffer calls"
+)]
+unsafe fn launch_multi_head_recurrent_step_f32_impl(
+    plan: MultiHeadRecurrentAllocationPlan,
+    q_f32: *const f32,
+    q_elements: usize,
+    k_f32: *const f32,
+    k_elements: usize,
+    v_f32: *const f32,
+    v_elements: usize,
+    beta_f32: *const f32,
+    beta_elements: usize,
+    g_f32: *const f32,
+    g_elements: usize,
+    scale: f32,
+    state_in_f32: *const f32,
+    state_in_elements: usize,
+    state_out_f32: *mut f32,
+    state_out_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: Option<&crate::numerical_status::NativeNumericalStatus>,
+) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (
+            status,
             plan,
             q_f32,
             q_elements,
@@ -849,13 +971,20 @@ pub unsafe fn launch_multi_head_recurrent_step_f32(
             output_f32,
             output_elements,
         )?;
+        let numerical_status = match status {
+            Some(status) => {
+                // SAFETY: the caller retains this nonaliasing status on the stream device.
+                unsafe { status.as_device_ptr().cast::<c_void>() }
+            }
+            None => core::ptr::null_mut(),
+        };
         stream.make_current()?;
         // SAFETY: the caller upholds device ownership, lifetime, concurrent
         // access, and numerical-domain obligations documented above; checked
         // spans and the allocation-plan owner established exact extents,
         // alignment, non-aliasing results, and ABI dimensions.
         let code = unsafe {
-            logismos_launch_gdn_grouped_step_f32(
+            logismos_launch_gdn_grouped_step_f32_checked(
                 q_f32.cast::<c_void>(),
                 k_f32.cast::<c_void>(),
                 v_f32.cast::<c_void>(),
@@ -869,6 +998,7 @@ pub unsafe fn launch_multi_head_recurrent_step_f32(
                 abi.value_head_count,
                 abi.key_dim,
                 abi.value_dim,
+                numerical_status,
                 stream.raw().cast::<c_void>(),
             )
         };
