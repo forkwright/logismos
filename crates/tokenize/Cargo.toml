@@ -8,6 +8,8 @@ description = "Tokenizer facade over the upstream huggingface/tokenizers crate."
 publish = false
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 snafu = { workspace = true }
 tokenizers = { workspace = true }

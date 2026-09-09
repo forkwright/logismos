@@ -174,4 +174,90 @@ pub enum Error {
         #[snafu(implicit)]
         location: snafu::Location,
     },
+
+    /// The immutable collective decoder program could not be derived.
+    #[snafu(display("tokenizer collective decoder program is invalid: {message}"))]
+    DecoderProgram {
+        /// Exact derivation failure.
+        message: String,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A checked collective decoder storage dimension overflowed `usize`.
+    #[snafu(display("tokenizer collective decoder storage overflowed while deriving {target}"))]
+    DecodePlanOverflow {
+        /// Storage dimension whose checked arithmetic overflowed.
+        target: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A bounded collective decoder allocation could not be reserved.
+    #[snafu(display("tokenizer could not reserve bounded {target} storage"))]
+    DecodeStorageAllocation {
+        /// Allocation purpose.
+        target: &'static str,
+        /// Allocation failure returned by the standard library.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// More generated token IDs were supplied than the acquired storage admits.
+    #[snafu(display(
+        "tokenizer collective decode received {actual} token IDs, exceeding capacity {capacity}"
+    ))]
+    DecodeTokenCapacityExceeded {
+        /// Number of IDs after the refused append.
+        actual: usize,
+        /// Acquired generated-ID capacity.
+        capacity: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A decoder write exceeded its pre-acquired arena.
+    #[snafu(display(
+        "tokenizer collective decoder needed {needed} {target} units, exceeding acquired capacity {capacity}"
+    ))]
+    DecodeStorageExhausted {
+        /// Arena or index being written.
+        target: &'static str,
+        /// Exact capacity needed for the refused write.
+        needed: usize,
+        /// Acquired logical capacity.
+        capacity: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// An internal collective decoder byte span violated its UTF-8 invariant.
+    #[snafu(display("tokenizer collective decoder produced an invalid UTF-8 span: {source}"))]
+    DecodeUtf8Invariant {
+        /// UTF-8 validation failure for the internal span.
+        source: std::str::Utf8Error,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Collective decoded output exceeded the caller's retained byte limit.
+    #[snafu(display(
+        "tokenizer collective decoded output has {actual} bytes, exceeding limit {limit}"
+    ))]
+    DecodedByteLimitExceeded {
+        /// Maximum retained decoded bytes.
+        limit: usize,
+        /// Exact decoded byte length before any output write.
+        actual: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }
