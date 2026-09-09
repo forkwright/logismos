@@ -278,7 +278,7 @@ impl NativeMatrix {
         // SAFETY: the caller upholds the native row-GEMV device-span and
         // finite-domain contract for this verified descriptor.
         unsafe {
-            kernels::launch_row_gemv_f32(
+            kernels::row_gemv::launch_row_gemv_f32(
                 self.shape,
                 self.bytes.as_device_ptr(),
                 self.bytes.len(),

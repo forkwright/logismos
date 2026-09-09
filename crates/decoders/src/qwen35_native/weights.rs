@@ -24,7 +24,7 @@ pub(crate) struct NativeWeights {
     pub(crate) post_attention_norm: DeviceBuffer<f32>,
 }
 pub(crate) struct NativeMatrix {
-    pub(crate) shape: kernels::RowGemvShape,
+    pub(crate) shape: kernels::row_gemv::RowGemvShape,
     pub(crate) bytes: DeviceBuffer<u8>,
 }
 

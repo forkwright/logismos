@@ -5,8 +5,8 @@ use hipcore::{Device, DeviceBuffer, Stream};
 use snafu::ResultExt;
 
 use crate::error::{
-    ArithmeticOverflowSnafu, ExecutionAllocationSnafu, NativeDeviceSnafu, NativeKernelSnafu,
-    NativePagedKvSnafu, NativeSessionStateSnafu,
+    ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionPagedDecodePlanSnafu,
+    NativeDeviceSnafu, NativeKernelSnafu, NativePagedKvSnafu, NativeSessionStateSnafu,
 };
 use crate::qwen35_mrope::text_mrope_coefficient;
 use crate::qwen35_native::plan::{DeviceFullAttentionPlan, WorkspacePlan};
@@ -121,13 +121,13 @@ impl DeviceResources {
             self.plan.layout.kv_heads,
             self.plan.layout.key,
         )
-        .context(NativeKernelSnafu)?;
+        .context(ExecutionPagedDecodePlanSnafu)?;
         let attention = kernels::attention::NativePagedDecodePlan::try_from_paged_decode(
             logical,
             self.plan.kv.layout().page_tokens(),
             self.plan.kv.layout().physical_pages(),
         )
-        .context(NativeKernelSnafu)?;
+        .context(ExecutionPagedDecodePlanSnafu)?;
         self.step = Some(StepBuffers {
             input,
             output: DeviceBuffer::alloc(self.stream.device(), self.plan.workspace.hidden)

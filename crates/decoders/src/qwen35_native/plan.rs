@@ -6,7 +6,8 @@ use cache::{NativePagedKvPlan, PagedKvGeometry};
 use snafu::ResultExt;
 
 use crate::error::{
-    ArithmeticOverflowSnafu, NativeKernelSnafu, NativePagedKvSnafu, NativeSessionStateSnafu,
+    ArithmeticOverflowSnafu, ExecutionPagedDecodePlanSnafu, NativeKernelSnafu, NativePagedKvSnafu,
+    NativeSessionStateSnafu,
 };
 use crate::qwen35_execution::{Layout, block_name, read_f32};
 use crate::{Qwen35Weights, Result};
@@ -53,7 +54,7 @@ pub(crate) struct WorkspacePlan {
 #[derive(Debug)]
 pub(crate) struct ProjectionWeight {
     pub(crate) name: String,
-    pub(crate) shape: kernels::RowGemvShape,
+    pub(crate) shape: kernels::row_gemv::RowGemvShape,
     pub(crate) serialized_bytes: usize,
 }
 
@@ -143,13 +144,13 @@ impl DeviceFullAttentionPlan {
             layout.kv_heads,
             layout.key,
         )
-        .context(NativeKernelSnafu)?;
+        .context(ExecutionPagedDecodePlanSnafu)?;
         let attention = kernels::attention::NativePagedDecodePlan::try_from_paged_decode(
             logical,
             page_tokens.get(),
             kv.layout().physical_pages(),
         )
-        .context(NativeKernelSnafu)?;
+        .context(ExecutionPagedDecodePlanSnafu)?;
         let f32_bytes = size_of::<f32>();
         let bytes = DeviceByteDemand {
             weights: sum(
