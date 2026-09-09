@@ -801,21 +801,21 @@ mod tests {
         assert_eq!(pool.table.len(), pool.fills.len());
         let mut seen = BTreeSet::new();
         for bundle in &pool.table {
-            assert!(*bundle < pool.plan.bundle_count());
+            assert!(*bundle < pool.plan.bundle_count);
             assert!(seen.insert(*bundle));
         }
         for bundle in &pool.free {
-            assert!(*bundle < pool.plan.bundle_count());
+            assert!(*bundle < pool.plan.bundle_count);
             assert!(seen.insert(*bundle));
         }
         if let Some(bundle) = held_old_tail {
-            assert!(bundle < pool.plan.bundle_count());
+            assert!(bundle < pool.plan.bundle_count);
             assert!(seen.insert(bundle));
         }
-        assert_eq!(seen.len(), pool.plan.bundle_count());
+        assert_eq!(seen.len(), pool.plan.bundle_count);
         assert_eq!(
             pool.table.len() + pool.free.len() + usize::from(held_old_tail.is_some()),
-            pool.plan.bundle_count()
+            pool.plan.bundle_count
         );
     }
 
