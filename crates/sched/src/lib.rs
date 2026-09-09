@@ -133,6 +133,14 @@ pub enum RuntimeCompletion {
         /// Issued load operation.
         operation: OperationId,
     },
+    /// The executor cannot attest that a failed load released every allocated resource.
+    ///
+    /// This conservatively retains the admission lease without inventing a
+    /// resident handle or permitting another load.
+    LoadQuarantined {
+        /// Issued load operation.
+        operation: OperationId,
+    },
     /// The executor confirms that eviction reclaimed the allocation.
     Evicted {
         /// Issued eviction operation.
@@ -140,6 +148,14 @@ pub enum RuntimeCompletion {
     },
     /// The executor failed to evict; the allocation remains retained.
     EvictFailed {
+        /// Issued eviction operation.
+        operation: OperationId,
+    },
+    /// The executor cannot attest that an eviction left an intact resident or reclaimed it.
+    ///
+    /// This conservatively retains the admission lease and disables automatic
+    /// eviction retry until a future trusted reconciliation protocol exists.
+    EvictionQuarantined {
         /// Issued eviction operation.
         operation: OperationId,
     },
@@ -329,6 +345,7 @@ enum AdmissionState {
         loading: bool,
     },
     Evicting(ResidentHandle),
+    Quarantined,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -687,7 +704,9 @@ impl Scheduler {
     /// Apply one trusted executor acknowledgement.
     ///
     /// A load failure releases only because this completion explicitly attests
-    /// that no allocation remains. Eviction failure retains the lease.
+    /// that no allocation remains or every allocated leaf was logically
+    /// released. `EvictFailed` is reserved for a known-intact resident;
+    /// quarantined completions retain the full lease without retry.
     ///
     /// # Errors
     ///
@@ -741,6 +760,16 @@ impl Scheduler {
             RuntimeCompletion::LoadFailed { .. } | RuntimeCompletion::Evicted { .. } => {
                 self.release_admission(admission_id)?;
                 self.operations.remove(&operation.value);
+            }
+            RuntimeCompletion::LoadQuarantined { .. }
+            | RuntimeCompletion::EvictionQuarantined { .. } => {
+                self.operations.remove(&operation.value);
+                let admission = self.admissions.get_mut(&admission_id).ok_or(
+                    SchedulerError::UnknownAdmission {
+                        location: error_location(),
+                    },
+                )?;
+                admission.state = AdmissionState::Quarantined;
             }
             RuntimeCompletion::EvictFailed { .. } => {
                 self.operations.remove(&operation.value);
@@ -949,7 +978,9 @@ impl Scheduler {
                     loading: false,
                 }
             }
-            AdmissionState::Draining { .. } | AdmissionState::Evicting(_) => return,
+            AdmissionState::Draining { .. }
+            | AdmissionState::Evicting(_)
+            | AdmissionState::Quarantined => return,
         };
         admission.state = state;
     }
@@ -1083,15 +1114,21 @@ impl RuntimeCompletion {
         match self {
             Self::Loaded { operation, .. }
             | Self::LoadFailed { operation }
+            | Self::LoadQuarantined { operation }
             | Self::Evicted { operation }
-            | Self::EvictFailed { operation } => operation.clone(),
+            | Self::EvictFailed { operation }
+            | Self::EvictionQuarantined { operation } => operation.clone(),
         }
     }
 
     fn kind(&self) -> OperationKind {
         match self {
-            Self::Loaded { .. } | Self::LoadFailed { .. } => OperationKind::Load,
-            Self::Evicted { .. } | Self::EvictFailed { .. } => OperationKind::Evict,
+            Self::Loaded { .. } | Self::LoadFailed { .. } | Self::LoadQuarantined { .. } => {
+                OperationKind::Load
+            }
+            Self::Evicted { .. } | Self::EvictFailed { .. } | Self::EvictionQuarantined { .. } => {
+                OperationKind::Evict
+            }
         }
     }
 }
@@ -1467,6 +1504,117 @@ mod tests {
             ),
             "a failed first eviction must not starve an independent draining resident"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_load_retains_capacity_and_rejects_untrusted_completions()
+    -> Result<(), SchedulerError> {
+        let grant = request(&format!("[{}]", workload("main", 4)), 4)?;
+        let mut scheduler = Scheduler::new(&grant, SchedulerLimits::default())?;
+        let ticket = one_ticket(&mut scheduler, &grant)?;
+        let load = poll_command(&mut scheduler)?;
+        let mut foreign = Scheduler::new(&grant, SchedulerLimits::default())?;
+        assert!(matches!(
+            foreign.complete(RuntimeCompletion::LoadQuarantined {
+                operation: load.operation(),
+            }),
+            Err(SchedulerError::ForeignCapability { .. })
+        ));
+        assert!(matches!(
+            scheduler.complete(RuntimeCompletion::EvictionQuarantined {
+                operation: load.operation(),
+            }),
+            Err(SchedulerError::OperationKindMismatch { .. })
+        ));
+        assert_eq!(scheduler.operations.len(), 1);
+
+        scheduler.complete(RuntimeCompletion::LoadQuarantined {
+            operation: load.operation(),
+        })?;
+        assert!(matches!(
+            scheduler
+                .admissions
+                .get(&ticket.admission_id)
+                .map(|admission| &admission.state),
+            Some(AdmissionState::Quarantined)
+        ));
+        assert!(matches!(
+            scheduler.begin_use(&ticket),
+            Err(SchedulerError::AdmissionNotResident { .. })
+        ));
+        assert!(matches!(
+            scheduler.prepare(&grant),
+            Err(SchedulerError::Placement {
+                source: PlacementRefusal::CapacityExhausted { .. },
+                ..
+            })
+        ));
+        assert!(matches!(scheduler.poll_command()?, PollOutcome::Idle));
+        scheduler.revoke(&scheduler.generation())?;
+        assert!(matches!(scheduler.poll_command()?, PollOutcome::Idle));
+        assert!(matches!(
+            scheduler.replace_grant(&grant),
+            Err(SchedulerError::GrantNotDrained { .. })
+        ));
+        assert!(matches!(
+            scheduler.complete(RuntimeCompletion::LoadQuarantined {
+                operation: load.operation(),
+            }),
+            Err(SchedulerError::UnknownOperation { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_eviction_is_terminal_without_trusted_reconciliation()
+    -> Result<(), SchedulerError> {
+        let grant = request(&format!("[{}]", workload("main", 4)), 4)?;
+        let mut scheduler = Scheduler::new(&grant, SchedulerLimits::default())?;
+        let ticket = loaded_ticket(&mut scheduler)?;
+        scheduler.request_retirement(&ticket)?;
+        let eviction = poll_command(&mut scheduler)?;
+        assert!(matches!(
+            scheduler.complete(RuntimeCompletion::LoadQuarantined {
+                operation: eviction.operation(),
+            }),
+            Err(SchedulerError::OperationKindMismatch { .. })
+        ));
+        scheduler.complete(RuntimeCompletion::EvictionQuarantined {
+            operation: eviction.operation(),
+        })?;
+        assert!(matches!(
+            scheduler
+                .admissions
+                .get(&ticket.admission_id)
+                .map(|admission| &admission.state),
+            Some(AdmissionState::Quarantined)
+        ));
+        assert!(matches!(
+            scheduler.begin_use(&ticket),
+            Err(SchedulerError::AdmissionNotResident { .. })
+        ));
+        scheduler.request_retirement(&ticket)?;
+        assert!(matches!(scheduler.poll_command()?, PollOutcome::Idle));
+        assert!(matches!(
+            scheduler.prepare(&grant),
+            Err(SchedulerError::Placement {
+                source: PlacementRefusal::CapacityExhausted { .. },
+                ..
+            })
+        ));
+        scheduler.revoke(&scheduler.generation())?;
+        assert!(matches!(scheduler.poll_command()?, PollOutcome::Idle));
+        assert!(matches!(
+            scheduler.replace_grant(&grant),
+            Err(SchedulerError::GrantNotDrained { .. })
+        ));
+        assert!(matches!(
+            scheduler.complete(RuntimeCompletion::EvictionQuarantined {
+                operation: eviction.operation(),
+            }),
+            Err(SchedulerError::UnknownOperation { .. })
+        ));
         Ok(())
     }
 
