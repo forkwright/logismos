@@ -41,13 +41,13 @@ enum ResourceState<Resource> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum BeginError {
+enum BeginError {
     MissingResource,
     NotReady,
 }
 
 #[derive(Debug)]
-pub(super) enum CompletionError<Error> {
+enum CompletionError<Error> {
     MissingResource,
     NotSubmitted,
     Commit { source: Error },

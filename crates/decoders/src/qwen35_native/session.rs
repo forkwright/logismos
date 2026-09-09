@@ -255,7 +255,7 @@ fn publish_completed_step(resources: &mut DeviceResources) -> Result<DeviceBuffe
     Ok(step.output)
 }
 
-fn begin_error(error: BeginError) -> crate::Error {
+pub(super) fn begin_error(error: BeginError) -> crate::Error {
     let rule = match error {
         BeginError::MissingResource => "native session lost its owned resource bundle",
         BeginError::NotReady => "native session is permanently poisoned after submission",
@@ -263,7 +263,7 @@ fn begin_error(error: BeginError) -> crate::Error {
     NativeSessionStateSnafu { rule }.build()
 }
 
-fn completion_error(error: CompletionError<crate::Error>) -> crate::Error {
+pub(super) fn completion_error(error: CompletionError<crate::Error>) -> crate::Error {
     match error {
         CompletionError::Commit { source, .. }
         | CompletionError::Synchronization { source, .. } => source,
