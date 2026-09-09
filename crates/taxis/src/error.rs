@@ -10,6 +10,28 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum Error {
+    /// Checked tensor geometry arithmetic overflowed.
+    #[snafu(display("tensor geometry overflow while computing {operation}"))]
+    GeometryOverflow {
+        /// Checked computation that could not fit in `usize`.
+        operation: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Explicit layout has a different number of dimensions and strides.
+    #[snafu(display("layout rank mismatch: {dimensions} dimensions, {strides} strides"))]
+    LayoutRankMismatch {
+        /// Number of shape dimensions.
+        dimensions: usize,
+        /// Number of supplied strides.
+        strides: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// Underlying HIP failure (allocation, copy, etc.).
     #[snafu(transparent)]
     Hip {

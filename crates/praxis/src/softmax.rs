@@ -78,10 +78,7 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
     } else {
         let x_host = x.to_host_f16()?;
         let y = kernels::softmax::cpu::softmax_fp16_ref(&x_host, m, n)?;
-        Ok(Tensor::from_cpu(
-            taxis::CpuStorage::F16(y),
-            x.shape().clone(),
-        ))
+        Tensor::from_cpu(taxis::CpuStorage::F16(y), x.shape().clone())
     }
 }
 
@@ -105,7 +102,8 @@ mod tests {
         let x_host: Vec<f16> = (0..(m * n))
             .map(|i| f16::from_f32((i % 7) as f32 - 3.0))
             .collect();
-        let x = Tensor::from_cpu(CpuStorage::F16(x_host), Shape::new(&[m, n]));
+        let x = Tensor::from_cpu(CpuStorage::F16(x_host), Shape::new(&[m, n]))
+            .expect("valid tensor fixture");
 
         let y = softmax(&x).expect("cpu softmax");
         let host = y.to_host_f16().expect("host readback");

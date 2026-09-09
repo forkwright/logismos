@@ -45,7 +45,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dtype_byte_count_rounds_subbyte_storage() {
-        assert_eq!(DType::I4.byte_count(3), 2);
+    fn dtype_byte_count_rounds_subbyte_storage() -> Result<()> {
+        assert_eq!(DType::I4.checked_byte_count(3)?, 2);
+        assert_eq!(
+            DType::I4.checked_byte_count(usize::MAX)?,
+            usize::MAX / 2 + 1
+        );
+        assert_eq!(DType::F32.checked_byte_count(1usize << 59)?, 1usize << 61);
+        Ok(())
     }
 }

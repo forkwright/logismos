@@ -30,54 +30,40 @@ struct TensorInner {
 }
 
 impl Tensor {
-    /// Construct a CPU tensor from a typed `Vec`.
-    ///
-    /// Does **not** validate `storage.len() == shape.elem_count()` — a
-    /// mismatched pair silently produces a `Tensor` whose declared
-    /// shape disagrees with its backing storage, through safe API,
-    /// with no error. The caller must uphold the invariant itself.
-    /// Prefer [`Self::try_from_cpu`] whenever the storage/shape pairing
-    /// is not already guaranteed correct by construction — e.g. data
-    /// copied from an external archive.
-    #[must_use]
-    pub fn from_cpu(storage: CpuStorage, shape: Shape) -> Self {
-        let dtype = storage.dtype();
-        let layout = Layout::contiguous(shape);
-        Self {
-            inner: Arc::new(TensorInner {
-                dtype,
-                storage: Arc::new(Storage::Cpu(storage)),
-                layout,
-            }),
-        }
-    }
-
     /// Construct a CPU tensor from a typed `Vec`, validating that the
     /// storage's element count matches the shape's.
     ///
     /// # Errors
     ///
-    /// [`Error::ShapeMismatch`] when `storage.len() != shape.elem_count()`.
-    pub fn try_from_cpu(storage: CpuStorage, shape: Shape) -> Result<Self> {
-        let elem_count = shape.elem_count();
+    /// [`Error::ShapeMismatch`] when storage length disagrees with shape.
+    pub fn from_cpu(storage: CpuStorage, shape: Shape) -> Result<Self> {
+        let elem_count = shape.checked_elem_count()?;
         if storage.len() != elem_count {
             return ShapeMismatchSnafu {
-                op: "try_from_cpu",
+                op: "from_cpu",
                 msg: format!(
-                    "storage.len()={} != shape.elem_count()={elem_count}",
+                    "storage.len()={} != checked shape element count={elem_count}",
                     storage.len()
                 ),
             }
             .fail();
         }
-        Ok(Self::from_cpu(storage, shape))
+        let dtype = storage.dtype();
+        let layout = Layout::contiguous(shape)?;
+        Ok(Self {
+            inner: Arc::new(TensorInner {
+                dtype,
+                storage: Arc::new(Storage::Cpu(storage)),
+                layout,
+            }),
+        })
     }
 
     /// Construct a HIP tensor from a host slice of `f32`.
     ///
     /// # Errors
     ///
-    /// [`Error::ShapeMismatch`] when `data.len() != shape.elem_count()`.
+    /// [`Error::ShapeMismatch`] when data length disagrees with shape.
     /// [`Error::Hip`] on device allocation or copy failure.
     pub fn from_host_f32(device: &Device, data: &[f32], shape: Shape) -> Result<Self> {
         Self::from_host_typed(device, data, shape, DType::F32)
@@ -107,19 +93,19 @@ impl Tensor {
         shape: Shape,
         dtype: DType,
     ) -> Result<Self> {
-        if data.len() != shape.elem_count() {
+        let elem_count = shape.checked_elem_count()?;
+        if data.len() != elem_count {
             return ShapeMismatchSnafu {
                 op: "from_host_typed",
                 msg: format!(
-                    "data.len()={} != shape.elem_count()={}",
-                    data.len(),
-                    shape.elem_count()
+                    "data.len()={} != checked shape element count={elem_count}",
+                    data.len()
                 ),
             }
             .fail();
         }
         let storage = HipStorage::from_host(device, dtype, data)?;
-        let layout = Layout::contiguous(shape);
+        let layout = Layout::contiguous(shape)?;
         Ok(Self {
             inner: Arc::new(TensorInner {
                 dtype,
@@ -135,9 +121,9 @@ impl Tensor {
     ///
     /// [`Error::Hip`] on allocation or zero-fill failure.
     pub fn zeros_hip(device: &Device, dtype: DType, shape: Shape) -> Result<Self> {
-        let elem = shape.elem_count();
+        let elem = shape.checked_elem_count()?;
         let storage = HipStorage::alloc(device, dtype, elem)?;
-        let layout = Layout::contiguous(shape);
+        let layout = Layout::contiguous(shape)?;
         Ok(Self {
             inner: Arc::new(TensorInner {
                 dtype,
@@ -173,8 +159,8 @@ impl Tensor {
 
     /// Element count.
     #[must_use]
-    pub fn elem_count(&self) -> usize {
-        self.inner.layout.elem_count()
+    pub fn checked_elem_count(&self) -> Result<usize> {
+        self.inner.layout.checked_elem_count()
     }
 
     /// Storage reference.
@@ -296,15 +282,16 @@ mod tests {
     use crate::error::Error;
 
     #[test]
-    fn cpu_tensor_constructs() {
+    fn cpu_tensor_constructs() -> Result<()> {
         let t = Tensor::from_cpu(
             CpuStorage::F32(vec![1.0, 2.0, 3.0, 4.0]),
             Shape::new(&[2, 2]),
-        );
+        )?;
         assert_eq!(t.dims(), &[2, 2]);
         assert_eq!(t.dtype(), DType::F32);
         assert!(t.is_contiguous());
         assert!(!t.is_on_device());
+        Ok(())
     }
 
     // INVARIANT: `zeros_hip` must produce an all-zero buffer (forkwright/logismos#26).
@@ -328,26 +315,20 @@ mod tests {
     }
 
     #[test]
-    fn try_from_cpu_accepts_matching_pair() -> Result<()> {
-        let t = Tensor::try_from_cpu(
+    fn from_cpu_accepts_matching_pair() -> Result<()> {
+        let t = Tensor::from_cpu(
             CpuStorage::F32(vec![1.0, 2.0, 3.0, 4.0]),
             Shape::new(&[2, 2]),
         )?;
-        assert_eq!(t.elem_count(), 4);
+        assert_eq!(t.checked_elem_count()?, 4);
         Ok(())
     }
 
     #[test]
-    fn try_from_cpu_rejects_length_mismatch() {
-        // WHY(forkwright/logismos#58): `from_cpu` never validated
-        // `storage.len()` against `shape.elem_count()`, so a caller
-        // passing a mismatched pair got a `Tensor` that silently lies
-        // about its own shape — no panic, no error, through safe API.
-        // `try_from_cpu` is the validating counterpart; this fails
-        // against `from_cpu` (which has no error path to return) and
-        // passes against `try_from_cpu`.
-        let result =
-            Tensor::try_from_cpu(CpuStorage::F32(vec![1.0, 2.0, 3.0]), Shape::new(&[2, 2]));
+    fn from_cpu_rejects_length_mismatch() {
+        // WHY(forkwright/logismos#58): a tensor must never outlive its
+        // storage/shape validation boundary.
+        let result = Tensor::from_cpu(CpuStorage::F32(vec![1.0, 2.0, 3.0]), Shape::new(&[2, 2]));
         assert!(matches!(result, Err(Error::ShapeMismatch { .. })));
     }
 }
