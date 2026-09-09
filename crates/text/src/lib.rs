@@ -373,6 +373,8 @@ where
     }
 }
 
+// WHY: Snafu's generic source path requires `AsErrorSource` (`'static`),
+// while the driver contract deliberately accepts only `std::error::Error`.
 impl<DriverError> std::error::Error for RecycledGenerationError<DriverError>
 where
     DriverError: std::error::Error + 'static,
@@ -426,9 +428,8 @@ pub trait RecycledGenerationDriver {
     ///
     /// # Errors
     ///
-    /// Returns the same typed pipeline error used by the shared generation
-    /// loop. Implementations must preserve typed backend sources and leave no
-    /// externally published response on failure.
+    /// Returns the driver's associated error. The consuming generation entry
+    /// moves it unchanged into [`RecycledGenerationError::Driver`].
     fn step_into(
         &mut self,
         token_ids: &[u32],
