@@ -1390,37 +1390,20 @@ mod tests {
 
     #[cfg(logismos_no_gpu_kernels)]
     #[test]
-    fn cpu_only_build_refuses_each_native_entry_without_hip()
-    -> core::result::Result<(), Box<dyn std::error::Error>> {
-        assert!(
-            matches!(
-                no_gpu_refusal(RMS_NORM_KERNEL),
-                Err(crate::Error::NoGpuBuild { .. })
-            ),
-            "RMSNorm must report typed no-GPU refusal"
-        );
-        assert!(
-            matches!(
-                no_gpu_refusal(ROTARY_KERNEL),
-                Err(crate::Error::NoGpuBuild { .. })
-            ),
-            "rotary must report typed no-GPU refusal"
-        );
-        assert!(
-            matches!(
-                no_gpu_refusal(SPLIT_Q_GATE_KERNEL),
-                Err(crate::Error::NoGpuBuild { .. })
-            ),
-            "split must report typed no-GPU refusal"
-        );
-        assert!(
-            matches!(
-                no_gpu_refusal(SIGMOID_MUL_KERNEL),
-                Err(crate::Error::NoGpuBuild { .. })
-            ),
-            "sigmoid multiplication must report typed no-GPU refusal"
-        );
-        Ok(())
+    fn cpu_only_shared_refusal_helper_reports_every_operation() {
+        for kernel in [
+            RMS_NORM_KERNEL,
+            ROTARY_KERNEL,
+            SPLIT_Q_GATE_KERNEL,
+            SIGMOID_MUL_KERNEL,
+            SILU_MUL_KERNEL,
+            RESIDUAL_ADD_KERNEL,
+        ] {
+            assert!(
+                matches!(no_gpu_refusal(kernel), Err(crate::Error::NoGpuBuild { .. })),
+                "{kernel} must report typed no-GPU refusal"
+            );
+        }
     }
 
     #[cfg(not(logismos_no_gpu_kernels))]
