@@ -6,7 +6,7 @@ use snafu::ResultExt;
 
 use crate::error::{
     ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionPagedDecodePlanSnafu,
-    NativeDeviceSnafu, NativeKernelSnafu, NativePagedKvSnafu, NativeSessionStateSnafu,
+    NativeDeviceSnafu, NativePagedKvSnafu, NativeSessionStateSnafu,
 };
 use crate::qwen35_mrope::text_mrope_coefficient;
 use crate::qwen35_native::plan::{DeviceFullAttentionPlan, WorkspacePlan};
