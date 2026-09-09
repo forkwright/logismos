@@ -2487,7 +2487,12 @@ mod tests {
     -> Result<(), SchedulerError> {
         let grant = request(&format!("[{}]", workload("main", 4)), 4)?;
         let mut scheduler = Scheduler::new(&grant, SchedulerLimits::default())?;
-        let ticket = loaded_ticket(&mut scheduler)?;
+        let ticket = one_ticket(&mut scheduler, &grant)?;
+        let load = poll_command(&mut scheduler)?;
+        scheduler.complete(RuntimeCompletion::Loaded {
+            operation: load.operation(),
+            resident: ResidentHandle::try_new("resident-main")?,
+        })?;
         scheduler.request_retirement(&ticket)?;
         let eviction = poll_command(&mut scheduler)?;
         assert!(matches!(
@@ -3087,7 +3092,7 @@ mod tests {
         let grant = request("[]", 12)?;
         let mut scheduler = Scheduler::new_with_native_host_results(
             &grant,
-            SchedulerLimits::try_new(64, 8, 1)?,
+            SchedulerLimits::try_new(64, 8, 2)?,
             NativeHostResultEnvelope::new(4),
         )?;
         let ticket = native_loaded(&mut scheduler, 4, "native-main")?;
@@ -3099,6 +3104,11 @@ mod tests {
                 Some(requested_host_bytes(4)?),
             ),
         )?;
+        let reserved_host = scheduler.host_result_reserved;
+        let active_uses = scheduler
+            .admissions
+            .get(&ticket.admission_id)
+            .map(|admission| admission.active_uses);
         assert!(matches!(
             scheduler.begin_native_use(
                 &ticket,
@@ -3110,18 +3120,22 @@ mod tests {
             ),
             Err(SchedulerError::NativeHostResultExhausted { .. })
         ));
+        assert_eq!(scheduler.host_result_reserved, reserved_host);
+        assert_eq!(
+            scheduler
+                .admissions
+                .get(&ticket.admission_id)
+                .map(|admission| admission.active_uses),
+            active_uses,
+            "a host-envelope refusal keeps the live native use unchanged"
+        );
+        assert_eq!(scheduler.native_uses.len(), 1);
         let result = scheduler.finish_native_use_after_teardown(&first)?.ok_or(
             SchedulerError::UnknownUsePermit {
                 location: error_location(),
             },
         )?;
-        assert!(matches!(
-            scheduler.begin_native_use(
-                &ticket,
-                NativeUseRequest::new(requested_device_bytes(6)?, None, None),
-            ),
-            Err(SchedulerError::ActiveUseLimit { .. })
-        ));
+        assert_eq!(scheduler.host_result_reserved, 4);
         scheduler.discard_native_result(&result)?;
         let second = scheduler.begin_native_use(
             &ticket,
@@ -3134,6 +3148,42 @@ mod tests {
             "a use without retained output returns no result lease"
         );
         assert_eq!(scheduler.host_result_reserved, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_native_result_occupies_custody_slot() -> Result<(), SchedulerError> {
+        let grant = request("[]", 12)?;
+        let mut scheduler = Scheduler::new(&grant, SchedulerLimits::try_new(64, 8, 1)?)?;
+        let ticket = native_loaded(&mut scheduler, 4, "native-main")?;
+        let permit = scheduler.begin_native_use(
+            &ticket,
+            NativeUseRequest::new(
+                requested_device_bytes(1)?,
+                Some(requested_device_bytes(1)?),
+                None,
+            ),
+        )?;
+        let result = scheduler.finish_native_use_after_teardown(&permit)?.ok_or(
+            SchedulerError::UnknownUsePermit {
+                location: error_location(),
+            },
+        )?;
+        assert_eq!(scheduler.native_results.len(), 1);
+        assert!(matches!(
+            scheduler.begin_native_use(
+                &ticket,
+                NativeUseRequest::new(requested_device_bytes(1)?, None, None),
+            ),
+            Err(SchedulerError::ActiveUseLimit { .. })
+        ));
+        assert_eq!(scheduler.native_results.len(), 1);
+        scheduler.discard_native_result(&result)?;
+        let next = scheduler.begin_native_use(
+            &ticket,
+            NativeUseRequest::new(requested_device_bytes(1)?, None, None),
+        )?;
+        assert!(scheduler.finish_native_use_after_teardown(&next)?.is_none());
         Ok(())
     }
 
@@ -3205,8 +3255,16 @@ mod tests {
             &ticket,
             NativeUseRequest::new(requested_device_bytes(1)?, None, None),
         )?;
-        quarantined.revoke(&quarantined.generation())?;
         quarantined.quarantine_native_use(&permit)?;
+        assert!(matches!(
+            quarantined.begin_native_use(
+                &ticket,
+                NativeUseRequest::new(requested_device_bytes(1)?, None, None),
+            ),
+            Err(SchedulerError::AdmissionNotResident { .. })
+        ));
+        assert_eq!(quarantined.native_quarantined_uses.len(), 1);
+        quarantined.revoke(&quarantined.generation())?;
         assert!(
             quarantined
                 .finish_native_use_after_teardown(&finished)?
@@ -3218,8 +3276,9 @@ mod tests {
                 &ticket,
                 NativeUseRequest::new(requested_device_bytes(1)?, None, None),
             ),
-            Err(SchedulerError::AdmissionNotResident { .. })
+            Err(SchedulerError::GrantRevoked { .. })
         ));
+        assert_eq!(quarantined.native_quarantined_uses.len(), 1);
         assert!(matches!(quarantined.poll_command()?, PollOutcome::Idle));
         Ok(())
     }
