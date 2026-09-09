@@ -1,18 +1,19 @@
 //! Blocking unsafe qualification session for one native Qwen3.5 main-model token.
 
 use hipcore::{Device, DeviceBuffer};
+use std::sync::Arc;
 
 use super::ResourceOwner;
 use super::model_plan::{DeviceModelPlan, ModelDeviceByteDemand};
-use super::model_resources::ModelDeviceResources;
+use super::model_resources::{ModelSessionResources, NativeResidentModelResources};
 use super::session::{Qwen35NativeSessionState, begin_error, completion_error, session_state};
 use crate::{Qwen35Weights, Result};
 
-/// Checked device-allocation demand for one native main-model qualification session.
+/// Checked device-allocation demand for one resident native model and one session.
 ///
-/// Categories describe requested allocation extents for the one owned resource
-/// bundle. They are neither observed residency nor a capacity, performance, or
-/// device-qualification result.
+/// Categories describe requested allocation extents under the checked plan.
+/// They are neither observed residency nor a capacity, performance, device-
+/// qualification, or serving result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen35NativeExecutionDeviceDemand {
     bytes: ModelDeviceByteDemand,
@@ -120,10 +121,46 @@ impl Qwen35NativeExecutionDeviceDemand {
         self.bytes.numerical_status
     }
 
-    /// Checked total requested device bytes across this one owned session.
+    /// Checked total requested device bytes for one resident model, one session,
+    /// one token's controls, and one returned logits buffer.
     #[must_use]
     pub const fn total_bytes(self) -> usize {
         self.total
+    }
+
+    /// Requested immutable device bytes retained once by a resident model.
+    #[must_use]
+    pub const fn resident_bytes(self) -> usize {
+        self.bytes.weights
+    }
+
+    /// Requested mutable device bytes retained by each native session.
+    #[must_use]
+    pub const fn session_bytes(self) -> usize {
+        self.bytes.full_workspace
+            + self.bytes.recurrent_workspace
+            + self.bytes.finish_workspace
+            + self.bytes.hidden_rows
+            + self.bytes.final_normalized
+            + self.bytes.key_values
+            + self.bytes.page_table
+            + self.bytes.recurrent_history_active
+            + self.bytes.recurrent_history_staged
+            + self.bytes.recurrent_state_active
+            + self.bytes.recurrent_state_staged
+            + self.bytes.numerical_status
+    }
+
+    /// Requested one-token control-buffer bytes.
+    #[must_use]
+    pub const fn step_bytes(self) -> usize {
+        self.bytes.mrope_controls
+    }
+
+    /// Requested returned-logit bytes for one completed token.
+    #[must_use]
+    pub const fn output_bytes(self) -> usize {
+        self.bytes.logits
     }
 }
 
@@ -170,6 +207,25 @@ impl<'weights> Qwen35NativeExecutionPlan<'weights> {
         self.demand
     }
 
+    /// Upload this plan's immutable verified weights into one reusable native model.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed upload or allocation failures without creating mutable
+    /// request state or submitting inference work.
+    ///
+    /// # Safety
+    ///
+    /// `device` must be the qualified `gfx1100` device selected for the native
+    /// kernels. This establishes immutable resident ownership only; it is not a
+    /// physical residency, capacity, performance, or serving claim.
+    pub unsafe fn into_model(self, device: &Device) -> Result<Qwen35NativeExecutionModel> {
+        let resources = NativeResidentModelResources::new(self.weights, self.plan, device)?;
+        Ok(Qwen35NativeExecutionModel {
+            resources: Arc::new(resources),
+        })
+    }
+
     /// Upload this plan's exact verified weights and create its owned session.
     ///
     /// # Errors
@@ -183,7 +239,34 @@ impl<'weights> Qwen35NativeExecutionPlan<'weights> {
     /// kernels. Construction establishes ownership only: it is not a physical
     /// GPU qualification, capacity grant, performance claim, or serving API.
     pub unsafe fn into_session(self, device: &Device) -> Result<Qwen35NativeExecutionSession> {
-        let resources = ModelDeviceResources::new(self.weights, self.plan, device)?;
+        // SAFETY: the caller supplies the qualified device required to upload the immutable model.
+        unsafe { self.into_model(device) }?.new_session()
+    }
+}
+
+/// Shared immutable native model uploads bound to one verified execution plan.
+///
+/// This type declares no manual thread-safety contract. In particular, each
+/// mutable [`Qwen35NativeExecutionSession`] retains its own `Stream`, whose
+/// HIP wrapper is deliberately `!Sync`.
+#[derive(Clone)]
+pub struct Qwen35NativeExecutionModel {
+    resources: Arc<NativeResidentModelResources>,
+}
+
+impl Qwen35NativeExecutionModel {
+    /// Allocate one fresh mutable session under this model's fixed context plan.
+    ///
+    /// Each session owns a distinct stream, status word, cache, recurrent state,
+    /// workspaces and pending token buffers. Its context bound is the exact bound
+    /// admitted when this model was planned and cannot expand during dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed allocation or stream-creation failures without affecting
+    /// the immutable resident uploads or another session.
+    pub fn new_session(&self) -> Result<Qwen35NativeExecutionSession> {
+        let resources = ModelSessionResources::new(Arc::clone(&self.resources))?;
         Ok(Qwen35NativeExecutionSession {
             owner: ResourceOwner::new(resources),
         })
@@ -192,13 +275,14 @@ impl<'weights> Qwen35NativeExecutionPlan<'weights> {
 
 /// One owned blocking native main-model qualification session.
 ///
-/// The session owns the verified uploads, stream, full/recurrent workspaces,
-/// K/V pool and table, recurrent active and staged state, and each pending
-/// token's buffers. Submitted resources remain owned until completion is
-/// synchronized and publication succeeds; uncertain completion retains or
-/// forgets the complete bundle rather than releasing buffers early.
+/// The session retains shared immutable verified uploads and exclusively owns
+/// its stream, full/recurrent workspaces, K/V pool and table, recurrent active
+/// and staged state, status word, and pending token buffers. Submitted
+/// resources remain owned until completion is synchronized and publication
+/// succeeds; uncertain completion retains the shared model owner with the
+/// complete mutable bundle rather than releasing buffers early.
 pub struct Qwen35NativeExecutionSession {
-    owner: ResourceOwner<ModelDeviceResources>,
+    owner: ResourceOwner<ModelSessionResources>,
 }
 
 impl Qwen35NativeExecutionSession {
@@ -249,6 +333,53 @@ impl Qwen35NativeExecutionSession {
     }
 }
 
-fn publish_completed_step(resources: &mut ModelDeviceResources) -> Result<DeviceBuffer<f32>> {
+fn publish_completed_step(resources: &mut ModelSessionResources) -> Result<DeviceBuffer<f32>> {
     resources.publish_completed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Qwen35NativeExecutionDeviceDemand;
+    use crate::qwen35_native::model_plan::ModelDeviceByteDemand;
+
+    #[test]
+    fn demand_partitions_one_resident_model_from_one_session_and_token() -> Result<(), String> {
+        let bytes = ModelDeviceByteDemand {
+            weights: 11,
+            full_workspace: 13,
+            recurrent_workspace: 17,
+            finish_workspace: 19,
+            hidden_rows: 23,
+            final_normalized: 29,
+            logits: 31,
+            mrope_controls: 37,
+            key_values: 41,
+            page_table: 43,
+            recurrent_history_active: 47,
+            recurrent_history_staged: 53,
+            recurrent_state_active: 59,
+            recurrent_state_staged: 61,
+            numerical_status: 67,
+        };
+        let demand = Qwen35NativeExecutionDeviceDemand::from_bytes(bytes)
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(demand.resident_bytes(), 11);
+        assert_eq!(
+            demand.session_bytes(),
+            472,
+            "per-session demand must include only mutable state and workspaces"
+        );
+        assert_eq!(demand.step_bytes(), 37);
+        assert_eq!(demand.output_bytes(), 31);
+        assert_eq!(
+            demand.total_bytes(),
+            demand.resident_bytes()
+                + demand.session_bytes()
+                + demand.step_bytes()
+                + demand.output_bytes(),
+            "all demand categories must derive from the one checked resource plan"
+        );
+        Ok(())
+    }
 }

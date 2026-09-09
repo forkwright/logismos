@@ -29,7 +29,8 @@ mod weights;
 
 #[cfg(feature = "gpu")]
 pub use model_session::{
-    Qwen35NativeExecutionDeviceDemand, Qwen35NativeExecutionPlan, Qwen35NativeExecutionSession,
+    Qwen35NativeExecutionDeviceDemand, Qwen35NativeExecutionModel, Qwen35NativeExecutionPlan,
+    Qwen35NativeExecutionSession,
 };
 #[cfg(feature = "gpu")]
 pub use session::{

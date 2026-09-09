@@ -132,6 +132,56 @@ fn reserved_device_native_main_model_matches_oracle_and_excludes_nextn()
 
 #[test]
 #[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
+fn reserved_device_resident_model_creates_independent_native_sessions()
+-> core::result::Result<(), String> {
+    let fixture = canonical_hybrid_fixture_with_context_and_rotary(FIXTURE_CONTEXT, Some(64))?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let plan = Qwen35NativeExecutionPlan::try_from_weights(
+        &weights,
+        FIXTURE_CONTEXT,
+        kernels::attention::NativePageTokens::B8,
+    )
+    .map_err(|error| error.to_string())?;
+    let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
+    // SAFETY: this ignored witness uses the operator-reserved gfx1100 device
+    // and the bounded normal-or-zero fixture. It proves API ownership only,
+    // not hardware qualification or physical residency.
+    let model = unsafe { plan.into_model(&device) }.map_err(|error| error.to_string())?;
+    let mut first = model.new_session().map_err(|error| error.to_string())?;
+    let mut second = model.new_session().map_err(|error| error.to_string())?;
+    let mut first_oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
+    let mut second_oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
+
+    for token in [2_u32, 0] {
+        let expected = first_oracle.step(&[token])?;
+        // SAFETY: each session owns its fresh stream and mutable state while
+        // retaining the one immutable resident model through completion.
+        let output = unsafe { first.step(token) }.map_err(|error| error.to_string())?;
+        let mut actual = vec![0.0_f32; expected.len()];
+        output
+            .copy_to_host(&mut actual)
+            .map_err(|error| format!("read first native model output: {error}"))?;
+        assert_f32_matches_f64(&actual, &expected, "first resident-model session")?;
+    }
+    for token in [2_u32, 0] {
+        let expected = second_oracle.step(&[token])?;
+        // SAFETY: the second session's state starts at position zero and is
+        // distinct from the first session despite sharing immutable uploads.
+        let output = unsafe { second.step(token) }.map_err(|error| error.to_string())?;
+        let mut actual = vec![0.0_f32; expected.len()];
+        output
+            .copy_to_host(&mut actual)
+            .map_err(|error| format!("read second native model output: {error}"))?;
+        assert_f32_matches_f64(&actual, &expected, "second resident-model session")?;
+    }
+    assert_eq!(first.state(), Qwen35NativeSessionState::Ready);
+    assert_eq!(second.state(), Qwen35NativeSessionState::Ready);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
 fn reserved_device_native_main_model_status_refuses_invalid_embedding_operand()
 -> core::result::Result<(), String> {
     native_main_model_status_fault_witness(
