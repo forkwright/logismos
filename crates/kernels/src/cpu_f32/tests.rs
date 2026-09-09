@@ -388,33 +388,35 @@ fn linear_t_mismatched_b_len_panics() {
 }
 
 #[test]
-fn softmax_rows_sum_to_one() {
+fn softmax_rows_sum_to_one() -> Result<()> {
     let x = [0.0_f32, 1.0, 2.0, -1.0, 0.0, 1.0];
-    let y = softmax_last_dim(&x, 2, 3);
+    let y = softmax_last_dim(&x, 2, 3)?;
     for r in 0..2 {
         let s: f32 = y[r * 3..(r + 1) * 3].iter().sum();
         assert!((s - 1.0).abs() < 1e-6);
     }
+    Ok(())
 }
 
 #[test]
-fn softmax_fully_masked_row_is_uniform_not_nan() {
+fn softmax_fully_masked_row_is_uniform_not_nan() -> Result<()> {
     // WHY(forkwright/logismos#30): a row that is entirely
     // `f32::NEG_INFINITY` (a fully-masked attention row) used to
     // produce `NaN` in every slot via `(NEG_INF - NEG_INF).exp()`.
     // It must instead be a finite, uniform distribution.
     let x = [f32::NEG_INFINITY; 4];
-    let y = softmax_last_dim(&x, 1, 4);
+    let y = softmax_last_dim(&x, 1, 4)?;
     assert!(y.iter().all(|v| v.is_finite()), "row contains NaN: {y:?}");
     let sum: f32 = y.iter().sum();
     assert!((sum - 1.0).abs() < 1e-6, "row does not sum to 1: {sum}");
     for v in &y {
         assert!((v - 0.25).abs() < 1e-6, "row is not uniform: {y:?}");
     }
+    Ok(())
 }
 
 #[test]
-fn softmax_mixed_masked_and_unmasked_rows_both_finite() {
+fn softmax_mixed_masked_and_unmasked_rows_both_finite() -> Result<()> {
     // A batch where one row is fully masked and the other is not —
     // the fully-masked row must not poison the unmasked one, and both
     // must come back finite.
@@ -426,7 +428,7 @@ fn softmax_mixed_masked_and_unmasked_rows_both_finite() {
         1.0,
         2.0,
     ];
-    let y = softmax_last_dim(&x, 2, 3);
+    let y = softmax_last_dim(&x, 2, 3)?;
     assert!(
         y.iter().all(|v| v.is_finite()),
         "output contains NaN: {y:?}"
@@ -435,6 +437,50 @@ fn softmax_mixed_masked_and_unmasked_rows_both_finite() {
     let row1_sum: f32 = y[3..6].iter().sum();
     assert!((row0_sum - 1.0).abs() < 1e-6);
     assert!((row1_sum - 1.0).abs() < 1e-6);
+    Ok(())
+}
+
+#[test]
+fn softmax_rejects_malformed_shapes_in_every_profile() {
+    let short = softmax_last_dim(&[1.0_f32; 3], 1, 4);
+    assert!(matches!(short, Err(Error::SoftmaxShape { .. })));
+
+    let long = softmax_last_dim(&[1.0_f32; 5], 1, 4);
+    assert!(matches!(long, Err(Error::SoftmaxShape { .. })));
+
+    let empty_axis = softmax_last_dim(&[], 0, 0);
+    assert!(matches!(
+        empty_axis,
+        Err(Error::SoftmaxInvalidDimension { .. })
+    ));
+
+    let overflow = softmax_last_dim(&[], usize::MAX, 2);
+    assert!(matches!(overflow, Err(Error::SoftmaxSizeOverflow { .. })));
+}
+
+#[test]
+fn softmax_rejects_nan_and_positive_infinity_without_rejecting_masks() {
+    for logits in [
+        [f32::NAN, f32::NAN],
+        [f32::NAN, f32::NEG_INFINITY],
+        [0.0, f32::NAN],
+        [f32::INFINITY, f32::NEG_INFINITY],
+    ] {
+        let result = softmax_last_dim(&logits, 1, 2);
+        assert!(matches!(result, Err(Error::SoftmaxNonFinite { .. })));
+    }
+}
+
+#[test]
+fn softmax_preserves_row_offsets() -> Result<()> {
+    let x = [-4.0_f32, -3.0, -2.0, 3.0, 4.0, 5.0];
+    let y = softmax_last_dim(&x, 2, 3)?;
+    for row in y.chunks_exact(3) {
+        assert!((row[0] - 0.090_030_57).abs() < 1e-6);
+        assert!((row[1] - 0.244_728_48).abs() < 1e-6);
+        assert!((row[2] - 0.665_240_94).abs() < 1e-6);
+    }
+    Ok(())
 }
 
 #[test]

@@ -15,8 +15,9 @@
 
 use kernels::cpu_f32;
 use num_traits::ToPrimitive;
+use snafu::ResultExt;
 
-use crate::error::{Result, ShapeSnafu};
+use crate::error::{KernelSnafu, Result, ShapeSnafu};
 use crate::rope::RopeTable;
 
 /// Attention config shared between Qwen2 and Stella.
@@ -117,8 +118,9 @@ impl QwenAttention {
     ///
     /// # Errors
     ///
-    /// [`Error::Shape`] on input-shape disagreement with the config, or if
-    /// any internal head-slicing range falls outside an allocated buffer.
+    /// [`Error::Shape`] on input-shape disagreement with the config or an
+    /// internal head-slicing range outside an allocated buffer, and
+    /// [`Error::Kernel`] if checked softmax rejects invalid logits.
     pub fn forward(&self, x: &[f32], mask: &[u8], rope: &RopeTable) -> Result<Vec<f32>> {
         let cfg = self.cfg;
         let hidden = cfg.hidden;
@@ -275,7 +277,7 @@ impl QwenAttention {
             let start = h * seq * seq;
             let end = (h + 1) * seq * seq;
             let head = checked_slice_mut(&mut scores, start, end, "attention scores head")?;
-            let sm = cpu_f32::softmax_last_dim(head, seq, seq);
+            let sm = cpu_f32::softmax_last_dim(head, seq, seq).context(KernelSnafu)?;
             head.copy_from_slice(&sm);
         }
 

@@ -1,35 +1,58 @@
 //! CPU reference for row-wise softmax.
 
 use half::f16;
+use snafu::ResultExt;
+
+use crate::error::{SoftmaxAllocationSnafu, SoftmaxNonFiniteSnafu, checked_softmax_input_elements};
 
 /// Row-wise softmax. fp16 in, fp16 out, fp32 internal.
 ///
 /// # Errors
 ///
-/// [`crate::error::Error::UnsupportedShape`] when `x.len() != m * n`.
-/// Previously this was only checked by `debug_assert`, stripped in
-/// release, and the loop below silently skipped the affected row via
-/// `.get(..).else { continue }` — a shape-mismatch bug upstream
-/// produced an all-zero output row instead of a diagnosable failure.
+/// Returns a typed [`crate::error::Error`] for a malformed shape, non-finite
+/// logits other than intentional negative-infinity masks, or allocation.
 pub fn softmax_fp16_ref(x: &[f16], m: usize, n: usize) -> crate::error::Result<Vec<f16>> {
-    let expected_len = m * n;
-    if x.len() != expected_len {
-        return crate::error::UnsupportedShapeSnafu {
+    let expected_len = checked_softmax_input_elements("softmax_fp16_ref", m, n, x.len())?;
+    let mut y = Vec::new();
+    y.try_reserve_exact(expected_len)
+        .context(SoftmaxAllocationSnafu {
             kernel: "softmax_fp16_ref",
-            msg: format!("x.len()={} != m*n={expected_len}", x.len()),
+            requested_len: expected_len,
+        })?;
+    y.resize(expected_len, f16::from_f32(0.0));
+
+    for (row, (slice, output_row)) in x.chunks_exact(n).zip(y.chunks_exact_mut(n)).enumerate() {
+        let mut fully_masked = true;
+        for (column, &value) in slice.iter().enumerate() {
+            let value = value.to_f32();
+            if value == f32::NEG_INFINITY {
+                continue;
+            }
+            fully_masked = false;
+            if !value.is_finite() {
+                return SoftmaxNonFiniteSnafu {
+                    kernel: "softmax_fp16_ref",
+                    row,
+                    column,
+                    value,
+                }
+                .fail();
+            }
         }
-        .fail();
-    }
-    let mut y = vec![f16::from_f32(0.0); m * n];
-    for row in 0..m {
-        let start = row * n;
-        // INVARIANT: `x.len() == m * n` was checked above and `row <
-        // m`, so this slice is always in range — `.get()` + `continue`
-        // stays as defense-in-depth rather than indexing directly,
-        // matching this module's checked-access convention.
-        let Some(slice) = x.get(start..start + n) else {
+
+        if fully_masked {
+            // WHY(forkwright/logismos#59): a fully masked attention row is
+            // valid, but subtracting its negative-infinity maximum creates
+            // NaNs. Preserve the established finite uniform policy.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "n is an attention sequence length, far below 2^24"
+            )]
+            let uniform = 1.0 / n as f32;
+            output_row.fill(f16::from_f32(uniform));
             continue;
-        };
+        }
+
         let mut max_v: f32 = f32::NEG_INFINITY;
         for &v in slice {
             let f = v.to_f32();
@@ -37,38 +60,14 @@ pub fn softmax_fp16_ref(x: &[f16], m: usize, n: usize) -> crate::error::Result<V
                 max_v = f;
             }
         }
-        if max_v.is_infinite() && max_v.is_sign_negative() {
-            // WHY(forkwright/logismos#59): every entry in this row is
-            // -inf (a fully-masked attention row). `(v - max_v).exp()`
-            // would evaluate `(NEG_INFINITY - NEG_INFINITY).exp()` =
-            // `NaN.exp()` = `NaN` for every entry, propagating silently
-            // through every downstream consumer. Mirrors the same
-            // guard in `cpu_f32::softmax_last_dim` (both trace to the
-            // same all-`-inf`-row defect class).
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "n is an attention sequence length, far below 2^24"
-            )]
-            let uniform = if n == 0 { 0.0 } else { 1.0 / n as f32 };
-            for j in 0..n {
-                if let Some(slot) = y.get_mut(start + j) {
-                    *slot = f16::from_f32(uniform);
-                }
-            }
-            continue;
-        }
         let mut denom: f32 = 0.0;
-        let mut exps: Vec<f32> = Vec::with_capacity(n);
         for &v in slice {
             let e = (v.to_f32() - max_v).exp();
             denom += e;
-            exps.push(e);
         }
         let inv = denom.recip();
-        for (j, &exp) in exps.iter().enumerate().take(n) {
-            if let Some(slot) = y.get_mut(start + j) {
-                *slot = f16::from_f32(exp * inv);
-            }
+        for (slot, &value) in output_row.iter_mut().zip(slice.iter()) {
+            *slot = f16::from_f32((value.to_f32() - max_v).exp() * inv);
         }
     }
     Ok(y)
@@ -107,7 +106,7 @@ mod tests {
         let result = softmax_fp16_ref(&x, 2, 5);
         assert!(matches!(
             result,
-            Err(crate::error::Error::UnsupportedShape {
+            Err(crate::error::Error::SoftmaxShape {
                 kernel: "softmax_fp16_ref",
                 ..
             })
@@ -135,5 +134,37 @@ mod tests {
             assert!((v - 0.25).abs() < 1e-2, "row is not uniform: {vals:?}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn rejects_nonfinite_logits_but_accepts_negative_infinity_masks() {
+        for logits in [
+            [f32::NAN, f32::NAN],
+            [f32::NAN, f32::NEG_INFINITY],
+            [0.0, f32::NAN],
+            [f32::INFINITY, f32::NEG_INFINITY],
+        ] {
+            let input = logits.map(f16::from_f32);
+            let result = softmax_fp16_ref(&input, 1, 2);
+            assert!(matches!(
+                result,
+                Err(crate::error::Error::SoftmaxNonFinite { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn empty_axis_and_overflow_are_rejected() {
+        let empty_axis = softmax_fp16_ref(&[], 0, 0);
+        assert!(matches!(
+            empty_axis,
+            Err(crate::error::Error::SoftmaxInvalidDimension { .. })
+        ));
+
+        let overflow = softmax_fp16_ref(&[], usize::MAX, 2);
+        assert!(matches!(
+            overflow,
+            Err(crate::error::Error::SoftmaxSizeOverflow { .. })
+        ));
     }
 }

@@ -9,8 +9,9 @@
 //! Transformers `AutoModel` golden vectors.
 
 use kernels::cpu_f32;
+use snafu::ResultExt;
 
-use crate::error::{Result, ShapeSnafu};
+use crate::error::{KernelSnafu, Result, ShapeSnafu};
 use crate::rope::RopeTable;
 
 // ---------------------------------------------------------------------------
@@ -341,7 +342,8 @@ impl ModernBertAttention {
     ///
     /// # Errors
     ///
-    /// [`Error::Shape`] on size disagreement.
+    /// [`Error::Shape`] on size disagreement or [`Error::Kernel`] if checked
+    /// softmax rejects invalid logits.
     pub fn forward(
         &self,
         x: &[f32],
@@ -427,7 +429,7 @@ impl ModernBertAttention {
         }
         // Softmax per row per head
         for head in scores.chunks_exact_mut(seq * seq) {
-            let sm = cpu_f32::softmax_last_dim(head, seq, seq);
+            let sm = cpu_f32::softmax_last_dim(head, seq, seq).context(KernelSnafu)?;
             head.copy_from_slice(&sm);
         }
         // Attention output: [n_h, seq, d] = softmax @ V

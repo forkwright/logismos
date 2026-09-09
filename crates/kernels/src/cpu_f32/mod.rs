@@ -24,8 +24,9 @@ use snafu::ResultExt;
 use crate::error::{
     CpuF32AllocationSnafu, CpuF32ShapeSnafu, Result, RmsNormAllocationSnafu,
     RmsNormInvalidDimensionSnafu, RmsNormInvalidParameterSnafu, RmsNormNonFiniteSnafu,
-    RmsNormShapeSnafu, RmsNormSizeOverflowSnafu, RmsNormStage, UnitNormalizationNonFiniteSnafu,
-    UnitNormalizationNonUnitSnafu, UnitNormalizationStage, UnitNormalizationZeroNormSnafu,
+    RmsNormShapeSnafu, RmsNormSizeOverflowSnafu, RmsNormStage, SoftmaxAllocationSnafu,
+    SoftmaxNonFiniteSnafu, UnitNormalizationNonFiniteSnafu, UnitNormalizationNonUnitSnafu,
+    UnitNormalizationStage, UnitNormalizationZeroNormSnafu, checked_softmax_input_elements,
 };
 
 /// Maximum accepted absolute distance between a normalized vector's L2 norm and one.
@@ -614,23 +615,45 @@ fn multiply_scalar(left: f32, right: f32) -> f32 {
 /// Row-wise softmax along the last axis (fp32 throughout).
 ///
 /// `x`: `[rows, n]`. Returns `[rows, n]`.
-#[must_use]
-pub fn softmax_last_dim(x: &[f32], rows: usize, n: usize) -> Vec<f32> {
-    debug_assert_eq!(x.len(), rows * n);
-    let mut y = vec![0.0f32; rows * n];
-    for r in 0..rows {
-        let row_start = r * n;
-        let row_end = (r + 1) * n;
-        let Some(row) = x.get(row_start..row_end) else {
-            continue;
-        };
-        let mut m = f32::NEG_INFINITY;
-        for &v in row {
-            if v > m {
-                m = v;
+///
+/// Exact `f32::NEG_INFINITY` is an intentional attention-mask value. A row
+/// consisting only of that value returns the established uniform distribution;
+/// `NaN` and positive infinity are rejected instead of being misclassified as
+/// a fully masked row.
+///
+/// # Errors
+///
+/// Returns a typed [`crate::Error`] for a malformed shape, non-finite logits
+/// other than the intentional negative-infinity mask, or output allocation.
+pub fn softmax_last_dim(x: &[f32], rows: usize, n: usize) -> Result<Vec<f32>> {
+    let expected_len = checked_softmax_input_elements("cpu_f32_softmax", rows, n, x.len())?;
+    let mut y = Vec::new();
+    y.try_reserve_exact(expected_len)
+        .context(SoftmaxAllocationSnafu {
+            kernel: "cpu_f32_softmax",
+            requested_len: expected_len,
+        })?;
+    y.resize(expected_len, 0.0);
+
+    for (r, (row, output_row)) in x.chunks_exact(n).zip(y.chunks_exact_mut(n)).enumerate() {
+        let mut fully_masked = true;
+        for (column, &value) in row.iter().enumerate() {
+            if value == f32::NEG_INFINITY {
+                continue;
+            }
+            fully_masked = false;
+            if !value.is_finite() {
+                return SoftmaxNonFiniteSnafu {
+                    kernel: "cpu_f32_softmax",
+                    row: r,
+                    column,
+                    value,
+                }
+                .fail();
             }
         }
-        if m.is_infinite() && m.is_sign_negative() {
+
+        if fully_masked {
             // WHY(forkwright/logismos#30): every entry in this row is
             // -inf (a fully-masked attention row, routine for padded-batch
             // inference). `(v - m).exp()` would evaluate
@@ -638,36 +661,34 @@ pub fn softmax_last_dim(x: &[f32], rows: usize, n: usize) -> Vec<f32> {
             // for every entry, and that `NaN` propagates silently through
             // every downstream kernel. There is no informative
             // distribution to recover for a row with no unmasked tokens,
-            // so fall back to uniform — finite output beats a
-            // silently-propagating NaN.
+            // so the established uniform policy produces finite output.
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "n is an attention sequence length, far below 2^24"
             )]
-            let uniform = if n == 0 { 0.0 } else { 1.0 / n as f32 };
-            for j in 0..n {
-                if let Some(slot) = y.get_mut(row_start + j) {
-                    *slot = uniform;
-                }
-            }
+            let uniform = 1.0 / n as f32;
+            output_row.fill(uniform);
             continue;
         }
-        let mut denom = 0.0f32;
-        for (j, &v) in row.iter().enumerate() {
-            let e = (v - m).exp();
-            if let Some(slot) = y.get_mut(row_start + j) {
-                *slot = e;
+
+        let mut m = f32::NEG_INFINITY;
+        for &v in row {
+            if v > m {
+                m = v;
             }
+        }
+        let mut denom = 0.0f32;
+        for (slot, &v) in output_row.iter_mut().zip(row.iter()) {
+            let e = (v - m).exp();
+            *slot = e;
             denom += e;
         }
         let inv = denom.recip();
-        for j in 0..n {
-            if let Some(slot) = y.get_mut(row_start + j) {
-                *slot *= inv;
-            }
+        for slot in output_row {
+            *slot *= inv;
         }
     }
-    y
+    Ok(y)
 }
 
 /// Apply an additive mask in place. `scores`: `[rows, n]`; `mask`: `[rows_mask, n]`
