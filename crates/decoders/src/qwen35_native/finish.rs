@@ -5,7 +5,7 @@ use core::mem::size_of;
 use hipcore::{DeviceBuffer, Stream};
 use snafu::ResultExt;
 
-use super::custody::NativeBufferSink;
+use super::custody::{NativeBufferSink, NativeBuildResult, NativeBuildScope};
 use super::dispatch::{launch_residual, launch_rms_norm, launch_silu_mul};
 use super::plan::{
     F32Parameter, ProjectionWeight, dimension, elements_bytes, f32_parameter, projection, sum,
@@ -178,16 +178,29 @@ impl LayerFinishWeights {
         weights: &Qwen35Weights,
         plan: &LayerFinishPlan,
         device: &hipcore::Device,
-    ) -> Result<Self> {
+        scope: &NativeBuildScope,
+    ) -> NativeBuildResult<Self> {
+        let post_attention_norm = scope.guard(
+            f32_parameter_buffer(weights, &plan.weights.post_attention_norm, device, scope)?,
+            |buffer, sink| sink.push_f32(buffer),
+        );
+        let ffn_gate = scope.guard(
+            NativeMatrix::upload(weights, &plan.weights.ffn_gate, device, scope)?,
+            NativeMatrix::into_buffer_sink,
+        );
+        let ffn_up = scope.guard(
+            NativeMatrix::upload(weights, &plan.weights.ffn_up, device, scope)?,
+            NativeMatrix::into_buffer_sink,
+        );
+        let ffn_down = scope.guard(
+            NativeMatrix::upload(weights, &plan.weights.ffn_down, device, scope)?,
+            NativeMatrix::into_buffer_sink,
+        );
         Ok(Self {
-            post_attention_norm: f32_parameter_buffer(
-                weights,
-                &plan.weights.post_attention_norm,
-                device,
-            )?,
-            ffn_gate: NativeMatrix::upload(weights, &plan.weights.ffn_gate, device)?,
-            ffn_up: NativeMatrix::upload(weights, &plan.weights.ffn_up, device)?,
-            ffn_down: NativeMatrix::upload(weights, &plan.weights.ffn_down, device)?,
+            post_attention_norm: post_attention_norm.commit(),
+            ffn_gate: ffn_gate.commit(),
+            ffn_up: ffn_up.commit(),
+            ffn_down: ffn_down.commit(),
         })
     }
 
@@ -200,19 +213,29 @@ impl LayerFinishWeights {
 }
 
 impl LayerFinishWorkspace {
-    pub(super) fn new(plan: LayerFinishWorkspacePlan, device: &hipcore::Device) -> Result<Self> {
+    pub(super) fn new(
+        plan: LayerFinishWorkspacePlan,
+        device: &hipcore::Device,
+        scope: &NativeBuildScope,
+    ) -> NativeBuildResult<Self> {
         macro_rules! buffer {
             ($field:ident) => {
-                DeviceBuffer::alloc(device, plan.$field).context(crate::error::NativeDeviceSnafu)?
+                scope.allocate_f32(device, plan.$field)?
             };
         }
+        let attention_residual = buffer!(attention_residual);
+        let post_norm = buffer!(post_norm);
+        let ffn_gate = buffer!(ffn_gate);
+        let ffn_up = buffer!(ffn_up);
+        let ffn_product = buffer!(ffn_product);
+        let ffn_down = buffer!(ffn_down);
         Ok(Self {
-            attention_residual: buffer!(attention_residual),
-            post_norm: buffer!(post_norm),
-            ffn_gate: buffer!(ffn_gate),
-            ffn_up: buffer!(ffn_up),
-            ffn_product: buffer!(ffn_product),
-            ffn_down: buffer!(ffn_down),
+            attention_residual: attention_residual.commit(),
+            post_norm: post_norm.commit(),
+            ffn_gate: ffn_gate.commit(),
+            ffn_up: ffn_up.commit(),
+            ffn_product: ffn_product.commit(),
+            ffn_down: ffn_down.commit(),
         })
     }
 

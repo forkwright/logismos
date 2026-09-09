@@ -4,13 +4,508 @@ use hipcore::{Device, DeviceBuffer};
 use std::sync::Arc;
 
 use super::ResourceOwner;
+pub use super::custody::NativeBuildSource;
+use super::custody::{NativeBufferParts, NativeBuildScope};
 use super::model_plan::{DeviceModelPlan, ModelDeviceByteDemand};
 use super::model_resources::{
-    ModelSessionResources, ModelSessionTeardown, ModelSessionTeardownState,
-    NativeResidentModelResources, NativeResidentTeardown,
+    ModelSessionResources, ModelSessionTeardown, ModelSessionTeardownParts,
+    ModelSessionTeardownState, NativeResidentModelResources, NativeResidentTeardown,
+    NativeResidentTeardownParts, ResidentRetention, StreamRetention,
 };
 use super::session::{Qwen35NativeSessionState, begin_error, completion_error, session_state};
 use crate::{Qwen35Weights, Result};
+
+enum NativeBuildCustody {
+    Resident {
+        scope: NativeBuildScope,
+        device: Device,
+    },
+    Session {
+        scope: NativeBuildScope,
+        stream: Option<StreamRetention>,
+        resident: ResidentRetention<NativeResidentModelResources>,
+    },
+    Standalone {
+        scope: NativeBuildScope,
+        stream: Option<StreamRetention>,
+        device: Device,
+    },
+}
+
+/// A failed native construction retaining its exact source and partial owners.
+///
+/// Dropping this value performs no HIP operation. Completed allocations remain
+/// inert in one recursive scope; an indeterminate allocation or stream output
+/// remains in its typed source quarantine and never enters ordinary teardown.
+#[must_use = "failed native construction retains explicit resource custody"]
+pub struct NativeBuildFailure {
+    source: Box<NativeBuildSource>,
+    custody: Box<NativeBuildCustody>,
+}
+
+impl NativeBuildFailure {
+    pub(super) fn resident(
+        source: NativeBuildSource,
+        scope: NativeBuildScope,
+        device: Device,
+    ) -> Self {
+        Self {
+            source: Box::new(source),
+            custody: Box::new(NativeBuildCustody::Resident { scope, device }),
+        }
+    }
+
+    pub(super) fn session(
+        source: NativeBuildSource,
+        scope: NativeBuildScope,
+        stream: Option<StreamRetention>,
+        resident: ResidentRetention<NativeResidentModelResources>,
+    ) -> Self {
+        Self {
+            source: Box::new(source),
+            custody: Box::new(NativeBuildCustody::Session {
+                scope,
+                stream,
+                resident,
+            }),
+        }
+    }
+
+    pub(super) fn standalone(
+        source: NativeBuildSource,
+        scope: NativeBuildScope,
+        stream: Option<StreamRetention>,
+        device: Device,
+    ) -> Self {
+        Self {
+            source: Box::new(source),
+            custody: Box::new(NativeBuildCustody::Standalone {
+                scope,
+                stream,
+                device,
+            }),
+        }
+    }
+
+    /// Borrow the exact failure that stopped native construction.
+    #[must_use]
+    pub fn source_error(&self) -> &NativeBuildSource {
+        self.source.as_ref()
+    }
+
+    /// Whether the source retains a non-null output from a failed HIP creation.
+    ///
+    /// This is independent of release of known completed owners: terminal
+    /// creation custody has no destructor, retry, or ordinary inventory path.
+    #[must_use]
+    pub fn has_creation_quarantine(&self) -> bool {
+        source_has_creation_quarantine(self.source.as_ref())
+    }
+
+    /// Begin explicit teardown of every known completed construction owner.
+    ///
+    /// A live private construction guard prevents detachment and is returned as
+    /// [`NativeBuildReleaseState::ConstructionPending`]. Safe public callers
+    /// only receive a failure after those guards have unwound.
+    #[must_use = "construction release retains the source and all native custody"]
+    pub fn begin_release(self) -> NativeBuildRelease {
+        NativeBuildRelease::from_failure(self)
+    }
+
+    fn custody_kind(&self) -> &'static str {
+        match self.custody.as_ref() {
+            NativeBuildCustody::Resident { .. } => "resident",
+            NativeBuildCustody::Session { .. } => "session",
+            NativeBuildCustody::Standalone { .. } => "standalone",
+        }
+    }
+}
+
+impl core::fmt::Debug for NativeBuildFailure {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("NativeBuildFailure")
+            .field("source", &self.source)
+            .field("custody", &self.custody_kind())
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Display for NativeBuildFailure {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for NativeBuildFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+enum NativeBuildReleaseCustody {
+    Construction(NativeBuildCustody),
+    NoResources {
+        resident: Option<ResidentRetention<NativeResidentModelResources>>,
+    },
+    Unadmitted {
+        _buffers: NativeBufferParts,
+        _resident: Option<ResidentRetention<NativeResidentModelResources>>,
+    },
+    Resident(NativeResidentTeardown),
+    Session(ModelSessionTeardown),
+}
+
+/// Explicit release custody for a failed native construction.
+///
+/// Its overall state prioritizes any terminal creation quarantine. The
+/// subordinate known-owner state remains available separately, and dropping
+/// this value performs no HIP operation.
+#[must_use = "construction release outcomes retain source and native custody"]
+pub struct NativeBuildRelease {
+    source: Box<NativeBuildSource>,
+    custody: NativeBuildReleaseCustody,
+}
+
+/// Overall release state retained after native construction failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum NativeBuildReleaseState {
+    /// A failed HIP creation retains an indeterminate non-null output.
+    CreationQuarantined,
+    /// A private typed guard still prevents lossless custody materialization.
+    ConstructionPending,
+    /// No successfully created owner requires a HIP destructor.
+    NoResources,
+    /// Completed buffers exist but no owned stream can admit their teardown.
+    Unadmitted,
+    /// Checked aggregate accounting retained admitted and unadmitted ownership.
+    PartiallyAdmitted,
+    /// HIP preflight retained the complete aggregate before a destructor call.
+    Pending,
+    /// Stream completion remains unproved; only reconciliation is sound.
+    SynchronizationUnconfirmed,
+    /// A destructor outcome is indeterminate and cannot be retried.
+    Quarantined,
+    /// HIP acknowledged all destructors for the known completed owners.
+    Released,
+}
+
+impl NativeBuildRelease {
+    fn from_failure(failure: NativeBuildFailure) -> Self {
+        let NativeBuildFailure { source, custody } = failure;
+        let custody = match *custody {
+            NativeBuildCustody::Resident { scope, device } => {
+                materialize_resident_build(scope, device)
+            }
+            NativeBuildCustody::Session {
+                scope,
+                stream,
+                resident,
+            } => materialize_session_build(scope, stream, resident),
+            NativeBuildCustody::Standalone {
+                scope,
+                stream,
+                device,
+            } => materialize_standalone_build(scope, stream, device),
+        };
+        Self { source, custody }
+    }
+
+    /// Borrow the exact source that stopped construction.
+    #[must_use]
+    pub fn source_error(&self) -> &NativeBuildSource {
+        self.source.as_ref()
+    }
+
+    /// Whether a failed creation separately retains an indeterminate output.
+    #[must_use]
+    pub fn has_creation_quarantine(&self) -> bool {
+        source_has_creation_quarantine(self.source.as_ref())
+    }
+
+    /// Classify teardown of known successfully created owners.
+    #[must_use]
+    pub fn state(&self) -> NativeBuildReleaseState {
+        if self.has_creation_quarantine() {
+            return NativeBuildReleaseState::CreationQuarantined;
+        }
+        self.known_resource_state()
+    }
+
+    /// Classify only the independently retained known completed owners.
+    ///
+    /// This subordinate state is never a whole-construction release result
+    /// while [`Self::state`] reports creation quarantine.
+    #[must_use]
+    pub fn known_resource_state(&self) -> NativeBuildReleaseState {
+        match &self.custody {
+            NativeBuildReleaseCustody::Construction(_) => {
+                NativeBuildReleaseState::ConstructionPending
+            }
+            NativeBuildReleaseCustody::NoResources { .. } => NativeBuildReleaseState::NoResources,
+            NativeBuildReleaseCustody::Unadmitted { .. } => NativeBuildReleaseState::Unadmitted,
+            NativeBuildReleaseCustody::Resident(teardown) => build_release_state(teardown.state()),
+            NativeBuildReleaseCustody::Session(teardown) => {
+                build_release_state(teardown.known_state())
+            }
+        }
+    }
+
+    /// Retry only construction materialization or HIP preflight-pending release.
+    pub fn retry(self) -> Self {
+        let Self { source, custody } = self;
+        match custody {
+            NativeBuildReleaseCustody::Construction(custody) => {
+                Self::from_failure(NativeBuildFailure {
+                    source,
+                    custody: Box::new(custody),
+                })
+            }
+            NativeBuildReleaseCustody::Resident(teardown) => Self {
+                source,
+                custody: NativeBuildReleaseCustody::Resident(teardown.retry_pending()),
+            },
+            NativeBuildReleaseCustody::Session(teardown) => Self {
+                source,
+                custody: NativeBuildReleaseCustody::Session(teardown.retry_pending()),
+            },
+            custody => Self { source, custody },
+        }
+    }
+
+    /// Reconcile only a synchronization-unconfirmed known-owner release.
+    pub fn reconcile(self) -> Self {
+        let Self { source, custody } = self;
+        let custody = match custody {
+            NativeBuildReleaseCustody::Resident(teardown) => {
+                NativeBuildReleaseCustody::Resident(teardown.reconcile_synchronization())
+            }
+            NativeBuildReleaseCustody::Session(teardown) => {
+                NativeBuildReleaseCustody::Session(teardown.reconcile_synchronization())
+            }
+            other => other,
+        };
+        Self { source, custody }
+    }
+
+    /// Recover the stopped source after all known owners are absent or released.
+    ///
+    /// # Errors
+    ///
+    /// Returns unchanged custody if release is incomplete or a session still
+    /// retains its resident model anchor.
+    pub fn into_released_source(self) -> core::result::Result<NativeBuildSource, Box<Self>> {
+        if self.has_creation_quarantine() {
+            return Err(Box::new(self));
+        }
+        let Self { source, custody } = self;
+        match custody {
+            NativeBuildReleaseCustody::NoResources { resident: None } => Ok(*source),
+            NativeBuildReleaseCustody::Resident(teardown) => match teardown.into_released() {
+                Ok(()) => Ok(*source),
+                Err(teardown) => Err(Box::new(Self {
+                    source,
+                    custody: NativeBuildReleaseCustody::Resident(*teardown),
+                })),
+            },
+            NativeBuildReleaseCustody::Session(teardown) => {
+                release_source_from_session(source, teardown)
+            }
+            custody => Err(Box::new(Self { source, custody })),
+        }
+    }
+
+    /// Recover the exact resident model after failed session resources released.
+    ///
+    /// The returned residual custody retains the exact source independently of
+    /// the recovered model. In particular, a terminal creation quarantine can
+    /// never disappear merely because all known session owners were released.
+    /// Resident construction failures have no model to recover.
+    ///
+    /// # Errors
+    ///
+    /// Returns unchanged custody until every known session owner is released.
+    pub fn into_released_model(
+        self,
+    ) -> core::result::Result<(Qwen35NativeExecutionModel, Self), Box<Self>> {
+        let Self { source, custody } = self;
+        match custody {
+            NativeBuildReleaseCustody::NoResources {
+                resident: Some(resident),
+            } => {
+                let model = Qwen35NativeExecutionModel {
+                    resources: resident.recover(),
+                };
+                let residual = Self {
+                    source,
+                    custody: NativeBuildReleaseCustody::NoResources { resident: None },
+                };
+                Ok((model, residual))
+            }
+            NativeBuildReleaseCustody::Session(teardown) => {
+                release_model_from_session(source, teardown)
+            }
+            custody => Err(Box::new(Self { source, custody })),
+        }
+    }
+}
+
+fn materialize_resident_build(
+    scope: NativeBuildScope,
+    device: Device,
+) -> NativeBuildReleaseCustody {
+    let parts = match scope.try_into_parts() {
+        Ok(parts) => parts,
+        Err(scope) => {
+            return NativeBuildReleaseCustody::Construction(NativeBuildCustody::Resident {
+                scope,
+                device,
+            });
+        }
+    };
+    if parts.is_empty() {
+        return NativeBuildReleaseCustody::NoResources { resident: None };
+    }
+    NativeBuildReleaseCustody::Resident(
+        NativeResidentTeardownParts::new(device, parts.into_buffers()).begin_release(),
+    )
+}
+
+fn materialize_session_build(
+    scope: NativeBuildScope,
+    stream: Option<StreamRetention>,
+    resident: ResidentRetention<NativeResidentModelResources>,
+) -> NativeBuildReleaseCustody {
+    let parts = match scope.try_into_parts() {
+        Ok(parts) => parts,
+        Err(scope) => {
+            return NativeBuildReleaseCustody::Construction(NativeBuildCustody::Session {
+                scope,
+                stream,
+                resident,
+            });
+        }
+    };
+    let Some(stream) = stream else {
+        return if parts.is_empty() {
+            NativeBuildReleaseCustody::NoResources {
+                resident: Some(resident),
+            }
+        } else {
+            NativeBuildReleaseCustody::Unadmitted {
+                _buffers: parts,
+                _resident: Some(resident),
+            }
+        };
+    };
+    let parts = ModelSessionTeardownParts::new(
+        stream.recover(),
+        parts.into_buffers(),
+        Some(resident),
+        None,
+    );
+    NativeBuildReleaseCustody::Session(parts.begin_release())
+}
+
+fn materialize_standalone_build(
+    scope: NativeBuildScope,
+    stream: Option<StreamRetention>,
+    device: Device,
+) -> NativeBuildReleaseCustody {
+    let parts = match scope.try_into_parts() {
+        Ok(parts) => parts,
+        Err(scope) => {
+            return NativeBuildReleaseCustody::Construction(NativeBuildCustody::Standalone {
+                scope,
+                stream,
+                device,
+            });
+        }
+    };
+    let Some(stream) = stream else {
+        return if parts.is_empty() {
+            NativeBuildReleaseCustody::NoResources { resident: None }
+        } else {
+            NativeBuildReleaseCustody::Unadmitted {
+                _buffers: parts,
+                _resident: None,
+            }
+        };
+    };
+    drop(device);
+    let parts = ModelSessionTeardownParts::new(stream.recover(), parts.into_buffers(), None, None);
+    NativeBuildReleaseCustody::Session(parts.begin_release())
+}
+
+fn release_source_from_session(
+    source: Box<NativeBuildSource>,
+    teardown: ModelSessionTeardown,
+) -> core::result::Result<NativeBuildSource, Box<NativeBuildRelease>> {
+    match teardown.into_released() {
+        Ok(None) => Ok(*source),
+        Ok(Some(resident)) => Err(Box::new(NativeBuildRelease {
+            source,
+            custody: NativeBuildReleaseCustody::NoResources {
+                resident: Some(ResidentRetention::new(resident)),
+            },
+        })),
+        Err(teardown) => Err(Box::new(NativeBuildRelease {
+            source,
+            custody: NativeBuildReleaseCustody::Session(*teardown),
+        })),
+    }
+}
+
+fn release_model_from_session(
+    source: Box<NativeBuildSource>,
+    teardown: ModelSessionTeardown,
+) -> core::result::Result<(Qwen35NativeExecutionModel, NativeBuildRelease), Box<NativeBuildRelease>>
+{
+    match teardown.into_released() {
+        Ok(Some(resources)) => {
+            let model = Qwen35NativeExecutionModel { resources };
+            let residual = NativeBuildRelease {
+                source,
+                custody: NativeBuildReleaseCustody::NoResources { resident: None },
+            };
+            Ok((model, residual))
+        }
+        Ok(None) => Err(Box::new(NativeBuildRelease {
+            source,
+            custody: NativeBuildReleaseCustody::NoResources { resident: None },
+        })),
+        Err(teardown) => Err(Box::new(NativeBuildRelease {
+            source,
+            custody: NativeBuildReleaseCustody::Session(*teardown),
+        })),
+    }
+}
+
+fn build_release_state(state: ModelSessionTeardownState) -> NativeBuildReleaseState {
+    match state {
+        ModelSessionTeardownState::Released => NativeBuildReleaseState::Released,
+        ModelSessionTeardownState::Unadmitted => NativeBuildReleaseState::Unadmitted,
+        ModelSessionTeardownState::PartiallyAdmitted => NativeBuildReleaseState::PartiallyAdmitted,
+        ModelSessionTeardownState::Pending => NativeBuildReleaseState::Pending,
+        ModelSessionTeardownState::SynchronizationUnconfirmed => {
+            NativeBuildReleaseState::SynchronizationUnconfirmed
+        }
+        ModelSessionTeardownState::Quarantined => NativeBuildReleaseState::Quarantined,
+    }
+}
+
+fn source_has_creation_quarantine(source: &NativeBuildSource) -> bool {
+    match source {
+        NativeBuildSource::Decoder(_) => false,
+        NativeBuildSource::BufferAllocation(error) => {
+            !matches!(error.as_ref(), hipcore::BufferAllocationError::NoHandle(_))
+        }
+        NativeBuildSource::StreamCreation(error) => {
+            !matches!(error.as_ref(), hipcore::StreamCreationError::NoHandle(_))
+        }
+    }
+}
 
 /// Checked device-allocation demand for one resident native model and one session.
 ///
@@ -215,7 +710,10 @@ impl<'weights> Qwen35NativeExecutionPlan<'weights> {
     /// `device` must be the qualified `gfx1100` device selected for the native
     /// kernels. This establishes immutable resident ownership only; it is not a
     /// physical residency, capacity, performance, or serving claim.
-    pub unsafe fn into_model(self, device: &Device) -> Result<Qwen35NativeExecutionModel> {
+    pub unsafe fn into_model(
+        self,
+        device: &Device,
+    ) -> core::result::Result<Qwen35NativeExecutionModel, NativeBuildFailure> {
         let resources = NativeResidentModelResources::new(self.weights, self.plan, device)?;
         Ok(Qwen35NativeExecutionModel {
             resources: Arc::new(resources),
@@ -234,9 +732,13 @@ impl<'weights> Qwen35NativeExecutionPlan<'weights> {
     /// `device` must be the qualified `gfx1100` device selected for the native
     /// kernels. Construction establishes ownership only: it is not a physical
     /// GPU qualification, capacity grant, performance claim, or serving API.
-    pub unsafe fn into_session(self, device: &Device) -> Result<Qwen35NativeExecutionSession> {
+    pub unsafe fn into_session(
+        self,
+        device: &Device,
+    ) -> core::result::Result<Qwen35NativeExecutionSession, NativeBuildFailure> {
         // SAFETY: the caller supplies the qualified device required to upload the immutable model.
-        unsafe { self.into_model(device) }?.new_session()
+        let model = unsafe { self.into_model(device) }?;
+        model.new_session()
     }
 }
 
@@ -283,9 +785,20 @@ impl Qwen35NativeExecutionModel {
     ///
     /// Returns typed allocation or stream-creation failures without affecting
     /// the immutable resident uploads or another session.
-    pub fn new_session(&self) -> Result<Qwen35NativeExecutionSession> {
-        self.plan_session(self.resources.context_ceiling())?
-            .into_session()
+    pub fn new_session(
+        &self,
+    ) -> core::result::Result<Qwen35NativeExecutionSession, NativeBuildFailure> {
+        let plan = self
+            .plan_session(self.resources.context_ceiling())
+            .map_err(|error| {
+                NativeBuildFailure::session(
+                    NativeBuildSource::decoder(error),
+                    NativeBuildScope::new(),
+                    None,
+                    ResidentRetention::new(Arc::clone(&self.resources)),
+                )
+            })?;
+        plan.into_session()
     }
 
     /// Consume this model into explicit resident teardown when no use retains it.
@@ -370,7 +883,9 @@ impl Qwen35NativeExecutionSessionPlan {
     ///
     /// Returns typed stream or allocation failures without changing the
     /// resident uploads or another planned use.
-    pub fn into_session(self) -> Result<Qwen35NativeExecutionSession> {
+    pub fn into_session(
+        self,
+    ) -> core::result::Result<Qwen35NativeExecutionSession, NativeBuildFailure> {
         let resources = ModelSessionResources::new(self.model, self.plan)?;
         Ok(Qwen35NativeExecutionSession {
             owner: ResourceOwner::new(resources),
@@ -425,6 +940,16 @@ impl Qwen35NativeExecutionSessionTeardown {
     #[must_use]
     pub fn state(&self) -> Qwen35NativeExecutionSessionTeardownState {
         teardown_state(self.inner.state())
+    }
+
+    /// Return the subordinate release state of the owned stream and buffers.
+    ///
+    /// This can report release progress while [`Self::state`] remains
+    /// quarantined by a separate indeterminate output from failed allocation.
+    /// It is never a complete session-release acknowledgement on its own.
+    #[must_use]
+    pub fn known_resource_state(&self) -> Qwen35NativeExecutionSessionTeardownState {
+        teardown_state(self.inner.known_state())
     }
 
     /// Retry HIP aggregate teardown only after its preflight-pending outcome.

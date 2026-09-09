@@ -98,10 +98,80 @@ pub struct NativeNumericalStatusBuffer {
 
 #[cfg(feature = "gpu")]
 impl NativeNumericalStatusBuffer {
+    /// Initialize the retained status word and consume it into a checked owner.
+    ///
+    /// The host-to-device copy is synchronous. On failure, the returned error
+    /// retains the original allocation with unspecified contents; no initialized
+    /// status owner is published.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeNumericalStatusInitializationError`] when HIP cannot
+    /// complete the zero initialization.
+    pub fn initialize(
+        self,
+    ) -> core::result::Result<NativeNumericalStatus, NativeNumericalStatusInitializationError> {
+        let mut bits = self.bits;
+        match bits.copy_from_host(&[0]) {
+            Ok(()) => Ok(NativeNumericalStatus { bits }),
+            Err(source) => Err(NativeNumericalStatusInitializationError { source, bits }),
+        }
+    }
+
     /// Consume this carrier and return its original typed device-buffer owner.
     #[must_use]
     pub fn into_buffer(self) -> DeviceBuffer<u32> {
         self.bits
+    }
+}
+
+/// Failed initialization of a caller-owned native status buffer.
+///
+/// This failure retains the original allocation with unspecified contents.
+/// Native construction must move it into inert teardown custody before
+/// abandoning the failure.
+#[cfg(feature = "gpu")]
+pub struct NativeNumericalStatusInitializationError {
+    source: hipcore::Error,
+    bits: DeviceBuffer<u32>,
+}
+
+#[cfg(feature = "gpu")]
+impl core::fmt::Debug for NativeNumericalStatusInitializationError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("NativeNumericalStatusInitializationError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl core::fmt::Display for NativeNumericalStatusInitializationError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl std::error::Error for NativeNumericalStatusInitializationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl NativeNumericalStatusInitializationError {
+    /// Borrow the HIP failure that prevented initialization.
+    #[must_use]
+    pub const fn error(&self) -> &hipcore::Error {
+        &self.source
+    }
+
+    /// Consume the failure and recover its source and original allocation.
+    #[must_use]
+    pub fn into_parts(self) -> (hipcore::Error, DeviceBuffer<u32>) {
+        (self.source, self.bits)
     }
 }
 

@@ -7,7 +7,8 @@ use crate::error::{ArithmeticOverflowSnafu, NativePagedKvSnafu, NativeSessionSta
 use crate::qwen35_native::plan::{DeviceByteDemand, DeviceFullAttentionPlan};
 use crate::qwen35_native::resources::DeviceResources;
 use crate::qwen35_native::{
-    BeginError, CompletionError, CompletionResource, ResourceOwner, ResourceState,
+    BeginError, CompletionError, CompletionResource, NativeBuildFailure, ResourceOwner,
+    ResourceState,
 };
 use crate::{Qwen35Weights, Result};
 
@@ -141,7 +142,10 @@ impl<'weights> Qwen35NativeLayerPlan<'weights> {
     /// `device` must be a qualified `gfx1100` device for the selected native
     /// kernels. This constructor establishes ownership, not numerical or
     /// hardware qualification.
-    pub unsafe fn into_session(self, device: &Device) -> Result<Qwen35NativeLayerSession> {
+    pub unsafe fn into_session(
+        self,
+        device: &Device,
+    ) -> core::result::Result<Qwen35NativeLayerSession, NativeBuildFailure> {
         let resources = DeviceResources::new(self.weights, self.plan, device)?;
         Ok(Qwen35NativeLayerSession {
             owner: ResourceOwner::new(resources),

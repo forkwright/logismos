@@ -5,7 +5,9 @@ use core::ptr::{null, null_mut};
 use hipcore::{Device, DeviceBuffer, Stream};
 use snafu::ResultExt;
 
-use super::custody::NativeBufferSink;
+use super::custody::{
+    NativeBufferSink, NativeBuildGuard, NativeBuildResult, NativeBuildScope, NativeBuildSource,
+};
 use super::dispatch::{launch_rms_norm, launch_silu_mul};
 use super::finish::{
     DeferredLayerFinish, LayerFinishPlan, LayerFinishWeights, LayerFinishWorkspace,
@@ -80,18 +82,30 @@ impl NativeRecurrentWeights {
         weights: &Qwen35Weights,
         plan: &DeviceRecurrentPlan,
         device: &Device,
-    ) -> Result<Self> {
+        scope: &NativeBuildScope,
+    ) -> NativeBuildResult<Self> {
+        let qkv = matrix_guard(weights, &plan.matrices.qkv, device, scope)?;
+        let gate = matrix_guard(weights, &plan.matrices.gate, device, scope)?;
+        let alpha = matrix_guard(weights, &plan.matrices.alpha, device, scope)?;
+        let beta = matrix_guard(weights, &plan.matrices.beta, device, scope)?;
+        let output = matrix_guard(weights, &plan.matrices.output, device, scope)?;
+        let attention_norm =
+            parameter_guard(weights, &plan.parameters.attention_norm, device, scope)?;
+        let a = parameter_guard(weights, &plan.parameters.a, device, scope)?;
+        let dt = parameter_guard(weights, &plan.parameters.dt, device, scope)?;
+        let convolution = parameter_guard(weights, &plan.parameters.convolution, device, scope)?;
+        let output_norm = parameter_guard(weights, &plan.parameters.output_norm, device, scope)?;
         Ok(Self {
-            qkv: NativeMatrix::upload(weights, &plan.matrices.qkv, device)?,
-            gate: NativeMatrix::upload(weights, &plan.matrices.gate, device)?,
-            alpha: NativeMatrix::upload(weights, &plan.matrices.alpha, device)?,
-            beta: NativeMatrix::upload(weights, &plan.matrices.beta, device)?,
-            output: NativeMatrix::upload(weights, &plan.matrices.output, device)?,
-            attention_norm: f32_parameter_buffer(weights, &plan.parameters.attention_norm, device)?,
-            a: f32_parameter_buffer(weights, &plan.parameters.a, device)?,
-            dt: f32_parameter_buffer(weights, &plan.parameters.dt, device)?,
-            convolution: f32_parameter_buffer(weights, &plan.parameters.convolution, device)?,
-            output_norm: f32_parameter_buffer(weights, &plan.parameters.output_norm, device)?,
+            qkv: qkv.commit(),
+            gate: gate.commit(),
+            alpha: alpha.commit(),
+            beta: beta.commit(),
+            output: output.commit(),
+            attention_norm: attention_norm.commit(),
+            a: a.commit(),
+            dt: dt.commit(),
+            convolution: convolution.commit(),
+            output_norm: output_norm.commit(),
         })
     }
 
@@ -111,28 +125,47 @@ impl NativeRecurrentWeights {
 
 impl NativeRecurrentWorkspace {
     /// Allocate the exact scratch spans named by the recurrent plan.
-    pub(super) fn new(plan: &RecurrentWorkspacePlan, device: &Device) -> Result<Self> {
+    pub(super) fn new(
+        plan: &RecurrentWorkspacePlan,
+        device: &Device,
+        scope: &NativeBuildScope,
+    ) -> NativeBuildResult<Self> {
         macro_rules! buffer {
             ($field:ident) => {
-                DeviceBuffer::alloc(device, plan.$field).context(NativeDeviceSnafu)?
+                scope.allocate_f32(device, plan.$field)?
             };
         }
+        let normalized_hidden = buffer!(normalized_hidden);
+        let qkv = buffer!(qkv);
+        let z = buffer!(z);
+        let alpha = buffer!(alpha);
+        let beta_projection = buffer!(beta_projection);
+        let raw_convolution = buffer!(raw_convolution);
+        let activated_convolution = buffer!(activated_convolution);
+        let tiled_query = buffer!(tiled_query);
+        let tiled_key = buffer!(tiled_key);
+        let beta = buffer!(beta);
+        let log_decay = buffer!(log_decay);
+        let recurrence_output = buffer!(recurrence_output);
+        let normalized_output = buffer!(normalized_output);
+        let gated_output = buffer!(gated_output);
+        let projected_attention = buffer!(projected_attention);
         Ok(Self {
-            normalized_hidden: buffer!(normalized_hidden),
-            qkv: buffer!(qkv),
-            z: buffer!(z),
-            alpha: buffer!(alpha),
-            beta_projection: buffer!(beta_projection),
-            raw_convolution: buffer!(raw_convolution),
-            activated_convolution: buffer!(activated_convolution),
-            tiled_query: buffer!(tiled_query),
-            tiled_key: buffer!(tiled_key),
-            beta: buffer!(beta),
-            log_decay: buffer!(log_decay),
-            recurrence_output: buffer!(recurrence_output),
-            normalized_output: buffer!(normalized_output),
-            gated_output: buffer!(gated_output),
-            projected_attention: buffer!(projected_attention),
+            normalized_hidden: normalized_hidden.commit(),
+            qkv: qkv.commit(),
+            z: z.commit(),
+            alpha: alpha.commit(),
+            beta_projection: beta_projection.commit(),
+            raw_convolution: raw_convolution.commit(),
+            activated_convolution: activated_convolution.commit(),
+            tiled_query: tiled_query.commit(),
+            tiled_key: tiled_key.commit(),
+            beta: beta.commit(),
+            log_decay: log_decay.commit(),
+            recurrence_output: recurrence_output.commit(),
+            normalized_output: normalized_output.commit(),
+            gated_output: gated_output.commit(),
+            projected_attention: projected_attention.commit(),
         })
     }
 
@@ -157,24 +190,31 @@ impl NativeRecurrentWorkspace {
 
 impl NativeRecurrentState {
     /// Allocate zero-initialized committed and staged state for one layer.
-    pub(super) fn new(plan: &DeviceRecurrentPlan, device: &Device) -> Result<Self> {
+    pub(super) fn new(
+        plan: &DeviceRecurrentPlan,
+        device: &Device,
+        scope: &NativeBuildScope,
+    ) -> NativeBuildResult<Self> {
         let history_elements = plan.convolution_history_elements();
         let committed_convolution_history = if history_elements == 0 {
             None
         } else {
-            Some(zeroed_buffer(device, history_elements)?)
+            Some(zeroed_buffer(device, history_elements, scope)?)
         };
         let staged_convolution_history = if history_elements == 0 {
             None
         } else {
-            Some(zeroed_buffer(device, history_elements)?)
+            Some(zeroed_buffer(device, history_elements, scope)?)
         };
         let recurrent_elements = plan.recurrent_state_elements();
+        let committed_recurrent_state = zeroed_buffer(device, recurrent_elements, scope)?;
+        let staged_recurrent_state = zeroed_buffer(device, recurrent_elements, scope)?;
         Ok(Self {
-            committed_convolution_history,
-            staged_convolution_history,
-            committed_recurrent_state: zeroed_buffer(device, recurrent_elements)?,
-            staged_recurrent_state: zeroed_buffer(device, recurrent_elements)?,
+            committed_convolution_history: committed_convolution_history
+                .map(NativeBuildGuard::commit),
+            staged_convolution_history: staged_convolution_history.map(NativeBuildGuard::commit),
+            committed_recurrent_state: committed_recurrent_state.commit(),
+            staged_recurrent_state: staged_recurrent_state.commit(),
         })
     }
 
@@ -464,8 +504,35 @@ impl DeferredRecurrent<'_> {
     }
 }
 
-fn zeroed_buffer(device: &Device, elements: usize) -> Result<DeviceBuffer<f32>> {
-    let mut buffer = DeviceBuffer::alloc(device, elements).context(NativeDeviceSnafu)?;
-    buffer.zero_fill().context(NativeDeviceSnafu)?;
+fn matrix_guard(
+    weights: &Qwen35Weights,
+    plan: &super::plan::ProjectionWeight,
+    device: &Device,
+    scope: &NativeBuildScope,
+) -> NativeBuildResult<NativeBuildGuard<NativeMatrix>> {
+    let matrix = NativeMatrix::upload(weights, plan, device, scope)?;
+    Ok(scope.guard(matrix, NativeMatrix::into_buffer_sink))
+}
+
+fn parameter_guard(
+    weights: &Qwen35Weights,
+    plan: &super::plan::F32Parameter,
+    device: &Device,
+    scope: &NativeBuildScope,
+) -> NativeBuildResult<NativeBuildGuard<DeviceBuffer<f32>>> {
+    let buffer = f32_parameter_buffer(weights, plan, device, scope)?;
+    Ok(scope.guard(buffer, |buffer, sink| sink.push_f32(buffer)))
+}
+
+fn zeroed_buffer(
+    device: &Device,
+    elements: usize,
+    scope: &NativeBuildScope,
+) -> NativeBuildResult<NativeBuildGuard<DeviceBuffer<f32>>> {
+    let mut buffer = scope.allocate_f32(device, elements)?;
+    buffer
+        .zero_fill()
+        .context(NativeDeviceSnafu)
+        .map_err(NativeBuildSource::decoder)?;
     Ok(buffer)
 }

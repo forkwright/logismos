@@ -31,6 +31,7 @@ mod weights;
 
 #[cfg(feature = "gpu")]
 pub use model_session::{
+    NativeBuildFailure, NativeBuildRelease, NativeBuildReleaseState, NativeBuildSource,
     Qwen35NativeExecutionDeviceDemand, Qwen35NativeExecutionModel, Qwen35NativeExecutionModelClose,
     Qwen35NativeExecutionModelTeardown, Qwen35NativeExecutionPlan, Qwen35NativeExecutionSession,
     Qwen35NativeExecutionSessionPlan, Qwen35NativeExecutionSessionTeardown,
