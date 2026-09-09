@@ -345,7 +345,9 @@ enum AdmissionState {
         loading: bool,
     },
     Evicting(ResidentHandle),
-    Quarantined,
+    Quarantined {
+        resident: Option<ResidentHandle>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -729,7 +731,7 @@ impl Scheduler {
         self.ensure_completion_state(admission_id, pending.kind)?;
         match completion {
             RuntimeCompletion::Loaded { resident, .. } => {
-                if self.resident_is_live(&resident) {
+                if self.resident_handle_in_custody(&resident) {
                     return Err(SchedulerError::DuplicateResidentHandle {
                         location: error_location(),
                     });
@@ -761,15 +763,30 @@ impl Scheduler {
                 self.release_admission(admission_id)?;
                 self.operations.remove(&operation.value);
             }
-            RuntimeCompletion::LoadQuarantined { .. }
-            | RuntimeCompletion::EvictionQuarantined { .. } => {
+            RuntimeCompletion::LoadQuarantined { .. } => {
                 self.operations.remove(&operation.value);
                 let admission = self.admissions.get_mut(&admission_id).ok_or(
                     SchedulerError::UnknownAdmission {
                         location: error_location(),
                     },
                 )?;
-                admission.state = AdmissionState::Quarantined;
+                admission.state = AdmissionState::Quarantined { resident: None };
+            }
+            RuntimeCompletion::EvictionQuarantined { .. } => {
+                self.operations.remove(&operation.value);
+                let admission = self.admissions.get_mut(&admission_id).ok_or(
+                    SchedulerError::UnknownAdmission {
+                        location: error_location(),
+                    },
+                )?;
+                let AdmissionState::Evicting(resident) = &admission.state else {
+                    return Err(SchedulerError::OperationStateMismatch {
+                        location: error_location(),
+                    });
+                };
+                admission.state = AdmissionState::Quarantined {
+                    resident: Some(resident.clone()),
+                };
             }
             RuntimeCompletion::EvictFailed { .. } => {
                 self.operations.remove(&operation.value);
@@ -980,7 +997,7 @@ impl Scheduler {
             }
             AdmissionState::Draining { .. }
             | AdmissionState::Evicting(_)
-            | AdmissionState::Quarantined => return,
+            | AdmissionState::Quarantined { .. } => return,
         };
         admission.state = state;
     }
@@ -1028,7 +1045,7 @@ impl Scheduler {
         })
     }
 
-    fn resident_is_live(&self, candidate: &ResidentHandle) -> bool {
+    fn resident_handle_in_custody(&self, candidate: &ResidentHandle) -> bool {
         self.admissions.values().any(|admission| {
             matches!(
                 &admission.state,
@@ -1039,6 +1056,9 @@ impl Scheduler {
                         ..
                     }
                     | AdmissionState::Evicting(resident)
+                    | AdmissionState::Quarantined {
+                        resident: Some(resident),
+                    }
                     if resident == candidate
             )
         })
@@ -1537,7 +1557,7 @@ mod tests {
                 .admissions
                 .get(&ticket.admission_id)
                 .map(|admission| &admission.state),
-            Some(AdmissionState::Quarantined)
+            Some(AdmissionState::Quarantined { resident: None })
         ));
         assert!(matches!(
             scheduler.begin_use(&ticket),
@@ -1588,7 +1608,9 @@ mod tests {
                 .admissions
                 .get(&ticket.admission_id)
                 .map(|admission| &admission.state),
-            Some(AdmissionState::Quarantined)
+            Some(AdmissionState::Quarantined {
+                resident: Some(resident),
+            }) if resident.as_str() == "resident-main"
         ));
         assert!(matches!(
             scheduler.begin_use(&ticket),
@@ -1614,6 +1636,59 @@ mod tests {
                 operation: eviction.operation(),
             }),
             Err(SchedulerError::UnknownOperation { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_eviction_keeps_its_handle_in_custody() -> Result<(), SchedulerError> {
+        let first_request = request(&format!("[{}]", workload("first", 4)), 8)?;
+        let mut scheduler = Scheduler::new(&first_request, SchedulerLimits::default())?;
+        let first = one_ticket(&mut scheduler, &first_request)?;
+        let first_load = poll_command(&mut scheduler)?;
+        scheduler.complete(RuntimeCompletion::Loaded {
+            operation: first_load.operation(),
+            resident: ResidentHandle::try_new("resident-first")?,
+        })?;
+        scheduler.request_retirement(&first)?;
+        let eviction = poll_command(&mut scheduler)?;
+        scheduler.complete(RuntimeCompletion::EvictionQuarantined {
+            operation: eviction.operation(),
+        })?;
+
+        let second_request = request(&format!("[{}]", workload("second", 4)), 8)?;
+        let second = one_ticket(&mut scheduler, &second_request)?;
+        let second_load = poll_command(&mut scheduler)?;
+        assert!(matches!(
+            second_load.kind(),
+            RuntimeCommandKind::Load { profile_id, .. } if profile_id == "second"
+        ));
+        assert!(matches!(
+            scheduler.complete(RuntimeCompletion::Loaded {
+                operation: second_load.operation(),
+                resident: ResidentHandle::try_new("resident-first")?,
+            }),
+            Err(SchedulerError::DuplicateResidentHandle { .. })
+        ));
+        assert_eq!(
+            scheduler.operations.len(),
+            1,
+            "duplicate handle acknowledgement leaves its load pending"
+        );
+        scheduler.complete(RuntimeCompletion::Loaded {
+            operation: second_load.operation(),
+            resident: ResidentHandle::try_new("resident-second")?,
+        })?;
+        let permit = scheduler.begin_use(&second)?;
+        scheduler.finish_use(permit)?;
+        assert!(matches!(
+            scheduler
+                .admissions
+                .get(&first.admission_id)
+                .map(|admission| &admission.state),
+            Some(AdmissionState::Quarantined {
+                resident: Some(resident),
+            }) if resident.as_str() == "resident-first"
         ));
         Ok(())
     }
