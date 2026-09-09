@@ -44,15 +44,15 @@ __device__ int signed_i8(std::uint8_t value)
 
 __device__ void k_scale_min(const std::uint8_t* scales, std::size_t group, std::uint8_t* scale, std::uint8_t* minimum)
 {
-    if (group < 4) {
+    if (group < LOGISMOS_K_PAIR_COUNT) {
         *scale = scales[group] & LOW_SIX_BITS_MASK;
-        *minimum = scales[group + 4] & LOW_SIX_BITS_MASK;
+        *minimum = scales[group + LOGISMOS_K_PAIR_COUNT] & LOW_SIX_BITS_MASK;
         return;
     }
-    const std::uint8_t packed = scales[group + 4];
+    const std::uint8_t packed = scales[group + LOGISMOS_K_PAIR_COUNT];
     *scale = static_cast<std::uint8_t>(
         (packed & LOW_NIBBLE_MASK)
-        | ((scales[group - 4] >> HIGH_TWO_BITS_SHIFT) << 4));
+        | ((scales[group - LOGISMOS_K_PAIR_COUNT] >> HIGH_TWO_BITS_SHIFT) << 4));
     *minimum = static_cast<std::uint8_t>(
         (packed >> 4)
         | ((scales[group] >> HIGH_TWO_BITS_SHIFT) << 4));

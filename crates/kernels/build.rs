@@ -171,6 +171,13 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
 
     let k_pair_width = checked_mul(quant::K_GROUP_VALUES, 2, "Q4_K pair width")?;
     let k_pair_count = checked_div_exact(q4_values, k_pair_width, "Q4_K values per pair")?;
+    let u8_bits = usize::try_from(u8::BITS)
+        .map_err(|_| "u8 bit width does not fit usize while validating row formats".to_string())?;
+    require_equal(
+        checked_mul(k_pair_count, 2, "Q4_K scale-pair bit capacity")?,
+        u8_bits,
+        "Q4_K scale pair count must fill the Q5_K fifth-bit byte",
+    )?;
     require_equal(
         q4_quant,
         checked_mul(k_pair_count, quant::K_GROUP_VALUES, "Q4_K quant bytes")?,
@@ -186,21 +193,13 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         std::mem::size_of::<u16>(),
         "Q4_K super-minimum offset must follow the super-scale",
     )?;
-    require_equal(
-        q4_scale_offset,
-        q4_prefix,
-        "Q4_K scale offset must follow the prefix",
-    )?;
+    require_equal(q4_scale_offset, q4_prefix, "Q4_K scale offset must follow the prefix")?;
     require_equal(
         q4_quant_offset,
         checked_sum(&[q4_scale_offset, q4_scales], "Q4_K quant offset")?,
         "Q4_K quant offset must follow scales",
     )?;
-    require_equal(
-        q5_values,
-        q4_values,
-        "Q5_K values must share Q4_K pair geometry",
-    )?;
+    require_equal(q5_values, q4_values, "Q5_K values must share Q4_K pair geometry")?;
     require_equal(
         q5_quant,
         q4_quant,
@@ -221,11 +220,7 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         std::mem::size_of::<u16>(),
         "Q5_K super-minimum offset must follow the super-scale",
     )?;
-    require_equal(
-        q5_scale_offset,
-        q5_prefix,
-        "Q5_K scale offset must follow the prefix",
-    )?;
+    require_equal(q5_scale_offset, q5_prefix, "Q5_K scale offset must follow the prefix")?;
     require_equal(
         q5_high_offset,
         checked_sum(&[q5_scale_offset, q5_scales], "Q5_K high-bit offset")?,
@@ -242,15 +237,16 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         q6_quarters_per_half,
         "Q6_K values per half block",
     )?;
+    require_equal(
+        checked_mul(q6_quarters_per_half, 2, "Q6_K high-plane bit capacity")?,
+        u8_bits,
+        "Q6_K quarter count must fill its two-bit high-plane byte",
+    )?;
     let q6_half_block_count = checked_div_exact(q6_values, q6_half_width, "Q6_K half blocks")?;
-    let q6_low_bytes_per_half =
-        checked_div_exact(q6_low, q6_half_block_count, "Q6_K low bytes per half")?;
-    let q6_high_bytes_per_half =
-        checked_div_exact(q6_high, q6_half_block_count, "Q6_K high bytes per half")?;
-    let q6_scales_per_half =
-        checked_div_exact(q6_scales, q6_half_block_count, "Q6_K scales per half")?;
-    let q6_values_per_half =
-        checked_div_exact(q6_values, q6_half_block_count, "Q6_K values per half")?;
+    let q6_low_bytes_per_half = checked_div_exact(q6_low, q6_half_block_count, "Q6_K low bytes per half")?;
+    let q6_high_bytes_per_half = checked_div_exact(q6_high, q6_half_block_count, "Q6_K high bytes per half")?;
+    let q6_scales_per_half = checked_div_exact(q6_scales, q6_half_block_count, "Q6_K scales per half")?;
+    let q6_values_per_half = checked_div_exact(q6_values, q6_half_block_count, "Q6_K values per half")?;
     let q6_values_per_scale = checked_div_exact(q6_values, q6_scales, "Q6_K values per scale")?;
     require_equal(
         q6_low_bytes_per_half,
@@ -272,11 +268,7 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         checked_mul(q6_values_per_scale, 2, "Q6_K values per quarter relation")?,
         "Q6_K quarters must contain two scale groups",
     )?;
-    require_equal(
-        q6_high_offset,
-        q6_low,
-        "Q6_K high-bit offset must follow low planes",
-    )?;
+    require_equal(q6_high_offset, q6_low, "Q6_K high-bit offset must follow low planes")?;
     require_equal(
         q6_scale_offset,
         checked_sum(&[q6_high_offset, q6_high], "Q6_K scale offset")?,
@@ -297,8 +289,14 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         iq4_nl_scale,
         "IQ4_NL quant offset must follow the block scale",
     )?;
-    let iq4_xs_group_count =
-        checked_div_exact(iq4_xs_values, iq4_xs_group_values, "IQ4_XS group count")?;
+    let iq4_xs_group_count = checked_div_exact(
+        iq4_xs_values,
+        iq4_xs_group_values,
+        "IQ4_XS group count",
+    )?;
+    if !iq4_xs_group_values.is_multiple_of(2) {
+        return Err("quant layout relation violated: IQ4_XS group width must be even for packed lanes".to_string());
+    }
     require_equal(
         checked_mul(iq4_xs_quant, 2, "IQ4_XS reconstructed values")?,
         iq4_xs_values,
@@ -321,18 +319,12 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
     )?;
     require_equal(
         iq4_xs_scale_low_offset,
-        checked_sum(
-            &[iq4_xs_scale_high_offset, iq4_xs_scale_high],
-            "IQ4_XS low-scale offset",
-        )?,
+        checked_sum(&[iq4_xs_scale_high_offset, iq4_xs_scale_high], "IQ4_XS low-scale offset")?,
         "IQ4_XS low-scale offset must follow high scale bits",
     )?;
     require_equal(
         iq4_xs_quant_offset,
-        checked_sum(
-            &[iq4_xs_scale_low_offset, iq4_xs_scale_low],
-            "IQ4_XS quant offset",
-        )?,
+        checked_sum(&[iq4_xs_scale_low_offset, iq4_xs_scale_low], "IQ4_XS quant offset")?,
         "IQ4_XS quant offset must follow low scale bits",
     )?;
     if quant::f32_row::F32_ROW_VALUE_BYTES != std::mem::size_of::<u32>()
@@ -343,21 +335,14 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         || iq4_xs_scale != std::mem::size_of::<u16>()
         || iq4_xs_scale_high != std::mem::size_of::<u16>()
     {
-        return Err(
-            "quant constants violate serialized-row fixed-width field representation".to_string(),
-        );
+        return Err("quant constants violate serialized-row fixed-width field representation".to_string());
     }
     let q4_derived = checked_sum(&[q4_prefix, q4_scales, q4_quant], "Q4_K")?;
     let q5_derived = checked_sum(&[q5_prefix, q5_scales, q5_high, q5_quant], "Q5_K")?;
     let q6_derived = checked_sum(&[q6_low, q6_high, q6_scales, q6_super_scale], "Q6_K")?;
     let iq4_nl_derived = checked_sum(&[iq4_nl_scale, iq4_nl_quant], "IQ4_NL")?;
     let iq4_xs_derived = checked_sum(
-        &[
-            iq4_xs_scale,
-            iq4_xs_scale_low,
-            iq4_xs_scale_high,
-            iq4_xs_quant,
-        ],
+        &[iq4_xs_scale, iq4_xs_scale_low, iq4_xs_scale_high, iq4_xs_quant],
         "IQ4_XS",
     )?;
     if q4_bytes != q4_derived
@@ -366,14 +351,11 @@ fn write_row_format_header(out_dir: &Path) -> Result<(), String> {
         || iq4_nl_bytes != iq4_nl_derived
         || iq4_xs_bytes != iq4_xs_derived
     {
-        return Err(
-            "quant constants violate an executable serialized-row layout relation".to_string(),
-        );
+        return Err("quant constants violate an executable serialized-row layout relation".to_string());
     }
     let header = format!(
-        "#pragma once\n\n#include <cstddef>\n#include <cstdint>\n\ninline constexpr std::size_t LOGISMOS_F32_VALUE_BYTES = {f32_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUES_PER_BLOCK = {values_per_block};\ninline constexpr std::size_t LOGISMOS_Q8_0_SCALE_BYTES = {scale_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUE_BYTES = {value_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_BLOCK_BYTES = {block_bytes};\ninline constexpr std::size_t LOGISMOS_K_GROUP_VALUES = {k_group};\ninline constexpr std::size_t LOGISMOS_Q4_K_VALUES_PER_BLOCK = {q4_values};\ninline constexpr std::size_t LOGISMOS_Q4_K_PREFIX_BYTES = {q4_prefix};\ninline constexpr std::size_t LOGISMOS_Q4_K_SCALE_BYTES = {q4_scales};\ninline constexpr std::size_t LOGISMOS_Q4_K_BLOCK_BYTES = {q4_bytes};\ninline constexpr std::size_t LOGISMOS_Q5_K_VALUES_PER_BLOCK = {q5_values};\ninline constexpr std::size_t LOGISMOS_Q5_K_PREFIX_BYTES = {q5_prefix};\ninline constexpr std::size_t LOGISMOS_Q5_K_SCALE_BYTES = {q5_scales};\ninline constexpr std::size_t LOGISMOS_Q5_K_HIGH_BITS_BYTES = {q5_high};\ninline constexpr std::size_t LOGISMOS_Q5_K_BLOCK_BYTES = {q5_bytes};\ninline constexpr std::size_t LOGISMOS_Q6_K_VALUES_PER_BLOCK = {q6_values};\ninline constexpr std::size_t LOGISMOS_Q6_K_LOW_BITS_BYTES = {q6_low};\ninline constexpr std::size_t LOGISMOS_Q6_K_HIGH_BITS_BYTES = {q6_high};\ninline constexpr std::size_t LOGISMOS_Q6_K_SCALE_BYTES = {q6_scales};\ninline constexpr std::size_t LOGISMOS_Q6_K_BLOCK_BYTES = {q6_bytes};\ninline constexpr std::size_t LOGISMOS_IQ4_NL_VALUES_PER_BLOCK = {iq4_nl_values};\ninline constexpr std::size_t LOGISMOS_IQ4_NL_BLOCK_BYTES = {iq4_nl_bytes};\ninline constexpr std::size_t LOGISMOS_IQ4_XS_VALUES_PER_BLOCK = {iq4_xs_values};\ninline constexpr std::size_t LOGISMOS_IQ4_XS_BLOCK_BYTES = {iq4_xs_bytes};\ninline constexpr std::int8_t LOGISMOS_IQ4_RECONSTRUCTION_VALUES[16] = {{{iq4_values}}};\n",
-        f32_bytes = quant::f32_row::F32_ROW_VALUE_BYTES,
-        k_group = quant::K_GROUP_VALUES
+        "#pragma once\n\n#include <cstddef>\n#include <cstdint>\n\ninline constexpr std::size_t LOGISMOS_F32_VALUE_BYTES = {f32_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUES_PER_BLOCK = {values_per_block};\ninline constexpr std::size_t LOGISMOS_Q8_0_SCALE_BYTES = {scale_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_VALUE_BYTES = {value_bytes};\ninline constexpr std::size_t LOGISMOS_Q8_0_BLOCK_BYTES = {block_bytes};\ninline constexpr std::size_t LOGISMOS_K_GROUP_VALUES = {k_group};\ninline constexpr std::size_t LOGISMOS_Q4_K_VALUES_PER_BLOCK = {q4_values};\ninline constexpr std::size_t LOGISMOS_Q4_K_PREFIX_BYTES = {q4_prefix};\ninline constexpr std::size_t LOGISMOS_Q4_K_SCALE_BYTES = {q4_scales};\ninline constexpr std::size_t LOGISMOS_Q4_K_BLOCK_BYTES = {q4_bytes};\ninline constexpr std::size_t LOGISMOS_Q5_K_VALUES_PER_BLOCK = {q5_values};\ninline constexpr std::size_t LOGISMOS_Q5_K_PREFIX_BYTES = {q5_prefix};\ninline constexpr std::size_t LOGISMOS_Q5_K_SCALE_BYTES = {q5_scales};\ninline constexpr std::size_t LOGISMOS_Q5_K_HIGH_BITS_BYTES = {q5_high};\ninline constexpr std::size_t LOGISMOS_Q5_K_BLOCK_BYTES = {q5_bytes};\ninline constexpr std::size_t LOGISMOS_Q6_K_VALUES_PER_BLOCK = {q6_values};\ninline constexpr std::size_t LOGISMOS_Q6_K_LOW_BITS_BYTES = {q6_low};\ninline constexpr std::size_t LOGISMOS_Q6_K_HIGH_BITS_BYTES = {q6_high};\ninline constexpr std::size_t LOGISMOS_Q6_K_SCALE_BYTES = {q6_scales};\ninline constexpr std::size_t LOGISMOS_Q6_K_BLOCK_BYTES = {q6_bytes};\ninline constexpr std::size_t LOGISMOS_IQ4_NL_VALUES_PER_BLOCK = {iq4_nl_values};\ninline constexpr std::size_t LOGISMOS_IQ4_NL_BLOCK_BYTES = {iq4_nl_bytes};\ninline constexpr std::size_t LOGISMOS_IQ4_XS_VALUES_PER_BLOCK = {iq4_xs_values};\ninline constexpr std::size_t LOGISMOS_IQ4_XS_BLOCK_BYTES = {iq4_xs_bytes};\ninline constexpr std::int8_t LOGISMOS_IQ4_RECONSTRUCTION_VALUES[16] = {{{iq4_values}}};\n"
+        , f32_bytes = quant::f32_row::F32_ROW_VALUE_BYTES, k_group = quant::K_GROUP_VALUES
     );
     let header = format!(
         "{header}
@@ -409,9 +391,9 @@ inline constexpr std::size_t LOGISMOS_IQ4_XS_GROUP_VALUES = {iq4_xs_group_values
 
 fn checked_sum(fields: &[usize], format: &str) -> Result<usize, String> {
     fields.iter().try_fold(0usize, |total, field| {
-        total.checked_add(*field).ok_or_else(|| {
-            format!("quant {format} header fields overflow while deriving block bytes")
-        })
+        total
+            .checked_add(*field)
+            .ok_or_else(|| format!("quant {format} header fields overflow while deriving block bytes"))
     })
 }
 
@@ -422,23 +404,17 @@ fn checked_mul(left: usize, right: usize, label: &str) -> Result<usize, String> 
 
 fn checked_div_exact(dividend: usize, divisor: usize, label: &str) -> Result<usize, String> {
     if divisor == 0 {
-        return Err(format!(
-            "quant layout relation has zero divisor while deriving {label}"
-        ));
+        return Err(format!("quant layout relation has zero divisor while deriving {label}"));
     }
     if !dividend.is_multiple_of(divisor) {
-        return Err(format!(
-            "quant layout relation is not exact while deriving {label}"
-        ));
+        return Err(format!("quant layout relation is not exact while deriving {label}"));
     }
     Ok(dividend / divisor)
 }
 
 fn require_equal(actual: usize, expected: usize, relation: &str) -> Result<(), String> {
     if actual != expected {
-        return Err(format!(
-            "quant layout relation violated: {relation} ({actual} != {expected})"
-        ));
+        return Err(format!("quant layout relation violated: {relation} ({actual} != {expected})"));
     }
     Ok(())
 }
