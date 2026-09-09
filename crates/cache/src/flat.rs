@@ -237,10 +237,10 @@ impl FlatKvCache {
             .context(FlatAllocationSnafu { target: "length" })?;
         lens.resize(layout.num_layers, 0);
         Ok(Self {
-            lens,
             layout,
             k_buffers,
             v_buffers,
+            lens,
         })
     }
 
