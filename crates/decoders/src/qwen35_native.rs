@@ -38,6 +38,10 @@ enum CompletionOutcome {
 enum CompletionError<Error> {
     MissingResource,
     NotSubmitted,
+    Commit {
+        source: Error,
+        outcome: CompletionOutcome,
+    },
     Synchronization {
         source: Error,
         outcome: CompletionOutcome,
@@ -128,11 +132,11 @@ impl<Resource: CompletionResource> InFlight<'_, Resource> {
         self.submitted = true;
     }
 
-    /// Synchronizes submitted work, then runs an infallible logical commit.
-    fn complete(
+    /// Synchronizes submitted work, then runs the checked prepublication step.
+    fn complete<Value>(
         mut self,
-        commit: impl FnOnce(&mut Resource),
-    ) -> core::result::Result<(), CompletionError<Resource::Error>> {
+        commit: impl FnOnce(&mut Resource) -> core::result::Result<Value, Resource::Error>,
+    ) -> core::result::Result<Value, CompletionError<Resource::Error>> {
         if !self.submitted {
             return Err(CompletionError::NotSubmitted);
         }
@@ -146,8 +150,18 @@ impl<Resource: CompletionResource> InFlight<'_, Resource> {
             });
         }
 
-        commit(self.resource()?);
-        self.restore_ready()
+        let value = match commit(self.resource()?) {
+            Ok(value) => value,
+            Err(source) => {
+                self.poison_known_idle();
+                return Err(CompletionError::Commit {
+                    source,
+                    outcome: CompletionOutcome::KnownIdle,
+                });
+            }
+        };
+        self.restore_ready()?;
+        Ok(value)
     }
 
     fn restore_ready(&mut self) -> core::result::Result<(), CompletionError<Resource::Error>> {
@@ -166,6 +180,15 @@ impl<Resource: CompletionResource> InFlight<'_, Resource> {
             return;
         };
         self.owner.state = Some(ResourceState::PoisonedUncertain(resource));
+        self.finished = true;
+    }
+
+    fn poison_known_idle(&mut self) {
+        let Some(ResourceState::InFlight(resource)) = self.owner.state.take() else {
+            self.finished = true;
+            return;
+        };
+        self.owner.state = Some(ResourceState::PoisonedIdle(resource));
         self.finished = true;
     }
 
@@ -238,9 +261,14 @@ mod tests {
             }
         }
 
-        fn publish(&self) {
+        fn publish(&self) -> core::result::Result<(), TestError> {
             self.publications
                 .set(self.publications.get().saturating_add(1));
+            Ok(())
+        }
+
+        fn reject_publication(&self) -> core::result::Result<(), TestError> {
+            Err(TestError::ScriptFailure)
         }
     }
 
@@ -328,6 +356,35 @@ mod tests {
         assert!(matches!(owner.state(), Some(ResourceState::Ready(_))));
         assert_eq!(synchronizations.get(), 0);
         assert_eq!(publications.get(), 0);
+        drop(owner);
+        assert_eq!(drops.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_prepublication_failure_is_known_idle_and_never_retries()
+    -> core::result::Result<(), BeginError> {
+        let (mut owner, synchronizations, drops, publications) = owner([Ok(())]);
+        let mut guard = owner.begin()?;
+        guard.mark_submitted();
+        let error = guard
+            .complete(TestResource::reject_publication)
+            .err()
+            .ok_or(BeginError::MissingResource)?;
+        assert!(matches!(
+            error,
+            CompletionError::Commit {
+                source: TestError::ScriptFailure,
+                outcome: CompletionOutcome::KnownIdle,
+            }
+        ));
+        assert!(matches!(
+            owner.state(),
+            Some(ResourceState::PoisonedIdle(_))
+        ));
+        assert!(matches!(owner.begin(), Err(BeginError::NotReady)));
+        assert_eq!(publications.get(), 0);
+        assert_eq!(synchronizations.get(), 1);
         drop(owner);
         assert_eq!(drops.get(), 1);
         Ok(())
