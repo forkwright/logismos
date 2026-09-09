@@ -292,7 +292,7 @@ impl Vocabulary {
         identifiers.extend(vocabulary.into_values());
         identifiers.sort_unstable();
         identifiers.dedup();
-        let added_tokens = tokenizer.get_added_tokens_decoder();
+        let added_vocabulary = tokenizer.get_added_vocabulary();
         let mut slab = String::new();
         let mut entries = reserved_vec(identifiers.len(), "sparse vocabulary spans")?;
         let mut max_spelling_bytes = 0;
@@ -307,9 +307,7 @@ impl Vocabulary {
             let start = slab.len();
             slab.push_str(&spelling);
             let end = slab.len();
-            let special = added_tokens
-                .get(&identifier)
-                .is_some_and(|token| token.special);
+            let special = added_vocabulary.is_special_token(&spelling);
             entries.push(VocabularyEntry {
                 identifier,
                 span: TokenSpan { start, end },

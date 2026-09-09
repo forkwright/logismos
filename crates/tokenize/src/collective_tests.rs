@@ -29,6 +29,60 @@ fn tokenizer_json(tokens: &[&str], decoder: &Value) -> TestResult<Vec<u8>> {
     Ok(serde_json::to_vec(&tokenizer)?)
 }
 
+fn tokenizer_with_added_tokens(
+    added_tokens: &[Value],
+    normalizer: &Value,
+) -> TestResult<Tokenizer> {
+    let tokenizer = json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": added_tokens,
+        "normalizer": normalizer,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": null,
+        "decoder": null,
+        "model": {
+            "type": "WordLevel",
+            "vocab": {"[UNK]": 0, "base": 1},
+            "unk_token": "[UNK]"
+        }
+    });
+    let bytes = serde_json::to_vec(&tokenizer)?;
+    Ok(Tokenizer::from_bytes(&bytes)?)
+}
+
+fn assert_filtering(
+    tokenizer: &Tokenizer,
+    identifier: u32,
+    expected_kept: &str,
+    expected_skipped: &str,
+) -> TestResult {
+    for (skip_special_tokens, expected) in [(false, expected_kept), (true, expected_skipped)] {
+        let upstream = tokenizer.decode(&[identifier], skip_special_tokens)?;
+        let (bounded, retained) = bounded_decode(
+            tokenizer,
+            &[identifier],
+            expected.len(),
+            skip_special_tokens,
+        )?;
+        assert_eq!(
+            upstream, expected,
+            "hand-authored filtering expectation must match pinned upstream"
+        );
+        assert_eq!(
+            bounded, expected,
+            "bounded filtering must match the independent expectation"
+        );
+        assert_eq!(
+            bounded, upstream,
+            "bounded filtering must remain differential with pinned upstream"
+        );
+        assert_eq!(retained, [identifier]);
+    }
+    Ok(())
+}
+
 fn bounded_decode(
     tokenizer: &Tokenizer,
     identifiers: &[u32],
@@ -97,6 +151,20 @@ fn bpe_preserves_suffix_and_empty_suffix_semantics() -> TestResult {
         &[1, 2],
         " a b",
     )
+}
+
+#[test]
+fn bpe_empty_input_is_totalized_without_publication() -> TestResult {
+    let bytes = tokenizer_json(
+        &["[UNK]", "token</w>"],
+        &json!({"type": "BPEDecoder", "suffix": "</w>"}),
+    )?;
+    let tokenizer = Tokenizer::from_bytes(&bytes)?;
+    let (decoded, retained) = bounded_decode(&tokenizer, &[], 0, false)?;
+
+    assert_eq!(decoded, "", "empty BPE input must decode to empty output");
+    assert!(retained.is_empty(), "empty input must retain no token IDs");
+    Ok(())
 }
 
 #[test]
@@ -205,6 +273,23 @@ fn fuse_and_strip_preserve_token_boundaries_and_unicode() -> TestResult {
         &[1],
         "ühello",
     )
+}
+
+#[test]
+fn strip_overlapping_limits_are_totalized_to_empty() -> TestResult {
+    let bytes = tokenizer_json(
+        &["[UNK]", "xx"],
+        &json!({"type": "Strip", "content": "x", "start": 2, "stop": 2}),
+    )?;
+    let tokenizer = Tokenizer::from_bytes(&bytes)?;
+    let (decoded, retained) = bounded_decode(&tokenizer, &[1], 0, false)?;
+
+    assert_eq!(
+        decoded, "",
+        "overlapping leading and trailing strip limits must select the empty range"
+    );
+    assert_eq!(retained, [1]);
+    Ok(())
 }
 
 #[test]
@@ -321,6 +406,80 @@ fn unknown_and_special_ids_preserve_upstream_filtering() -> TestResult {
         );
     }
     Ok(())
+}
+
+#[test]
+fn normalized_special_uses_its_canonical_spelling_for_filtering() -> TestResult {
+    let added_tokens = [json!({
+        "id": 2,
+        "content": "LOUD",
+        "single_word": false,
+        "lstrip": false,
+        "rstrip": false,
+        "normalized": true,
+        "special": true
+    })];
+    let tokenizer = tokenizer_with_added_tokens(&added_tokens, &json!({"type": "Lowercase"}))?;
+
+    assert_filtering(&tokenizer, 2, "loud", "loud")
+}
+
+#[test]
+fn normalized_non_special_matching_special_content_is_filtered() -> TestResult {
+    let added_tokens = [
+        json!({
+            "id": 2,
+            "content": "quiet",
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": true
+        }),
+        json!({
+            "id": 3,
+            "content": "QUIET",
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": true,
+            "special": false
+        }),
+    ];
+    let tokenizer = tokenizer_with_added_tokens(&added_tokens, &json!({"type": "Lowercase"}))?;
+
+    assert_filtering(&tokenizer, 3, "quiet", "")
+}
+
+#[test]
+fn duplicate_added_content_retains_special_membership_history() -> TestResult {
+    let added_tokens = [
+        json!({
+            "id": 2,
+            "content": "history",
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": true
+        }),
+        json!({
+            "id": 2,
+            "content": "history",
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": false
+        }),
+    ];
+    let tokenizer = tokenizer_with_added_tokens(&added_tokens, &Value::Null)?;
+
+    assert!(
+        !tokenizer.is_special_token(2),
+        "the public ID-marker query must retain the final record's non-special marker"
+    );
+    assert_filtering(&tokenizer, 2, "history", "")
 }
 
 #[test]
