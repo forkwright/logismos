@@ -162,7 +162,16 @@ impl ModelSessionResources {
         })
     }
 
-    pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) -> Stream {
+    /// Transfer this session's original buffers and return its stream plus resident owner.
+    ///
+    /// The returned resident `Arc` must remain in the pending or quarantined
+    /// teardown custody until the returned stream has a terminal completion
+    /// outcome. It is not proof that the stream is quiescent or that any HIP
+    /// allocation has been released.
+    pub(super) fn into_buffer_sink(
+        self,
+        sink: &mut impl NativeBufferSink,
+    ) -> (Stream, Arc<NativeResidentModelResources>) {
         let Self {
             model,
             plan,
@@ -179,7 +188,6 @@ impl ModelSessionResources {
             step,
             position: _,
         } = self;
-        drop(model);
         drop(plan);
         if let Some(kv) = kv {
             let (keys, values, table) = kv.into_buffers().into_parts();
@@ -204,7 +212,7 @@ impl ModelSessionResources {
         if let Some(step) = step {
             step.into_buffer_sink(sink);
         }
-        stream
+        (stream, model)
     }
 
     pub(super) fn prepare_step(&mut self, token: u32) -> Result<()> {
