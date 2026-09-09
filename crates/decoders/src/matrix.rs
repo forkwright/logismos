@@ -162,6 +162,23 @@ impl<'artifact> CheckedMatrix<'artifact> {
             row,
         })
     }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn native_shape(&self) -> std::result::Result<kernels::RowGemvShape, kernels::Error> {
+        kernels::RowGemvShape::new(
+            self.format,
+            self.output_width,
+            self.input_width,
+            self.tensor.bytes().len(),
+            self.input_width,
+            self.output_width,
+        )
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn serialized_bytes(&self) -> &[u8] {
+        self.tensor.bytes()
+    }
 }
 
 fn row_format(ggml_type: GgmlType) -> Option<RowFormat> {

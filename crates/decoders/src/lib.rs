@@ -25,6 +25,7 @@ mod matrix;
 pub mod qwen3;
 pub mod qwen35;
 pub mod qwen35_execution;
+mod qwen35_mrope;
 pub mod qwen35_recurrent;
 mod qwen35_requirements;
 pub mod qwen35_weights;
