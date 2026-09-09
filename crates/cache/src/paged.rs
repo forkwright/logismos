@@ -16,10 +16,10 @@ use crate::error::{
     PagedReadBeyondVisibleSnafu, PagedRowWidthSnafu, PagedWriteOrderSnafu, PagedZeroDimensionSnafu,
     Result,
 };
+#[cfg(feature = "gpu")]
+use crate::error::{PagedAttentionSnafu, PagedNativeDeviceMismatchSnafu, PagedNativePoisonedSnafu};
 #[cfg(any(feature = "gpu", test))]
 use crate::error::{PagedNativeCommitNotPreparedSnafu, PagedNativeCommitPreparedSnafu};
-#[cfg(feature = "gpu")]
-use crate::error::{PagedNativeDeviceMismatchSnafu, PagedNativePoisonedSnafu};
 
 /// Geometry shared by an execution plan and its private KV allocation.
 #[derive(Clone, Copy, Debug)]
@@ -889,6 +889,14 @@ pub struct NativePagedKvPlan {
 #[cfg(feature = "gpu")]
 impl NativePagedKvPlan {
     /// Bind native K/V rows to the shared logical geometry with an explicit page size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PagedArithmetic`] or [`Error::PagedLayout`] when the
+    /// native row axes cannot exactly bind the logical row width, or when the
+    /// shared logical allocation cannot be derived. Returns
+    /// [`Error::Kernel`] when the checked native backing descriptor rejects
+    /// its dimensions or layout.
     pub fn try_from_geometry(
         geometry: PagedKvGeometry,
         kv_heads: usize,
@@ -977,6 +985,11 @@ pub struct NativePagedKvPool {
 #[cfg(feature = "gpu")]
 impl NativePagedKvPool {
     /// Allocate native K/V and table mirrors before any append is admitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed HIP allocation errors, or the shared ledger's checked
+    /// geometry and metadata-allocation errors, without publishing an append.
     pub fn new(plan: NativePagedKvPlan, device: &Device) -> Result<Self> {
         let ledger = PagedKvLedger::new(plan.logical)?;
         let keys = DeviceBuffer::alloc(device, plan.layout.backing_elements())?;
@@ -1002,6 +1015,12 @@ impl NativePagedKvPool {
     /// the ordered stream used for every prepare, row, and attention operation
     /// in this transaction. On any submission or completion uncertainty it
     /// must retain that complete bundle and never reuse this pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed poisoned/prepared-state, device-mismatch, append
+    /// capacity, ledger, or native copy/table-kernel failure. Host staging is
+    /// unpublished on failure; submitted native backing remains poisoned.
     pub unsafe fn begin_append(
         &mut self,
         append_tokens: usize,
@@ -1035,6 +1054,11 @@ impl NativePagedKvPool {
     /// write of its K/V, table, query, or output buffers may remain pending.
     /// On any submission or completion failure, retain and never reuse this
     /// complete native session instead of calling this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed poisoned or missing-prepared-append error before any
+    /// host-ledger publication.
     pub unsafe fn commit_prepared_after_completion(&mut self) -> Result<()> {
         self.ensure_not_poisoned()?;
         let mut reservation = self.prepared.take()?;
@@ -1125,6 +1149,12 @@ impl NativePagedAppend<'_> {
     /// to [`NativePagedKvPool::begin_append`]. The caller owns completion and
     /// must poison its whole session if submission completion becomes
     /// uncertain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed poisoned-state, device-mismatch, row-shape/order, or
+    /// native append-kernel error. A failed submitted append permanently
+    /// poisons the native backing.
     pub unsafe fn write_layer_row(
         &mut self,
         layer: usize,
@@ -1173,6 +1203,11 @@ impl NativePagedAppend<'_> {
     }
 
     /// Return one staged native layer view for Q=1 paged attention.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed missing-reservation, layer-range, or visible-prefix
+    /// failure without exposing native backing pointers.
     pub fn layer_kv(&self, layer: usize) -> Result<NativePagedLayerKv<'_>> {
         let tokens = self
             .pool
@@ -1191,6 +1226,11 @@ impl NativePagedAppend<'_> {
     /// complete device bundle before calling
     /// [`NativePagedKvPool::commit_prepared_after_completion`]. It does not
     /// publish host ledger state or issue a device operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed poisoned/prepared-state or incomplete-all-layer append
+    /// error, leaving host publication unchanged.
     pub fn prepare_commit(mut self) -> Result<()> {
         self.pool.ensure_not_poisoned()?;
         self.pool.prepared.ensure_empty()?;
@@ -1253,6 +1293,11 @@ impl NativePagedLayerKv<'_> {
     /// device lifetime, non-aliasing, and finite normal-or-zero obligations.
     /// `stream` must be this pool's device stream and exactly the ordered
     /// stream passed to begin/row submission for this transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed device-mismatch, descriptor-binding, checked-offset,
+    /// or native attention-launch failure before or during submission.
     pub unsafe fn launch_paged_decode(
         &self,
         plan: NativePagedDecodePlan,
@@ -1803,17 +1848,19 @@ mod tests {
             NativePageTokens::B8,
         )?;
         let accepted = NativePagedDecodePlan::try_from_paged_decode(
-            PagedDecodePlan::try_from_dimensions(1, 2, 1, 8)?,
+            PagedDecodePlan::try_from_dimensions(1, 2, 1, 8).context(PagedAttentionSnafu)?,
             8,
             cache.layout().physical_pages(),
-        )?;
+        )
+        .context(PagedAttentionSnafu)?;
         assert!(validate_native_attention_binding(cache, 1, accepted).is_ok());
 
         let remapped = NativePagedDecodePlan::try_from_paged_decode(
-            PagedDecodePlan::try_from_dimensions(1, 2, 2, 4)?,
+            PagedDecodePlan::try_from_dimensions(1, 2, 2, 4).context(PagedAttentionSnafu)?,
             8,
             cache.layout().physical_pages(),
-        )?;
+        )
+        .context(PagedAttentionSnafu)?;
         assert!(matches!(
             validate_native_attention_binding(cache, 1, remapped),
             Err(Error::PagedLayout { .. })
