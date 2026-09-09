@@ -766,7 +766,7 @@ pub fn multi_head_recurrent_fwd(
 /// writable spans must not alias each other or any input; inputs may alias
 /// other inputs. Both writable spans require exclusive access through stream
 /// completion: no other GPU command or host alias may read or write either
-/// span. No producer may modify any input during the launch.
+/// span. No producer may modify any input through stream completion.
 ///
 /// Device contents are not inspectable at this boundary. Callers must ensure
 /// every input, `scale`, and every recurrence intermediate is finite and
@@ -1590,6 +1590,70 @@ mod tests {
             (2, 4, 3, 2),
             "the checked ABI must preserve the allocation owner's grouped geometry"
         );
+        let too_wide_plan = match MultiHeadRecurrentAllocationPlan::try_from_dimensions(
+            1,
+            1,
+            1,
+            1,
+            MAX_GDN_VALUE_DIM + 1,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => panic!("test dimensions are valid: {error}"),
+        };
+        assert!(matches!(
+            validate_gdn_step_launch(
+                too_wide_plan,
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+                0,
+                1.0,
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            ),
+            Err(crate::Error::UnsupportedShape { .. })
+        ));
+        for invalid_scale in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MIN_POSITIVE / 2.0,
+            -f32::MIN_POSITIVE / 2.0,
+        ] {
+            assert!(matches!(
+                validate_gdn_step_launch(
+                    grouped_plan,
+                    grouped_q.as_ptr(),
+                    grouped_q.len(),
+                    grouped_k.as_ptr(),
+                    grouped_k.len(),
+                    grouped_v.as_ptr(),
+                    grouped_v.len(),
+                    grouped_beta.as_ptr(),
+                    grouped_beta.len(),
+                    grouped_g.as_ptr(),
+                    grouped_g.len(),
+                    invalid_scale,
+                    grouped_state_in.as_ptr(),
+                    grouped_state_in.len(),
+                    grouped_state_out.as_mut_ptr(),
+                    grouped_state_out.len(),
+                    grouped_output.as_mut_ptr(),
+                    grouped_output.len(),
+                ),
+                Err(crate::Error::UnsupportedShape { .. })
+            ));
+        }
         assert!(matches!(
             validate_gdn_step_launch(
                 plan,
