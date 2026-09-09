@@ -122,4 +122,3 @@ fn verified_plan_refuses_a_recurrent_main_block() -> std::result::Result<(), Str
     );
     Ok(())
 }
-
