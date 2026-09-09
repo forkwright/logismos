@@ -352,6 +352,26 @@ pub enum SchedulerError {
         #[snafu(implicit)]
         location: snafu::Location,
     },
+    /// A retained native host result would exceed its supplied accounting envelope.
+    #[snafu(display(
+        "retained native host result is exhausted: needs {required_bytes}, has {available_bytes}"
+    ))]
+    NativeHostResultExhausted {
+        /// Requested retained native host bytes.
+        required_bytes: u64,
+        /// Available bytes in the supplied retained-result envelope.
+        available_bytes: u64,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+    /// Checked retained-native-host accounting arithmetic overflowed.
+    #[snafu(display("retained native host result arithmetic overflowed"))]
+    NativeHostResultArithmeticOverflow {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
     /// A native host owner would exceed its supplied accounting envelope.
     #[snafu(display(
         "native host accounting is exhausted: needs {required_bytes}, has {available_bytes}"
@@ -1681,20 +1701,17 @@ impl Scheduler {
             .try_fold(0_u64, |total, requested| {
                 total.checked_add(requested.as_ref().map_or(0, |requested| requested.get()))
             })
-            .ok_or(SchedulerError::NativeHostBytesArithmeticOverflow {
-                location: error_location(),
-            })?;
-        let next_reserved = self.host.reserved.checked_add(requested_bytes).ok_or(
-            SchedulerError::NativeHostBytesArithmeticOverflow {
-                location: error_location(),
-            },
-        )?;
+            .ok_or_else(|| self.host_arithmetic_overflow())?;
+        let next_reserved = self
+            .host
+            .reserved
+            .checked_add(requested_bytes)
+            .ok_or_else(|| self.host_arithmetic_overflow())?;
         if next_reserved > self.host.envelope.bytes {
-            return Err(SchedulerError::NativeHostBytesExhausted {
-                required_bytes: requested_bytes,
-                available_bytes: self.host.envelope.bytes.saturating_sub(self.host.reserved),
-                location: error_location(),
-            });
+            return Err(self.host_exhausted(
+                requested_bytes,
+                self.host.envelope.bytes.saturating_sub(self.host.reserved),
+            ));
         }
         Ok(next_reserved)
     }
@@ -1713,13 +1730,39 @@ impl Scheduler {
         Ok(())
     }
 
+    fn host_exhausted(&self, required_bytes: u64, available_bytes: u64) -> SchedulerError {
+        if self.host.extended_owners {
+            SchedulerError::NativeHostBytesExhausted {
+                required_bytes,
+                available_bytes,
+                location: error_location(),
+            }
+        } else {
+            SchedulerError::NativeHostResultExhausted {
+                required_bytes,
+                available_bytes,
+                location: error_location(),
+            }
+        }
+    }
+
+    fn host_arithmetic_overflow(&self) -> SchedulerError {
+        if self.host.extended_owners {
+            SchedulerError::NativeHostBytesArithmeticOverflow {
+                location: error_location(),
+            }
+        } else {
+            SchedulerError::NativeHostResultArithmeticOverflow {
+                location: error_location(),
+            }
+        }
+    }
+
     fn next_host_release(&self, lease: Option<&HostLease>) -> Result<u64, SchedulerError> {
         self.host
             .reserved
             .checked_sub(lease.map_or(0, |lease| lease.requested.get()))
-            .ok_or(SchedulerError::NativeHostBytesArithmeticOverflow {
-                location: error_location(),
-            })
+            .ok_or_else(|| self.host_arithmetic_overflow())
     }
 
     fn prepare_native_finish(
@@ -3271,6 +3314,84 @@ mod tests {
     }
 
     #[test]
+    fn foreign_host_backed_native_use_cannot_mutate_either_ledger() -> Result<(), SchedulerError> {
+        let grant = request("[]", 8)?;
+        let mut first = Scheduler::new_with_native_host_envelope(
+            &grant,
+            SchedulerLimits::default(),
+            NativeHostEnvelope::new(4),
+        )?;
+        let mut second = Scheduler::new_with_native_host_envelope(
+            &grant,
+            SchedulerLimits::default(),
+            NativeHostEnvelope::new(4),
+        )?;
+        let (ticket, load) = first.admit_native_resident(&NativeResidentRequest::new_with_host(
+            "w7900",
+            requested_device_bytes(4)?,
+            requested_host_bytes(1)?,
+        ))?;
+        first.complete_native_load(&load, ResidentHandle::try_new("native-main")?)?;
+        let permit = first.begin_native_use(
+            &ticket,
+            NativeUseRequest::new_with_host(
+                requested_device_bytes(1)?,
+                requested_host_bytes(2)?,
+                None,
+                None,
+            ),
+        )?;
+        assert!(matches!(
+            second.finish_native_use_after_teardown(&permit),
+            Err(SchedulerError::ForeignCapability { .. })
+        ));
+        assert_eq!(first.host.reserved, 3);
+        assert_eq!(second.host.reserved, 0);
+        assert_eq!(first.native_uses.len(), 1);
+        assert!(second.native_uses.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_ticket_refuses_host_backed_native_use_without_reservation()
+    -> Result<(), SchedulerError> {
+        let grant = request("[]", 8)?;
+        let mut scheduler = Scheduler::new_with_native_host_envelope(
+            &grant,
+            SchedulerLimits::default(),
+            NativeHostEnvelope::new(4),
+        )?;
+        let (ticket, load) =
+            scheduler.admit_native_resident(&NativeResidentRequest::new_with_host(
+                "w7900",
+                requested_device_bytes(4)?,
+                requested_host_bytes(1)?,
+            ))?;
+        scheduler.complete_native_load(&load, ResidentHandle::try_new("native-main")?)?;
+        scheduler.revoke(&scheduler.generation())?;
+        let eviction = poll_command(&mut scheduler)?;
+        scheduler.complete(RuntimeCompletion::Evicted {
+            operation: eviction.operation(),
+        })?;
+        scheduler.replace_grant(&grant)?;
+        assert!(matches!(
+            scheduler.begin_native_use(
+                &ticket,
+                NativeUseRequest::new_with_host(
+                    requested_device_bytes(1)?,
+                    requested_host_bytes(1)?,
+                    None,
+                    None,
+                ),
+            ),
+            Err(SchedulerError::StaleGeneration { .. })
+        ));
+        assert_eq!(scheduler.host.reserved, 0);
+        assert!(scheduler.native_uses.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn native_use_releases_mutable_peak_and_retains_host_result() -> Result<(), SchedulerError> {
         let grant = request("[]", 12)?;
         let mut scheduler = Scheduler::new_with_native_host_results(
@@ -3301,7 +3422,7 @@ mod tests {
                     Some(requested_host_bytes(1)?)
                 ),
             ),
-            Err(SchedulerError::NativeHostBytesExhausted { .. })
+            Err(SchedulerError::NativeHostResultExhausted { .. })
         ));
         assert_eq!(scheduler.host.reserved, reserved_host);
         assert_eq!(
@@ -3331,6 +3452,40 @@ mod tests {
             "a use without retained output returns no result lease"
         );
         assert_eq!(scheduler.host.reserved, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_only_host_overflow_keeps_its_legacy_refusal() -> Result<(), SchedulerError> {
+        let grant = request("[]", 12)?;
+        let mut scheduler = Scheduler::new_with_native_host_results(
+            &grant,
+            SchedulerLimits::default(),
+            NativeHostResultEnvelope::new(u64::MAX),
+        )?;
+        let ticket = native_loaded(&mut scheduler, 4, "native-main")?;
+        let permit = scheduler.begin_native_use(
+            &ticket,
+            NativeUseRequest::new(
+                requested_device_bytes(1)?,
+                None,
+                Some(requested_host_bytes(u64::MAX)?),
+            ),
+        )?;
+        assert!(matches!(
+            scheduler.begin_native_use(
+                &ticket,
+                NativeUseRequest::new(
+                    requested_device_bytes(1)?,
+                    None,
+                    Some(requested_host_bytes(1)?),
+                ),
+            ),
+            Err(SchedulerError::NativeHostResultArithmeticOverflow { .. })
+        ));
+        assert_eq!(scheduler.host.reserved, u64::MAX);
+        assert_eq!(scheduler.native_uses.len(), 1);
+        scheduler.quarantine_native_use(&permit)?;
         Ok(())
     }
 
@@ -3532,6 +3687,62 @@ mod tests {
                 ),
             ),
             Err(SchedulerError::NativeDeviceBytes { .. })
+        ));
+        assert_eq!(scheduler.host.reserved, 0);
+        assert!(scheduler.native_uses.is_empty());
+        assert_eq!(
+            scheduler
+                .admissions
+                .get(&ticket.admission_id)
+                .map(|admission| admission.active_uses),
+            Some(0),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_resident_device_refusal_does_not_commit_host_preflight() -> Result<(), SchedulerError>
+    {
+        let grant = request("[]", 4)?;
+        let mut scheduler = Scheduler::new_with_native_host_envelope(
+            &grant,
+            SchedulerLimits::default(),
+            NativeHostEnvelope::new(4),
+        )?;
+        assert!(matches!(
+            scheduler.admit_native_resident(&NativeResidentRequest::new_with_host(
+                "w7900",
+                requested_device_bytes(5)?,
+                requested_host_bytes(4)?,
+            )),
+            Err(SchedulerError::NativeDeviceBytes { .. })
+        ));
+        assert_eq!(scheduler.host.reserved, 0);
+        assert!(scheduler.admissions.is_empty());
+        assert!(scheduler.native_loads.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn native_host_request_sum_overflow_preserves_all_accounting() -> Result<(), SchedulerError> {
+        let grant = request("[]", 8)?;
+        let mut scheduler = Scheduler::new_with_native_host_envelope(
+            &grant,
+            SchedulerLimits::default(),
+            NativeHostEnvelope::new(u64::MAX),
+        )?;
+        let ticket = native_loaded(&mut scheduler, 4, "native-main")?;
+        assert!(matches!(
+            scheduler.begin_native_use(
+                &ticket,
+                NativeUseRequest::new_with_host(
+                    requested_device_bytes(1)?,
+                    requested_host_bytes(u64::MAX)?,
+                    None,
+                    Some(requested_host_bytes(1)?),
+                ),
+            ),
+            Err(SchedulerError::NativeHostBytesArithmeticOverflow { .. })
         ));
         assert_eq!(scheduler.host.reserved, 0);
         assert!(scheduler.native_uses.is_empty());
