@@ -79,6 +79,55 @@ unsafe extern "C" {
         width: i32,
         stream: *mut c_void,
     ) -> u32;
+    fn logismos_launch_f32_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
+    fn logismos_launch_q8_0_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
+    fn logismos_launch_q4_k_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
+    fn logismos_launch_q5_k_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
+    fn logismos_launch_q6_k_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
+    fn logismos_launch_iq4_nl_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
+    fn logismos_launch_iq4_xs_row_decode_f32(
+        matrix: *const c_void,
+        output: *mut c_void,
+        row: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> u32;
 }
 
 /// Validated serialized matrix/vector extents shared by CPU execution and HIP launch.
@@ -169,6 +218,85 @@ impl RowGemvShape {
 
     pub(crate) const fn matrix_bytes(self) -> usize {
         self.matrix_bytes
+    }
+}
+
+/// Checked selected-row lookup geometry derived from one serialized matrix shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RowDecodePlan {
+    shape: RowGemvShape,
+    row: usize,
+    row_offset: usize,
+    row_i32: i32,
+    width_i32: i32,
+}
+
+impl RowDecodePlan {
+    /// Select one stored row from an already-admitted serialized matrix shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::UnsupportedShape`] when `row` lies outside the
+    /// checked matrix or cannot cross the HIP ABI. The source shape remains
+    /// the sole owner of format, matrix extent, row bytes, and output width.
+    pub fn try_from_shape(shape: RowGemvShape, row: usize) -> Result<Self> {
+        if row >= shape.rows {
+            return unsupported_shape(format!(
+                "selected row {row} must be smaller than checked row count {}",
+                shape.rows
+            ));
+        }
+        let row_offset = row.checked_mul(shape.row_bytes).ok_or_else(|| {
+            UnsupportedShapeSnafu {
+                kernel: KERNEL,
+                msg: format!(
+                    "selected row offset overflows usize ({row} * {})",
+                    shape.row_bytes
+                ),
+            }
+            .build()
+        })?;
+        let row_end = row_offset.checked_add(shape.row_bytes).ok_or_else(|| {
+            UnsupportedShapeSnafu {
+                kernel: KERNEL,
+                msg: "selected row end overflows usize".to_owned(),
+            }
+            .build()
+        })?;
+        if row_end > shape.matrix_bytes {
+            return unsupported_shape("selected row exceeds the checked matrix extent");
+        }
+        Ok(Self {
+            shape,
+            row,
+            row_offset,
+            row_i32: i32::try_from(row).map_err(|_| abi_error("selected row", row))?,
+            width_i32: i32::try_from(shape.width).map_err(|_| abi_error("width", shape.width))?,
+        })
+    }
+
+    /// Return the sole source matrix-shape authority.
+    #[must_use]
+    pub const fn shape(self) -> RowGemvShape {
+        self.shape
+    }
+
+    /// Return the selected stored row index.
+    #[must_use]
+    pub const fn row(self) -> usize {
+        self.row
+    }
+
+    /// Return the checked serialized-byte offset of the selected row.
+    #[must_use]
+    pub const fn row_offset(self) -> usize {
+        self.row_offset
+    }
+
+    /// Return the exact f32 output extent.
+    #[must_use]
+    pub const fn output_elements(self) -> usize {
+        self.shape.width
     }
 }
 
@@ -287,6 +415,67 @@ pub unsafe fn launch_row_gemv_f32(
     }
 }
 
+#[cfg(feature = "gpu")]
+/// Decode one selected serialized row into a distinct dense f32 device buffer.
+///
+/// This is a direct token-to-logits lookup primitive, not a basis-vector GEMV:
+/// the checked plan's stored row selects the sole decoded output.
+///
+/// # Errors
+///
+/// Returns typed exact-span, layout, selected-row, CPU-only, stream, or HIP
+/// launch failures.
+///
+/// # Safety
+///
+/// `matrix` and `output` must identify live exact device spans on `stream`'s
+/// device through completion. The serialized matrix remains immutable and the
+/// output remains exclusively writable and disjoint from it. Every decoded
+/// scale, reconstructed value, and output must be finite and normal-or-zero;
+/// the device ABI has no numerical status channel.
+pub unsafe fn launch_row_decode_f32(
+    plan: RowDecodePlan,
+    matrix: *const u8,
+    matrix_bytes: usize,
+    output: *mut f32,
+    output_len: usize,
+    stream: &Stream,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = (plan, matrix, matrix_bytes, output, output_len, stream);
+        no_gpu_build_refusal()
+    }
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        validate_decode_buffers(plan, matrix, matrix_bytes, output, output_len)?;
+        stream.make_current()?;
+        // SAFETY: the checked plan and local span validation establish the
+        // private ABI; the caller upholds device ownership, lifetime, and
+        // normal-or-zero numerical-domain obligations through completion.
+        let code = unsafe {
+            launch_decode_format(
+                plan.shape.format,
+                matrix.cast::<c_void>(),
+                output.cast::<c_void>(),
+                plan.row_i32,
+                plan.width_i32,
+                stream.raw().cast::<c_void>(),
+            )?
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            LaunchSnafu {
+                kernel: KERNEL,
+                kind: hipcore::ErrorKind::from_raw(code),
+                code,
+            }
+            .fail()
+        }
+    }
+}
+
 #[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 unsafe fn launch_format(
     format: quant::RowFormat,
@@ -362,6 +551,45 @@ unsafe fn launch_format(
     }
 }
 
+#[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
+unsafe fn launch_decode_format(
+    format: quant::RowFormat,
+    matrix: *const c_void,
+    output: *mut c_void,
+    row: i32,
+    width: i32,
+    stream: *mut c_void,
+) -> Result<u32> {
+    // SAFETY: caller selected the same checked RowFormat owner as GEMV and
+    // validated the exact matrix/output spans before this private ABI entry.
+    unsafe {
+        match format {
+            quant::RowFormat::F32 => Ok(logismos_launch_f32_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            quant::RowFormat::Q8_0 => Ok(logismos_launch_q8_0_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            quant::RowFormat::Q4K => Ok(logismos_launch_q4_k_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            quant::RowFormat::Q5K => Ok(logismos_launch_q5_k_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            quant::RowFormat::Q6K => Ok(logismos_launch_q6_k_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            quant::RowFormat::IQ4NL => Ok(logismos_launch_iq4_nl_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            quant::RowFormat::IQ4XS => Ok(logismos_launch_iq4_xs_row_decode_f32(
+                matrix, output, row, width, stream,
+            )),
+            _ => unsupported_shape(format!("native HIP row decode does not support {format}")),
+        }
+    }
+}
+
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 fn validate_device_buffers(
     shape: RowGemvShape,
@@ -397,6 +625,36 @@ fn validate_device_buffers(
     reject_overlapping_device_spans(KERNEL, output, activations)
 }
 
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn validate_decode_buffers(
+    plan: RowDecodePlan,
+    matrix: *const u8,
+    matrix_bytes: usize,
+    output: *mut f32,
+    output_len: usize,
+) -> Result<()> {
+    if matrix_bytes != plan.shape.matrix_bytes {
+        return unsupported_shape(format!(
+            "matrix byte length {matrix_bytes} must equal checked {}",
+            plan.shape.matrix_bytes
+        ));
+    }
+    if output_len != plan.shape.width {
+        return unsupported_shape(format!(
+            "output length {output_len} must equal checked {}",
+            plan.shape.width
+        ));
+    }
+    let matrix = checked_u8_device_span(KERNEL, matrix, plan.shape.matrix_bytes, "matrix")?;
+    let output = checked_f32_device_span(
+        KERNEL,
+        output.cast_const(),
+        plan.shape.width,
+        "decoded row output",
+    )?;
+    reject_overlapping_device_spans(KERNEL, output, matrix)
+}
+
 #[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
 fn no_gpu_build_refusal() -> Result<()> {
     NoGpuBuildSnafu { kernel: KERNEL }.fail()
@@ -414,7 +672,7 @@ pub(crate) fn reserve_output(rows: usize) -> Result<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{KERNEL, RowGemvShape};
+    use super::{KERNEL, RowDecodePlan, RowGemvShape};
     use crate::Error;
 
     #[test]
@@ -458,6 +716,22 @@ mod tests {
         assert_ne!(baseline, other_format);
         assert_ne!(baseline, other_width);
         assert_ne!(baseline, other_rows);
+        Ok(())
+    }
+
+    #[test]
+    fn row_decode_plan_derives_selected_row_extent_from_one_shape_owner()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let shape = RowGemvShape::new(quant::RowFormat::F32, 3, 3, 36, 3, 3)?;
+        let plan = RowDecodePlan::try_from_shape(shape, 2)?;
+        assert_eq!(plan.shape(), shape);
+        assert_eq!(plan.row(), 2);
+        assert_eq!(plan.row_offset(), 24);
+        assert_eq!(plan.output_elements(), 3);
+        assert!(
+            RowDecodePlan::try_from_shape(shape, 3).is_err(),
+            "a selected row beyond the checked matrix must be refused"
+        );
         Ok(())
     }
 
@@ -633,6 +907,80 @@ mod tests {
             ),
             Err(Error::UnsupportedShape { kernel: KERNEL, .. })
         ));
+        Ok(())
+    }
+
+    #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+    #[test]
+    fn row_decode_validator_binds_exact_matrix_and_distinct_output()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let matrix = [0_u8; 24];
+        let mut output = [0.0_f32; 3];
+        let shape = RowGemvShape::new(quant::RowFormat::F32, 2, 3, matrix.len(), 3, 2)?;
+        let plan = RowDecodePlan::try_from_shape(shape, 1)?;
+        super::validate_decode_buffers(
+            plan,
+            matrix.as_ptr(),
+            matrix.len(),
+            output.as_mut_ptr(),
+            output.len(),
+        )?;
+        assert!(
+            super::validate_decode_buffers(
+                plan,
+                matrix.as_ptr(),
+                matrix.len() - 1,
+                output.as_mut_ptr(),
+                output.len(),
+            )
+            .is_err(),
+            "short serialized matrix must be refused"
+        );
+        assert!(
+            super::validate_decode_buffers(
+                plan,
+                matrix.as_ptr(),
+                matrix.len(),
+                output.as_mut_ptr(),
+                output.len() - 1,
+            )
+            .is_err(),
+            "short decoded output must be refused"
+        );
+        assert!(
+            super::validate_decode_buffers(
+                plan,
+                core::ptr::null(),
+                matrix.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+            .is_err(),
+            "null serialized matrix must be refused"
+        );
+        assert!(
+            super::validate_decode_buffers(
+                plan,
+                matrix.as_ptr(),
+                matrix.len(),
+                output.as_mut_ptr().wrapping_byte_add(1),
+                output.len(),
+            )
+            .is_err(),
+            "misaligned decoded output must be refused"
+        );
+        let mut aligned_matrix = [0.0_f32; 6];
+        assert!(
+            super::validate_decode_buffers(
+                plan,
+                aligned_matrix.as_ptr().cast::<u8>(),
+                matrix.len(),
+                aligned_matrix.as_mut_ptr(),
+                output.len(),
+            )
+            .is_err(),
+            "decoded output must not alias serialized matrix storage"
+        );
         Ok(())
     }
 
