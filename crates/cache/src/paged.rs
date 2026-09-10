@@ -1305,9 +1305,8 @@ impl NativePagedAppend<'_> {
         self.pool.ensure_stream_device(stream)?;
         self.pool.ensure_buffer_device(keys)?;
         self.pool.ensure_buffer_device(values)?;
-        let reservation = self.reservation()?;
-        let active = reservation
-            .append_tokens
+        let append_tokens = self.reservation()?.append_tokens;
+        let active = append_tokens
             .checked_mul(self.pool.plan.logical.geometry.row_width)
             .ok_or_else(|| {
                 PagedArithmeticSnafu {
@@ -1321,8 +1320,11 @@ impl NativePagedAppend<'_> {
             }
             .fail();
         }
-        for token in 0..reservation.append_tokens {
-            let location = self.pool.ledger.write_location(reservation, layer, token)?;
+        for token in 0..append_tokens {
+            let location = {
+                let reservation = self.reservation()?;
+                self.pool.ledger.write_location(reservation, layer, token)?
+            };
             let input_offset = token
                 .checked_mul(self.pool.plan.logical.geometry.row_width)
                 .ok_or_else(|| {
