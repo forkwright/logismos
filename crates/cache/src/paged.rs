@@ -1300,25 +1300,58 @@ impl NativePagedAppend<'_> {
         self.pool.ensure_buffer_device(keys)?;
         self.pool.ensure_buffer_device(values)?;
         let reservation = self.reservation()?;
-        let active = reservation.append_tokens.checked_mul(self.pool.plan.logical.geometry.row_width).ok_or_else(|| PagedArithmeticSnafu { operation: "native append active row prefix" }.build())?;
+        let active = reservation
+            .append_tokens
+            .checked_mul(self.pool.plan.logical.geometry.row_width)
+            .ok_or_else(|| {
+                PagedArithmeticSnafu {
+                    operation: "native append active row prefix",
+                }
+                .build()
+            })?;
         if keys.len() < active || values.len() < active {
-            return PagedLayoutSnafu { operation: "native append active row prefix" }.fail();
+            return PagedLayoutSnafu {
+                operation: "native append active row prefix",
+            }
+            .fail();
         }
         for token in 0..reservation.append_tokens {
             let location = self.pool.ledger.write_location(reservation, layer, token)?;
-            let input_offset = token.checked_mul(self.pool.plan.logical.geometry.row_width).ok_or_else(|| PagedArithmeticSnafu { operation: "native append input row offset" }.build())?;
+            let input_offset = token
+                .checked_mul(self.pool.plan.logical.geometry.row_width)
+                .ok_or_else(|| {
+                    PagedArithmeticSnafu {
+                        operation: "native append input row offset",
+                    }
+                    .build()
+                })?;
             // SAFETY: active-prefix validation and checked offset select one row in each caller owner.
             let submitted = unsafe {
                 kernels::paged_kv::append_row_f32(
-                    self.pool.plan.layout, self.pool.keys.as_device_ptr(), self.pool.keys.len(),
-                    self.pool.values.as_device_ptr(), self.pool.values.len(),
-                    keys.as_device_ptr().add(input_offset), self.pool.plan.logical.geometry.row_width,
-                    values.as_device_ptr().add(input_offset), self.pool.plan.logical.geometry.row_width,
-                    layer, location.bundle, location.within, stream,
+                    self.pool.plan.layout,
+                    self.pool.keys.as_device_ptr(),
+                    self.pool.keys.len(),
+                    self.pool.values.as_device_ptr(),
+                    self.pool.values.len(),
+                    keys.as_device_ptr().add(input_offset),
+                    self.pool.plan.logical.geometry.row_width,
+                    values.as_device_ptr().add(input_offset),
+                    self.pool.plan.logical.geometry.row_width,
+                    layer,
+                    location.bundle,
+                    location.within,
+                    stream,
                 )
             };
-            if let Err(error) = submitted { self.pool.poisoned = true; return Err(error.into()); }
-            if let Err(error) = self.pool.ledger.record_write(layer, location.page, location.within) {
+            if let Err(error) = submitted {
+                self.pool.poisoned = true;
+                return Err(error.into());
+            }
+            if let Err(error) = self
+                .pool
+                .ledger
+                .record_write(layer, location.page, location.within)
+            {
                 self.pool.poisoned = true;
                 return Err(error);
             }
@@ -1396,10 +1429,7 @@ impl NativePagedAppend<'_> {
     /// failure without exposing native backing pointers.
     pub fn layer_kv(&self, layer: usize) -> Result<NativePagedLayerKv<'_>> {
         let reservation = self.reservation()?;
-        let tokens = self
-            .pool
-            .ledger
-            .visible_tokens(reservation, layer)?;
+        let tokens = self.pool.ledger.visible_tokens(reservation, layer)?;
         Ok(NativePagedLayerKv {
             pool: self.pool,
             layer,
@@ -1594,9 +1624,19 @@ impl NativePagedLayerKv<'_> {
         // SAFETY: opaque backing and typed owners remain live through caller completion.
         unsafe {
             kernels::attention::launch_paged_prefill_b1_f32_checked(
-                plan, query.as_device_ptr(), query.len(), backing.keys, backing.elements,
-                backing.values, backing.elements, backing.table, backing.table_entries,
-                output.as_device_ptr(), output.len(), stream, status,
+                plan,
+                query.as_device_ptr(),
+                query.len(),
+                backing.keys,
+                backing.elements,
+                backing.values,
+                backing.elements,
+                backing.table,
+                backing.table_entries,
+                output.as_device_ptr(),
+                output.len(),
+                stream,
+                status,
             )
         }?;
         Ok(())
@@ -1613,12 +1653,26 @@ impl NativePagedLayerKv<'_> {
         self.pool.ensure_buffer_device(query)?;
         self.pool.ensure_buffer_device(output)?;
         validate_native_prefill_binding(self.pool.plan, self.offset, self.tokens, plan)?;
-        let layer_offset = self.layer.checked_mul(self.pool.plan.layout.layer_elements()).ok_or_else(|| PagedArithmeticSnafu { operation: "native prefill layer backing offset" }.build())?;
+        let layer_offset = self
+            .layer
+            .checked_mul(self.pool.plan.layout.layer_elements())
+            .ok_or_else(|| {
+                PagedArithmeticSnafu {
+                    operation: "native prefill layer backing offset",
+                }
+                .build()
+            })?;
         // SAFETY: checked layer index identifies one full layer backing extent.
         let keys = unsafe { self.pool.keys.as_device_ptr().add(layer_offset) }.cast_const();
         // SAFETY: K/V layer extents are equal and non-overlapping owners.
         let values = unsafe { self.pool.values.as_device_ptr().add(layer_offset) }.cast_const();
-        Ok(NativePagedDecodeBacking { keys, values, elements: self.pool.plan.layout.layer_elements(), table: self.pool.table.as_device_ptr().cast_const(), table_entries: plan.page_table_entries() })
+        Ok(NativePagedDecodeBacking {
+            keys,
+            values,
+            elements: self.pool.plan.layout.layer_elements(),
+            table: self.pool.table.as_device_ptr().cast_const(),
+            table_entries: plan.page_table_entries(),
+        })
     }
 
     fn checked_attention_backing(
