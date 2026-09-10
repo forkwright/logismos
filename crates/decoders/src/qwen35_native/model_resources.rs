@@ -1482,7 +1482,6 @@ mod tests {
     use crate::qwen35::tests::{canonical_hybrid_fixture_with_context, verify_fixture};
     use crate::qwen35_native::model_plan::DeviceModelPlan;
     use crate::qwen35_native::model_step::ModelChunkPlan;
-    use snafu::IntoError;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

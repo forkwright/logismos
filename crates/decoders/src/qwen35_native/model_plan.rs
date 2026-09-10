@@ -526,7 +526,7 @@ fn page_table_bytes(plan: Option<NativePagedKvPlan>, layout: Layout) -> Result<u
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceModelPlan, ModelDeviceByteDemand, NativeBlockPlan};
+    use super::{DeviceModelPlan, ModelDeviceByteDemand, NativeBlockPlan, elements_bytes};
     use crate::Qwen35Weights;
     use crate::qwen35::tests::{
         canonical_hybrid_fixture, canonical_hybrid_fixture_with_nextn, verify_fixture,
