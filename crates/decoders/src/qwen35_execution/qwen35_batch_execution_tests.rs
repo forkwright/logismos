@@ -119,6 +119,75 @@ fn batch_execution_preserves_per_sequence_logit_selection()
 }
 
 #[test]
+fn batch_execution_admits_distinct_owner_context_and_step_bounds()
+-> std::result::Result<(), String> {
+    let fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let mut wider_oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
+    let mut narrower_oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
+    let wider = execution_with_bounds(
+        &weights,
+        BATCH_CONTEXT,
+        BATCH_STEP_TOKENS,
+        Qwen35LogitSelection::AllTokens,
+    )?;
+    let narrower = execution_with_bounds(&weights, 4, 1, Qwen35LogitSelection::LastToken)?;
+    let wider_chunk = [0, 1, 2];
+    let narrower_chunk = [3];
+    let wider_expected = wider_oracle.step(&wider_chunk)?;
+    let narrower_expected = narrower_oracle.step(&narrower_chunk)?;
+    let mut executions = [wider, narrower];
+    let outputs = Qwen35Execution::plan_batch(
+        &mut executions,
+        &[wider_chunk.as_slice(), narrower_chunk.as_slice()],
+    )
+    .map_err(|error| error.to_string())?
+    .execute()
+    .map_err(|error| error.to_string())?;
+
+    assert_f32_slice_matches_f64(&outputs[0], &wider_expected, "wider owner logits", 0)?;
+    assert_f32_slice_matches_f64(
+        &outputs[1],
+        &narrower_expected,
+        "narrower owner logits",
+        0,
+    )?;
+    assert_private_state_matches_oracle(&executions[0], &wider_oracle.state_for_test())?;
+    assert_private_state_matches_oracle(&executions[1], &narrower_oracle.state_for_test())?;
+    Ok(())
+}
+
+#[test]
+fn batch_plan_refuses_smaller_owner_context_despite_larger_aggregate_bound()
+-> std::result::Result<(), String> {
+    let fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let wider = execution_with_bounds(
+        &weights,
+        BATCH_CONTEXT,
+        BATCH_STEP_TOKENS,
+        Qwen35LogitSelection::AllTokens,
+    )?;
+    let mut narrower = execution_with_bounds(&weights, 2, 2, Qwen35LogitSelection::AllTokens)?;
+    narrower.step(&[3]).map_err(|error| error.to_string())?;
+    let mut executions = [wider, narrower];
+    let before = execution_state_bits(&executions)?;
+
+    assert!(
+        Qwen35Execution::plan_batch(&mut executions, &[&[0], &[1, 2]]).is_err(),
+        "the narrower owner's context bound must not be replaced by the aggregate maximum"
+    );
+    assert_eq!(
+        execution_state_bits(&executions)?,
+        before,
+        "per-owner context refusal must leave both executions bitwise unchanged"
+    );
+    Ok(())
+}
+
+#[test]
 fn batch_plan_preflight_refusals_leave_every_execution_unchanged()
 -> std::result::Result<(), String> {
     let fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
@@ -371,7 +440,11 @@ fn late_second_sequence_refusal_rolls_back_the_whole_batch_and_retries()
     .map_err(|error| error.to_string())?
     .execute()
     .map_err(|error| error.to_string())?;
-    assert_eq!(retry, expected, "whole-batch retry must match a pristine control");
+    assert_eq!(
+        logits_bits(retry),
+        logits_bits(expected),
+        "whole-batch retry must match a pristine control bitwise"
+    );
     assert_eq!(
         execution_state_bits(&executions)?,
         execution_state_bits(&control)?,
@@ -384,8 +457,17 @@ fn execution(
     weights: &Qwen35Weights,
     selection: Qwen35LogitSelection,
 ) -> std::result::Result<Qwen35Execution, String> {
+    execution_with_bounds(weights, BATCH_CONTEXT, BATCH_STEP_TOKENS, selection)
+}
+
+fn execution_with_bounds(
+    weights: &Qwen35Weights,
+    max_context: usize,
+    max_step_tokens: usize,
+    selection: Qwen35LogitSelection,
+) -> std::result::Result<Qwen35Execution, String> {
     weights
-        .execution_plan(BATCH_CONTEXT, BATCH_STEP_TOKENS, selection)
+        .execution_plan(max_context, max_step_tokens, selection)
         .map_err(|error| error.to_string())?
         .execution()
         .map_err(|error| error.to_string())
@@ -425,8 +507,7 @@ fn execution_state_bits(
 ) -> std::result::Result<Vec<ExecutionStateBits>, String> {
     executions
         .iter()
-        .map(private_state_snapshot)
-        .map(snapshot_bits)
+        .map(|execution| private_state_snapshot(execution).map(snapshot_bits))
         .collect()
 }
 
@@ -446,6 +527,10 @@ fn snapshot_bits(snapshot: ExecutionStateSnapshot) -> ExecutionStateBits {
 
 fn f32_bits(values: Vec<f32>) -> Vec<u32> {
     values.into_iter().map(f32::to_bits).collect()
+}
+
+fn logits_bits(logits: Vec<Vec<f32>>) -> Vec<Vec<u32>> {
+    logits.into_iter().map(f32_bits).collect()
 }
 
 fn checked_sum(values: &[u64], context: &'static str) -> std::result::Result<u64, String> {
