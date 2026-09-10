@@ -8,8 +8,8 @@ use super::custody::{NativeBufferSink, NativeBuildResult, NativeBuildScope, Nati
 use super::model_resources::{StreamRetention, build_native_kv, build_numerical_status};
 use super::model_session::NativeBuildFailure;
 use crate::error::{
-    ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionPagedDecodePlanSnafu,
-    NativeDeviceSnafu, NativeSessionStateSnafu,
+    ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionPagedPrefillPlanSnafu,
+    NativeDeviceSnafu, NativeKernelSnafu, NativeSessionStateSnafu,
 };
 use crate::qwen35_mrope::{TextMrope, text_mrope_coefficient};
 use crate::qwen35_native::finish::LayerFinishWorkspace;
@@ -161,20 +161,20 @@ impl DeviceResources {
             &[self.position],
             self.plan.layout.max_context(),
         )
-        .context(ExecutionPagedDecodePlanSnafu)?;
+        .context(NativeKernelSnafu)?;
         let logical = kernels::PagedPrefillPlan::try_from_packed_prefill(
             &packed,
             self.plan.layout.heads,
             self.plan.layout.kv_heads,
             self.plan.layout.key,
         )
-        .context(ExecutionPagedDecodePlanSnafu)?;
+        .context(ExecutionPagedPrefillPlanSnafu)?;
         let attention = kernels::attention::NativePagedPrefillPlan::try_from_paged_prefill(
             logical,
             self.plan.kv.layout().page_tokens(),
             self.plan.kv.layout().physical_pages(),
         )
-        .context(ExecutionPagedDecodePlanSnafu)?;
+        .context(ExecutionPagedPrefillPlanSnafu)?;
         self.step = Some(StepBuffers {
             input,
             output: DeviceBuffer::alloc(self.stream.device(), self.plan.workspace.hidden)
