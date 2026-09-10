@@ -1097,7 +1097,8 @@ mod tests {
                 head_major.as_mut_ptr(),
                 head_major.len(),
             )
-            .is_err()
+            .is_err(),
+            "gather must refuse a convolution span shorter than checked T=3 rows"
         );
         assert!(
             validate_value_gather_launch(
@@ -1107,7 +1108,8 @@ mod tests {
                 head_major.as_mut_ptr(),
                 head_major.len() - 1,
             )
-            .is_err()
+            .is_err(),
+            "gather must refuse a head-major destination shorter than its exact layout"
         );
         assert!(
             validate_value_gather_launch(
@@ -1117,7 +1119,8 @@ mod tests {
                 convolved.as_mut_ptr(),
                 head_major.len(),
             )
-            .is_err()
+            .is_err(),
+            "gather must refuse a writable head-major span overlapping convolution input"
         );
         assert!(
             validate_compact_layout_launch(
@@ -1127,7 +1130,8 @@ mod tests {
                 head_major.as_mut_ptr(),
                 token_major.len(),
             )
-            .is_err()
+            .is_err(),
+            "reverse layout must refuse token-major output overlapping head-major input"
         );
         assert!(
             validate_compact_layout_launch(
@@ -1137,7 +1141,8 @@ mod tests {
                 token_major.as_mut_ptr(),
                 token_major.len() - 1,
             )
-            .is_err()
+            .is_err(),
+            "reverse layout must refuse a token-major destination shorter than its exact layout"
         );
         Ok(())
     }
