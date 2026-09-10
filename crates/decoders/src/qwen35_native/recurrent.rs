@@ -10,9 +10,9 @@ use super::custody::{
 };
 use super::dispatch::{launch_rms_norm_view, launch_silu_mul_view};
 use super::finish::{
-    DeferredLayerFinish, LayerFinishPlan, LayerFinishWeights, LayerFinishWorkspace,
+    ActiveLayerFinishPlan, DeferredLayerFinish, LayerFinishWeights, LayerFinishWorkspace,
 };
-use super::recurrent_plan::{DeviceRecurrentPlan, RecurrentWorkspacePlan};
+use super::recurrent_plan::{ActiveRecurrentPlan, DeviceRecurrentPlan, RecurrentWorkspacePlan};
 use super::resources::NativeBufferView;
 use super::weights::{NativeMatrix, f32_parameter_buffer};
 use crate::error::{NativeDeviceSnafu, NativeKernelSnafu};
@@ -87,13 +87,13 @@ pub(super) struct NativeRecurrentState {
 
 /// Borrowed recurrent launch inputs with no completion or publication authority.
 pub(super) struct DeferredRecurrent<'resources> {
-    pub(super) plan: &'resources DeviceRecurrentPlan,
+    pub(super) plan: &'resources ActiveRecurrentPlan,
     pub(super) weights: &'resources NativeRecurrentWeights,
     pub(super) workspace: NativeRecurrentWorkspaceViews<'resources>,
     pub(super) state: &'resources NativeRecurrentState,
     pub(super) input: NativeBufferView<'resources, f32>,
     pub(super) output: NativeBufferView<'resources, f32>,
-    pub(super) finish_plan: &'resources LayerFinishPlan,
+    pub(super) finish_plan: &'resources ActiveLayerFinishPlan,
     pub(super) finish_weights: &'resources LayerFinishWeights,
     pub(super) finish_workspace: &'resources LayerFinishWorkspace,
     pub(super) stream: &'resources Stream,
@@ -217,6 +217,9 @@ impl NativeRecurrentWorkspace {
         sink.push_f32(self.projected_attention);
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when any active scratch extent exceeds this capacity owner.
     pub(super) fn active(
         &self,
         plan: RecurrentWorkspacePlan,
@@ -778,6 +781,10 @@ mod tests {
         let finish =
             LayerFinishPlan::from_weights_rows(&weights, layout, RECURRENT_BLOCK, TOKEN_COUNT)
                 .map_err(|error| error.to_string())?;
+        let active_plan = plan.active(TOKEN_COUNT).map_err(|error| error.to_string())?;
+        let active_finish = finish
+            .active(layout, TOKEN_COUNT)
+            .map_err(|error| error.to_string())?;
         let (expected_hidden, expected_history, expected_state) =
             cpu_recurrent_expectations(&weights, &fixture, &hidden, &packed)?;
 
@@ -785,18 +792,18 @@ mod tests {
         let resources =
             RecurrentWitnessResources::build(&device, &weights, &plan, &finish, &hidden)?;
         let deferred = DeferredRecurrent {
-            plan: &plan,
+            plan: &active_plan,
             weights: &resources.native_weights,
             workspace: resources
                 .recurrent_workspace
-                .active(plan.workspace)
+                .active(active_plan.workspace)
                 .map_err(|error| error.to_string())?,
             state: &resources.state,
             input: NativeBufferView::prefix(&resources.input, hidden.len())
                 .map_err(|error| error.to_string())?,
             output: NativeBufferView::prefix(&resources.output, hidden.len())
                 .map_err(|error| error.to_string())?,
-            finish_plan: &finish,
+            finish_plan: &active_finish,
             finish_weights: &resources.finish_weights,
             finish_workspace: &resources.finish_workspace,
             stream: &resources.stream,

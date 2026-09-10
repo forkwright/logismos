@@ -14,11 +14,11 @@ use super::plan::{
     F32Parameter, ProjectionWeight, dimension, elements_bytes, f32_parameter, projection, sum,
 };
 use super::weights::{NativeMatrix, f32_parameter_buffer};
-use crate::error::NativeKernelSnafu;
+use crate::error::{NativeKernelSnafu, NativeSessionStateSnafu};
 use crate::qwen35_execution::{Layout, block_name};
 use crate::{Qwen35Weights, Result};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct LayerFinishPlan {
     pub(super) post_attention_norm: kernels::decoder_ops::RmsNormF32Plan,
     pub(super) ffn: kernels::decoder_ops::ElementwiseF32Plan,
@@ -34,7 +34,7 @@ pub(super) struct LayerFinishDeviceDemand {
     pub(super) scratch: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct LayerFinishWeightPlan {
     pub(super) post_attention_norm: F32Parameter,
     pub(super) ffn_gate: ProjectionWeight,
@@ -50,6 +50,15 @@ pub(super) struct LayerFinishWorkspacePlan {
     pub(super) ffn_up: usize,
     pub(super) ffn_product: usize,
     pub(super) ffn_down: usize,
+}
+
+/// Checked active operation geometry for one borrowed finish submission.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ActiveLayerFinishPlan {
+    pub(super) post_attention_norm: kernels::decoder_ops::RmsNormF32Plan,
+    pub(super) ffn: kernels::decoder_ops::ElementwiseF32Plan,
+    pub(super) residual: kernels::decoder_ops::ElementwiseF32Plan,
+    pub(super) workspace: LayerFinishWorkspacePlan,
 }
 
 pub(super) struct LayerFinishWeights {
@@ -83,7 +92,7 @@ pub(super) struct DeferredLayerFinish<'resources> {
     pub(super) input: NativeBufferView<'resources, f32>,
     pub(super) attention_projection: NativeBufferView<'resources, f32>,
     pub(super) output: NativeBufferView<'resources, f32>,
-    pub(super) plan: &'resources LayerFinishPlan,
+    pub(super) plan: &'resources ActiveLayerFinishPlan,
     pub(super) weights: &'resources LayerFinishWeights,
     pub(super) workspace: LayerFinishWorkspaceViews<'resources>,
     pub(super) stream: &'resources Stream,
@@ -91,14 +100,10 @@ pub(super) struct DeferredLayerFinish<'resources> {
 }
 
 impl LayerFinishPlan {
-    pub(super) fn from_weights(
-        weights: &Qwen35Weights,
-        layout: Layout,
-        block: usize,
-    ) -> Result<Self> {
-        Self::from_weights_rows(weights, layout, block, 1)
-    }
-
+    /// # Errors
+    ///
+    /// Returns an error when verified finish weights or token-major kernel
+    /// geometry cannot be admitted.
     pub(super) fn from_weights_rows(
         weights: &Qwen35Weights,
         layout: Layout,
@@ -122,8 +127,21 @@ impl LayerFinishPlan {
         Self::from_bound_weights(layout, weights, token_count)
     }
 
-    pub(super) fn active(&self, layout: Layout, token_count: usize) -> Result<Self> {
-        Self::from_bound_weights(layout, self.weights.clone(), token_count)
+    /// # Errors
+    ///
+    /// Returns an error when `token_count` cannot form a checked active finish plan.
+    pub(super) fn active(
+        &self,
+        layout: Layout,
+        token_count: usize,
+    ) -> Result<ActiveLayerFinishPlan> {
+        if self.weights.post_attention_norm.elements != layout.hidden {
+            return NativeSessionStateSnafu {
+                rule: "active native finish geometry must retain its bound post-attention norm width",
+            }
+            .fail();
+        }
+        ActiveLayerFinishPlan::from_layout(layout, token_count)
     }
 
     fn from_bound_weights(
@@ -131,6 +149,24 @@ impl LayerFinishPlan {
         weights: LayerFinishWeightPlan,
         token_count: usize,
     ) -> Result<Self> {
+        let active = ActiveLayerFinishPlan::from_layout(layout, token_count)?;
+        let demand = LayerFinishDeviceDemand {
+            weights: weights.bytes()?,
+            scratch: active.workspace.bytes()?,
+        };
+        Ok(Self {
+            post_attention_norm: active.post_attention_norm,
+            ffn: active.ffn,
+            residual: active.residual,
+            weights,
+            workspace: active.workspace,
+            demand,
+        })
+    }
+}
+
+impl ActiveLayerFinishPlan {
+    fn from_layout(layout: Layout, token_count: usize) -> Result<Self> {
         let post_attention_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(
             token_count,
             layout.hidden,
@@ -160,17 +196,11 @@ impl LayerFinishPlan {
             ffn_product: ffn.elements(),
             ffn_down: residual.elements(),
         };
-        let demand = LayerFinishDeviceDemand {
-            weights: weights.bytes()?,
-            scratch: workspace.bytes()?,
-        };
         Ok(Self {
             post_attention_norm,
             ffn,
             residual,
-            weights,
             workspace,
-            demand,
         })
     }
 }
@@ -293,6 +323,9 @@ impl LayerFinishWorkspace {
         sink.push_f32(self.ffn_down);
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when any active scratch extent exceeds this capacity owner.
     pub(super) fn active(
         &self,
         plan: LayerFinishWorkspacePlan,
@@ -419,7 +452,7 @@ mod tests {
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
         let layout = Layout::from_metadata(&weights, 4).map_err(|error| error.to_string())?;
-        let t1 = LayerFinishPlan::from_weights(&weights, layout, 3)
+        let t1 = LayerFinishPlan::from_weights_rows(&weights, layout, 3, 1)
             .map_err(|error| error.to_string())?;
         assert!(
             LayerFinishPlan::from_weights_rows(&weights, layout, 3, 0).is_err(),

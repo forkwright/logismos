@@ -292,10 +292,17 @@ impl NativeWorkspace {
 }
 
 impl<'buffer, T: BytePod> NativeBufferView<'buffer, T> {
+    /// # Errors
+    ///
+    /// Returns an error when `elements` exceeds the retained allocation.
     pub(super) fn prefix(buffer: &'buffer DeviceBuffer<T>, elements: usize) -> Result<Self> {
         Self::window(buffer, 0, elements)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the offset arithmetic overflows or the requested
+    /// range exceeds the retained allocation.
     pub(super) fn window(
         buffer: &'buffer DeviceBuffer<T>,
         offset: usize,
@@ -329,6 +336,9 @@ impl<'buffer, T: BytePod> NativeBufferView<'buffer, T> {
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the range overflows or exceeds its allocation extent.
 pub(super) fn checked_buffer_window(
     allocation_elements: usize,
     offset: usize,

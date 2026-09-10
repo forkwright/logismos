@@ -14,7 +14,7 @@ use crate::qwen35_recurrent::{ExecutionLayout, RecurrentTensorRole, recurrent_te
 use kernels::PackedPrefillPlan;
 
 /// One verified matrix descriptor used by a native recurrent block.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct RecurrentProjectionWeights {
     pub(super) qkv: ProjectionWeight,
     pub(super) gate: ProjectionWeight,
@@ -24,7 +24,7 @@ pub(super) struct RecurrentProjectionWeights {
 }
 
 /// One verified F32 descriptor used by a native recurrent block.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct RecurrentF32Parameters {
     pub(super) attention_norm: F32Parameter,
     pub(super) a: F32Parameter,
@@ -101,6 +101,15 @@ pub(super) struct DeviceRecurrentPlan {
     weight_bytes: usize,
 }
 
+/// Checked active recurrent operation geometry with no weight ownership.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ActiveRecurrentPlan {
+    pub(super) layout: ExecutionLayout,
+    pub(super) workspace: RecurrentWorkspacePlan,
+    pub(super) convolution: kernels::CausalConvAllocationPlan,
+    pub(super) recurrence: kernels::MultiHeadRecurrentAllocationPlan,
+}
+
 impl DeviceRecurrentPlan {
     /// Bind one admitted recurrent main block to native operation descriptors.
     ///
@@ -130,7 +139,11 @@ impl DeviceRecurrentPlan {
         Self::from_token_count(weights, block, packed.total_tokens())
     }
 
-    pub(super) fn active(&self, token_count: usize) -> Result<Self> {
+    /// # Errors
+    ///
+    /// Returns an error when `token_count` cannot form checked convolution or
+    /// recurrence geometry under this retained artifact binding.
+    pub(super) fn active(&self, token_count: usize) -> Result<ActiveRecurrentPlan> {
         let convolution = kernels::CausalConvAllocationPlan::try_from_dimensions(
             token_count,
             self.layout.convolution_width(),
@@ -145,10 +158,8 @@ impl DeviceRecurrentPlan {
             self.layout.value_dim(),
         )
         .context(RecurrentGdnSnafu)?;
-        Ok(Self {
+        Ok(ActiveRecurrentPlan {
             layout: self.layout,
-            matrices: self.matrices.clone(),
-            parameters: self.parameters.clone(),
             workspace: RecurrentWorkspacePlan::from_layout(
                 self.layout,
                 token_count,
@@ -157,7 +168,6 @@ impl DeviceRecurrentPlan {
             )?,
             convolution,
             recurrence,
-            weight_bytes: self.weight_bytes,
         })
     }
 

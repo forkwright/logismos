@@ -10,7 +10,7 @@ use crate::error::{
     NativeSessionStateSnafu,
 };
 use crate::qwen35_execution::{Layout, block_name, read_f32};
-use crate::qwen35_native::finish::LayerFinishPlan;
+use crate::qwen35_native::finish::{ActiveLayerFinishPlan, LayerFinishPlan};
 use crate::{Qwen35Weights, Result};
 
 #[derive(Debug)]
@@ -45,14 +45,14 @@ pub(super) struct WorkspacePlan {
     pub(super) gated: usize,
     pub(super) output_projection: usize,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct ProjectionWeight {
     pub(super) name: String,
     pub(super) shape: kernels::row_gemv::RowGemvShape,
     pub(super) serialized_bytes: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct AttentionProjectionWeights {
     pub(super) q_gate: ProjectionWeight,
     pub(super) key: ProjectionWeight,
@@ -60,14 +60,14 @@ pub(super) struct AttentionProjectionWeights {
     pub(super) output: ProjectionWeight,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct F32Parameter {
     pub(super) name: String,
     pub(super) dimensions: Vec<u64>,
     pub(super) elements: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct AttentionNormalizationWeights {
     pub(super) input: F32Parameter,
     pub(super) query: F32Parameter,
@@ -134,6 +134,10 @@ impl DeviceFullAttentionPlan {
         Self::from_weights_rows(weights, block, max_context, page_tokens, 1)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when artifact metadata, block admission, checked
+    /// kernel geometry, or capacity demand cannot represent these rows.
     pub(super) fn from_weights_rows(
         weights: &Qwen35Weights,
         block: usize,
@@ -145,15 +149,10 @@ impl DeviceFullAttentionPlan {
         Self::from_layout_rows(weights, layout, block, page_tokens, token_count)
     }
 
-    pub(super) fn from_layout(
-        weights: &Qwen35Weights,
-        layout: Layout,
-        block: usize,
-        page_tokens: kernels::attention::NativePageTokens,
-    ) -> Result<Self> {
-        Self::from_layout_rows(weights, layout, block, page_tokens, 1)
-    }
-
+    /// # Errors
+    ///
+    /// Returns an error when the admitted block or row geometry cannot be
+    /// represented by its checked native descriptors.
     pub(super) fn from_layout_rows(
         weights: &Qwen35Weights,
         layout: Layout,
@@ -234,11 +233,17 @@ impl DeviceFullAttentionPlan {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when `token_count` cannot form a checked active workspace.
     pub(super) fn active_workspace(&self, token_count: usize) -> Result<WorkspacePlan> {
         WorkspacePlan::from_layout_rows(self.layout, token_count)
     }
 
-    pub(super) fn active_finish(&self, token_count: usize) -> Result<LayerFinishPlan> {
+    /// # Errors
+    ///
+    /// Returns an error when `token_count` cannot form a checked active finish plan.
+    pub(super) fn active_finish(&self, token_count: usize) -> Result<ActiveLayerFinishPlan> {
         self.finish.active(self.layout, token_count)
     }
 }
@@ -339,6 +344,10 @@ impl WorkspacePlan {
         Self::from_layout_rows(layout, 1)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when a nonempty token-major workspace cannot be
+    /// represented by the checked operation plans.
     pub(super) fn from_layout_rows(layout: Layout, token_count: usize) -> Result<Self> {
         let hidden_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(
             token_count,

@@ -6,7 +6,7 @@ use snafu::ResultExt;
 
 use super::CompletionResource;
 use super::finish::{
-    DeferredLayerFinish, LayerFinishPlan, LayerFinishWeights, LayerFinishWorkspace,
+    ActiveLayerFinishPlan, DeferredLayerFinish, LayerFinishWeights, LayerFinishWorkspace,
 };
 use super::plan::WorkspacePlan;
 use super::resources::{
@@ -36,7 +36,7 @@ impl CompletionResource for DeviceResources {
 pub(super) struct DeferredFullAttention<'resources> {
     pub(super) weights: &'resources NativeWeights,
     pub(super) workspace: &'resources NativeWorkspace,
-    pub(super) finish_plan: &'resources LayerFinishPlan,
+    pub(super) finish_plan: &'resources ActiveLayerFinishPlan,
     pub(super) finish_weights: &'resources LayerFinishWeights,
     pub(super) finish_workspace: &'resources LayerFinishWorkspace,
     pub(super) plan: WorkspacePlan,
@@ -69,13 +69,14 @@ impl DeviceResources {
             .build()
         })?;
         let stream = &self.stream;
+        let finish_plan = self.plan.active_finish(1)?;
         // SAFETY: this session owns the cache, stream, and exact one-token
         // append row buffers; all remain live until guard completion.
         let mut append = unsafe { self.kv.begin_append(1, stream) }.context(NativePagedKvSnafu)?;
         let deferred = DeferredFullAttention {
             weights: &self.weights,
             workspace: &self.workspace,
-            finish_plan: &self.plan.finish,
+            finish_plan: &finish_plan,
             finish_weights: &self.weights.finish,
             finish_workspace: &self.finish_workspace,
             plan: self.plan.workspace,
