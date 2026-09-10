@@ -373,17 +373,19 @@ impl WorkspacePlan {
         .context(NativeKernelSnafu)?;
         let (query_rotary, key_rotary) = mrope_rotation_plans(layout)?;
         let split = kernels::decoder_ops::SplitQGateF32Plan::try_from_dimensions(
-            token_major_extent(token_count, layout.heads, "native full-attention split rows")?,
+            token_major_extent(
+                token_count,
+                layout.heads,
+                "native full-attention split rows",
+            )?,
             layout.key,
         )
         .context(NativeKernelSnafu)?;
-        let gate = kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(
-            token_major_extent(
-                token_count,
-                layout.query_width,
-                "native full-attention gated query elements",
-            )?,
-        )
+        let gate = kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(token_major_extent(
+            token_count,
+            layout.query_width,
+            "native full-attention gated query elements",
+        )?)
         .context(NativeKernelSnafu)?;
         Ok(Self {
             hidden_norm,
@@ -398,7 +400,11 @@ impl WorkspacePlan {
             query: split.output_elements(),
             gate_values: split.output_elements(),
             normalized_query: query_norm.elements(),
-            key: token_major_extent(token_count, layout.kv_width, "native full-attention key elements")?,
+            key: token_major_extent(
+                token_count,
+                layout.kv_width,
+                "native full-attention key elements",
+            )?,
             normalized_key: key_norm.elements(),
             value: token_major_extent(
                 token_count,
