@@ -4,6 +4,7 @@ use hipcore::{Device, DeviceBuffer, Stream};
 use snafu::ResultExt;
 
 use super::custody::{NativeBufferSink, NativeBuildResult, NativeBuildScope, NativeBuildSource};
+use super::resources::NativeBufferView;
 use crate::error::{NativeDeviceSnafu, NativeKernelSnafu, NativeSessionStateSnafu};
 use crate::qwen35_execution::read_f32;
 use crate::qwen35_native::finish::LayerFinishWeights;
@@ -124,16 +125,16 @@ impl NativeMatrix {
         sink.push_u8(self.bytes);
     }
 
-    /// Launch a checked projection for `token_count` dense input rows.
+    /// Launch a checked projection over exact active windows of capacity-owned rows.
     ///
     /// # Safety
     ///
-    /// `input` and `output` must be exact distinct spans on `stream`'s device,
-    /// with the sticky status allocation retained through completion.
-    pub(super) unsafe fn launch_rows(
+    /// The views must be distinct device spans on `stream`'s device, and the
+    /// sticky status allocation must remain live through completion.
+    pub(super) unsafe fn launch_rows_view(
         &self,
-        input: &DeviceBuffer<f32>,
-        output: &DeviceBuffer<f32>,
+        input: NativeBufferView<'_, f32>,
+        output: NativeBufferView<'_, f32>,
         token_count: usize,
         stream: &Stream,
         numerical_status: &kernels::numerical_status::NativeNumericalStatus,
@@ -152,9 +153,9 @@ impl NativeMatrix {
                 batch,
                 self.bytes.as_device_ptr(),
                 self.bytes.len(),
-                input.as_device_ptr().cast_const(),
+                input.as_const_ptr(),
                 input.len(),
-                output.as_device_ptr(),
+                output.as_mut_ptr(),
                 output.len(),
                 stream,
                 numerical_status,

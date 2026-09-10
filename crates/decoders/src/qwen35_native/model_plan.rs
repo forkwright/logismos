@@ -3,6 +3,7 @@
 use core::mem::size_of;
 
 use cache::{NativePagedKvPlan, PagedKvGeometry};
+use kernels::PackedPrefillPlan;
 use snafu::ResultExt;
 
 use super::finish::{LayerFinishPlan, LayerFinishWorkspacePlan};
@@ -82,6 +83,8 @@ impl ModelDeviceByteDemand {
 pub(super) struct DeviceModelPlan {
     pub(super) layout: Layout,
     pub(super) page_tokens: kernels::attention::NativePageTokens,
+    /// Maximum one-sequence chunk whose workspace is allocated by this plan.
+    pub(super) max_chunk_tokens: usize,
     pub(super) embedding: ProjectionWeight,
     pub(super) output: ProjectionWeight,
     pub(super) output_norm: F32Parameter,
@@ -107,12 +110,26 @@ struct ModelBlockPlans {
 }
 
 impl DeviceModelPlan {
-    pub(super) fn from_weights(
+    /// Bind one model's reusable workspace to a checked single-sequence chunk capacity.
+    ///
+    /// This retains the historical one-token constructor as an exact capacity-one
+    /// delegate. Persistent cache and recurrent state remain context- and
+    /// layer-shaped; only transient rows and controls scale with this capacity.
+    pub(super) fn from_weights_prefill(
         weights: &Qwen35Weights,
         max_context: usize,
+        max_chunk_tokens: usize,
         page_tokens: kernels::attention::NativePageTokens,
     ) -> Result<Self> {
+        if max_chunk_tokens == 0 || max_chunk_tokens > max_context {
+            return NativeSessionStateSnafu {
+                rule: "native prefill chunk capacity must be positive and within context",
+            }
+            .fail();
+        }
         let layout = Layout::from_metadata(weights, max_context)?;
+        let capacity = PackedPrefillPlan::new(&[max_chunk_tokens], &[0], max_context)
+            .context(NativeKernelSnafu)?;
         let embedding = projection(weights, TOKEN_EMBEDDING.to_string())?;
         let output = projection(weights, OUTPUT.to_string())?;
         verify_vocabulary_matrix(
@@ -141,12 +158,14 @@ impl DeviceModelPlan {
             weights,
             layout,
             page_tokens,
+            &capacity,
             global_weight_bytes(&embedding, &output, &output_norm)?,
         )?;
         let finish_workspace = blocks.finish_workspace()?;
         let kv = native_kv_plan(layout, blocks.full_layers, page_tokens)?;
         let bytes = ModelDeviceByteDemand::from_model(
             layout,
+            max_chunk_tokens,
             output_rms,
             output.shape.rows(),
             &blocks,
@@ -156,6 +175,7 @@ impl DeviceModelPlan {
         Ok(Self {
             layout,
             page_tokens,
+            max_chunk_tokens,
             embedding,
             output,
             output_norm,
@@ -168,6 +188,18 @@ impl DeviceModelPlan {
             bytes,
         })
     }
+
+    pub(super) fn hidden_row_elements(&self) -> Result<usize> {
+        self.layout
+            .hidden
+            .checked_mul(self.max_chunk_tokens)
+            .ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "native prefill hidden row elements",
+                }
+                .build()
+            })
+    }
 }
 
 impl ModelBlockPlans {
@@ -175,6 +207,7 @@ impl ModelBlockPlans {
         weights: &Qwen35Weights,
         layout: Layout,
         page_tokens: kernels::attention::NativePageTokens,
+        capacity: &PackedPrefillPlan,
         weights_bytes: usize,
     ) -> Result<Self> {
         let mut plans = Self {
@@ -190,9 +223,9 @@ impl ModelBlockPlans {
         };
         for block in 0..layout.main_block_count() {
             if layout.is_full(block) {
-                plans.push_full(weights, layout, block, page_tokens)?;
+                plans.push_full(weights, layout, block, page_tokens, capacity.total_tokens())?;
             } else {
-                plans.push_recurrent(weights, layout, block)?;
+                plans.push_recurrent(weights, layout, block, capacity)?;
             }
         }
         Ok(plans)
@@ -204,8 +237,15 @@ impl ModelBlockPlans {
         layout: Layout,
         block: usize,
         page_tokens: kernels::attention::NativePageTokens,
+        token_count: usize,
     ) -> Result<()> {
-        let plan = DeviceFullAttentionPlan::from_layout(weights, layout, block, page_tokens)?;
+        let plan = DeviceFullAttentionPlan::from_layout_rows(
+            weights,
+            layout,
+            block,
+            page_tokens,
+            token_count,
+        )?;
         // INVARIANT: the verified structural profile fixes main-block
         // dimensions, so one checked descriptor owns each reusable per-kind
         // workspace extent.
@@ -237,9 +277,11 @@ impl ModelBlockPlans {
         weights: &Qwen35Weights,
         layout: Layout,
         block: usize,
+        capacity: &PackedPrefillPlan,
     ) -> Result<()> {
-        let plan = DeviceRecurrentPlan::from_weights(weights, block)?;
-        let finish = LayerFinishPlan::from_weights(weights, layout, block)?;
+        let plan = DeviceRecurrentPlan::from_packed_prefill(weights, block, capacity)?;
+        let finish =
+            LayerFinishPlan::from_weights_rows(weights, layout, block, capacity.total_tokens())?;
         self.recurrent_workspace.get_or_insert(plan.workspace);
         self.finish_workspace.get_or_insert(finish.workspace);
         self.finish_workspace_bytes
@@ -281,6 +323,7 @@ impl ModelBlockPlans {
 impl ModelDeviceByteDemand {
     fn from_model(
         layout: Layout,
+        max_chunk_tokens: usize,
         output_rms: kernels::decoder_ops::RmsNormF32Plan,
         vocabulary: usize,
         blocks: &ModelBlockPlans,
@@ -300,7 +343,11 @@ impl ModelDeviceByteDemand {
                 .build()
             })?,
             hidden_rows: elements_bytes(
-                checked_sum(layout.hidden, layout.hidden, "native hidden ping-pong rows")?,
+                checked_sum(
+                    hidden_row_elements(layout, max_chunk_tokens)?,
+                    hidden_row_elements(layout, max_chunk_tokens)?,
+                    "native hidden ping-pong rows",
+                )?,
                 size_of::<f32>(),
                 "native hidden ping-pong bytes",
             )?,
@@ -367,6 +414,15 @@ fn global_weight_bytes(
 fn checked_sum(left: usize, right: usize, context: &'static str) -> Result<usize> {
     left.checked_add(right)
         .ok_or_else(|| ArithmeticOverflowSnafu { context }.build())
+}
+
+fn hidden_row_elements(layout: Layout, max_chunk_tokens: usize) -> Result<usize> {
+    layout.hidden.checked_mul(max_chunk_tokens).ok_or_else(|| {
+        ArithmeticOverflowSnafu {
+            context: "native prefill hidden row elements",
+        }
+        .build()
+    })
 }
 
 fn verify_vocabulary_matrix(
@@ -470,7 +526,7 @@ fn page_table_bytes(plan: Option<NativePagedKvPlan>, layout: Layout) -> Result<u
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceModelPlan, ModelDeviceByteDemand, NativeBlockPlan};
+    use super::{DeviceModelPlan, ModelDeviceByteDemand, NativeBlockPlan, elements_bytes};
     use crate::Qwen35Weights;
     use crate::qwen35::tests::{
         canonical_hybrid_fixture, canonical_hybrid_fixture_with_nextn, verify_fixture,
@@ -487,7 +543,7 @@ mod tests {
         let artifact = verify_fixture(fixture)?;
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
-        DeviceModelPlan::from_weights(&weights, CONTEXT, PAGE_TOKENS)
+        DeviceModelPlan::from_weights_prefill(&weights, CONTEXT, 1, PAGE_TOKENS)
             .map_err(|error| error.to_string())
     }
 
@@ -583,8 +639,142 @@ mod tests {
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
         assert!(
-            DeviceModelPlan::from_weights(&weights, 0, PAGE_TOKENS).is_err(),
+            DeviceModelPlan::from_weights_prefill(&weights, 0, 1, PAGE_TOKENS).is_err(),
             "the model plan must refuse an empty caller context before device allocation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_capacity_scales_only_transient_rows_controls_and_workspaces()
+    -> std::result::Result<(), String> {
+        const CAPACITY: usize = 3;
+        let (token, chunk) = prefill_capacity_plans(CAPACITY)?;
+
+        assert_eq!(token.max_chunk_tokens, 1);
+        assert_eq!(chunk.max_chunk_tokens, CAPACITY);
+        assert_eq!(
+            chunk
+                .hidden_row_elements()
+                .map_err(|error| error.to_string())?,
+            9
+        );
+        assert_prefill_persistent_storage_is_unscaled(&token, &chunk);
+        assert_prefill_transient_storage_scales(&token, &chunk, CAPACITY);
+        assert_prefill_controls_scale(&token, &chunk, CAPACITY)?;
+        Ok(())
+    }
+
+    fn prefill_capacity_plans(
+        capacity: usize,
+    ) -> std::result::Result<(DeviceModelPlan, DeviceModelPlan), String> {
+        let fixture = canonical_hybrid_fixture()?;
+        let artifact = verify_fixture(&fixture)?;
+        let weights =
+            Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let token = DeviceModelPlan::from_weights_prefill(&weights, CONTEXT, 1, PAGE_TOKENS)
+            .map_err(|error| error.to_string())?;
+        let chunk = DeviceModelPlan::from_weights_prefill(&weights, CONTEXT, capacity, PAGE_TOKENS)
+            .map_err(|error| error.to_string())?;
+        Ok((token, chunk))
+    }
+
+    fn assert_prefill_persistent_storage_is_unscaled(
+        token: &DeviceModelPlan,
+        chunk: &DeviceModelPlan,
+    ) {
+        assert_eq!(chunk.bytes.weights, token.bytes.weights);
+        assert_eq!(chunk.bytes.key_values, token.bytes.key_values);
+        assert_eq!(chunk.bytes.page_table, token.bytes.page_table);
+        assert_eq!(
+            chunk.bytes.recurrent_history_active,
+            token.bytes.recurrent_history_active
+        );
+        assert_eq!(
+            chunk.bytes.recurrent_history_staged,
+            token.bytes.recurrent_history_staged
+        );
+        assert_eq!(
+            chunk.bytes.recurrent_state_active,
+            token.bytes.recurrent_state_active
+        );
+        assert_eq!(
+            chunk.bytes.recurrent_state_staged,
+            token.bytes.recurrent_state_staged
+        );
+        assert_eq!(chunk.bytes.final_normalized, token.bytes.final_normalized);
+        assert_eq!(chunk.bytes.logits, token.bytes.logits);
+    }
+
+    fn assert_prefill_transient_storage_scales(
+        token: &DeviceModelPlan,
+        chunk: &DeviceModelPlan,
+        capacity: usize,
+    ) {
+        assert_eq!(
+            chunk.bytes.full_workspace,
+            token.bytes.full_workspace * capacity
+        );
+        assert_eq!(
+            chunk.bytes.recurrent_workspace,
+            token.bytes.recurrent_workspace * capacity
+        );
+        assert_eq!(
+            chunk.bytes.finish_workspace,
+            token.bytes.finish_workspace * capacity
+        );
+        assert_eq!(chunk.bytes.hidden_rows, token.bytes.hidden_rows * capacity);
+    }
+
+    fn assert_prefill_controls_scale(
+        token: &DeviceModelPlan,
+        chunk: &DeviceModelPlan,
+        capacity: usize,
+    ) -> std::result::Result<(), String> {
+        let token_control_elements = prefill_control_elements(token)?;
+        let chunk_control_elements = prefill_control_elements(chunk)?;
+        assert_eq!(
+            chunk_control_elements,
+            token_control_elements * capacity,
+            "the capacity workspace owner must account for one token-major cosine/sine row per admitted token"
+        );
+        assert_eq!(
+            chunk.bytes.mrope_controls,
+            elements_bytes(
+                chunk_control_elements,
+                size_of::<f32>(),
+                "test native mRoPE controls",
+            )
+            .map_err(|error| error.to_string())?,
+            "mRoPE byte demand must derive directly from its capacity workspace owner"
+        );
+        assert_eq!(
+            chunk.bytes.mrope_controls,
+            token.bytes.mrope_controls * capacity,
+            "capacity-three controls must be exactly three capacity-one control spans, never squared"
+        );
+        Ok(())
+    }
+
+    fn prefill_control_elements(plan: &DeviceModelPlan) -> std::result::Result<usize, String> {
+        plan.full_workspace
+            .ok_or("canonical model must retain full-attention workspace")?
+            .coefficient_elements()
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn prefill_capacity_refuses_zero_or_context_excess_before_device_allocation()
+    -> std::result::Result<(), String> {
+        let fixture = canonical_hybrid_fixture()?;
+        let artifact = verify_fixture(&fixture)?;
+        let weights =
+            Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+
+        assert!(DeviceModelPlan::from_weights_prefill(&weights, CONTEXT, 0, PAGE_TOKENS).is_err());
+        assert!(
+            DeviceModelPlan::from_weights_prefill(&weights, CONTEXT, CONTEXT + 1, PAGE_TOKENS)
+                .is_err()
         );
         Ok(())
     }

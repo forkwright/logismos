@@ -1,9 +1,4 @@
-// Q=1 paged-attention correctness kernel.
-//
-// One 32-lane wave owns one query head. It does not own cache state, model
-// policy, or table construction; Rust validates only descriptor extents while
-// the unsafe caller owns table values and device-residency obligations.
-
+// B=1 causal multiquery paged-attention geometry wrapper.
 #include <cstddef>
 #include <cstdint>
 
@@ -11,28 +6,35 @@
 
 #include "paged_attention_wave32.h"
 
-extern "C" __global__ void logismos_paged_decode_q1_f32_kernel(
+extern "C" __global__ void logismos_paged_prefill_b1_f32_kernel(
     const float* __restrict__ query_f32,
     const float* __restrict__ keys_f32,
     const float* __restrict__ values_f32,
     const std::uint32_t* __restrict__ page_table_u32,
     float* __restrict__ output_f32,
     float scale,
-    std::uint32_t visible_tokens,
+    std::uint32_t tokens,
+    std::uint32_t offset,
     std::uint32_t query_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_width,
     std::uint32_t page_tokens,
     std::uint32_t* numerical_status)
 {
-    const std::uint32_t query_head = blockIdx.x;
+    const std::uint32_t work = blockIdx.x;
+    const std::uint32_t token = work / query_heads;
+    const std::uint32_t query_head = work % query_heads;
     const std::uint32_t lane = threadIdx.x;
-    if (query_head >= query_heads) {
+    if (token >= tokens) {
         return;
     }
-
+    const std::uint32_t visible_tokens = offset + token + 1U;
+    const std::size_t row_stride =
+        static_cast<std::size_t>(query_heads) * static_cast<std::size_t>(head_width);
     const std::size_t query_start =
-        static_cast<std::size_t>(query_head) * static_cast<std::size_t>(head_width);
+        static_cast<std::size_t>(token) * row_stride
+        + static_cast<std::size_t>(query_head) * static_cast<std::size_t>(head_width);
+
     logismos_paged_attention_wave32_f32(
         query_f32,
         keys_f32,

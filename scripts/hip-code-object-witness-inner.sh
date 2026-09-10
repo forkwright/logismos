@@ -65,6 +65,38 @@ verify_code_object_metadata() {
     printf '%s\n' "$code_objects"
 }
 
+verify_defined_global_symbol() {
+    local symbols=$1
+    local expected_symbol=$2
+    local line
+    local symbol
+    local field
+    local field_count
+    local is_global
+    local -a fields
+
+    while IFS= read -r line; do
+        [[ "$line" == *"$expected_symbol"* ]] || continue
+        [[ "$line" != *'*UND*'* ]] || continue
+        read -r -a fields <<<"$line"
+        field_count=${#fields[@]}
+        ((field_count > 0)) || continue
+        symbol=${fields[field_count - 1]}
+        [[ "$symbol" == "$expected_symbol" ]] || continue
+        is_global=false
+        for field in "${fields[@]:0:field_count - 1}"; do
+            if [[ "$field" == g || "$field" == G ]]; then
+                is_global=true
+                break
+            fi
+        done
+        if [[ "$is_global" == true ]]; then
+            return 0
+        fi
+    done <<<"$symbols"
+    return 1
+}
+
 verify_syntax_rejection() {
     local build_script=$1
     local hipcc=$2
@@ -154,6 +186,17 @@ main() {
             fail "kernel archive omits HIP object $member"
         fi
     done
+    prefill_launcher_member='paged_prefill_b1_launchers.cpp.o'
+    if ! grep -Fqx -- "$prefill_launcher_member" <<<"$members"; then
+        fail "kernel archive omits causal prefill launcher object $prefill_launcher_member"
+    fi
+    symbols_file="$scratch/inspect/symbols.txt"
+    if ! "$llvm_objdump" --syms "$archive" >"$symbols_file"; then
+        fail "llvm-objdump could not inspect the kernel archive symbol table"
+    fi
+    if ! verify_defined_global_symbol "$(<"$symbols_file")" 'logismos_launch_paged_prefill_b1_f32'; then
+        fail "kernel archive omits causal prefill launcher symbol logismos_launch_paged_prefill_b1_f32"
+    fi
 
     metadata_file="$scratch/inspect/offloading.txt"
     if ! (cd "$scratch/inspect" && "$llvm_objdump" --offloading "$archive" >"$metadata_file"); then

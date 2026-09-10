@@ -45,6 +45,14 @@ Review and apply that generated delta with the normal source-editing tool.
 Do not add host-write mounts, use an ambient Cargo wrapper, or copy `target/`
 into its own scratch snapshot.
 
+The same scratch-copy pattern applies when formatting needs to write files.
+Run `cargo fmt --manifest-path "$fmt_staging/Cargo.toml" --all` in that private
+copy, export the formatted sources into `target/`, and review/apply only their
+formatting delta. Check the real source afterward with
+`scripts/gpu-denied-runner.sh -- cargo fmt --all -- --check`. An in-place
+formatting attempt failing with `Read-only file system` is the intended source
+mount boundary, not Cargo lock contention or permission to weaken the runner.
+
 ## Exact artifact inspection
 
 `--ro-input-file` admits one exact artifact as an explicit, read-only host

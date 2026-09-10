@@ -250,7 +250,7 @@ the exact verified weight owner. Each session owns one stream and one
 layer-indexed KV pool when full attention is present. Each recurrent layer has distinct committed and staged
 raw convolution history and GDN state. A single full-attention workspace, a
 single recurrent workspace and a common residual/FFN workspace are reused in
-stream order; two hidden rows alternate between main blocks. Recurrent Q/K
+stream order; two hidden-row arrays alternate between main blocks. Recurrent Q/K
 normalization tiles by source-head modulo into equal-head GDN. An explicitly
 owned gather reads each activated convolution row's V tail into head-major
 storage; a second owned buffer restores recurrent output to token-major order
@@ -258,14 +258,29 @@ before normalization and gating. Both allocations participate in workspace
 demand, construction guards and uncertain-completion custody. Both block kinds
 enter the shared finish only after their own output projection.
 
-The deferred recurrent body and common finish support dense single-sequence
-token rows through the same projection, preparation and execution owners.
-Per-head recurrent weights broadcast across tokens; persistent history and
-state do not multiply by token count. The private packed qualification path
-borrows checked context geometry and refuses multiple sequences. It introduces
-no independent position or publication owner. The production main-model path
-still consumes one token at a time; complete model prefill requires multiquery
-attention and one whole-chunk transaction beyond this block composition.
+The model supports bounded single-sequence `prefill`, with `step` using that
+same transaction for one token. Existing plan/session constructors retain their
+one-token capacity; `try_from_weights_prefill` and `plan_prefill_session` admit
+an explicit maximum chunk size and derive its demand. A call validates every
+token ID, capacity and context span before device effects. Its checked packed
+geometry derives from the model's sole committed position, not a layer counter.
+
+Shared workspace and hidden arrays are allocated at admitted capacity. Small
+allocation-free operation descriptors and checked borrowed windows select the
+actual live rows, including short chunks and later one-token decode. Immutable
+weight descriptors are not cloned during submission. Per-head recurrent weights
+broadcast across tokens; persistent history/state and context-sized KV backing
+do not multiply by chunk capacity.
+
+Full attention stages every layer's chunk K/V rows before its causal multiquery
+launch. Token `t` sees only the committed offset plus `t + 1` rows, using the
+existing contiguous GQA mapping and wave32 online reduction. Rotary controls
+are token-major at the corresponding absolute positions. Existing embedding,
+rotary and KV row launches are bounded submission plumbing, not a loop around
+independently committing model steps. Final normalization and the output head
+consume only the terminal hidden row, so output is one vocabulary-sized logits
+buffer rather than one per prompt token. Multi-sequence model ownership and
+mixed-length batching remain separate work.
 
 The existing resource guard covers the first embedding submission through
 final logits. One append spans every full layer, interleaved with recurrent
@@ -275,12 +290,14 @@ form an infallible tail. The public demand distinguishes actual immutable
 uploads, shared workspaces, hidden/final/logit/control buffers, KV/table,
 active/staged recurrent allocations and numerical status. It excludes
 host/runtime overhead and arbitrarily retained returned logits. Its resident,
-session, token-control and returned-logit categories derive from the same
+session, maximum-chunk-control and returned-logit categories derive from the same
 checked demand. Uncertain completion retains the shared model reference with
 the complete per-session bundle. Sharing does not make `Drop` an eviction
 receipt. Demand is neither a resource grant nor
 measured physical residency. Native numeric obligations remain explicitly
 unsafe; compiler-checked, ignored device witnesses are not execution evidence.
+The existing text/service consumers retain one-token plans; this additive
+executor capability does not silently change their admission or serving policy.
 
 Explicit model/session close transfers original buffers into `hipcore`'s
 heterogeneous teardown inventory. The inventory preserves a checked manifest

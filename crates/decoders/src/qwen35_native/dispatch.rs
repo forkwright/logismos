@@ -1,16 +1,18 @@
 //! One-token native full-attention launch ordering.
 
 use cache::NativePagedAppend;
-use hipcore::{DeviceBuffer, Stream};
+use hipcore::Stream;
 use snafu::ResultExt;
 
 use super::CompletionResource;
 use super::finish::{
-    DeferredLayerFinish, LayerFinishPlan, LayerFinishWeights, LayerFinishWorkspace,
+    ActiveLayerFinishPlan, DeferredLayerFinish, LayerFinishWeights, LayerFinishWorkspace,
 };
 use super::plan::WorkspacePlan;
-use super::resources::{DeviceResources, FullAttentionStep, NativeWorkspace};
-use super::weights::{NativeMatrix, NativeWeights};
+use super::resources::{
+    DeviceResources, FullAttentionStep, NativeBufferView, NativeWorkspace, checked_buffer_window,
+};
+use super::weights::NativeWeights;
 use crate::Result;
 use crate::error::{
     NativeDeviceSnafu, NativeKernelSnafu, NativePagedKvSnafu, NativeSessionStateSnafu,
@@ -34,7 +36,7 @@ impl CompletionResource for DeviceResources {
 pub(super) struct DeferredFullAttention<'resources> {
     pub(super) weights: &'resources NativeWeights,
     pub(super) workspace: &'resources NativeWorkspace,
-    pub(super) finish_plan: &'resources LayerFinishPlan,
+    pub(super) finish_plan: &'resources ActiveLayerFinishPlan,
     pub(super) finish_weights: &'resources LayerFinishWeights,
     pub(super) finish_workspace: &'resources LayerFinishWorkspace,
     pub(super) plan: WorkspacePlan,
@@ -67,13 +69,14 @@ impl DeviceResources {
             .build()
         })?;
         let stream = &self.stream;
+        let finish_plan = self.plan.active_finish(1)?;
         // SAFETY: this session owns the cache, stream, and exact one-token
         // append row buffers; all remain live until guard completion.
         let mut append = unsafe { self.kv.begin_append(1, stream) }.context(NativePagedKvSnafu)?;
         let deferred = DeferredFullAttention {
             weights: &self.weights,
             workspace: &self.workspace,
-            finish_plan: &self.plan.finish,
+            finish_plan: &finish_plan,
             finish_weights: &self.weights.finish,
             finish_workspace: &self.finish_workspace,
             plan: self.plan.workspace,
@@ -108,12 +111,15 @@ impl DeferredFullAttention<'_> {
         // SAFETY: submit's contract retains the checked attention projection spans.
         unsafe { self.project_attention() }?;
         let finish = DeferredLayerFinish {
-            input: self.step.input,
-            attention_projection: &self.workspace.output_projection,
-            output: self.step.output,
+            input: NativeBufferView::prefix(self.step.input, self.plan.hidden)?,
+            attention_projection: NativeBufferView::prefix(
+                &self.workspace.output_projection,
+                self.plan.output_projection,
+            )?,
+            output: NativeBufferView::prefix(self.step.output, self.plan.hidden)?,
             plan: self.finish_plan,
             weights: self.finish_weights,
-            workspace: self.finish_workspace,
+            workspace: self.finish_workspace.active(self.finish_plan.workspace)?,
             stream: self.stream,
             numerical_status: self.numerical_status,
         };
@@ -126,52 +132,60 @@ impl DeferredFullAttention<'_> {
         let weights = self.weights;
         let workspace = self.workspace;
         let stream = self.stream;
+        let input = NativeBufferView::prefix(self.step.input, self.plan.hidden)?;
+        let hidden = NativeBufferView::prefix(&workspace.hidden, self.plan.hidden)?;
+        let q_gate = NativeBufferView::prefix(&workspace.q_gate, self.plan.q_gate)?;
+        let key = NativeBufferView::prefix(&workspace.key, self.plan.key)?;
+        let value = NativeBufferView::prefix(&workspace.value, self.plan.value)?;
         // SAFETY: this method's caller retains the exact checked spans and
         // sticky status allocation through completion.
         unsafe {
-            launch_rms_norm(
+            launch_rms_norm_view(
                 self.plan.hidden_norm,
-                self.step.input,
-                &weights.input_norm,
-                &workspace.hidden,
+                input,
+                NativeBufferView::prefix(&weights.input_norm, weights.input_norm.len())?,
+                hidden,
                 stream,
                 self.numerical_status,
             )
         }?;
         // SAFETY: the checked matrix descriptor and distinct spans remain live.
         unsafe {
-            weights.q_gate.launch(
-                &workspace.hidden,
-                &workspace.q_gate,
+            weights.q_gate.launch_rows_view(
+                hidden,
+                q_gate,
+                self.plan.hidden_norm.rows(),
                 stream,
                 self.numerical_status,
             )
         }?;
         // SAFETY: the checked matrix descriptor and distinct spans remain live.
         unsafe {
-            weights.key.launch(
-                &workspace.hidden,
-                &workspace.key,
+            weights.key.launch_rows_view(
+                hidden,
+                key,
+                self.plan.hidden_norm.rows(),
                 stream,
                 self.numerical_status,
             )
         }?;
         // SAFETY: the checked matrix descriptor and distinct spans remain live.
         unsafe {
-            weights.value.launch(
-                &workspace.hidden,
-                &workspace.value,
+            weights.value.launch_rows_view(
+                hidden,
+                value,
+                self.plan.hidden_norm.rows(),
                 stream,
                 self.numerical_status,
             )
         }?;
         // SAFETY: the checked split geometry and exact spans remain live.
         unsafe {
-            launch_split(
+            launch_split_view(
                 self.plan.split,
-                &workspace.q_gate,
-                &workspace.query,
-                &workspace.gate,
+                q_gate,
+                NativeBufferView::prefix(&workspace.query, self.plan.query)?,
+                NativeBufferView::prefix(&workspace.gate, self.plan.gate_values)?,
                 stream,
                 self.numerical_status,
             )
@@ -182,61 +196,107 @@ impl DeferredFullAttention<'_> {
         let weights = self.weights;
         let workspace = self.workspace;
         let stream = self.stream;
+        let query = NativeBufferView::prefix(&workspace.query, self.plan.query)?;
+        let normalized_query =
+            NativeBufferView::prefix(&workspace.normalized_query, self.plan.normalized_query)?;
+        let key = NativeBufferView::prefix(&workspace.key, self.plan.key)?;
+        let normalized_key =
+            NativeBufferView::prefix(&workspace.normalized_key, self.plan.normalized_key)?;
         // SAFETY: this method's caller retains the exact checked spans and
         // sticky status allocation through completion.
         unsafe {
-            launch_rms_norm(
+            launch_rms_norm_view(
                 self.plan.query_norm,
-                &workspace.query,
-                &weights.query_norm,
-                &workspace.normalized_query,
+                query,
+                NativeBufferView::prefix(&weights.query_norm, weights.query_norm.len())?,
+                normalized_query,
                 stream,
                 self.numerical_status,
             )
         }?;
         // SAFETY: the exact checked K-normalization spans remain live.
         unsafe {
-            launch_rms_norm(
+            launch_rms_norm_view(
                 self.plan.key_norm,
-                &workspace.key,
-                &weights.key_norm,
-                &workspace.normalized_key,
+                key,
+                NativeBufferView::prefix(&weights.key_norm, weights.key_norm.len())?,
+                normalized_key,
                 stream,
                 self.numerical_status,
             )
         }?;
         // SAFETY: the controls and rotated Q span are distinct exact buffers.
-        unsafe {
-            launch_rotary(
-                self.plan.query_rotary,
-                &workspace.normalized_query,
+        unsafe { self.rotate_rows(normalized_query, normalized_key, stream) }
+    }
+
+    unsafe fn rotate_rows(
+        &self,
+        normalized_query: NativeBufferView<'_, f32>,
+        normalized_key: NativeBufferView<'_, f32>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let token_count = self.plan.hidden_norm.rows();
+        let query_row_elements = self.plan.query_rotary.elements();
+        let key_row_elements = self.plan.key_rotary.elements();
+        let coefficient_elements = self.plan.query_rotary.coefficient_elements();
+        for token in 0..token_count {
+            let query_offset = row_offset(token, query_row_elements, "native query rotary row")?;
+            let key_offset = row_offset(token, key_row_elements, "native key rotary row")?;
+            let coefficient_offset =
+                row_offset(token, coefficient_elements, "native MRoPE coefficient row")?;
+            checked_buffer_window(normalized_query.len(), query_offset, query_row_elements)?;
+            checked_buffer_window(normalized_key.len(), key_offset, key_row_elements)?;
+            let query = NativeBufferView::window(
+                &self.workspace.normalized_query,
+                query_offset,
+                query_row_elements,
+            )?;
+            let key = NativeBufferView::window(
+                &self.workspace.normalized_key,
+                key_offset,
+                key_row_elements,
+            )?;
+            let cosine = NativeBufferView::window(
                 self.step.cosine,
-                self.step.sine,
-                stream,
-                self.numerical_status,
-            )
-        }?;
-        // SAFETY: the controls and rotated K span are distinct exact buffers.
-        unsafe {
-            launch_rotary(
-                self.plan.key_rotary,
-                &workspace.normalized_key,
-                self.step.cosine,
-                self.step.sine,
-                stream,
-                self.numerical_status,
-            )
+                coefficient_offset,
+                coefficient_elements,
+            )?;
+            let sine =
+                NativeBufferView::window(self.step.sine, coefficient_offset, coefficient_elements)?;
+            // SAFETY: each row view is a checked disjoint window and controls
+            // are immutable token-major coefficients retained through completion.
+            unsafe {
+                launch_rotary_view(
+                    self.plan.query_rotary,
+                    query,
+                    cosine,
+                    sine,
+                    stream,
+                    self.numerical_status,
+                )
+            }?;
+            // SAFETY: K is a separate checked row window with the same controls.
+            unsafe {
+                launch_rotary_view(
+                    self.plan.key_rotary,
+                    key,
+                    cosine,
+                    sine,
+                    stream,
+                    self.numerical_status,
+                )
+            }?;
         }
+        Ok(())
     }
 
     unsafe fn append_and_attend(&self, append: &mut NativePagedAppend<'_>) -> Result<()> {
         let workspace = self.workspace;
-        // SAFETY: this method's caller retains the exact native row spans and
-        // append through completion on the ordered stream.
+        // SAFETY: the opaque append owner validates its reservation-sized
+        // active prefixes inside these retained capacity allocations.
         unsafe {
-            append.write_layer_row(
+            append.write_layer_rows(
                 self.full_layer,
-                0,
                 &workspace.normalized_key,
                 &workspace.value,
                 self.stream,
@@ -246,7 +306,7 @@ impl DeferredFullAttention<'_> {
         let layer = append
             .layer_kv(self.full_layer)
             .context(NativePagedKvSnafu)?;
-        if layer.tokens() != self.step.attention.logical().visible_tokens() {
+        if layer.tokens() != self.step.attention.visible_tokens() {
             return NativeSessionStateSnafu {
                 rule: "native staged KV visibility must match the checked attention plan",
             }
@@ -255,7 +315,7 @@ impl DeferredFullAttention<'_> {
         // SAFETY: the opaque cache view retains K/V/table spans, while query
         // and output are separate owned exact spans on its stream.
         unsafe {
-            layer.launch_paged_decode_checked(
+            layer.launch_paged_prefill_checked(
                 self.step.attention,
                 &workspace.normalized_query,
                 &workspace.attention,
@@ -268,23 +328,29 @@ impl DeferredFullAttention<'_> {
 
     unsafe fn project_attention(&self) -> Result<()> {
         let workspace = self.workspace;
+        let attention = NativeBufferView::prefix(&workspace.attention, self.plan.attention)?;
+        let gate = NativeBufferView::prefix(&workspace.gate, self.plan.gate_values)?;
+        let gated = NativeBufferView::prefix(&workspace.gated, self.plan.gated)?;
+        let output_projection =
+            NativeBufferView::prefix(&workspace.output_projection, self.plan.output_projection)?;
         // SAFETY: this method's caller retains the checked exact elementwise
         // spans and sticky status allocation through completion.
         unsafe {
-            launch_sigmoid_mul(
+            launch_sigmoid_mul_view(
                 self.plan.gate,
-                &workspace.attention,
-                &workspace.gate,
-                &workspace.gated,
+                attention,
+                gate,
+                gated,
                 self.stream,
                 self.numerical_status,
             )
         }?;
         // SAFETY: the checked matrix descriptor and distinct spans remain live.
         unsafe {
-            self.weights.output.launch(
-                &workspace.gated,
-                &workspace.output_projection,
+            self.weights.output.launch_rows_view(
+                gated,
+                output_projection,
+                self.plan.hidden_norm.rows(),
                 self.stream,
                 self.numerical_status,
             )
@@ -292,62 +358,32 @@ impl DeferredFullAttention<'_> {
     }
 }
 
-impl NativeMatrix {
-    /// Launch one verified row-major projection into an owned exact output span.
-    ///
-    /// # Safety
-    ///
-    /// `input` and `output` must be non-overlapping device spans on `stream`'s
-    /// device with its sticky status allocation through completion. The checked
-    /// kernel classifies explicit operands and results before publication.
-    pub(super) unsafe fn launch(
-        &self,
-        input: &DeviceBuffer<f32>,
-        output: &DeviceBuffer<f32>,
-        stream: &Stream,
-        numerical_status: &kernels::numerical_status::NativeNumericalStatus,
-    ) -> Result<()> {
-        // SAFETY: the caller upholds the native row-GEMV device-span and
-        // status-lifetime contract for this verified descriptor.
-        unsafe {
-            kernels::row_gemv::launch_row_gemv_f32_checked(
-                self.shape,
-                self.bytes.as_device_ptr(),
-                self.bytes.len(),
-                input.as_device_ptr().cast_const(),
-                input.len(),
-                output.as_device_ptr(),
-                output.len(),
-                stream,
-                numerical_status,
-            )
-        }
-        .context(NativeKernelSnafu)
-    }
+fn row_offset(row: usize, row_elements: usize, context: &'static str) -> Result<usize> {
+    row.checked_mul(row_elements)
+        .ok_or_else(|| crate::error::ArithmeticOverflowSnafu { context }.build())
 }
 
 /// # Safety
 ///
-/// The three spans must be distinct exact buffers on `stream`'s device and
-/// retain the status allocation through completion. The checked kernel records
-/// explicit operand and arithmetic faults for the post-sync owner to classify.
-pub(super) unsafe fn launch_rms_norm(
+/// The three views must be distinct exact spans on `stream`'s device and
+/// retain the status allocation through completion.
+pub(super) unsafe fn launch_rms_norm_view(
     plan: kernels::decoder_ops::RmsNormF32Plan,
-    input: &DeviceBuffer<f32>,
-    weight: &DeviceBuffer<f32>,
-    output: &DeviceBuffer<f32>,
+    input: NativeBufferView<'_, f32>,
+    weight: NativeBufferView<'_, f32>,
+    output: NativeBufferView<'_, f32>,
     stream: &Stream,
     numerical_status: &kernels::numerical_status::NativeNumericalStatus,
 ) -> Result<()> {
-    // SAFETY: caller establishes exact spans and retains the status allocation.
+    // SAFETY: caller establishes exact non-aliasing views and status lifetime.
     unsafe {
         kernels::decoder_ops::launch_rms_norm_f32_checked(
             plan,
-            input.as_device_ptr().cast_const(),
+            input.as_const_ptr(),
             input.len(),
-            weight.as_device_ptr().cast_const(),
+            weight.as_const_ptr(),
             weight.len(),
-            output.as_device_ptr(),
+            output.as_mut_ptr(),
             output.len(),
             stream,
             numerical_status,
@@ -358,26 +394,25 @@ pub(super) unsafe fn launch_rms_norm(
 
 /// # Safety
 ///
-/// `values` must be exclusive, while coefficient spans remain immutable and
-/// all buffers, including `numerical_status`, stay live on `stream`'s device
-/// through completion.
-unsafe fn launch_rotary(
+/// `values` must be exclusively writable, coefficient views immutable, and
+/// all views must remain live on `stream`'s device through completion.
+unsafe fn launch_rotary_view(
     plan: kernels::decoder_ops::RotaryHalfSplitF32Plan,
-    values: &DeviceBuffer<f32>,
-    cosine: &DeviceBuffer<f32>,
-    sine: &DeviceBuffer<f32>,
+    values: NativeBufferView<'_, f32>,
+    cosine: NativeBufferView<'_, f32>,
+    sine: NativeBufferView<'_, f32>,
     stream: &Stream,
     numerical_status: &kernels::numerical_status::NativeNumericalStatus,
 ) -> Result<()> {
-    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
+    // SAFETY: caller establishes exact non-aliasing views and status lifetime.
     unsafe {
         kernels::decoder_ops::launch_rotary_half_split_f32_in_place_checked(
             plan,
-            values.as_device_ptr(),
+            values.as_mut_ptr(),
             values.len(),
-            cosine.as_device_ptr().cast_const(),
+            cosine.as_const_ptr(),
             cosine.len(),
-            sine.as_device_ptr().cast_const(),
+            sine.as_const_ptr(),
             sine.len(),
             stream,
             numerical_status,
@@ -388,25 +423,25 @@ unsafe fn launch_rotary(
 
 /// # Safety
 ///
-/// The input and two output spans must be distinct exact buffers on
-/// `stream`'s device and retain `numerical_status` through completion.
-unsafe fn launch_split(
+/// The input and two output views must be distinct exact spans on `stream`'s
+/// device and retain `numerical_status` through completion.
+unsafe fn launch_split_view(
     plan: kernels::decoder_ops::SplitQGateF32Plan,
-    input: &DeviceBuffer<f32>,
-    query: &DeviceBuffer<f32>,
-    gate: &DeviceBuffer<f32>,
+    input: NativeBufferView<'_, f32>,
+    query: NativeBufferView<'_, f32>,
+    gate: NativeBufferView<'_, f32>,
     stream: &Stream,
     numerical_status: &kernels::numerical_status::NativeNumericalStatus,
 ) -> Result<()> {
-    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
+    // SAFETY: caller establishes exact non-aliasing views and status lifetime.
     unsafe {
         kernels::decoder_ops::launch_split_q_gate_f32_checked(
             plan,
-            input.as_device_ptr().cast_const(),
+            input.as_const_ptr(),
             input.len(),
-            query.as_device_ptr(),
+            query.as_mut_ptr(),
             query.len(),
-            gate.as_device_ptr(),
+            gate.as_mut_ptr(),
             gate.len(),
             stream,
             numerical_status,
@@ -417,25 +452,25 @@ unsafe fn launch_split(
 
 /// # Safety
 ///
-/// The two inputs and output must be distinct exact spans on `stream`'s device
-/// with the shared status allocation through completion.
-pub(super) unsafe fn launch_sigmoid_mul(
+/// The two input and output views must be distinct exact spans on `stream`'s
+/// device with the shared status allocation through completion.
+pub(super) unsafe fn launch_sigmoid_mul_view(
     plan: kernels::decoder_ops::ElementwiseF32Plan,
-    value: &DeviceBuffer<f32>,
-    gate: &DeviceBuffer<f32>,
-    output: &DeviceBuffer<f32>,
+    value: NativeBufferView<'_, f32>,
+    gate: NativeBufferView<'_, f32>,
+    output: NativeBufferView<'_, f32>,
     stream: &Stream,
     numerical_status: &kernels::numerical_status::NativeNumericalStatus,
 ) -> Result<()> {
-    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
+    // SAFETY: caller establishes exact non-aliasing views and status lifetime.
     unsafe {
         kernels::decoder_ops::sigmoid_mul_checked(
             plan,
-            value.as_device_ptr().cast_const(),
+            value.as_const_ptr(),
             value.len(),
-            gate.as_device_ptr().cast_const(),
+            gate.as_const_ptr(),
             gate.len(),
-            output.as_device_ptr(),
+            output.as_mut_ptr(),
             output.len(),
             stream,
             numerical_status,
@@ -446,25 +481,25 @@ pub(super) unsafe fn launch_sigmoid_mul(
 
 /// # Safety
 ///
-/// The two inputs and output must be distinct exact spans on `stream`'s device
-/// with the shared status allocation through completion.
-pub(super) unsafe fn launch_silu_mul(
+/// The two input and output views must be distinct exact spans on `stream`'s
+/// device with the shared status allocation through completion.
+pub(super) unsafe fn launch_silu_mul_view(
     plan: kernels::decoder_ops::ElementwiseF32Plan,
-    gate: &DeviceBuffer<f32>,
-    up: &DeviceBuffer<f32>,
-    output: &DeviceBuffer<f32>,
+    gate: NativeBufferView<'_, f32>,
+    up: NativeBufferView<'_, f32>,
+    output: NativeBufferView<'_, f32>,
     stream: &Stream,
     numerical_status: &kernels::numerical_status::NativeNumericalStatus,
 ) -> Result<()> {
-    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
+    // SAFETY: caller establishes exact non-aliasing views and status lifetime.
     unsafe {
         kernels::decoder_ops::silu_mul_checked(
             plan,
-            gate.as_device_ptr().cast_const(),
+            gate.as_const_ptr(),
             gate.len(),
-            up.as_device_ptr().cast_const(),
+            up.as_const_ptr(),
             up.len(),
-            output.as_device_ptr(),
+            output.as_mut_ptr(),
             output.len(),
             stream,
             numerical_status,
@@ -475,25 +510,25 @@ pub(super) unsafe fn launch_silu_mul(
 
 /// # Safety
 ///
-/// The two inputs and output must be distinct exact spans on `stream`'s device
-/// with the shared status allocation through completion.
-pub(super) unsafe fn launch_residual(
+/// The two input and output views must be distinct exact spans on `stream`'s
+/// device with the shared status allocation through completion.
+pub(super) unsafe fn launch_residual_view(
     plan: kernels::decoder_ops::ElementwiseF32Plan,
-    left: &DeviceBuffer<f32>,
-    right: &DeviceBuffer<f32>,
-    output: &DeviceBuffer<f32>,
+    left: NativeBufferView<'_, f32>,
+    right: NativeBufferView<'_, f32>,
+    output: NativeBufferView<'_, f32>,
     stream: &Stream,
     numerical_status: &kernels::numerical_status::NativeNumericalStatus,
 ) -> Result<()> {
-    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
+    // SAFETY: caller establishes exact non-aliasing views and status lifetime.
     unsafe {
         kernels::decoder_ops::residual_add_checked(
             plan,
-            left.as_device_ptr().cast_const(),
+            left.as_const_ptr(),
             left.len(),
-            right.as_device_ptr().cast_const(),
+            right.as_const_ptr(),
             right.len(),
-            output.as_device_ptr(),
+            output.as_mut_ptr(),
             output.len(),
             stream,
             numerical_status,

@@ -26,10 +26,13 @@ use crate::error::Result as KernelResult;
 use crate::error::UnsupportedShapeSnafu;
 #[cfg(feature = "gpu")]
 use crate::numerical_status::NativeNumericalStatus;
+use crate::packed_prefill::PackedPrefillPlan;
 
 const PAGED_DECODE: &str = "paged_decode";
 #[cfg(feature = "gpu")]
 const PAGED_DECODE_KERNEL: &str = "paged_decode_q1_f32";
+#[cfg(feature = "gpu")]
+const PAGED_PREFILL_KERNEL: &str = "paged_prefill_b1_f32";
 
 #[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 unsafe extern "C" {
@@ -49,6 +52,24 @@ unsafe extern "C" {
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
+    fn logismos_launch_paged_prefill_b1_f32(
+        query_f32: *const c_void,
+        keys_f32: *const c_void,
+        values_f32: *const c_void,
+        page_table_u32: *const c_void,
+        output_f32: *mut c_void,
+        tokens: u32,
+        work_items: u32,
+        offset: u32,
+        query_heads: u32,
+        kv_heads: u32,
+        head_width: u32,
+        page_tokens: u32,
+        physical_pages: u32,
+        scale: f32,
+        numerical_status: *mut c_void,
+        stream: *mut c_void,
+    ) -> u32;
 }
 
 /// Result alias for the logical paged-decode operation.
@@ -56,6 +77,12 @@ pub type PagedDecodeResult<T> = core::result::Result<T, PagedDecodeError>;
 
 /// Result alias for a logical paged-decode operation with caller-owned rows.
 pub type PagedDecodeRowsResult<T, E> = core::result::Result<T, PagedDecodeRowsError<E>>;
+
+/// Result alias for the logical single-sequence paged-prefill operation.
+pub type PagedPrefillResult<T> = core::result::Result<T, PagedPrefillError>;
+
+/// Result alias for paged prefill with caller-owned key/value rows.
+pub type PagedPrefillRowsResult<T, E> = core::result::Result<T, PagedPrefillRowsError<E>>;
 
 /// Checked concurrent allocation requests for one CPU query-head operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,6 +433,329 @@ pub enum PagedDecodeRowsError<E: std::error::Error + 'static> {
     },
 }
 
+/// Checked B=1 causal attention geometry for one packed model chunk.
+///
+/// Construction borrows the packed plan as the authority for token count and
+/// committed offset, then lowers those facts into this owned descriptor. The
+/// descriptor adds the attention axes and active query/output spans
+/// `[tokens, query_heads, head_width]` without retaining a second position
+/// authority.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PagedPrefillPlan {
+    last_query: PagedDecodePlan,
+    tokens: usize,
+    query_elements: usize,
+}
+
+impl PagedPrefillPlan {
+    /// Derive B=1 causal attention geometry from one borrowed packed chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagedPrefillError`] when the packed operation contains any
+    /// batch other than one, attention dimensions are invalid, or an active
+    /// query/output extent cannot be represented.
+    pub fn try_from_packed_prefill(
+        packed: &PackedPrefillPlan,
+        query_heads: usize,
+        kv_heads: usize,
+        head_width: usize,
+    ) -> PagedPrefillResult<Self> {
+        if packed.sequence_count() != 1 {
+            return BatchSizeSnafu {
+                sequences: packed.sequence_count(),
+            }
+            .fail();
+        }
+        let tokens = packed
+            .sequence_length(0)
+            .ok_or_else(|| PackedLayoutSnafu.build())?;
+        let last_query = PagedDecodePlan::try_from_dimensions(
+            packed
+                .committed_offset(0)
+                .ok_or_else(|| PackedLayoutSnafu.build())?
+                .checked_add(tokens)
+                .ok_or_else(|| {
+                    PrefillDimensionOverflowSnafu {
+                        dimensions: "committed offset + tokens",
+                    }
+                    .build()
+                })?,
+            query_heads,
+            kv_heads,
+            head_width,
+        )
+        .map_err(|source| PagedPrefillError::Decode { source })?;
+        let query_elements = tokens
+            .checked_mul(last_query.query_elements)
+            .ok_or_else(|| {
+                PrefillDimensionOverflowSnafu {
+                    dimensions: "tokens * query_heads * head_width",
+                }
+                .build()
+            })?;
+        std::alloc::Layout::array::<f32>(query_elements).context(PrefillAllocationLayoutSnafu {
+            allocation: "prefill query/output span",
+            elements: query_elements,
+        })?;
+        Ok(Self {
+            last_query,
+            tokens,
+            query_elements,
+        })
+    }
+
+    /// Return the committed prefix length preceding this chunk.
+    #[must_use]
+    pub fn offset(self) -> usize {
+        self.last_query.visible_tokens() - self.tokens
+    }
+
+    /// Return the active token count in this chunk.
+    #[must_use]
+    pub const fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// Return the final causal visible-prefix length for the chunk's last row.
+    #[must_use]
+    pub const fn visible_tokens(self) -> usize {
+        self.last_query.visible_tokens()
+    }
+
+    /// Return the admitted query-head count.
+    #[must_use]
+    pub const fn query_heads(self) -> usize {
+        self.last_query.query_heads()
+    }
+
+    /// Return the admitted key/value-head count.
+    #[must_use]
+    pub const fn kv_heads(self) -> usize {
+        self.last_query.kv_heads()
+    }
+
+    /// Return the admitted key/value head width.
+    #[must_use]
+    pub const fn head_width(self) -> usize {
+        self.last_query.head_width()
+    }
+
+    /// Return the contiguous query-heads-per-key/value-head group.
+    #[must_use]
+    pub const fn gqa_group(self) -> usize {
+        self.last_query.gqa_group()
+    }
+
+    /// Return the decoder-compatible f32 attention scale.
+    #[must_use]
+    pub const fn scale(self) -> f32 {
+        self.last_query.scale()
+    }
+
+    /// Return the active query extent `[tokens, query_heads, head_width]`.
+    #[must_use]
+    pub const fn query_elements(self) -> usize {
+        self.query_elements
+    }
+
+    /// Return the active output extent `[tokens, query_heads, head_width]`.
+    #[must_use]
+    pub const fn output_elements(self) -> usize {
+        self.query_elements
+    }
+
+    /// Return query `token`'s exact causal visible prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagedPrefillError::TokenOutOfRange`] when `token` is not an
+    /// active row in this chunk.
+    pub fn visible_tokens_for(self, token: usize) -> PagedPrefillResult<usize> {
+        if token >= self.tokens {
+            return TokenOutOfRangeSnafu {
+                token,
+                tokens: self.tokens,
+            }
+            .fail();
+        }
+        self.offset()
+            .checked_add(token)
+            .and_then(|position| position.checked_add(1))
+            .ok_or_else(|| {
+                PrefillDimensionOverflowSnafu {
+                    dimensions: "committed offset + query token + one",
+                }
+                .build()
+            })
+    }
+}
+
+/// Failures while admitting or evaluating B=1 causal paged prefill.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+#[non_exhaustive]
+pub enum PagedPrefillError {
+    /// The borrowed packed operation described something other than B=1.
+    #[snafu(display("{PAGED_DECODE}: paged prefill requires B=1, got {sequences} sequences"))]
+    BatchSize {
+        /// Number of sequences in the packed operation.
+        sequences: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The packed operation contradicted its checked B=1 accessors.
+    #[snafu(display("{PAGED_DECODE}: packed B=1 plan has no sequence zero"))]
+    PackedLayout {
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A required prefill span arithmetic operation overflowed.
+    #[snafu(
+        display("{PAGED_DECODE}: prefill {dimensions} overflows usize"),
+        context(name(PrefillDimensionOverflowSnafu))
+    )]
+    DimensionOverflow {
+        /// The failed dimension calculation.
+        dimensions: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The active query/output span cannot form a Rust layout.
+    #[snafu(
+        display("{PAGED_DECODE}: {allocation} layout for {elements} elements is unrepresentable"),
+        context(name(PrefillAllocationLayoutSnafu))
+    )]
+    AllocationLayout {
+        /// Span role.
+        allocation: &'static str,
+        /// Exact element count.
+        elements: usize,
+        /// Layout failure reported by the standard library.
+        source: std::alloc::LayoutError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A requested chunk-relative query token was outside the active chunk.
+    #[snafu(display("{PAGED_DECODE}: prefill token {token} is outside 0..{tokens}"))]
+    TokenOutOfRange {
+        /// Requested chunk-relative token.
+        token: usize,
+        /// Active chunk token count.
+        tokens: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The canonical Q=1 operation rejected a shared attention condition.
+    #[snafu(transparent)]
+    Decode {
+        /// Source Q=1 error.
+        source: PagedDecodeError,
+    },
+
+    /// Native dense-page construction rejected a reused Q=1 physical constraint.
+    #[snafu(display("{source}"), context(name(PrefillNativeSnafu)))]
+    Native {
+        /// Source native descriptor error.
+        source: PagedDecodeError,
+    },
+
+    /// The output allocation could not reserve its checked active extent.
+    #[snafu(
+        display("{PAGED_DECODE}: could not reserve {elements} f32 elements for prefill output"),
+        context(name(PrefillAllocationSnafu))
+    )]
+    Allocation {
+        /// Exact requested output extent.
+        elements: usize,
+        /// Allocation failure reported by the standard library.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The query backing did not cover the active chunk extent.
+    #[snafu(display(
+        "{PAGED_DECODE}: prefill query length {actual} does not match expected {expected}"
+    ))]
+    QueryLengthMismatch {
+        /// Required active query extent.
+        expected: usize,
+        /// Supplied query backing extent.
+        actual: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// A checked active query row was absent from the supplied backing.
+    #[snafu(display(
+        "{PAGED_DECODE}: prefill query span {start}..{end} exceeds supplied length {available}"
+    ))]
+    QuerySpan {
+        /// Requested active query-row start.
+        start: usize,
+        /// Requested active query-row end.
+        end: usize,
+        /// Supplied query backing length.
+        available: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+}
+
+/// A typed failure from B=1 prefill or one caller-owned row borrow.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+#[non_exhaustive]
+pub enum PagedPrefillRowsError<E: std::error::Error + 'static> {
+    /// The prefill operation rejected its geometry, input, or arithmetic.
+    #[snafu(
+        display("{PAGED_DECODE}: prefill operation failure: {source}"),
+        context(name(PrefillRowsKernelSnafu))
+    )]
+    Kernel {
+        /// Source operation failure.
+        source: PagedPrefillError,
+    },
+
+    /// The caller could not borrow a key row at one absolute cache token.
+    #[snafu(
+        display("{PAGED_DECODE}: prefill key row {token} unavailable: {source}"),
+        context(name(PrefillRowsKeyRowSnafu))
+    )]
+    KeyRow {
+        /// Absolute cache token.
+        token: usize,
+        /// Typed caller-owned row-borrow failure.
+        source: E,
+    },
+
+    /// The caller could not borrow a value row at one absolute cache token.
+    #[snafu(
+        display("{PAGED_DECODE}: prefill value row {token} unavailable: {source}"),
+        context(name(PrefillRowsValueRowSnafu))
+    )]
+    ValueRow {
+        /// Absolute cache token.
+        token: usize,
+        /// Typed caller-owned row-borrow failure.
+        source: E,
+    },
+}
+
 /// Evaluate one query head over a caller-owned logical causal visible prefix.
 ///
 /// `key_row` and `value_row` each borrow one row in ascending logical-token
@@ -510,6 +860,124 @@ where
             output[column] += probability * value;
             ensure_finite(output[column], "head output", column)
                 .map_err(|source| PagedDecodeRowsError::Kernel { source })?;
+        }
+    }
+    Ok(output)
+}
+
+/// Evaluate every active B=1 query row against its exact causal cache prefix.
+///
+/// `queries` is the active `[tokens, query_heads, head_width]` prefix. The
+/// row providers use absolute cache-token indices, so token `t` only visits
+/// `0..plan.offset() + t + 1`. Each query-head evaluation delegates to the
+/// established Q=1 implementation, preserving its materialized-score f32
+/// order and grouped-query head selection.
+///
+/// # Errors
+///
+/// Returns [`PagedPrefillRowsError::Kernel`] for active-query shape,
+/// allocation, Q=1 geometry, input, or arithmetic failures. A provider's
+/// typed failure remains the source of [`PagedPrefillRowsError::KeyRow`] or
+/// [`PagedPrefillRowsError::ValueRow`].
+pub fn paged_prefill_cpu<'rows, E, KeyRow, ValueRow>(
+    plan: PagedPrefillPlan,
+    queries: &[f32],
+    mut key_row: KeyRow,
+    mut value_row: ValueRow,
+) -> PagedPrefillRowsResult<Vec<f32>, E>
+where
+    E: std::error::Error + 'static,
+    KeyRow: FnMut(usize) -> core::result::Result<&'rows [f32], E>,
+    ValueRow: FnMut(usize) -> core::result::Result<&'rows [f32], E>,
+{
+    if queries.len() != plan.query_elements() {
+        return Err(PagedPrefillRowsError::Kernel {
+            source: QueryLengthMismatchSnafu {
+                expected: plan.query_elements(),
+                actual: queries.len(),
+            }
+            .build(),
+        });
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(plan.output_elements())
+        .context(PrefillAllocationSnafu {
+            elements: plan.output_elements(),
+        })
+        .map_err(|source| PagedPrefillRowsError::Kernel { source })?;
+    let query_head_elements = plan
+        .query_heads()
+        .checked_mul(plan.head_width())
+        .ok_or_else(|| PagedPrefillRowsError::Kernel {
+            source: PrefillDimensionOverflowSnafu {
+                dimensions: "query_heads * head_width",
+            }
+            .build(),
+        })?;
+    for token in 0..plan.tokens() {
+        let visible_tokens = plan
+            .visible_tokens_for(token)
+            .map_err(|source| PagedPrefillRowsError::Kernel { source })?;
+        let query_plan = PagedDecodePlan::try_from_dimensions(
+            visible_tokens,
+            plan.query_heads(),
+            plan.kv_heads(),
+            plan.head_width(),
+        )
+        .map_err(|source| PagedPrefillRowsError::Kernel {
+            source: PagedPrefillError::Decode { source },
+        })?;
+        let token_start = token.checked_mul(query_head_elements).ok_or_else(|| {
+            PagedPrefillRowsError::Kernel {
+                source: PrefillDimensionOverflowSnafu {
+                    dimensions: "token * query_heads * head_width",
+                }
+                .build(),
+            }
+        })?;
+        for query_head in 0..plan.query_heads() {
+            let query_start = query_head
+                .checked_mul(plan.head_width())
+                .and_then(|head_start| token_start.checked_add(head_start))
+                .ok_or_else(|| PagedPrefillRowsError::Kernel {
+                    source: PrefillDimensionOverflowSnafu {
+                        dimensions: "prefill query row offset",
+                    }
+                    .build(),
+                })?;
+            let query_end = query_start.checked_add(plan.head_width()).ok_or_else(|| {
+                PagedPrefillRowsError::Kernel {
+                    source: PrefillDimensionOverflowSnafu {
+                        dimensions: "prefill query row end",
+                    }
+                    .build(),
+                }
+            })?;
+            let query = queries.get(query_start..query_end).ok_or_else(|| {
+                PagedPrefillRowsError::Kernel {
+                    source: QuerySpanSnafu {
+                        start: query_start,
+                        end: query_end,
+                        available: queries.len(),
+                    }
+                    .build(),
+                }
+            })?;
+            let head_output =
+                paged_decode_cpu(query_plan, query_head, query, &mut key_row, &mut value_row)
+                    .map_err(|error| match error {
+                        PagedDecodeRowsError::Kernel { source } => PagedPrefillRowsError::Kernel {
+                            source: PagedPrefillError::Decode { source },
+                        },
+                        PagedDecodeRowsError::KeyRow { token, source } => {
+                            PagedPrefillRowsError::KeyRow { token, source }
+                        }
+                        PagedDecodeRowsError::ValueRow { token, source } => {
+                            PagedPrefillRowsError::ValueRow { token, source }
+                        }
+                    })?;
+            output.extend_from_slice(&head_output);
         }
     }
     Ok(output)
@@ -761,6 +1229,341 @@ impl NativePagedDecodePlan {
     #[must_use]
     pub const fn output_elements(self) -> usize {
         self.output_elements
+    }
+}
+
+/// Checked native dense-page descriptor for one B=1 causal packed chunk.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NativePagedPrefillPlan {
+    logical: PagedPrefillPlan,
+    page_tokens: NativePageTokens,
+    physical_pages: usize,
+    logical_pages: usize,
+    key_value_elements: usize,
+    abi_tokens: u32,
+    abi_work_items: u32,
+    abi_offset: u32,
+    abi_query_heads: u32,
+    abi_kv_heads: u32,
+    abi_head_width: u32,
+    abi_page_tokens: u32,
+    abi_physical_pages: u32,
+}
+
+#[cfg(feature = "gpu")]
+impl NativePagedPrefillPlan {
+    /// Bind one owned B=1 prefill descriptor to explicit native pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagedPrefillError`] when the page-token selector is not
+    /// B8/B16/B32, physical-page count is zero, a dense K/V or table extent
+    /// overflows, or a required native ABI dimension cannot fit `u32`.
+    pub fn try_from_paged_prefill(
+        logical: PagedPrefillPlan,
+        page_tokens: usize,
+        physical_pages: usize,
+    ) -> PagedPrefillResult<Self> {
+        let page_tokens = NativePageTokens::try_from_tokens(page_tokens)
+            .map_err(|source| PagedPrefillError::Native { source })?;
+        validate_nonzero_dimension("physical_pages", physical_pages)
+            .map_err(|source| PagedPrefillError::Native { source })?;
+        native_abi_u32("visible_tokens", logical.visible_tokens())
+            .map_err(|source| PagedPrefillError::Native { source })?;
+        let logical_pages = logical
+            .visible_tokens()
+            .checked_sub(1)
+            .and_then(|last| last.checked_div(page_tokens.get()))
+            .and_then(|page| page.checked_add(1))
+            .ok_or_else(|| PagedPrefillError::Native {
+                source: DimensionOverflowSnafu {
+                    dimensions: "prefill visible_tokens / page_tokens",
+                }
+                .build(),
+            })?;
+        let row_elements = logical
+            .kv_heads()
+            .checked_mul(logical.head_width())
+            .ok_or_else(|| {
+                PrefillDimensionOverflowSnafu {
+                    dimensions: "kv_heads * head_width",
+                }
+                .build()
+            })?;
+        let physical_tokens = checked_product(
+            physical_pages,
+            page_tokens.get(),
+            "physical_pages * page_tokens",
+        )
+        .map_err(|source| PagedPrefillError::Native { source })?;
+        let key_value_elements = checked_product(
+            physical_tokens,
+            row_elements,
+            "physical_pages * page_tokens * kv_heads * head_width",
+        )
+        .map_err(|source| PagedPrefillError::Native { source })?;
+        validate_f32_layout("native prefill keys", key_value_elements)
+            .map_err(|source| PagedPrefillError::Native { source })?;
+        validate_layout::<u32>("native prefill page table", logical_pages)
+            .map_err(|source| PagedPrefillError::Native { source })?;
+        Ok(Self {
+            logical,
+            page_tokens,
+            physical_pages,
+            logical_pages,
+            key_value_elements,
+            abi_tokens: native_abi_u32("tokens", logical.tokens())
+                .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_work_items: native_abi_u32(
+                "tokens * query_heads",
+                logical
+                    .tokens()
+                    .checked_mul(logical.query_heads())
+                    .ok_or_else(|| {
+                        PrefillDimensionOverflowSnafu {
+                            dimensions: "tokens * query_heads",
+                        }
+                        .build()
+                    })?,
+            )
+            .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_offset: native_abi_u32("offset", logical.offset())
+                .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_query_heads: native_abi_u32("query_heads", logical.query_heads())
+                .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_kv_heads: native_abi_u32("kv_heads", logical.kv_heads())
+                .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_head_width: native_abi_u32("head_width", logical.head_width())
+                .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_page_tokens: native_abi_u32("page_tokens", page_tokens.get())
+                .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_physical_pages: native_abi_u32("physical_pages", physical_pages)
+                .map_err(|source| PagedPrefillError::Native { source })?,
+        })
+    }
+
+    /// Return the owned logical B=1 causal chunk geometry.
+    #[must_use]
+    pub const fn logical(self) -> PagedPrefillPlan {
+        self.logical
+    }
+
+    /// Return the active token count in this chunk.
+    #[must_use]
+    pub const fn tokens(self) -> usize {
+        self.logical.tokens()
+    }
+
+    /// Return the final causal visible-prefix length.
+    #[must_use]
+    pub const fn visible_tokens(self) -> usize {
+        self.logical.visible_tokens()
+    }
+
+    /// Return this descriptor's explicit physical page-token selector.
+    #[must_use]
+    pub const fn page_tokens(self) -> NativePageTokens {
+        self.page_tokens
+    }
+
+    /// Return the supplied dense physical-page count.
+    #[must_use]
+    pub const fn physical_pages(self) -> usize {
+        self.physical_pages
+    }
+
+    /// Return the checked table entry count for the final visible prefix.
+    #[must_use]
+    pub const fn page_table_entries(self) -> usize {
+        self.logical_pages
+    }
+
+    /// Return the active query extent `[tokens, query_heads, head_width]`.
+    #[must_use]
+    pub const fn query_elements(self) -> usize {
+        self.logical.query_elements()
+    }
+
+    /// Return the active output extent `[tokens, query_heads, head_width]`.
+    #[must_use]
+    pub const fn output_elements(self) -> usize {
+        self.logical.output_elements()
+    }
+
+    /// Return one separate dense physical K or V backing extent.
+    #[must_use]
+    pub const fn key_value_elements(self) -> usize {
+        self.key_value_elements
+    }
+}
+
+/// Launch checked B=1 causal multiquery paged attention.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedShape`] when an active query/output
+/// prefix, exact K/V/table extent, device span, or output aliasing condition
+/// violates the descriptor. A CPU-only build returns
+/// [`crate::Error::NoGpuBuild`]; HIP stream-current and launch failures are
+/// propagated.
+#[cfg(feature = "gpu")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the native prefill ABI owns five buffers, their capacities, stream, and status"
+)]
+pub unsafe fn launch_paged_prefill_b1_f32_checked(
+    plan: NativePagedPrefillPlan,
+    query_f32: *const f32,
+    query_elements: usize,
+    keys_f32: *const f32,
+    key_elements: usize,
+    values_f32: *const f32,
+    value_elements: usize,
+    page_table_u32: *const u32,
+    page_table_entries: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> KernelResult<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = (
+            plan,
+            query_f32,
+            query_elements,
+            keys_f32,
+            key_elements,
+            values_f32,
+            value_elements,
+            page_table_u32,
+            page_table_entries,
+            output_f32,
+            output_elements,
+            stream,
+            status,
+        );
+        NoGpuBuildSnafu {
+            kernel: PAGED_PREFILL_KERNEL,
+        }
+        .fail()
+    }
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        validate_paged_prefill_launch(
+            plan,
+            query_f32,
+            query_elements,
+            keys_f32,
+            key_elements,
+            values_f32,
+            value_elements,
+            page_table_u32,
+            page_table_entries,
+            output_f32,
+            output_elements,
+        )?;
+        stream.make_current()?;
+        let code = unsafe {
+            logismos_launch_paged_prefill_b1_f32(
+                query_f32.cast::<c_void>(),
+                keys_f32.cast::<c_void>(),
+                values_f32.cast::<c_void>(),
+                page_table_u32.cast::<c_void>(),
+                output_f32.cast::<c_void>(),
+                plan.abi_tokens,
+                plan.abi_work_items,
+                plan.abi_offset,
+                plan.abi_query_heads,
+                plan.abi_kv_heads,
+                plan.abi_head_width,
+                plan.abi_page_tokens,
+                plan.abi_physical_pages,
+                plan.logical.scale(),
+                status.as_device_ptr().cast::<c_void>(),
+                stream.raw().cast::<c_void>(),
+            )
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            LaunchSnafu {
+                kernel: PAGED_PREFILL_KERNEL,
+                kind: hipcore::ErrorKind::from_raw(code),
+                code,
+            }
+            .fail()
+        }
+    }
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "native prefill validation mirrors the fixed launch ABI"
+)]
+fn validate_paged_prefill_launch(
+    plan: NativePagedPrefillPlan,
+    query_f32: *const f32,
+    query_elements: usize,
+    keys_f32: *const f32,
+    key_elements: usize,
+    values_f32: *const f32,
+    value_elements: usize,
+    page_table_u32: *const u32,
+    page_table_entries: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+) -> KernelResult<()> {
+    validate_native_prefix_length("query", query_elements, plan.query_elements())?;
+    validate_native_length("keys", key_elements, plan.key_value_elements())?;
+    validate_native_length("values", value_elements, plan.key_value_elements())?;
+    validate_native_length("page table", page_table_entries, plan.page_table_entries())?;
+    validate_native_prefix_length("output", output_elements, plan.output_elements())?;
+    let query = checked_f32_device_span(
+        PAGED_PREFILL_KERNEL,
+        query_f32,
+        plan.query_elements(),
+        "query",
+    )?;
+    let keys = checked_f32_device_span(PAGED_PREFILL_KERNEL, keys_f32, key_elements, "keys")?;
+    let values =
+        checked_f32_device_span(PAGED_PREFILL_KERNEL, values_f32, value_elements, "values")?;
+    let table = checked_device_span(
+        PAGED_PREFILL_KERNEL,
+        page_table_u32,
+        page_table_entries,
+        "page table",
+    )?;
+    let output = checked_f32_device_span(
+        PAGED_PREFILL_KERNEL,
+        output_f32.cast_const(),
+        plan.output_elements(),
+        "output",
+    )?;
+    for input in [query, keys, values, table] {
+        reject_overlapping_device_spans(PAGED_PREFILL_KERNEL, output, input)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+fn validate_native_prefix_length(
+    name: &'static str,
+    actual: usize,
+    required: usize,
+) -> KernelResult<()> {
+    if actual >= required {
+        Ok(())
+    } else {
+        UnsupportedShapeSnafu {
+            kernel: PAGED_PREFILL_KERNEL,
+            msg: format!(
+                "{name} length {actual} does not cover native prefill active extent {required}"
+            ),
+        }
+        .fail()
     }
 }
 
@@ -1088,6 +1891,15 @@ mod tests {
     use super::*;
     use crate::numerical_status::{NativeNumericalStatusCategory, NativeNumericalStatusMask};
 
+    #[derive(Clone, Copy)]
+    struct PrefillOracleGeometry {
+        tokens: usize,
+        offset: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        head_width: usize,
+    }
+
     #[test]
     fn checked_native_first_token_maximum_sentinel_is_not_an_operand_failure()
     -> core::result::Result<(), Box<dyn std::error::Error>> {
@@ -1198,6 +2010,467 @@ mod tests {
         assert_eq!(plan.head_output_elements(), 3);
         assert_eq!(plan.workspace_elements(), 6);
         Ok(())
+    }
+
+    #[test]
+    fn prefill_cpu_matches_independent_f64_causal_gqa_oracle()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        const TOKENS: usize = 3;
+        const OFFSET: usize = 2;
+        const QUERY_HEADS: usize = 4;
+        const KV_HEADS: usize = 2;
+        const HEAD_WIDTH: usize = 3;
+
+        let oracle_geometry = PrefillOracleGeometry {
+            tokens: TOKENS,
+            offset: OFFSET,
+            query_heads: QUERY_HEADS,
+            kv_heads: KV_HEADS,
+            head_width: HEAD_WIDTH,
+        };
+
+        let packed = PackedPrefillPlan::new(&[TOKENS], &[OFFSET], OFFSET + TOKENS)?;
+        let plan =
+            PagedPrefillPlan::try_from_packed_prefill(&packed, QUERY_HEADS, KV_HEADS, HEAD_WIDTH)?;
+        assert_eq!(
+            plan.offset(),
+            OFFSET,
+            "lowered offset must preserve the packed committed prefix"
+        );
+        assert_eq!(
+            plan.visible_tokens_for(0)?,
+            OFFSET + 1,
+            "first chunk query must include its own row after the committed prefix"
+        );
+        assert_eq!(
+            plan.visible_tokens_for(TOKENS - 1)?,
+            OFFSET + TOKENS,
+            "last chunk query must reach the checked final visible prefix"
+        );
+        let queries = prefill_queries(TOKENS, QUERY_HEADS, HEAD_WIDTH);
+        let keys = prefill_rows(OFFSET + TOKENS, KV_HEADS, HEAD_WIDTH, 0.25);
+        let values = prefill_rows(OFFSET + TOKENS, KV_HEADS, HEAD_WIDTH, 1.75);
+        let actual = paged_prefill_cpu(
+            plan,
+            &queries,
+            |token| {
+                Ok::<_, std::convert::Infallible>(
+                    &keys[token * KV_HEADS * HEAD_WIDTH..(token + 1) * KV_HEADS * HEAD_WIDTH],
+                )
+            },
+            |token| {
+                Ok::<_, std::convert::Infallible>(
+                    &values[token * KV_HEADS * HEAD_WIDTH..(token + 1) * KV_HEADS * HEAD_WIDTH],
+                )
+            },
+        )?;
+        let oracle = prefill_oracle_f64(oracle_geometry, &queries, &keys, &values);
+        assert_eq!(
+            actual.len(),
+            oracle.len(),
+            "CPU output must cover every fixture token/query-head/coordinate"
+        );
+        for (actual, oracle) in actual.iter().zip(oracle) {
+            assert!(
+                (*actual as f64 - oracle).abs() <= 1.0e-5_f64,
+                "canonical Q=1 f32 decomposition must agree with the independent f64 oracle: actual={actual}, oracle={oracle}"
+            );
+        }
+
+        let mut future_mutated = values.clone();
+        let future_start = (OFFSET + TOKENS - 1) * KV_HEADS * HEAD_WIDTH;
+        for value in &mut future_mutated[future_start..] {
+            *value += 1_000.0;
+        }
+        let future_actual = paged_prefill_cpu(
+            plan,
+            &queries,
+            |token| {
+                Ok::<_, std::convert::Infallible>(
+                    &keys[token * KV_HEADS * HEAD_WIDTH..(token + 1) * KV_HEADS * HEAD_WIDTH],
+                )
+            },
+            |token| {
+                Ok::<_, std::convert::Infallible>(
+                    &future_mutated
+                        [token * KV_HEADS * HEAD_WIDTH..(token + 1) * KV_HEADS * HEAD_WIDTH],
+                )
+            },
+        )?;
+        let immutable_prefix = (TOKENS - 1) * QUERY_HEADS * HEAD_WIDTH;
+        assert_eq!(
+            &actual[..immutable_prefix],
+            &future_actual[..immutable_prefix],
+            "a staged future value row must not reach earlier causal queries"
+        );
+        assert_ne!(
+            &actual[immutable_prefix..],
+            &future_actual[immutable_prefix..],
+            "the terminal query must retain visibility of its own staged row"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_cpu_short_chunk_continues_from_the_prior_prefix()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        const QUERY_HEADS: usize = 2;
+        const KV_HEADS: usize = 1;
+        const HEAD_WIDTH: usize = 2;
+
+        let oracle_geometry = PrefillOracleGeometry {
+            tokens: 1,
+            offset: 3,
+            query_heads: QUERY_HEADS,
+            kv_heads: KV_HEADS,
+            head_width: HEAD_WIDTH,
+        };
+
+        let keys = prefill_rows(4, KV_HEADS, HEAD_WIDTH, 0.5);
+        let values = prefill_rows(4, KV_HEADS, HEAD_WIDTH, 2.0);
+        let packed = PackedPrefillPlan::new(&[1], &[3], 4)?;
+        let plan =
+            PagedPrefillPlan::try_from_packed_prefill(&packed, QUERY_HEADS, KV_HEADS, HEAD_WIDTH)?;
+        assert_eq!(
+            plan.offset(),
+            3,
+            "continuation must derive its committed offset"
+        );
+        assert_eq!(
+            plan.visible_tokens_for(0)?,
+            4,
+            "continuation query must include exactly one staged row"
+        );
+        let queries = prefill_queries(1, QUERY_HEADS, HEAD_WIDTH);
+        let actual = paged_prefill_cpu(
+            plan,
+            &queries,
+            |token| {
+                Ok::<_, std::convert::Infallible>(
+                    &keys[token * KV_HEADS * HEAD_WIDTH..(token + 1) * KV_HEADS * HEAD_WIDTH],
+                )
+            },
+            |token| {
+                Ok::<_, std::convert::Infallible>(
+                    &values[token * KV_HEADS * HEAD_WIDTH..(token + 1) * KV_HEADS * HEAD_WIDTH],
+                )
+            },
+        )?;
+        let oracle = prefill_oracle_f64(oracle_geometry, &queries, &keys, &values);
+        for (actual, oracle) in actual.iter().zip(oracle) {
+            assert!(
+                (*actual as f64 - oracle).abs() <= 1.0e-5_f64,
+                "short continuation must retain the full committed causal prefix: actual={actual}, oracle={oracle}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_plan_refuses_batch_and_overflowing_attention_geometry()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let batched = PackedPrefillPlan::new(&[1, 1], &[0, 0], 1)?;
+        assert!(
+            matches!(
+                PagedPrefillPlan::try_from_packed_prefill(&batched, 1, 1, 1),
+                Err(PagedPrefillError::BatchSize { sequences: 2, .. })
+            ),
+            "B=1 prefill must refuse packed batch geometry"
+        );
+
+        let packed = PackedPrefillPlan::new(&[1], &[0], 1)?;
+        assert!(
+            matches!(
+                PagedPrefillPlan::try_from_packed_prefill(&packed, usize::MAX, 1, 2),
+                Err(PagedPrefillError::Decode {
+                    source: PagedDecodeError::DimensionOverflow { .. }
+                })
+            ),
+            "prefill must preserve Q1 checked geometry overflow refusal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_cpu_preserves_query_and_provider_refusals()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let packed = PackedPrefillPlan::new(&[1], &[0], 1)?;
+        let plan = PagedPrefillPlan::try_from_packed_prefill(&packed, 1, 1, 1)?;
+        let short_query = paged_prefill_cpu(
+            plan,
+            &[],
+            |_| Ok::<_, std::io::Error>(&[0.0_f32]),
+            |_| Ok::<_, std::io::Error>(&[0.0_f32]),
+        );
+        assert!(
+            matches!(
+                short_query,
+                Err(PagedPrefillRowsError::Kernel {
+                    source: PagedPrefillError::QueryLengthMismatch { .. }
+                })
+            ),
+            "short active query backing must fail at the prefill result boundary"
+        );
+
+        let provider_failure = paged_prefill_cpu(
+            plan,
+            &[0.0_f32],
+            |_| Err::<&[f32], _>(std::io::Error::other("synthetic key-provider failure")),
+            |_| Ok::<_, std::io::Error>(&[0.0_f32]),
+        );
+        assert!(
+            matches!(
+                provider_failure,
+                Err(PagedPrefillRowsError::KeyRow { token: 0, .. })
+            ),
+            "key-provider failure must retain its absolute cache token and typed result variant"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn native_prefill_plan_preserves_causal_page_boundaries()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let packed = PackedPrefillPlan::new(&[2], &[7], 9)?;
+        let logical = PagedPrefillPlan::try_from_packed_prefill(&packed, 2, 1, 4)?;
+        let b8 = NativePagedPrefillPlan::try_from_paged_prefill(logical, 8, 3)?;
+        let b16 = NativePagedPrefillPlan::try_from_paged_prefill(logical, 16, 3)?;
+        let b32 = NativePagedPrefillPlan::try_from_paged_prefill(logical, 32, 3)?;
+        assert_eq!(
+            b8.tokens(),
+            2,
+            "native descriptor must retain active chunk length"
+        );
+        assert_eq!(
+            b8.visible_tokens(),
+            9,
+            "native descriptor must retain final causal prefix"
+        );
+        assert_eq!(
+            b8.page_table_entries(),
+            2,
+            "B8 must cross the offset-seven page boundary"
+        );
+        assert_eq!(
+            b16.page_table_entries(),
+            1,
+            "B16 must retain one page for the same prefix"
+        );
+        assert_eq!(
+            b32.page_table_entries(),
+            1,
+            "B32 must retain one page for the same prefix"
+        );
+        assert!(
+            matches!(
+                NativePagedPrefillPlan::try_from_paged_prefill(logical, 8, 0),
+                Err(PagedPrefillError::Native {
+                    source: PagedDecodeError::ZeroDimension { .. }
+                })
+            ),
+            "native prefill must preserve physical-page admission refusal"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn native_prefill_launch_preflight_checks_prefixes_spans_and_abi()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let packed = PackedPrefillPlan::new(&[2], &[7], 9)?;
+        let logical = PagedPrefillPlan::try_from_packed_prefill(&packed, 2, 1, 4)?;
+        let native = NativePagedPrefillPlan::try_from_paged_prefill(logical, 8, 3)?;
+        let query = 0x1000_usize as *const f32;
+        let keys = 0x2000_usize as *const f32;
+        let values = 0x3000_usize as *const f32;
+        let table = 0x4000_usize as *const u32;
+        let output = 0x5000_usize as *mut f32;
+        let query_capacity = native
+            .query_elements()
+            .checked_add(4)
+            .ok_or("synthetic query capacity overflowed")?;
+        let output_capacity = native
+            .output_elements()
+            .checked_add(4)
+            .ok_or("synthetic output capacity overflowed")?;
+
+        assert!(
+            validate_paged_prefill_launch(
+                native,
+                query,
+                query_capacity,
+                keys,
+                native.key_value_elements(),
+                values,
+                native.key_value_elements(),
+                table,
+                native.page_table_entries(),
+                output,
+                output_capacity,
+            )
+            .is_ok(),
+            "capacity-sized query/output owners may exceed their active prefixes"
+        );
+        assert!(
+            matches!(
+                validate_paged_prefill_launch(
+                    native,
+                    query,
+                    native.query_elements() - 1,
+                    keys,
+                    native.key_value_elements(),
+                    values,
+                    native.key_value_elements(),
+                    table,
+                    native.page_table_entries(),
+                    output,
+                    output_capacity,
+                ),
+                Err(crate::Error::UnsupportedShape { .. })
+            ),
+            "a short active query prefix must fail before native launch"
+        );
+        assert!(
+            matches!(
+                validate_paged_prefill_launch(
+                    native,
+                    query,
+                    query_capacity,
+                    keys,
+                    native.key_value_elements() - 1,
+                    values,
+                    native.key_value_elements(),
+                    table,
+                    native.page_table_entries(),
+                    output,
+                    output_capacity,
+                ),
+                Err(crate::Error::UnsupportedShape { .. })
+            ),
+            "a short dense key backing must fail before native launch"
+        );
+        assert!(
+            matches!(
+                validate_paged_prefill_launch(
+                    native,
+                    query,
+                    query_capacity,
+                    keys,
+                    native.key_value_elements(),
+                    values,
+                    native.key_value_elements(),
+                    table,
+                    native.page_table_entries() - 1,
+                    output,
+                    output_capacity,
+                ),
+                Err(crate::Error::UnsupportedShape { .. })
+            ),
+            "a short page table must fail before native launch"
+        );
+        assert!(
+            matches!(
+                validate_paged_prefill_launch(
+                    native,
+                    query,
+                    query_capacity,
+                    keys,
+                    native.key_value_elements(),
+                    values,
+                    native.key_value_elements(),
+                    table,
+                    native.page_table_entries(),
+                    query.cast_mut(),
+                    output_capacity,
+                ),
+                Err(crate::Error::UnsupportedShape { .. })
+            ),
+            "the writable output must not alias the active query prefix"
+        );
+
+        let beyond_u32 = usize::try_from(u32::MAX)?
+            .checked_add(1)
+            .ok_or("host usize cannot represent the u32 ABI boundary")?;
+        let overflowing_packed = PackedPrefillPlan::new(&[1], &[beyond_u32 - 1], beyond_u32)?;
+        let overflowing_logical =
+            PagedPrefillPlan::try_from_packed_prefill(&overflowing_packed, 1, 1, 1)?;
+        assert!(
+            matches!(
+                NativePagedPrefillPlan::try_from_paged_prefill(overflowing_logical, 8, 1),
+                Err(PagedPrefillError::Native {
+                    source: PagedDecodeError::NativeAbiOutOfRange {
+                        dimension: "visible_tokens",
+                        value,
+                        ..
+                    }
+                }) if value == beyond_u32
+            ),
+            "native prefill construction must reject a visible prefix outside its u32 ABI"
+        );
+        Ok(())
+    }
+
+    fn prefill_queries(tokens: usize, query_heads: usize, head_width: usize) -> Vec<f32> {
+        (0..tokens * query_heads * head_width)
+            .map(|index| 0.1 + index as f32 * 0.03)
+            .collect()
+    }
+
+    fn prefill_rows(tokens: usize, kv_heads: usize, head_width: usize, bias: f32) -> Vec<f32> {
+        (0..tokens * kv_heads * head_width)
+            .map(|index| bias + index as f32 * 0.07)
+            .collect()
+    }
+
+    fn prefill_oracle_f64(
+        geometry: PrefillOracleGeometry,
+        queries: &[f32],
+        keys: &[f32],
+        values: &[f32],
+    ) -> Vec<f64> {
+        let gqa_group = geometry.query_heads / geometry.kv_heads;
+        let scale = 1.0_f64 / (geometry.head_width as f64).sqrt();
+        let mut output = Vec::new();
+        for token in 0..geometry.tokens {
+            let visible_tokens = geometry.offset + token + 1;
+            for query_head in 0..geometry.query_heads {
+                let query_start = (token * geometry.query_heads + query_head) * geometry.head_width;
+                let query = &queries[query_start..query_start + geometry.head_width];
+                let kv_head = query_head / gqa_group;
+                let scores = (0..visible_tokens)
+                    .map(|key_token| {
+                        let key_start =
+                            (key_token * geometry.kv_heads + kv_head) * geometry.head_width;
+                        query
+                            .iter()
+                            .zip(&keys[key_start..key_start + geometry.head_width])
+                            .map(|(query, key)| *query as f64 * *key as f64)
+                            .sum::<f64>()
+                            * scale
+                    })
+                    .collect::<Vec<_>>();
+                let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let normalizer = scores
+                    .iter()
+                    .map(|score| (score - maximum).exp())
+                    .sum::<f64>();
+                for column in 0..geometry.head_width {
+                    let weighted = scores
+                        .iter()
+                        .enumerate()
+                        .map(|(key_token, score)| {
+                            let value_index = (key_token * geometry.kv_heads + kv_head)
+                                * geometry.head_width
+                                + column;
+                            (score - maximum).exp() / normalizer * values[value_index] as f64
+                        })
+                        .sum::<f64>();
+                    output.push(weighted);
+                }
+            }
+        }
+        output
     }
 
     #[test]

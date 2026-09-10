@@ -1,15 +1,15 @@
 //! Owned native resources before one-token submission.
 
 use cache::NativePagedKvPool;
-use hipcore::{Device, DeviceBuffer, Stream};
+use hipcore::{BytePod, Device, DeviceBuffer, Stream};
 use snafu::ResultExt;
 
 use super::custody::{NativeBufferSink, NativeBuildResult, NativeBuildScope, NativeBuildSource};
 use super::model_resources::{StreamRetention, build_native_kv, build_numerical_status};
 use super::model_session::NativeBuildFailure;
 use crate::error::{
-    ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionPagedDecodePlanSnafu,
-    NativeDeviceSnafu, NativeSessionStateSnafu,
+    ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionPagedPrefillPlanSnafu,
+    NativeDeviceSnafu, NativeKernelSnafu, NativeSessionStateSnafu,
 };
 use crate::qwen35_mrope::{TextMrope, text_mrope_coefficient};
 use crate::qwen35_native::finish::LayerFinishWorkspace;
@@ -43,12 +43,23 @@ pub(super) struct NativeWorkspace {
     pub(super) output_projection: DeviceBuffer<f32>,
 }
 
+/// An exact checked view into an owned device allocation.
+///
+/// Capacity owners retain their complete allocation while a submitted chunk
+/// passes only this active window to strict native launch validation.
+#[derive(Clone, Copy)]
+pub(super) struct NativeBufferView<'buffer, T: BytePod> {
+    buffer: &'buffer DeviceBuffer<T>,
+    offset: usize,
+    elements: usize,
+}
+
 pub(super) struct StepBuffers {
     pub(super) input: DeviceBuffer<f32>,
     pub(super) output: DeviceBuffer<f32>,
     pub(super) cosine: DeviceBuffer<f32>,
     pub(super) sine: DeviceBuffer<f32>,
-    pub(super) attention: kernels::attention::NativePagedDecodePlan,
+    pub(super) attention: kernels::attention::NativePagedPrefillPlan,
 }
 
 struct DeviceBuildFields {
@@ -64,7 +75,7 @@ pub(super) struct FullAttentionStep<'buffers> {
     pub(super) output: &'buffers DeviceBuffer<f32>,
     pub(super) cosine: &'buffers DeviceBuffer<f32>,
     pub(super) sine: &'buffers DeviceBuffer<f32>,
-    pub(super) attention: kernels::attention::NativePagedDecodePlan,
+    pub(super) attention: kernels::attention::NativePagedPrefillPlan,
 }
 
 impl DeviceResources {
@@ -142,21 +153,25 @@ impl DeviceResources {
         let (cosine, sine) = native_mrope_controls(
             self.plan.layout.text_mrope(),
             self.position,
+            1,
             self.plan.workspace.query_rotary.coefficient_elements(),
         )?;
-        let logical = kernels::PagedDecodePlan::try_from_dimensions(
-            visible,
+        let packed =
+            kernels::PackedPrefillPlan::new(&[1], &[self.position], self.plan.layout.max_context())
+                .context(NativeKernelSnafu)?;
+        let logical = kernels::PagedPrefillPlan::try_from_packed_prefill(
+            &packed,
             self.plan.layout.heads,
             self.plan.layout.kv_heads,
             self.plan.layout.key,
         )
-        .context(ExecutionPagedDecodePlanSnafu)?;
-        let attention = kernels::attention::NativePagedDecodePlan::try_from_paged_decode(
+        .context(ExecutionPagedPrefillPlanSnafu)?;
+        let attention = kernels::attention::NativePagedPrefillPlan::try_from_paged_prefill(
             logical,
             self.plan.kv.layout().page_tokens(),
             self.plan.kv.layout().physical_pages(),
         )
-        .context(ExecutionPagedDecodePlanSnafu)?;
+        .context(ExecutionPagedPrefillPlanSnafu)?;
         self.step = Some(StepBuffers {
             input,
             output: DeviceBuffer::alloc(self.stream.device(), self.plan.workspace.hidden)
@@ -273,28 +288,138 @@ impl NativeWorkspace {
     }
 }
 
+impl<'buffer, T: BytePod> NativeBufferView<'buffer, T> {
+    /// # Errors
+    ///
+    /// Returns an error when `elements` exceeds the retained allocation.
+    pub(super) fn prefix(buffer: &'buffer DeviceBuffer<T>, elements: usize) -> Result<Self> {
+        Self::window(buffer, 0, elements)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the offset arithmetic overflows or the requested
+    /// range exceeds the retained allocation.
+    pub(super) fn window(
+        buffer: &'buffer DeviceBuffer<T>,
+        offset: usize,
+        elements: usize,
+    ) -> Result<Self> {
+        checked_buffer_window(buffer.len(), offset, elements)?;
+        Ok(Self {
+            buffer,
+            offset,
+            elements,
+        })
+    }
+
+    #[must_use]
+    pub(super) const fn len(&self) -> usize {
+        self.elements
+    }
+
+    #[must_use]
+    pub(super) fn as_const_ptr(&self) -> *const T {
+        // SAFETY: `window` proves the offset lies within (or immediately after)
+        // the retained allocation, and callers use the paired exact length.
+        unsafe { self.buffer.as_device_ptr().add(self.offset).cast_const() }
+    }
+
+    #[must_use]
+    pub(super) fn as_mut_ptr(&self) -> *mut T {
+        // SAFETY: `window` proves the offset lies within (or immediately after)
+        // the retained allocation, and callers use the paired exact length.
+        unsafe { self.buffer.as_device_ptr().add(self.offset) }
+    }
+}
+
+/// # Errors
+///
+/// Returns an error when the range overflows or exceeds its allocation extent.
+pub(super) fn checked_buffer_window(
+    allocation_elements: usize,
+    offset: usize,
+    elements: usize,
+) -> Result<core::ops::Range<usize>> {
+    let end = offset.checked_add(elements).ok_or_else(|| {
+        ArithmeticOverflowSnafu {
+            context: "native device-buffer window end",
+        }
+        .build()
+    })?;
+    if end > allocation_elements {
+        return NativeSessionStateSnafu {
+            rule: "native active device-buffer window must remain within its capacity allocation",
+        }
+        .fail();
+    }
+    Ok(offset..end)
+}
+
 pub(super) fn native_mrope_controls(
     mrope: TextMrope,
     position: usize,
+    token_count: usize,
     pairs: usize,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
+    let elements = token_count.checked_mul(pairs).ok_or_else(|| {
+        ArithmeticOverflowSnafu {
+            context: "native MRoPE token count * coefficient pairs",
+        }
+        .build()
+    })?;
     let mut cosine = Vec::new();
     let mut sine = Vec::new();
     cosine
-        .try_reserve_exact(pairs)
+        .try_reserve_exact(elements)
         .context(ExecutionAllocationSnafu {
             target: "native cosine controls",
-            length: pairs,
+            length: elements,
         })?;
-    sine.try_reserve_exact(pairs)
+    sine.try_reserve_exact(elements)
         .context(ExecutionAllocationSnafu {
             target: "native sine controls",
-            length: pairs,
+            length: elements,
         })?;
-    for pair in 0..pairs {
-        let (cosine_value, sine_value) = text_mrope_coefficient(mrope, position, pair)?;
-        cosine.push(cosine_value);
-        sine.push(sine_value);
+    for token in 0..token_count {
+        let absolute_position = position.checked_add(token).ok_or_else(|| {
+            ArithmeticOverflowSnafu {
+                context: "native MRoPE absolute token position",
+            }
+            .build()
+        })?;
+        for pair in 0..pairs {
+            let (cosine_value, sine_value) =
+                text_mrope_coefficient(mrope, absolute_position, pair)?;
+            cosine.push(cosine_value);
+            sine.push(sine_value);
+        }
     }
     Ok((cosine, sine))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_buffer_window;
+
+    #[test]
+    fn active_buffer_windows_refuse_tails_and_overflow_without_device_ownership() {
+        assert_eq!(
+            checked_buffer_window(12, 8, 4).map_err(|error| error.to_string()),
+            Ok(8..12),
+            "the exact final active row remains inside capacity"
+        );
+        assert!(
+            checked_buffer_window(12, 8, 5).is_err(),
+            "a window cannot expose an unallocated capacity tail"
+        );
+        assert!(
+            checked_buffer_window(12, usize::MAX, 1).is_err(),
+            "offset arithmetic overflows before any device pointer is formed"
+        );
+        assert!(
+            checked_buffer_window(12, 0, 13).is_err(),
+            "a short allocation cannot stand in for an active prefix"
+        );
+    }
 }

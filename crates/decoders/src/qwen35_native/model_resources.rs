@@ -14,15 +14,17 @@ use super::custody::{
     NativeBufferParts, NativeBufferSink, NativeBuildGuard, NativeBuildResult, NativeBuildScope,
     NativeBuildSource,
 };
-use super::dispatch::{DeferredFullAttention, launch_rms_norm};
+use super::dispatch::{DeferredFullAttention, launch_rms_norm_view};
 use super::finish::{LayerFinishWeights, LayerFinishWorkspace};
 use super::model_plan::{DeviceModelPlan, NativeBlockPlan};
 use super::model_session::NativeBuildFailure;
-use super::model_step::ModelTokenPlan;
+use super::model_step::ModelChunkPlan;
 use super::recurrent::{
     DeferredRecurrent, NativeRecurrentState, NativeRecurrentWeights, NativeRecurrentWorkspace,
 };
-use super::resources::{FullAttentionStep, NativeWorkspace, native_mrope_controls};
+use super::resources::{
+    FullAttentionStep, NativeBufferView, NativeWorkspace, native_mrope_controls,
+};
 use super::weights::{NativeMatrix, NativeWeights, f32_parameter_buffer};
 use crate::error::{
     ArithmeticOverflowSnafu, ExecutionAllocationSnafu, NativeDeviceSnafu, NativeKernelSnafu,
@@ -31,7 +33,7 @@ use crate::error::{
 use crate::{Qwen35Weights, Result};
 
 struct ModelStep {
-    token: ModelTokenPlan,
+    chunk: ModelChunkPlan,
     logits: DeviceBuffer<f32>,
     cosine: Option<DeviceBuffer<f32>>,
     sine: Option<DeviceBuffer<f32>>,
@@ -569,8 +571,11 @@ fn build_remaining_session_fields(
         LayerFinishWorkspace::new(plan.finish_workspace, &model.device, scope)?,
         LayerFinishWorkspace::into_buffer_sink,
     );
-    let hidden_a = scope.allocate_f32(&model.device, plan.layout.hidden)?;
-    let hidden_b = scope.allocate_f32(&model.device, plan.layout.hidden)?;
+    let hidden_elements = plan
+        .hidden_row_elements()
+        .map_err(NativeBuildSource::decoder)?;
+    let hidden_a = scope.allocate_f32(&model.device, hidden_elements)?;
+    let hidden_b = scope.allocate_f32(&model.device, hidden_elements)?;
     let final_normalized = scope.allocate_f32(&model.device, plan.output_rms.elements())?;
     let layers = allocate_session_layers(plan, &model.device, scope)?;
     Ok(SessionBuildFields {
@@ -700,8 +705,17 @@ impl NativeResidentModelResources {
         })
     }
 
-    pub(super) fn plan_session(&self, max_context: usize) -> Result<DeviceModelPlan> {
-        derive_session_plan(&self.verified_weights, &self.plan, max_context)
+    pub(super) fn plan_prefill_session(
+        &self,
+        max_context: usize,
+        max_chunk_tokens: usize,
+    ) -> Result<DeviceModelPlan> {
+        derive_session_plan(
+            &self.verified_weights,
+            &self.plan,
+            max_context,
+            max_chunk_tokens,
+        )
     }
 
     pub(super) const fn context_ceiling(&self) -> usize {
@@ -860,10 +874,10 @@ impl ModelSessionResources {
         }
     }
 
-    pub(super) fn prepare_step(&mut self, token: u32) -> Result<()> {
+    pub(super) fn prepare_prefill(&mut self, tokens: &[u32]) -> Result<()> {
         self.ensure_step_available()?;
-        let token = ModelTokenPlan::from_model(&self.plan, self.position, token)?;
-        let controls = self.attention_control_values(token)?;
+        let chunk = ModelChunkPlan::from_model(&self.plan, self.position, tokens)?;
+        let controls = self.attention_control_values(&chunk)?;
         let mut failed_step = NativeBufferParts::new();
         let device = self.stream.device().clone();
         let (cosine, sine) = match controls {
@@ -914,7 +928,7 @@ impl ModelSessionResources {
             }
         };
         self.step = Some(ModelStep {
-            token,
+            chunk,
             logits,
             cosine,
             sine,
@@ -950,7 +964,7 @@ impl ModelSessionResources {
         self.failed_step.is_some() || self.failed_step_creation.is_some()
     }
 
-    /// Submit one token through the complete artifact-ordered native main model.
+    /// Submit one bounded B=1 chunk through the complete artifact-ordered model.
     ///
     /// # Safety
     ///
@@ -970,27 +984,37 @@ impl ModelSessionResources {
             }
             .build()
         })?;
-        // SAFETY: this bundle owns the exact serialized embedding matrix,
-        // first hidden row, and ordered stream through completion.
-        unsafe {
-            kernels::row_gemv::launch_row_decode_f32_checked(
-                step.token.embedding,
-                self.model.embedding.bytes.as_device_ptr(),
-                self.model.embedding.bytes.len(),
-                self.hidden_a.as_device_ptr(),
-                self.hidden_a.len(),
-                &self.stream,
-                &self.numerical_status,
-            )
+        let token_count = step.chunk.token_count();
+        for (token, embedding) in step.chunk.embeddings.iter().copied().enumerate() {
+            let offset = token.checked_mul(self.plan.layout.hidden).ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "native model chunk embedding row offset",
+                }
+                .build()
+            })?;
+            let output = NativeBufferView::window(&self.hidden_a, offset, self.plan.layout.hidden)?;
+            // SAFETY: this bundle owns the serialized embedding matrix and each
+            // exact non-overlapping hidden-row window through completion.
+            unsafe {
+                kernels::row_gemv::launch_row_decode_f32_checked(
+                    embedding,
+                    self.model.embedding.bytes.as_device_ptr(),
+                    self.model.embedding.bytes.len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                    &self.stream,
+                    &self.numerical_status,
+                )
+            }
+            .context(NativeKernelSnafu)?;
         }
-        .context(NativeKernelSnafu)?;
 
         let mut append = self
             .kv
             .as_mut()
             .map(|pool| {
                 // SAFETY: this model owns the pool and its exact ordered stream through completion.
-                unsafe { pool.begin_append(1, &self.stream) }
+                unsafe { pool.begin_append(token_count, &self.stream) }
             })
             .transpose()
             .context(NativePagedKvSnafu)?;
@@ -1033,19 +1057,21 @@ impl ModelSessionResources {
                         }
                         .build()
                     })?;
-                    let attention = step.token.attention.ok_or_else(|| {
+                    let attention = step.chunk.attention.ok_or_else(|| {
                         NativeSessionStateSnafu {
                             rule: "native full-attention block requires prepared paged attention controls",
                         }
                         .build()
                     })?;
+                    let active_workspace = plan.active_workspace(token_count)?;
+                    let active_finish = plan.active_finish(token_count)?;
                     let deferred = DeferredFullAttention {
                         weights,
                         workspace,
-                        finish_plan: &plan.finish,
+                        finish_plan: &active_finish,
                         finish_weights: &weights.finish,
                         finish_workspace: &self.finish_workspace,
-                        plan: plan.workspace,
+                        plan: active_workspace,
                         step: FullAttentionStep {
                             input,
                             output,
@@ -1077,14 +1103,21 @@ impl ModelSessionResources {
                         }
                         .build()
                     })?;
+                    let active = recurrent.plan.active(token_count)?;
+                    let workspace = workspace.active(&active.workspace)?;
+                    let finish = recurrent.finish.active(self.plan.layout, token_count)?;
+                    let input =
+                        NativeBufferView::prefix(input, active.workspace.input_norm.elements())?;
+                    let output =
+                        NativeBufferView::prefix(output, active.workspace.input_norm.elements())?;
                     let deferred = DeferredRecurrent {
-                        plan: &recurrent.plan,
+                        plan: &active,
                         weights: &resources.weights,
                         workspace,
                         state,
                         input,
                         output,
-                        finish_plan: &recurrent.finish,
+                        finish_plan: &finish,
                         finish_weights: &resources.finish,
                         finish_workspace: &self.finish_workspace,
                         stream: &self.stream,
@@ -1102,22 +1135,38 @@ impl ModelSessionResources {
             }
             core::mem::swap(&mut input, &mut output);
         }
-        // SAFETY: this model owns the exact final hidden, norm, and logits spans through completion.
+        let final_offset = token_count
+            .checked_sub(1)
+            .and_then(|token| token.checked_mul(self.plan.layout.hidden))
+            .ok_or_else(|| {
+                NativeSessionStateSnafu {
+                    rule: "native model submission requires one active chunk token",
+                }
+                .build()
+            })?;
+        let final_hidden = NativeBufferView::window(input, final_offset, self.plan.layout.hidden)?;
+        let output_norm =
+            NativeBufferView::prefix(&self.model.output_norm, self.model.output_norm.len())?;
+        let normalized =
+            NativeBufferView::prefix(&self.final_normalized, self.final_normalized.len())?;
+        // SAFETY: this model owns the exact terminal hidden, norm, and logits spans through completion.
         unsafe {
-            launch_rms_norm(
+            launch_rms_norm_view(
                 self.plan.output_rms,
-                input,
-                &self.model.output_norm,
-                &self.final_normalized,
+                final_hidden,
+                output_norm,
+                normalized,
                 &self.stream,
                 &self.numerical_status,
             )
         }?;
+        let logits = NativeBufferView::prefix(&step.logits, step.logits.len())?;
         // SAFETY: the verified output matrix and exact final/logit spans remain owned through completion.
         unsafe {
-            self.model.output.launch(
-                &self.final_normalized,
-                &step.logits,
+            self.model.output.launch_rows_view(
+                NativeBufferView::prefix(&self.final_normalized, self.final_normalized.len())?,
+                logits,
+                1,
                 &self.stream,
                 &self.numerical_status,
             )
@@ -1135,14 +1184,18 @@ impl ModelSessionResources {
             }
             .build()
         })?;
-        let next_position = step.token.next_position;
-        if let Some(kv) = self.kv.as_mut() {
-            // SAFETY: the resource owner synchronized this exact stream; every fallible local check and output extraction precedes host-ledger publication.
-            unsafe {
-                kv.commit_prepared_after_completion()
-                    .context(NativePagedKvSnafu)?;
+        let kv = &mut self.kv;
+        let step = commit_prepared_or_restore(&mut self.step, step, || {
+            if let Some(kv) = kv {
+                // SAFETY: the resource owner synchronized this exact stream; every fallible local check and output extraction precedes host-ledger publication.
+                unsafe {
+                    kv.commit_prepared_after_completion()
+                        .context(NativePagedKvSnafu)?;
+                }
             }
-        }
+            Ok(())
+        })?;
+        let next_position = step.chunk.next_position;
         for layer in &mut self.layers {
             if let NativeSessionLayer::Recurrent(state) = layer {
                 state.publish_completed();
@@ -1154,9 +1207,9 @@ impl ModelSessionResources {
 
     fn attention_control_values(
         &self,
-        token: ModelTokenPlan,
+        chunk: &ModelChunkPlan,
     ) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
-        if token.attention.is_none() {
+        if chunk.attention.is_none() {
             return Ok(None);
         }
         let Some(workspace) = self.plan.full_workspace else {
@@ -1168,9 +1221,24 @@ impl ModelSessionResources {
         let (cosine, sine) = native_mrope_controls(
             self.plan.layout.text_mrope(),
             self.position,
+            chunk.token_count(),
             workspace.query_rotary.coefficient_elements(),
         )?;
         Ok(Some((cosine, sine)))
+    }
+}
+
+fn commit_prepared_or_restore<T>(
+    pending_slot: &mut Option<T>,
+    pending: T,
+    commit: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    match commit() {
+        Ok(()) => Ok(pending),
+        Err(error) => {
+            *pending_slot = Some(pending);
+            Err(error)
+        }
     }
 }
 
@@ -1278,6 +1346,7 @@ fn derive_session_plan(
     weights: &Qwen35Weights,
     resident: &DeviceModelPlan,
     max_context: usize,
+    max_chunk_tokens: usize,
 ) -> Result<DeviceModelPlan> {
     if max_context > resident.layout.max_context() {
         return NativeSessionStateSnafu {
@@ -1285,7 +1354,12 @@ fn derive_session_plan(
         }
         .fail();
     }
-    let session = DeviceModelPlan::from_weights(weights, max_context, resident.page_tokens)?;
+    let session = DeviceModelPlan::from_weights_prefill(
+        weights,
+        max_context,
+        max_chunk_tokens,
+        resident.page_tokens,
+    )?;
     if session.embedding.shape != resident.embedding.shape
         || session.output.shape != resident.output.shape
         || session.output_rms.elements() != resident.output_rms.elements()
@@ -1403,11 +1477,11 @@ fn retain_session_layers(layers: Vec<NativeSessionLayer>, sink: &mut NativeBuffe
 
 #[cfg(test)]
 mod tests {
-    use super::derive_session_plan;
+    use super::{commit_prepared_or_restore, derive_session_plan};
     use crate::Qwen35Weights;
     use crate::qwen35::tests::{canonical_hybrid_fixture_with_context, verify_fixture};
     use crate::qwen35_native::model_plan::DeviceModelPlan;
-    use crate::qwen35_native::model_step::ModelTokenPlan;
+    use crate::qwen35_native::model_step::ModelChunkPlan;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1422,9 +1496,10 @@ mod tests {
         let artifact = verify_fixture(&canonical_hybrid_fixture_with_context(RESIDENT_CONTEXT)?)?;
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
-        let resident = DeviceModelPlan::from_weights(&weights, RESIDENT_CONTEXT, PAGE_TOKENS)
-            .map_err(|error| error.to_string())?;
-        let session = derive_session_plan(&weights, &resident, SESSION_CONTEXT)
+        let resident =
+            DeviceModelPlan::from_weights_prefill(&weights, RESIDENT_CONTEXT, 1, PAGE_TOKENS)
+                .map_err(|error| error.to_string())?;
+        let session = derive_session_plan(&weights, &resident, SESSION_CONTEXT, 1)
             .map_err(|error| error.to_string())?;
 
         assert_eq!(session.layout.max_context(), SESSION_CONTEXT);
@@ -1435,11 +1510,11 @@ mod tests {
             "a smaller exact session context must allocate its own smaller K/V extent"
         );
         assert!(
-            ModelTokenPlan::from_model(&session, SESSION_CONTEXT, 0).is_err(),
+            ModelChunkPlan::from_model(&session, SESSION_CONTEXT, &[0]).is_err(),
             "the per-use plan cannot dispatch beyond its exact requested context"
         );
         assert!(
-            derive_session_plan(&weights, &resident, RESIDENT_CONTEXT + 1).is_err(),
+            derive_session_plan(&weights, &resident, RESIDENT_CONTEXT + 1, 1).is_err(),
             "a session plan cannot exceed the resident model's immutable ceiling"
         );
         Ok(())
@@ -1474,5 +1549,38 @@ mod tests {
         assert_eq!(Arc::strong_count(&recovered), 1);
         drop(recovered);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_prepublication_commit_restores_pending_step_custody() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let pending = DropProbe(Arc::clone(&drops));
+        let mut pending_slot = None;
+        let result = commit_prepared_or_restore(&mut pending_slot, pending, || {
+            Err(crate::error::NativeSessionStateSnafu {
+                rule: "test prepublication commit failure",
+            }
+            .build())
+        });
+
+        assert!(
+            result.is_err(),
+            "the simulated prepared-KV failure must remain observable"
+        );
+        assert!(
+            pending_slot.is_some(),
+            "a fallible publication boundary must restore the complete pending-step owner"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "restored pending-step custody must not run its ordinary drop path"
+        );
+        drop(pending_slot);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the retained pending-step owner drops exactly once when explicit ownership ends"
+        );
     }
 }

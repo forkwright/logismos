@@ -11,7 +11,6 @@ use crate::error::{
 };
 use crate::qwen35::recurrent_layernorm_rms_epsilon;
 use crate::qwen35_recurrent::{ExecutionLayout, RecurrentTensorRole, recurrent_tensor_name};
-#[cfg(test)]
 use kernels::PackedPrefillPlan;
 
 /// One verified matrix descriptor used by a native recurrent block.
@@ -102,25 +101,22 @@ pub(super) struct DeviceRecurrentPlan {
     weight_bytes: usize,
 }
 
-impl DeviceRecurrentPlan {
-    /// Bind one admitted recurrent main block to native operation descriptors.
-    ///
-    /// No device allocation, upload, submission, state mutation, or cache
-    /// publication occurs here.
-    pub(super) fn from_weights(weights: &Qwen35Weights, block: usize) -> Result<Self> {
-        Self::from_token_count(weights, block, 1)
-    }
+/// Checked active recurrent operation geometry with no weight ownership.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ActiveRecurrentPlan {
+    pub(super) layout: ExecutionLayout,
+    pub(super) workspace: RecurrentWorkspacePlan,
+    pub(super) convolution: kernels::CausalConvAllocationPlan,
+    pub(super) recurrence: kernels::MultiHeadRecurrentAllocationPlan,
+}
 
-    /// Bind one test-only single-sequence packed recurrent chunk to native descriptors.
+impl DeviceRecurrentPlan {
+    /// Bind one single-sequence packed recurrent chunk to native descriptors.
     ///
     /// The packed descriptor remains borrowed at this boundary: its existing
     /// context admission is consumed as geometry, never copied into model
     /// position, grant, or publication state.
     ///
-    /// The production native model has no chunk entrypoint yet. Keeping this
-    /// constructor test-only makes that absence explicit while letting the
-    /// reserved-device witness exercise the private block body.
-    #[cfg(test)]
     pub(super) fn from_packed_prefill(
         weights: &Qwen35Weights,
         block: usize,
@@ -133,6 +129,38 @@ impl DeviceRecurrentPlan {
             .fail();
         }
         Self::from_token_count(weights, block, packed.total_tokens())
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when `token_count` cannot form checked convolution or
+    /// recurrence geometry under this retained artifact binding.
+    pub(super) fn active(&self, token_count: usize) -> Result<ActiveRecurrentPlan> {
+        let convolution = kernels::CausalConvAllocationPlan::try_from_dimensions(
+            token_count,
+            self.layout.convolution_width(),
+            self.layout.convolution_kernel(),
+        )
+        .context(RecurrentConvolutionSnafu)?;
+        let recurrence = kernels::MultiHeadRecurrentAllocationPlan::try_from_dimensions(
+            token_count,
+            self.layout.value_head_count(),
+            self.layout.value_head_count(),
+            self.layout.key_dim(),
+            self.layout.value_dim(),
+        )
+        .context(RecurrentGdnSnafu)?;
+        Ok(ActiveRecurrentPlan {
+            layout: self.layout,
+            workspace: RecurrentWorkspacePlan::from_layout(
+                self.layout,
+                token_count,
+                convolution,
+                recurrence,
+            )?,
+            convolution,
+            recurrence,
+        })
     }
 
     fn from_token_count(weights: &Qwen35Weights, block: usize, token_count: usize) -> Result<Self> {
@@ -476,8 +504,9 @@ mod tests {
         let artifact = verify_fixture(&canonical_hybrid_fixture()?)?;
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
-        let plan =
-            DeviceRecurrentPlan::from_weights(&weights, 0).map_err(|error| error.to_string())?;
+        let packed = PackedPrefillPlan::new(&[1], &[0], 1).map_err(|error| error.to_string())?;
+        let plan = DeviceRecurrentPlan::from_packed_prefill(&weights, 0, &packed)
+            .map_err(|error| error.to_string())?;
 
         assert_eq!(plan.workspace.qkv, plan.convolution.output_elements());
         assert_eq!(
@@ -504,12 +533,13 @@ mod tests {
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
 
+        let packed = PackedPrefillPlan::new(&[1], &[0], 1).map_err(|error| error.to_string())?;
         assert!(
-            DeviceRecurrentPlan::from_weights(&weights, 3).is_err(),
+            DeviceRecurrentPlan::from_packed_prefill(&weights, 3, &packed).is_err(),
             "a cadence full-attention block cannot use recurrent native geometry"
         );
         assert!(
-            DeviceRecurrentPlan::from_weights(&weights, 4).is_err(),
+            DeviceRecurrentPlan::from_packed_prefill(&weights, 4, &packed).is_err(),
             "a block outside the main-block domain cannot use recurrent native geometry"
         );
         Ok(())
