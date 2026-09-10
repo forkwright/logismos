@@ -1254,6 +1254,12 @@ pub struct NativePagedPrefillPlan {
 #[cfg(feature = "gpu")]
 impl NativePagedPrefillPlan {
     /// Bind one owned B=1 prefill descriptor to explicit native pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagedPrefillError`] when the page-token selector is not
+    /// B8/B16/B32, physical-page count is zero, a dense K/V or table extent
+    /// overflows, or a required native ABI dimension cannot fit `u32`.
     pub fn try_from_paged_prefill(
         logical: PagedPrefillPlan,
         page_tokens: usize,
@@ -1337,38 +1343,55 @@ impl NativePagedPrefillPlan {
         })
     }
 
+    /// Return the owned logical B=1 causal chunk geometry.
     #[must_use]
     pub const fn logical(self) -> PagedPrefillPlan {
         self.logical
     }
+
+    /// Return the active token count in this chunk.
     #[must_use]
     pub const fn tokens(self) -> usize {
         self.logical.tokens()
     }
+
+    /// Return the final causal visible-prefix length.
     #[must_use]
     pub const fn visible_tokens(self) -> usize {
         self.logical.visible_tokens()
     }
+
+    /// Return this descriptor's explicit physical page-token selector.
     #[must_use]
     pub const fn page_tokens(self) -> NativePageTokens {
         self.page_tokens
     }
+
+    /// Return the supplied dense physical-page count.
     #[must_use]
     pub const fn physical_pages(self) -> usize {
         self.physical_pages
     }
+
+    /// Return the checked table entry count for the final visible prefix.
     #[must_use]
     pub const fn page_table_entries(self) -> usize {
         self.logical_pages
     }
+
+    /// Return the active query extent `[tokens, query_heads, head_width]`.
     #[must_use]
     pub const fn query_elements(self) -> usize {
         self.logical.query_elements()
     }
+
+    /// Return the active output extent `[tokens, query_heads, head_width]`.
     #[must_use]
     pub const fn output_elements(self) -> usize {
         self.logical.output_elements()
     }
+
+    /// Return one separate dense physical K or V backing extent.
     #[must_use]
     pub const fn key_value_elements(self) -> usize {
         self.key_value_elements
@@ -1376,6 +1399,14 @@ impl NativePagedPrefillPlan {
 }
 
 /// Launch checked B=1 causal multiquery paged attention.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedShape`] when an active query/output
+/// prefix, exact K/V/table extent, device span, or output aliasing condition
+/// violates the descriptor. A CPU-only build returns
+/// [`crate::Error::NoGpuBuild`]; HIP stream-current and launch failures are
+/// propagated.
 #[cfg(feature = "gpu")]
 #[expect(
     clippy::too_many_arguments,
@@ -2239,6 +2270,143 @@ mod tests {
                 })
             ),
             "native prefill must preserve physical-page admission refusal"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn native_prefill_launch_preflight_checks_prefixes_spans_and_abi()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let packed = PackedPrefillPlan::new(&[2], &[7], 9)?;
+        let logical = PagedPrefillPlan::try_from_packed_prefill(&packed, 2, 1, 4)?;
+        let native = NativePagedPrefillPlan::try_from_paged_prefill(logical, 8, 3)?;
+        let query = 0x1000_usize as *const f32;
+        let keys = 0x2000_usize as *const f32;
+        let values = 0x3000_usize as *const f32;
+        let table = 0x4000_usize as *const u32;
+        let output = 0x5000_usize as *mut f32;
+        let query_capacity = native
+            .query_elements()
+            .checked_add(4)
+            .ok_or("synthetic query capacity overflowed")?;
+        let output_capacity = native
+            .output_elements()
+            .checked_add(4)
+            .ok_or("synthetic output capacity overflowed")?;
+
+        assert!(
+            validate_paged_prefill_launch(
+                native,
+                query,
+                query_capacity,
+                keys,
+                native.key_value_elements(),
+                values,
+                native.key_value_elements(),
+                table,
+                native.page_table_entries(),
+                output,
+                output_capacity,
+            )
+            .is_ok(),
+            "capacity-sized query/output owners may exceed their active prefixes"
+        );
+        assert!(
+            matches!(
+                validate_paged_prefill_launch(
+                    native,
+                    query,
+                    native.query_elements() - 1,
+                    keys,
+                    native.key_value_elements(),
+                    values,
+                    native.key_value_elements(),
+                    table,
+                    native.page_table_entries(),
+                    output,
+                    output_capacity,
+                ),
+                Err(crate::Error::UnsupportedShape { .. })
+            ),
+            "a short active query prefix must fail before native launch"
+        );
+        assert!(
+            matches!(
+                validate_paged_prefill_launch(
+                    native,
+                    query,
+                    query_capacity,
+                    keys,
+                    native.key_value_elements() - 1,
+                    values,
+                    native.key_value_elements(),
+                    table,
+                    native.page_table_entries(),
+                    output,
+                    output_capacity,
+                ),
+                Err(crate::Error::UnsupportedShape { .. })
+            ),
+            "a short dense key backing must fail before native launch"
+        );
+        assert!(
+            matches!(
+                validate_paged_prefill_launch(
+                    native,
+                    query,
+                    query_capacity,
+                    keys,
+                    native.key_value_elements(),
+                    values,
+                    native.key_value_elements(),
+                    table,
+                    native.page_table_entries() - 1,
+                    output,
+                    output_capacity,
+                ),
+                Err(crate::Error::UnsupportedShape { .. })
+            ),
+            "a short page table must fail before native launch"
+        );
+        assert!(
+            matches!(
+                validate_paged_prefill_launch(
+                    native,
+                    query,
+                    query_capacity,
+                    keys,
+                    native.key_value_elements(),
+                    values,
+                    native.key_value_elements(),
+                    table,
+                    native.page_table_entries(),
+                    query.cast_mut(),
+                    output_capacity,
+                ),
+                Err(crate::Error::UnsupportedShape { .. })
+            ),
+            "the writable output must not alias the active query prefix"
+        );
+
+        let beyond_u32 = usize::try_from(u32::MAX)?
+            .checked_add(1)
+            .ok_or("host usize cannot represent the u32 ABI boundary")?;
+        let overflowing_packed = PackedPrefillPlan::new(&[1], &[beyond_u32 - 1], beyond_u32)?;
+        let overflowing_logical =
+            PagedPrefillPlan::try_from_packed_prefill(&overflowing_packed, 1, 1, 1)?;
+        assert!(
+            matches!(
+                NativePagedPrefillPlan::try_from_paged_prefill(overflowing_logical, 8, 1),
+                Err(PagedPrefillError::Native {
+                    source: PagedDecodeError::NativeAbiOutOfRange {
+                        dimension: "visible_tokens",
+                        value,
+                        ..
+                    }
+                }) if value == beyond_u32
+            ),
+            "native prefill construction must reject a visible prefix outside its u32 ABI"
         );
         Ok(())
     }

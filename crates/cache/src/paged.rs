@@ -1284,6 +1284,12 @@ pub struct NativePagedAppend<'a> {
 impl NativePagedAppend<'_> {
     /// Stage every active `[tokens, kv_heads, head_width]` row for one layer.
     ///
+    /// # Errors
+    ///
+    /// Returns a typed cache, device, capacity-prefix, row-geometry, or HIP
+    /// append-submission failure. Submission failures poison the all-layer
+    /// prepared transaction.
+    ///
     /// # Safety
     ///
     /// The capacity-sized input owners and stream must remain live on this
@@ -1606,6 +1612,12 @@ impl NativePagedLayerKv<'_> {
     }
 
     /// Launch checked B=1 causal prefill without exposing cache pointers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed cache, device, final-visible-prefix, page-geometry, or
+    /// checked native attention-launch failure. The caller must synchronize and
+    /// read `status` before publishing the append's host ledger.
     ///
     /// # Safety
     ///

@@ -112,10 +112,6 @@ main() {
     if [[ ! -x "$llvm_objdump" ]]; then
         fail "ROCm llvm-objdump is unavailable beside the selected HIP compiler"
     fi
-    llvm_nm="$llvm_root/bin/llvm-nm"
-    if [[ ! -x "$llvm_nm" ]]; then
-        fail "ROCm llvm-nm is unavailable beside the selected HIP compiler"
-    fi
     if ! command -v ar >/dev/null; then
         fail "ar is unavailable for archive inspection"
     fi
@@ -162,8 +158,14 @@ main() {
     if ! grep -Fqx -- "$prefill_launcher_member" <<<"$members"; then
         fail "kernel archive omits causal prefill launcher object $prefill_launcher_member"
     fi
-    launcher_symbols=$("$llvm_nm" --defined-only --extern-only "$archive" | awk '{print $NF}')
-    if ! grep -Fxq 'logismos_launch_paged_prefill_b1_f32' <<<"$launcher_symbols"; then
+    if ! "$llvm_objdump" --syms "$archive" | awk '
+        $NF == "logismos_launch_paged_prefill_b1_f32" && $0 ~ /[[:space:]][gG][[:space:]]/ && $0 !~ /\*UND\*/ {
+            found = 1
+        }
+        END {
+            exit !found
+        }
+    '; then
         fail "kernel archive omits causal prefill launcher symbol logismos_launch_paged_prefill_b1_f32"
     fi
 
