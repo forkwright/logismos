@@ -5,7 +5,7 @@ use super::qwen35_execution_oracle_tests::{
     private_state_snapshot,
 };
 use super::*;
-use crate::Qwen35Weights;
+use crate::{Qwen35BatchCpuRequirements, Qwen35CpuRequirements, Qwen35Weights};
 use crate::qwen35::tests::{
     CanonicalHybridOracle, canonical_hybrid_fixture_with_context, set_f32_value, verify_fixture,
 };
@@ -22,6 +22,13 @@ type ExecutionStateBits = (
     Vec<(Vec<u32>, Vec<u32>)>,
     Vec<(usize, Vec<u32>, Vec<u32>)>,
 );
+type TwoExecutions = [Qwen35Execution; BATCH_SEQUENCE_COUNT];
+type IdenticalArtifactExecutions = (
+    TwoExecutions,
+    Qwen35CpuRequirements,
+    Qwen35CpuRequirements,
+);
+type FaultyBatchExecutions = (TwoExecutions, usize);
 
 #[test]
 fn batch_execution_deinterleaves_unequal_histories_and_continues() -> std::result::Result<(), String>
@@ -240,6 +247,20 @@ fn batch_plan_preflight_refusals_leave_every_execution_unchanged() -> std::resul
 
 #[test]
 fn batch_plan_aggregates_identical_artifacts_conservatively() -> std::result::Result<(), String> {
+    let (mut executions, first_requirements, second_requirements) =
+        identical_artifact_executions()?;
+    let plan = Qwen35Execution::plan_batch(&mut executions, &[&[0, 1], &[2]])
+        .map_err(|error| error.to_string())?;
+    assert_conservative_batch_requirements(
+        plan.cpu_requirements(),
+        first_requirements,
+        second_requirements,
+    )?;
+    drop(plan);
+    Ok(())
+}
+
+fn identical_artifact_executions() -> std::result::Result<IdenticalArtifactExecutions, String> {
     let fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
     let shared_payload = verify_fixture(&fixture)?;
     let shared_weights =
@@ -270,14 +291,18 @@ fn batch_plan_aggregates_identical_artifacts_conservatively() -> std::result::Re
         second_requirements.artifact_digest(),
         "separately verified identical bytes must retain their content identity"
     );
-    let mut executions = [
+    let executions = [
         first_plan.execution().map_err(|error| error.to_string())?,
         second_plan.execution().map_err(|error| error.to_string())?,
     ];
-    let plan = Qwen35Execution::plan_batch(&mut executions, &[&[0, 1], &[2]])
-        .map_err(|error| error.to_string())?;
-    let requirements = plan.cpu_requirements();
+    Ok((executions, first_requirements, second_requirements))
+}
 
+fn assert_conservative_batch_requirements(
+    requirements: Qwen35BatchCpuRequirements,
+    first_requirements: Qwen35CpuRequirements,
+    second_requirements: Qwen35CpuRequirements,
+) -> std::result::Result<(), String> {
     assert_eq!(
         requirements.artifact_digest(),
         first_requirements.artifact_digest()
@@ -343,7 +368,6 @@ fn batch_plan_aggregates_identical_artifacts_conservatively() -> std::result::Re
             "logical batch upper bound",
         )?
     );
-    drop(plan);
     Ok(())
 }
 
@@ -377,30 +401,7 @@ fn dropped_batch_plan_does_not_publish_private_state() -> std::result::Result<()
 #[test]
 fn late_second_sequence_refusal_rolls_back_the_whole_batch_and_retries()
 -> std::result::Result<(), String> {
-    let mut faulty_fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
-    let faulty_row = usize::try_from(LATE_FAILURE_TOKEN).map_err(|error| error.to_string())?;
-    let faulty_index = faulty_row
-        .checked_mul(CANONICAL_HIDDEN)
-        .ok_or("late-failure embedding offset overflowed")?;
-    set_f32_value(
-        &mut faulty_fixture,
-        "token_embd.weight",
-        faulty_index,
-        f32::NAN,
-    )?;
-    let faulty_payload = verify_fixture(&faulty_fixture)?;
-    let faulty_weights =
-        Qwen35Weights::try_from_verified(&faulty_payload).map_err(|error| error.to_string())?;
-    let mut executions = [
-        execution(&faulty_weights, Qwen35LogitSelection::AllTokens)?,
-        execution(&faulty_weights, Qwen35LogitSelection::AllTokens)?,
-    ];
-    executions[0]
-        .step(&[0, 1, 2])
-        .map_err(|error| error.to_string())?;
-    executions[1]
-        .step(&[3])
-        .map_err(|error| error.to_string())?;
+    let (mut executions, faulty_row) = faulty_batch_executions()?;
     let before = execution_state_bits(&executions)?;
     let first_chunk = [2, 3];
     let second_chunk = [0, LATE_FAILURE_TOKEN];
@@ -430,26 +431,51 @@ fn late_second_sequence_refusal_rolls_back_the_whole_batch_and_retries()
         "late second-sequence failure must not publish either staged state"
     );
 
+    assert_pristine_retry_matches(&mut executions, &first_chunk)?;
+    Ok(())
+}
+
+fn faulty_batch_executions() -> std::result::Result<FaultyBatchExecutions, String> {
+    let mut faulty_fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
+    let faulty_row = usize::try_from(LATE_FAILURE_TOKEN).map_err(|error| error.to_string())?;
+    let faulty_index = faulty_row
+        .checked_mul(CANONICAL_HIDDEN)
+        .ok_or("late-failure embedding offset overflowed")?;
+    set_f32_value(
+        &mut faulty_fixture,
+        "token_embd.weight",
+        faulty_index,
+        f32::NAN,
+    )?;
+    let faulty_payload = verify_fixture(&faulty_fixture)?;
+    let faulty_weights =
+        Qwen35Weights::try_from_verified(&faulty_payload).map_err(|error| error.to_string())?;
+    let mut executions = [
+        execution(&faulty_weights, Qwen35LogitSelection::AllTokens)?,
+        execution(&faulty_weights, Qwen35LogitSelection::AllTokens)?,
+    ];
+    executions[0]
+        .step(&[0, 1, 2])
+        .map_err(|error| error.to_string())?;
+    executions[1]
+        .step(&[3])
+        .map_err(|error| error.to_string())?;
+    Ok((executions, faulty_row))
+}
+
+fn assert_pristine_retry_matches(
+    executions: &mut TwoExecutions,
+    first_chunk: &[u32],
+) -> std::result::Result<(), String> {
     let retry_second = [0, 1];
     let retry = Qwen35Execution::plan_batch(
-        &mut executions,
+        executions,
         &[first_chunk.as_slice(), retry_second.as_slice()],
     )
     .map_err(|error| error.to_string())?
     .execute()
     .map_err(|error| error.to_string())?;
-    let good_fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
-    let good_payload = verify_fixture(&good_fixture)?;
-    let good_weights =
-        Qwen35Weights::try_from_verified(&good_payload).map_err(|error| error.to_string())?;
-    let mut control = [
-        execution(&good_weights, Qwen35LogitSelection::AllTokens)?,
-        execution(&good_weights, Qwen35LogitSelection::AllTokens)?,
-    ];
-    control[0]
-        .step(&[0, 1, 2])
-        .map_err(|error| error.to_string())?;
-    control[1].step(&[3]).map_err(|error| error.to_string())?;
+    let mut control = pristine_prefixed_executions()?;
     let expected = Qwen35Execution::plan_batch(
         &mut control,
         &[first_chunk.as_slice(), retry_second.as_slice()],
@@ -463,11 +489,26 @@ fn late_second_sequence_refusal_rolls_back_the_whole_batch_and_retries()
         "whole-batch retry must match a pristine control bitwise"
     );
     assert_eq!(
-        execution_state_bits(&executions)?,
+        execution_state_bits(executions)?,
         execution_state_bits(&control)?,
         "retry must publish exactly the pristine-control state"
     );
     Ok(())
+}
+
+fn pristine_prefixed_executions() -> std::result::Result<TwoExecutions, String> {
+    let fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let mut executions = [
+        execution(&weights, Qwen35LogitSelection::AllTokens)?,
+        execution(&weights, Qwen35LogitSelection::AllTokens)?,
+    ];
+    executions[0]
+        .step(&[0, 1, 2])
+        .map_err(|error| error.to_string())?;
+    executions[1].step(&[3]).map_err(|error| error.to_string())?;
+    Ok(executions)
 }
 
 fn execution(
