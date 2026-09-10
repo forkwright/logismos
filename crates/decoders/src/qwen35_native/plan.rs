@@ -352,56 +352,37 @@ impl WorkspacePlan {
         )
         .context(NativeKernelSnafu)?;
         let query_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(
-            token_count.checked_mul(layout.heads).ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "native full-attention query-normalization rows",
-                }
-                .build()
-            })?,
+            token_major_extent(
+                token_count,
+                layout.heads,
+                "native full-attention query-normalization rows",
+            )?,
             layout.key,
             layout.epsilon(),
         )
         .context(NativeKernelSnafu)?;
         let key_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(
-            token_count.checked_mul(layout.kv_heads).ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "native full-attention key-normalization rows",
-                }
-                .build()
-            })?,
+            token_major_extent(
+                token_count,
+                layout.kv_heads,
+                "native full-attention key-normalization rows",
+            )?,
             layout.key,
             layout.epsilon(),
         )
         .context(NativeKernelSnafu)?;
-        let query_rotary = kernels::decoder_ops::RotaryHalfSplitF32Plan::try_from_dimensions(
-            layout.heads,
-            layout.key,
-            layout.text_mrope().rotary_width(),
-        )
-        .context(NativeKernelSnafu)?;
-        let key_rotary = kernels::decoder_ops::RotaryHalfSplitF32Plan::try_from_dimensions(
-            layout.kv_heads,
-            layout.key,
-            layout.text_mrope().rotary_width(),
-        )
-        .context(NativeKernelSnafu)?;
+        let (query_rotary, key_rotary) = mrope_rotation_plans(layout)?;
         let split = kernels::decoder_ops::SplitQGateF32Plan::try_from_dimensions(
-            token_count.checked_mul(layout.heads).ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "native full-attention split rows",
-                }
-                .build()
-            })?,
+            token_major_extent(token_count, layout.heads, "native full-attention split rows")?,
             layout.key,
         )
         .context(NativeKernelSnafu)?;
         let gate = kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(
-            token_count.checked_mul(layout.query_width).ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "native full-attention gated query elements",
-                }
-                .build()
-            })?,
+            token_major_extent(
+                token_count,
+                layout.query_width,
+                "native full-attention gated query elements",
+            )?,
         )
         .context(NativeKernelSnafu)?;
         Ok(Self {
@@ -417,19 +398,13 @@ impl WorkspacePlan {
             query: split.output_elements(),
             gate_values: split.output_elements(),
             normalized_query: query_norm.elements(),
-            key: token_count.checked_mul(layout.kv_width).ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "native full-attention key elements",
-                }
-                .build()
-            })?,
+            key: token_major_extent(token_count, layout.kv_width, "native full-attention key elements")?,
             normalized_key: key_norm.elements(),
-            value: token_count.checked_mul(layout.kv_width).ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "native full-attention value elements",
-                }
-                .build()
-            })?,
+            value: token_major_extent(
+                token_count,
+                layout.kv_width,
+                "native full-attention value elements",
+            )?,
             attention: gate.elements(),
             gated: gate.elements(),
             output_projection: hidden_norm.elements(),
@@ -473,6 +448,33 @@ impl WorkspacePlan {
                 .build()
             })
     }
+}
+
+fn mrope_rotation_plans(
+    layout: Layout,
+) -> Result<(
+    kernels::decoder_ops::RotaryHalfSplitF32Plan,
+    kernels::decoder_ops::RotaryHalfSplitF32Plan,
+)> {
+    let query = kernels::decoder_ops::RotaryHalfSplitF32Plan::try_from_dimensions(
+        layout.heads,
+        layout.key,
+        layout.text_mrope().rotary_width(),
+    )
+    .context(NativeKernelSnafu)?;
+    let key = kernels::decoder_ops::RotaryHalfSplitF32Plan::try_from_dimensions(
+        layout.kv_heads,
+        layout.key,
+        layout.text_mrope().rotary_width(),
+    )
+    .context(NativeKernelSnafu)?;
+    Ok((query, key))
+}
+
+fn token_major_extent(token_count: usize, width: usize, context: &'static str) -> Result<usize> {
+    token_count
+        .checked_mul(width)
+        .ok_or_else(|| ArithmeticOverflowSnafu { context }.build())
 }
 
 pub(super) fn elements_bytes(
