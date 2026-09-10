@@ -160,9 +160,11 @@ and outside the inference runtime's authority.
 The standalone serialized-row GEMV primitive consumes `quant::RowFormat`, raw
 row-major matrix bytes and f32 activations/output. Serialized F32 weights stay
 f32; they do not pass through the separate fp16 WMMA operation. A checked opaque
-shape owns exact extents and ABI bounds. The CPU reference delegates each row
-to `quant`; private format-specific HIP entrypoints use one sequential thread
-per row with source-specific floating-point controls and little-endian byte
+shape owns exact extents and ABI bounds; a batch plan derives token-major
+activation/output spans from that shape without replicating weights. The CPU
+reference delegates each row to `quant`; private format-specific HIP entrypoints
+use one sequential thread per token/output-row pair with source-specific
+floating-point controls and little-endian byte
 decoding. Format identity remains the Rust enum, not a second numeric wire schema.
 Its unsafe asynchronous launcher requires valid device buffers, lifetimes,
 nonaliasing and admitted finite arithmetic. CPU typed nonfinite refusals do not
@@ -171,9 +173,11 @@ operands and intermediates; CPU subnormal witnesses do not qualify GPU denormal
 modes. This is a correctness-oriented primitive, not a
 whole-model GPU path, performance result or hardware qualification.
 
-The grouped-GDN and causal-convolution native decode steps reuse their CPU
-allocation plans as geometry owners. Their raw asynchronous launchers read
-immutable prior state/history and write distinct staged results. They share a
+The grouped-GDN and causal-convolution native operations reuse their CPU
+allocation plans as geometry owners. Dense single-sequence launches visit time
+on device; the step entrypoints retain their T=1 contract. Their raw asynchronous
+launchers read immutable prior state/history and write distinct staged results.
+They share a
 private span owner with row GEMV for checked byte/f32 extents and writable
 aliases. Empty convolution history has no memory footprint. Decoder transactions, persistent
 residency and grant handling remain above these operations. Their precise
@@ -247,9 +251,21 @@ layer-indexed KV pool when full attention is present. Each recurrent layer has d
 raw convolution history and GDN state. A single full-attention workspace, a
 single recurrent workspace and a common residual/FFN workspace are reused in
 stream order; two hidden rows alternate between main blocks. Recurrent Q/K
-normalization tiles by source-head modulo into equal-head GDN; its activated
-convolution V tail is borrowed rather than transposed or copied. Both block
-kinds enter the shared finish only after their own output projection.
+normalization tiles by source-head modulo into equal-head GDN. An explicitly
+owned gather reads each activated convolution row's V tail into head-major
+storage; a second owned buffer restores recurrent output to token-major order
+before normalization and gating. Both allocations participate in workspace
+demand, construction guards and uncertain-completion custody. Both block kinds
+enter the shared finish only after their own output projection.
+
+The deferred recurrent body and common finish support dense single-sequence
+token rows through the same projection, preparation and execution owners.
+Per-head recurrent weights broadcast across tokens; persistent history and
+state do not multiply by token count. The private packed qualification path
+borrows checked context geometry and refuses multiple sequences. It introduces
+no independent position or publication owner. The production main-model path
+still consumes one token at a time; complete model prefill requires multiquery
+attention and one whole-chunk transaction beyond this block composition.
 
 The existing resource guard covers the first embedding submission through
 final logits. One append spans every full layer, interleaved with recurrent
