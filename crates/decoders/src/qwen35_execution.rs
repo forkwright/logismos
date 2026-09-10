@@ -339,17 +339,10 @@ impl StagedExecution {
         let sequence_positions = packed_sequence_positions(packed, sequence, token_ids.len())?;
         let total = returned_logits_elements(self.layout, token_ids.len(), self.selection)?;
         let mut logits = reserve("token logits", total)?;
-        for (token_index, token_id) in token_ids.iter().enumerate() {
+        for ((token_index, token_id), position) in
+            token_ids.iter().enumerate().zip(sequence_positions.clone())
+        {
             let mut hidden = self.embed(*token_id)?;
-            let position = sequence_positions
-                .start
-                .checked_add(token_index)
-                .ok_or_else(|| {
-                    ArithmeticOverflowSnafu {
-                        context: "packed execution token position",
-                    }
-                    .build()
-                })?;
             let recurrent_packed =
                 PackedPrefillPlan::new(&[1], &[position], self.layout.max_context)
                     .context(ExecutionCpuSnafu)?;
