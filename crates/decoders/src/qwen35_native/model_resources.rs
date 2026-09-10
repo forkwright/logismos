@@ -1330,13 +1330,13 @@ fn upload_resident_layers(
             NativeBlockPlan::Full(plan) => NativeModelLayer::Full(Box::new(NativeWeights::upload(
                 weights, plan, device, scope,
             )?)),
-            NativeBlockPlan::Recurrent(recurrent) => {
+            NativeBlockPlan::Recurrent(block) => {
                 let recurrent = scope.guard(
-                    NativeRecurrentWeights::upload(weights, &recurrent.plan, device, scope)?,
+                    NativeRecurrentWeights::upload(weights, &block.plan, device, scope)?,
                     NativeRecurrentWeights::into_buffer_sink,
                 );
                 let finish = scope.guard(
-                    LayerFinishWeights::upload(weights, &recurrent.finish, device, scope)?,
+                    LayerFinishWeights::upload(weights, &block.finish, device, scope)?,
                     LayerFinishWeights::into_buffer_sink,
                 );
                 NativeModelLayer::Recurrent(Box::new(NativeRecurrentLayerWeights {
