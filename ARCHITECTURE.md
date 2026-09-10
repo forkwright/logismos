@@ -296,8 +296,9 @@ the complete per-session bundle. Sharing does not make `Drop` an eviction
 receipt. Demand is neither a resource grant nor
 measured physical residency. Native numeric obligations remain explicitly
 unsafe; compiler-checked, ignored device witnesses are not execution evidence.
-The existing text/service consumers retain one-token plans; this additive
-executor capability does not silently change their admission or serving policy.
+Legacy text planning retains one-token capacity; Hermeneus's explicit per-use
+prefill entry can opt into a larger checked plan. Neither entry silently changes
+admission or serving policy.
 
 Explicit model/session close transfers original buffers into `hipcore`'s
 heterogeneous teardown inventory. The inventory preserves a checked manifest
@@ -426,8 +427,17 @@ limits and the artifact's execution capacity. Planning consumes one prepared
 request, checks the shared profile owner, and retains a fresh exact-context
 session plan. The caller can inspect its native demand and logits-storage plan
 before acquiring request storage; equal vocabulary width is not profile identity.
+`plan_generation` retains capacity one; `plan_generation_prefill` forwards an
+explicit maximum chunk size unchanged into that exact decoder session plan.
+The same plan supplies execution capacity and device demand, without resident-wide
+policy or implicit capacity reduction. The prepared text owner supplies the
+whole prompt followed by single-token continuation; the native adapter partitions
+each nonempty slice into borrowed chunks bounded by that plan. It checks
+cancellation before each chunk, releases every intermediate output before the
+next submission, and copies only the final logits row. Submitted chunks are not
+interrupted by cancellation.
 Explicit qualified execution delegates generation semantics to `text` and
-token execution to `decoders`, with per-token output release and per-use session
+token execution to `decoders`, with per-chunk output release and per-use session
 teardown. Unconfirmed cleanup withholds publication and retains typed custody.
 Resident abandonment is inert, not eviction; explicit close owns its teardown.
 This lower-level boundary does not bind scheduler leases to physical owners,

@@ -1535,7 +1535,10 @@ mod tests {
             &cancellation,
         );
 
-        assert!(matches!(result, Err(NativeTextDriverError::EmptyTokenBatch)));
+        assert!(matches!(
+            result,
+            Err(NativeTextDriverError::EmptyTokenBatch)
+        ));
         assert_eq!(driver.prefills, [vec![61, 62]]);
         assert!(driver.released.is_empty());
         assert_eq!(driver.unresolved_output, Some(62));
