@@ -6,9 +6,7 @@ use snafu::ResultExt;
 
 use super::{LayerState, Qwen35Execution, StagedExecution, reserve};
 use crate::Result;
-use crate::error::{
-    ArithmeticOverflowSnafu, ExecutionBatchSnafu, ExecutionCpuSnafu, ExecutionPagedKvSnafu,
-};
+use crate::error::{ExecutionBatchSnafu, ExecutionCpuSnafu, ExecutionPagedKvSnafu};
 use crate::qwen35_requirements::Qwen35BatchCpuRequirements;
 
 /// Opaque atomic plan for independently owned bounded CPU Qwen3.5 sessions.
@@ -17,6 +15,7 @@ use crate::qwen35_requirements::Qwen35BatchCpuRequirements;
 /// before staging, and consumes itself to publish every owner together. Equal
 /// artifact content is an admission relation only: it never aliases private
 /// recurrent state, K/V pools, or serialized backing.
+#[derive(Debug)]
 pub struct Qwen35BatchExecutionPlan<'execution, 'tokens> {
     executions: &'execution mut [Qwen35Execution],
     token_ids: &'tokens [&'tokens [u32]],
@@ -113,6 +112,7 @@ impl<'execution, 'tokens> Qwen35BatchExecutionPlan<'execution, 'tokens> {
     pub const fn packed_prefill_plan(&self) -> &PackedPrefillPlan {
         &self.packed
     }
+
     /// Execute and publish every independently staged session atomically.
     ///
     /// Returned vectors preserve input sequence order; each inner vector obeys
@@ -133,7 +133,7 @@ impl<'execution, 'tokens> Qwen35BatchExecutionPlan<'execution, 'tokens> {
         } = self;
         let sequence_count = packed.sequence_count();
         let mut pending = reserve("batch staged execution owners", sequence_count)?;
-        stage_batch(executions, token_ids, &packed, 0, &mut pending)?;
+        stage_batch(executions, token_ids, &packed, &mut pending)?;
 
         let mut prepared_owners = reserve("batch prepared execution owners", sequence_count)?;
         let mut prepared_commits = reserve("batch prepared cache commits", sequence_count)?;
@@ -161,47 +161,33 @@ fn stage_batch<'execution>(
     executions: &'execution mut [Qwen35Execution],
     token_ids: &[&[u32]],
     packed: &PackedPrefillPlan,
-    sequence: usize,
     pending: &mut Vec<PendingExecution<'execution>>,
 ) -> Result<()> {
-    match (executions.split_first_mut(), token_ids.split_first()) {
-        (None, None) => Ok(()),
-        (Some((execution, remaining_executions)), Some((tokens, remaining_tokens))) => {
-            let staged = execution.stage()?;
-            let (layers, position, paged_kv_pool) = (
-                &mut execution.layers,
-                &mut execution.position,
-                &mut execution.paged_kv_pool,
-            );
-            pending.push(PendingExecution::stage(
-                staged,
-                layers,
-                position,
-                paged_kv_pool,
-                tokens,
-                packed,
-                sequence,
-            )?);
-            let next_sequence = sequence.checked_add(1).ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "batch execution sequence index",
-                }
-                .build()
-            })?;
-            stage_batch(
-                remaining_executions,
-                remaining_tokens,
-                packed,
-                next_sequence,
-                pending,
-            )
-        }
-        _ => ExecutionBatchSnafu {
-            sequence,
+    if executions.len() != token_ids.len() {
+        return ExecutionBatchSnafu {
+            sequence: token_ids.len(),
             rule: "staged execution and token-input sequences must remain aligned",
         }
-        .fail(),
+        .fail();
     }
+    for (sequence, (execution, tokens)) in executions.iter_mut().zip(token_ids).enumerate() {
+        let staged = execution.stage()?;
+        let (layers, position, paged_kv_pool) = (
+            &mut execution.layers,
+            &mut execution.position,
+            &mut execution.paged_kv_pool,
+        );
+        pending.push(PendingExecution::stage(
+            staged,
+            layers,
+            position,
+            paged_kv_pool,
+            tokens,
+            packed,
+            sequence,
+        )?);
+    }
+    Ok(())
 }
 
 pub(super) struct PendingExecution<'execution> {
@@ -268,14 +254,14 @@ impl<'execution> PendingExecution<'execution> {
     }
 }
 
-struct PreparedExecution<'execution> {
+pub(super) struct PreparedExecution<'execution> {
     target_layers: &'execution mut Vec<LayerState>,
     target_position: &'execution mut usize,
     staged: StagedExecution,
 }
 
 impl PreparedExecution<'_> {
-    fn publish(self) {
+    pub(super) fn publish(self) {
         let Self {
             target_layers,
             target_position,
