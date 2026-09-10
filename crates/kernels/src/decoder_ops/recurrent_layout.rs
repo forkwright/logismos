@@ -1068,6 +1068,81 @@ mod tests {
     }
 
     #[test]
+    fn value_layout_validators_admit_t3_exact_spans_and_refuse_aliases()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let qk = RecurrentQkL2F32Plan::try_from_token_rows(3, 8, 2, 2, 1, 1e-5)?;
+        let plan = RecurrentValueLayoutF32Plan::try_from_qk_plan(qk, 2)?;
+        let mut convolved = [0.0_f32; 24];
+        let mut head_major = [0.0_f32; 12];
+        let mut token_major = [0.0_f32; 12];
+        validate_value_gather_launch(
+            plan,
+            convolved.as_ptr(),
+            convolved.len(),
+            head_major.as_mut_ptr(),
+            head_major.len(),
+        )?;
+        validate_compact_layout_launch(
+            plan,
+            head_major.as_ptr(),
+            head_major.len(),
+            token_major.as_mut_ptr(),
+            token_major.len(),
+        )?;
+        assert!(
+            validate_value_gather_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len() - 1,
+                head_major.as_mut_ptr(),
+                head_major.len(),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_value_gather_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len(),
+                head_major.as_mut_ptr(),
+                head_major.len() - 1,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_value_gather_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len(),
+                convolved.as_mut_ptr(),
+                head_major.len(),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_compact_layout_launch(
+                plan,
+                head_major.as_ptr(),
+                head_major.len(),
+                head_major.as_mut_ptr(),
+                token_major.len(),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_compact_layout_launch(
+                plan,
+                head_major.as_ptr(),
+                head_major.len(),
+                token_major.as_mut_ptr(),
+                token_major.len() - 1,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn l2_denominator_applies_epsilon_after_the_unweighted_root() -> Result<()> {
         let plan = RecurrentQkL2F32Plan::try_from_dimensions(5, 1, 1, 2, EPSILON)?;
         let convolved = [0.125_f32, 0.0, 0.0625, 0.0, 99.0];

@@ -1093,23 +1093,21 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            validate_causal_conv_step_launch_with_domain(
-                plan,
-                input.as_ptr(),
-                input.len(),
-                weights.as_ptr(),
-                weights.len(),
-                history_in.as_ptr(),
-                history_in.len(),
-                history_out.as_mut_ptr(),
-                history_out.len(),
-                output.as_mut_ptr(),
-                output.len(),
-                false,
-            )
-            .is_ok()
-        );
+        let dense_abi = validate_causal_conv_step_launch_with_domain(
+            plan,
+            input.as_ptr(),
+            input.len(),
+            weights.as_ptr(),
+            weights.len(),
+            history_in.as_ptr(),
+            history_in.len(),
+            history_out.as_mut_ptr(),
+            history_out.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            false,
+        )?;
+        assert_eq!(dense_abi.token_count, 3, "dense ABI must retain T=3");
         assert!(CausalConvAllocationPlan::try_from_dimensions(usize::MAX, 2, 2).is_err());
         Ok(())
     }

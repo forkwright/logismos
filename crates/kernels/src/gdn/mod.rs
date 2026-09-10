@@ -1736,30 +1736,28 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            validate_gdn_step_launch_with_domain(
-                plan,
-                q.as_ptr(),
-                q.len(),
-                k.as_ptr(),
-                k.len(),
-                v.as_ptr(),
-                v.len(),
-                beta.as_ptr(),
-                beta.len(),
-                g.as_ptr(),
-                g.len(),
-                1.0,
-                state_in.as_ptr(),
-                state_in.len(),
-                state_out.as_mut_ptr(),
-                state_out.len(),
-                output.as_mut_ptr(),
-                output.len(),
-                false,
-            )
-            .is_ok()
-        );
+        let dense_abi = validate_gdn_step_launch_with_domain(
+            plan,
+            q.as_ptr(),
+            q.len(),
+            k.as_ptr(),
+            k.len(),
+            v.as_ptr(),
+            v.len(),
+            beta.as_ptr(),
+            beta.len(),
+            g.as_ptr(),
+            g.len(),
+            1.0,
+            state_in.as_ptr(),
+            state_in.len(),
+            state_out.as_mut_ptr(),
+            state_out.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            false,
+        )?;
+        assert_eq!(dense_abi.token_count, 3, "dense ABI must retain T=3");
         assert!(
             MultiHeadRecurrentAllocationPlan::try_from_dimensions(usize::MAX, 1, 1, 2, 2).is_err()
         );
