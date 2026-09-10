@@ -75,6 +75,44 @@ struct NativeFixture {
 }
 
 #[derive(Clone, Copy)]
+struct CausalPrefillFixtureGeometry {
+    offset: usize,
+    tokens: usize,
+    query_heads: usize,
+    head_width: usize,
+}
+
+impl CausalPrefillFixtureGeometry {
+    fn final_visible_tokens(self) -> Result<usize, NativeReferenceError> {
+        self.offset
+            .checked_add(self.tokens)
+            .ok_or(NativeReferenceError::ArithmeticOverflow {
+                operation: "causal prefill fixture final visible tokens",
+            })
+    }
+
+    fn visible_tokens_for(self, token: usize) -> Result<usize, NativeReferenceError> {
+        if token >= self.tokens {
+            return Err(NativeReferenceError::Extent {
+                input: "causal prefill fixture token",
+                expected: self.tokens,
+                actual: token
+                    .checked_add(1)
+                    .ok_or(NativeReferenceError::ArithmeticOverflow {
+                        operation: "causal prefill fixture token extent",
+                    })?,
+            });
+        }
+        self.offset
+            .checked_add(token)
+            .and_then(|position| position.checked_add(1))
+            .ok_or(NativeReferenceError::ArithmeticOverflow {
+                operation: "causal prefill fixture visible tokens",
+            })
+    }
+}
+
+#[derive(Clone, Copy)]
 enum DotReduction {
     NativeTree,
     Sequential,
@@ -609,6 +647,179 @@ fn reserved_device_q1_paged_attention_matches_native_fixture()
         &expected,
         "reserved device output must match the independent logical fixture",
     )?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an explicitly reserved HIP device; absent devices are a failure"]
+fn reserved_device_prefill_causal_multiquery_matches_f64_future_leak_fixture()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hipcore::{Device, DeviceBuffer, Stream};
+
+    const TOKENS: usize = 2;
+    const PREFILL_QUERY_HEADS: usize = 2;
+    const PREFILL_KV_HEADS: usize = 1;
+    const PREFILL_HEAD_WIDTH: usize = 1;
+    const PREFILL_PHYSICAL_PAGES: usize = 3;
+
+    let device = Device::new(0)?;
+    let stream = Stream::new(&device)?;
+    for page_tokens in [8_usize, 16, 32] {
+        let geometry = CausalPrefillFixtureGeometry {
+            offset: page_tokens - 1,
+            tokens: TOKENS,
+            query_heads: PREFILL_QUERY_HEADS,
+            head_width: PREFILL_HEAD_WIDTH,
+        };
+        let final_visible_tokens = geometry.final_visible_tokens()?;
+        let packed = crate::PackedPrefillPlan::new(
+            &[geometry.tokens],
+            &[geometry.offset],
+            final_visible_tokens,
+        )?;
+        let logical = PagedPrefillPlan::try_from_packed_prefill(
+            &packed,
+            PREFILL_QUERY_HEADS,
+            PREFILL_KV_HEADS,
+            PREFILL_HEAD_WIDTH,
+        )?;
+        let native = NativePagedPrefillPlan::try_from_paged_prefill(
+            logical,
+            page_tokens,
+            PREFILL_PHYSICAL_PAGES,
+        )?;
+        assert_eq!(
+            native.logical().offset(),
+            geometry.offset,
+            "native B=1 prefill must retain the synthetic nonzero prefix"
+        );
+        assert_eq!(
+            native.visible_tokens(),
+            final_visible_tokens,
+            "native B=1 prefill must retain the synthetic final visible prefix"
+        );
+
+        let fixture_values = causal_prefill_future_leak_values(geometry)?;
+        let expected = causal_prefill_f64_oracle(geometry, &fixture_values)?;
+        let mut table = reserve("causal prefill page table", native.page_table_entries())?;
+        for logical_page in 0..native.page_table_entries() {
+            table.push(u32::try_from(logical_page)?);
+        }
+        let keys_host = vec![0.0_f32; native.key_value_elements()];
+        let mut values_host = vec![0.0_f32; native.key_value_elements()];
+        for (token, value) in fixture_values.iter().copied().enumerate() {
+            let logical_page = token / page_tokens;
+            let in_page_token = token % page_tokens;
+            let physical_page = usize::try_from(*table.get(logical_page).ok_or(
+                NativeReferenceError::Extent {
+                    input: "causal prefill page table",
+                    expected: logical_page.checked_add(1).ok_or(
+                        NativeReferenceError::ArithmeticOverflow {
+                            operation: "causal prefill page table extent",
+                        },
+                    )?,
+                    actual: table.len(),
+                },
+            )?)?;
+            let physical_token = physical_page
+                .checked_mul(page_tokens)
+                .and_then(|page_start| page_start.checked_add(in_page_token))
+                .ok_or(NativeReferenceError::ArithmeticOverflow {
+                    operation: "causal prefill physical token",
+                })?;
+            // This fixture has one KV head of width one, so a physical token
+            // is exactly one dense key/value element. The identity page table
+            // still exercises the final row on a second page for B=8/16/32.
+            assign(
+                &mut values_host,
+                physical_token,
+                value,
+                "causal prefill physical value",
+            )?;
+        }
+
+        let query_host = vec![0.0_f32; native.query_elements()];
+        let output_host = vec![0.0_f32; native.output_elements()];
+        let query = DeviceBuffer::from_host(&device, &query_host)?;
+        let keys = DeviceBuffer::from_host(&device, &keys_host)?;
+        let values = DeviceBuffer::from_host(&device, &values_host)?;
+        let page_table = DeviceBuffer::from_host(&device, &table)?;
+        let output = DeviceBuffer::from_host(&device, &output_host)?;
+        let status = crate::numerical_status::NativeNumericalStatus::new(&device)?;
+        // SAFETY: each device buffer has the descriptor's admitted active
+        // extent, the output is separate, and the synthetic page table maps
+        // only initialized physical rows for the full stream lifetime.
+        unsafe {
+            launch_paged_prefill_b1_f32_checked(
+                native,
+                query.as_device_ptr(),
+                query.len(),
+                keys.as_device_ptr(),
+                keys.len(),
+                values.as_device_ptr(),
+                values.len(),
+                page_table.as_device_ptr(),
+                page_table.len(),
+                output.as_device_ptr(),
+                output.len(),
+                &stream,
+                &status,
+            )?;
+        }
+        stream.synchronize()?;
+        status.read_after_synchronization()?;
+        let mut actual = vec![0.0_f32; output.len()];
+        output.copy_to_host(&mut actual)?;
+        assert_close_to_f64(
+            &actual,
+            &expected,
+            "causal multiquery device output must match the independent f64 fixture",
+        )?;
+
+        let first_expected = expected
+            .first()
+            .copied()
+            .ok_or(NativeReferenceError::Extent {
+                input: "causal prefill expected output",
+                expected: 1,
+                actual: expected.len(),
+            })?;
+        let first_actual = actual
+            .first()
+            .copied()
+            .ok_or(NativeReferenceError::Extent {
+                input: "causal prefill device output",
+                expected: 1,
+                actual: actual.len(),
+            })?;
+        assert!(
+            relative_eq!(
+                first_actual,
+                first_expected
+                    .to_f32()
+                    .ok_or(NativeReferenceError::F32Narrowing {
+                        input: "causal prefill first expected output",
+                        index: 0,
+                    })?,
+                epsilon = WELL_CONDITIONED_EPSILON
+            ),
+            "the first causal row must retain its known prefix endpoint"
+        );
+        let future_leaking_mean = causal_prefill_f64_mean(&fixture_values, final_visible_tokens)?;
+        assert!(
+            !relative_eq!(
+                first_actual,
+                future_leaking_mean
+                    .to_f32()
+                    .ok_or(NativeReferenceError::F32Narrowing {
+                        input: "causal prefill future-leaking output",
+                        index: 0,
+                    })?,
+                epsilon = WELL_CONDITIONED_EPSILON
+            ),
+            "the first causal row must not read the staged future chunk row"
+        );
+    }
     Ok(())
 }
 
@@ -1443,6 +1654,62 @@ fn query_reusing_head_zero(fixture: &NativeFixture) -> Result<Vec<f32>, NativeRe
             })?;
     destination.copy_from_slice(&source);
     Ok(wrong_query)
+}
+
+fn causal_prefill_future_leak_values(
+    geometry: CausalPrefillFixtureGeometry,
+) -> Result<Vec<f32>, NativeReferenceError> {
+    let final_visible_tokens = geometry.final_visible_tokens()?;
+    let mut values = reserve("causal prefill future-leak values", final_visible_tokens)?;
+    for position in 0..final_visible_tokens {
+        // The final staged row is deliberately dominant. If the first query
+        // sees it, its uniform zero-score average changes by orders of
+        // magnitude instead of remaining the known prefix endpoint.
+        let value = if position.checked_add(1) == Some(final_visible_tokens) {
+            4096.0
+        } else {
+            checked_f32("causal prefill prefix value", position)? + 1.0
+        };
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn causal_prefill_f64_oracle(
+    geometry: CausalPrefillFixtureGeometry,
+    values: &[f32],
+) -> Result<Vec<f64>, NativeReferenceError> {
+    let per_token = geometry
+        .query_heads
+        .checked_mul(geometry.head_width)
+        .ok_or(NativeReferenceError::ArithmeticOverflow {
+            operation: "causal prefill oracle token output",
+        })?;
+    let output_elements =
+        geometry
+            .tokens
+            .checked_mul(per_token)
+            .ok_or(NativeReferenceError::ArithmeticOverflow {
+                operation: "causal prefill oracle output",
+            })?;
+    let mut output = reserve("causal prefill f64 oracle output", output_elements)?;
+    for token in 0..geometry.tokens {
+        let mean = causal_prefill_f64_mean(values, geometry.visible_tokens_for(token)?)?;
+        for _ in 0..per_token {
+            output.push(mean);
+        }
+    }
+    Ok(output)
+}
+
+fn causal_prefill_f64_mean(values: &[f32], visible: usize) -> Result<f64, NativeReferenceError> {
+    let prefix = values.get(..visible).ok_or(NativeReferenceError::Extent {
+        input: "causal prefill f64 values",
+        expected: visible,
+        actual: values.len(),
+    })?;
+    let sum = prefix.iter().copied().map(f64::from).sum::<f64>();
+    Ok(sum / checked_f64("causal prefill f64 visible tokens", visible)?)
 }
 
 fn assert_close_to_f64(
