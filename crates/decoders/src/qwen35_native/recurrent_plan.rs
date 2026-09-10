@@ -11,11 +11,10 @@ use crate::error::{
 };
 use crate::qwen35::recurrent_layernorm_rms_epsilon;
 use crate::qwen35_recurrent::{ExecutionLayout, RecurrentTensorRole, recurrent_tensor_name};
-#[cfg(test)]
 use kernels::PackedPrefillPlan;
 
 /// One verified matrix descriptor used by a native recurrent block.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct RecurrentProjectionWeights {
     pub(super) qkv: ProjectionWeight,
     pub(super) gate: ProjectionWeight,
@@ -25,7 +24,7 @@ pub(super) struct RecurrentProjectionWeights {
 }
 
 /// One verified F32 descriptor used by a native recurrent block.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct RecurrentF32Parameters {
     pub(super) attention_norm: F32Parameter,
     pub(super) a: F32Parameter,
@@ -111,16 +110,12 @@ impl DeviceRecurrentPlan {
         Self::from_token_count(weights, block, 1)
     }
 
-    /// Bind one test-only single-sequence packed recurrent chunk to native descriptors.
+    /// Bind one single-sequence packed recurrent chunk to native descriptors.
     ///
     /// The packed descriptor remains borrowed at this boundary: its existing
     /// context admission is consumed as geometry, never copied into model
     /// position, grant, or publication state.
     ///
-    /// The production native model has no chunk entrypoint yet. Keeping this
-    /// constructor test-only makes that absence explicit while letting the
-    /// reserved-device witness exercise the private block body.
-    #[cfg(test)]
     pub(super) fn from_packed_prefill(
         weights: &Qwen35Weights,
         block: usize,
@@ -133,6 +128,37 @@ impl DeviceRecurrentPlan {
             .fail();
         }
         Self::from_token_count(weights, block, packed.total_tokens())
+    }
+
+    pub(super) fn active(&self, token_count: usize) -> Result<Self> {
+        let convolution = kernels::CausalConvAllocationPlan::try_from_dimensions(
+            token_count,
+            self.layout.convolution_width(),
+            self.layout.convolution_kernel(),
+        )
+        .context(RecurrentConvolutionSnafu)?;
+        let recurrence = kernels::MultiHeadRecurrentAllocationPlan::try_from_dimensions(
+            token_count,
+            self.layout.value_head_count(),
+            self.layout.value_head_count(),
+            self.layout.key_dim(),
+            self.layout.value_dim(),
+        )
+        .context(RecurrentGdnSnafu)?;
+        Ok(Self {
+            layout: self.layout,
+            matrices: self.matrices.clone(),
+            parameters: self.parameters.clone(),
+            workspace: RecurrentWorkspacePlan::from_layout(
+                self.layout,
+                token_count,
+                convolution,
+                recurrence,
+            )?,
+            convolution,
+            recurrence,
+            weight_bytes: self.weight_bytes,
+        })
     }
 
     fn from_token_count(weights: &Qwen35Weights, block: usize, token_count: usize) -> Result<Self> {

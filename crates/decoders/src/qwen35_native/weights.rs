@@ -4,6 +4,7 @@ use hipcore::{Device, DeviceBuffer, Stream};
 use snafu::ResultExt;
 
 use super::custody::{NativeBufferSink, NativeBuildResult, NativeBuildScope, NativeBuildSource};
+use super::resources::NativeBufferView;
 use crate::error::{NativeDeviceSnafu, NativeKernelSnafu, NativeSessionStateSnafu};
 use crate::qwen35_execution::read_f32;
 use crate::qwen35_native::finish::LayerFinishWeights;
@@ -155,6 +156,45 @@ impl NativeMatrix {
                 input.as_device_ptr().cast_const(),
                 input.len(),
                 output.as_device_ptr(),
+                output.len(),
+                stream,
+                numerical_status,
+            )
+        }
+        .context(NativeKernelSnafu)
+    }
+
+    /// Launch a checked projection over exact active windows of capacity-owned rows.
+    ///
+    /// # Safety
+    ///
+    /// The views must be distinct device spans on `stream`'s device, and the
+    /// sticky status allocation must remain live through completion.
+    pub(super) unsafe fn launch_rows_view(
+        &self,
+        input: NativeBufferView<'_, f32>,
+        output: NativeBufferView<'_, f32>,
+        token_count: usize,
+        stream: &Stream,
+        numerical_status: &kernels::numerical_status::NativeNumericalStatus,
+    ) -> Result<()> {
+        let batch = kernels::row_gemv::RowGemvBatchPlan::try_from_shape(
+            self.shape,
+            token_count,
+            input.len(),
+            output.len(),
+        )
+        .context(NativeKernelSnafu)?;
+        // SAFETY: the caller retains the exact checked device spans and status
+        // allocation through completion for the matrix shape bound above.
+        unsafe {
+            kernels::row_gemv::launch_row_gemv_f32_rows_checked(
+                batch,
+                self.bytes.as_device_ptr(),
+                self.bytes.len(),
+                input.as_const_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
                 output.len(),
                 stream,
                 numerical_status,

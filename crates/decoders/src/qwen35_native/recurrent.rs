@@ -8,11 +8,12 @@ use snafu::ResultExt;
 use super::custody::{
     NativeBufferSink, NativeBuildGuard, NativeBuildResult, NativeBuildScope, NativeBuildSource,
 };
-use super::dispatch::{launch_rms_norm, launch_silu_mul};
+use super::dispatch::{launch_rms_norm_view, launch_silu_mul_view};
 use super::finish::{
     DeferredLayerFinish, LayerFinishPlan, LayerFinishWeights, LayerFinishWorkspace,
 };
 use super::recurrent_plan::{DeviceRecurrentPlan, RecurrentWorkspacePlan};
+use super::resources::NativeBufferView;
 use super::weights::{NativeMatrix, f32_parameter_buffer};
 use crate::error::{NativeDeviceSnafu, NativeKernelSnafu};
 use crate::{Qwen35Weights, Result};
@@ -52,6 +53,27 @@ pub(super) struct NativeRecurrentWorkspace {
     pub(super) projected_attention: DeviceBuffer<f32>,
 }
 
+/// Exact active recurrent scratch borrowed from capacity-owned workspace.
+pub(super) struct NativeRecurrentWorkspaceViews<'resources> {
+    normalized_hidden: NativeBufferView<'resources, f32>,
+    qkv: NativeBufferView<'resources, f32>,
+    z: NativeBufferView<'resources, f32>,
+    alpha: NativeBufferView<'resources, f32>,
+    beta_projection: NativeBufferView<'resources, f32>,
+    raw_convolution: NativeBufferView<'resources, f32>,
+    activated_convolution: NativeBufferView<'resources, f32>,
+    tiled_query: NativeBufferView<'resources, f32>,
+    tiled_key: NativeBufferView<'resources, f32>,
+    value_head_major: NativeBufferView<'resources, f32>,
+    beta: NativeBufferView<'resources, f32>,
+    log_decay: NativeBufferView<'resources, f32>,
+    recurrence_output: NativeBufferView<'resources, f32>,
+    token_major_recurrence_output: NativeBufferView<'resources, f32>,
+    normalized_output: NativeBufferView<'resources, f32>,
+    gated_output: NativeBufferView<'resources, f32>,
+    projected_attention: NativeBufferView<'resources, f32>,
+}
+
 /// Per-layer committed and staged recurrent state.
 ///
 /// A width-one convolution has no history footprint, so its two history
@@ -67,10 +89,10 @@ pub(super) struct NativeRecurrentState {
 pub(super) struct DeferredRecurrent<'resources> {
     pub(super) plan: &'resources DeviceRecurrentPlan,
     pub(super) weights: &'resources NativeRecurrentWeights,
-    pub(super) workspace: &'resources NativeRecurrentWorkspace,
+    pub(super) workspace: NativeRecurrentWorkspaceViews<'resources>,
     pub(super) state: &'resources NativeRecurrentState,
-    pub(super) input: &'resources DeviceBuffer<f32>,
-    pub(super) output: &'resources DeviceBuffer<f32>,
+    pub(super) input: NativeBufferView<'resources, f32>,
+    pub(super) output: NativeBufferView<'resources, f32>,
     pub(super) finish_plan: &'resources LayerFinishPlan,
     pub(super) finish_weights: &'resources LayerFinishWeights,
     pub(super) finish_workspace: &'resources LayerFinishWorkspace,
@@ -194,6 +216,31 @@ impl NativeRecurrentWorkspace {
         sink.push_f32(self.gated_output);
         sink.push_f32(self.projected_attention);
     }
+
+    pub(super) fn active(
+        &self,
+        plan: RecurrentWorkspacePlan,
+    ) -> Result<NativeRecurrentWorkspaceViews<'_>> {
+        Ok(NativeRecurrentWorkspaceViews {
+            normalized_hidden: NativeBufferView::prefix(&self.normalized_hidden, plan.normalized_hidden)?,
+            qkv: NativeBufferView::prefix(&self.qkv, plan.qkv)?,
+            z: NativeBufferView::prefix(&self.z, plan.z)?,
+            alpha: NativeBufferView::prefix(&self.alpha, plan.alpha)?,
+            beta_projection: NativeBufferView::prefix(&self.beta_projection, plan.beta_projection)?,
+            raw_convolution: NativeBufferView::prefix(&self.raw_convolution, plan.raw_convolution)?,
+            activated_convolution: NativeBufferView::prefix(&self.activated_convolution, plan.activated_convolution)?,
+            tiled_query: NativeBufferView::prefix(&self.tiled_query, plan.tiled_query)?,
+            tiled_key: NativeBufferView::prefix(&self.tiled_key, plan.tiled_key)?,
+            value_head_major: NativeBufferView::prefix(&self.value_head_major, plan.value_head_major)?,
+            beta: NativeBufferView::prefix(&self.beta, plan.beta)?,
+            log_decay: NativeBufferView::prefix(&self.log_decay, plan.log_decay)?,
+            recurrence_output: NativeBufferView::prefix(&self.recurrence_output, plan.recurrence_output)?,
+            token_major_recurrence_output: NativeBufferView::prefix(&self.token_major_recurrence_output, plan.token_major_recurrence_output)?,
+            normalized_output: NativeBufferView::prefix(&self.normalized_output, plan.normalized_output)?,
+            gated_output: NativeBufferView::prefix(&self.gated_output, plan.gated_output)?,
+            projected_attention: NativeBufferView::prefix(&self.projected_attention, plan.projected_attention)?,
+        })
+    }
 }
 
 impl NativeRecurrentState {
@@ -278,11 +325,14 @@ impl DeferredRecurrent<'_> {
         // SAFETY: submit's contract retains the exact input, norm, and output
         // spans, and the checked plan fixes their geometry.
         unsafe {
-            launch_rms_norm(
+            launch_rms_norm_view(
                 self.plan.workspace.input_norm,
                 self.input,
-                &self.weights.attention_norm,
-                &self.workspace.normalized_hidden,
+                NativeBufferView::prefix(
+                    &self.weights.attention_norm,
+                    self.weights.attention_norm.len(),
+                )?,
+                self.workspace.normalized_hidden,
                 self.stream,
                 self.numerical_status,
             )
@@ -290,9 +340,9 @@ impl DeferredRecurrent<'_> {
         // SAFETY: each verified matrix binds its exact distinct input/output
         // span; all buffers remain owned by the deferred model resource.
         unsafe {
-            self.weights.qkv.launch_rows(
-                &self.workspace.normalized_hidden,
-                &self.workspace.qkv,
+            self.weights.qkv.launch_rows_view(
+                self.workspace.normalized_hidden,
+                self.workspace.qkv,
                 self.plan.recurrence.token_count(),
                 self.stream,
                 self.numerical_status,
@@ -300,9 +350,9 @@ impl DeferredRecurrent<'_> {
         }?;
         // SAFETY: each remaining projection has its own exact output span.
         unsafe {
-            self.weights.gate.launch_rows(
-                &self.workspace.normalized_hidden,
-                &self.workspace.z,
+            self.weights.gate.launch_rows_view(
+                self.workspace.normalized_hidden,
+                self.workspace.z,
                 self.plan.recurrence.token_count(),
                 self.stream,
                 self.numerical_status,
@@ -310,9 +360,9 @@ impl DeferredRecurrent<'_> {
         }?;
         // SAFETY: alpha and beta outputs are distinct exact workspace spans.
         unsafe {
-            self.weights.alpha.launch_rows(
-                &self.workspace.normalized_hidden,
-                &self.workspace.alpha,
+            self.weights.alpha.launch_rows_view(
+                self.workspace.normalized_hidden,
+                self.workspace.alpha,
                 self.plan.recurrence.token_count(),
                 self.stream,
                 self.numerical_status,
@@ -320,9 +370,9 @@ impl DeferredRecurrent<'_> {
         }?;
         // SAFETY: beta projection output remains distinct through completion.
         unsafe {
-            self.weights.beta.launch_rows(
-                &self.workspace.normalized_hidden,
-                &self.workspace.beta_projection,
+            self.weights.beta.launch_rows_view(
+                self.workspace.normalized_hidden,
+                self.workspace.beta_projection,
                 self.plan.recurrence.token_count(),
                 self.stream,
                 self.numerical_status,
@@ -338,9 +388,9 @@ impl DeferredRecurrent<'_> {
         unsafe {
             kernels::decoder_ops::silu_checked(
                 self.plan.workspace.convolution_silu,
-                self.workspace.raw_convolution.as_device_ptr().cast_const(),
+                self.workspace.raw_convolution.as_const_ptr(),
                 self.workspace.raw_convolution.len(),
-                self.workspace.activated_convolution.as_device_ptr(),
+                self.workspace.activated_convolution.as_mut_ptr(),
                 self.workspace.activated_convolution.len(),
                 self.stream,
                 self.numerical_status,
@@ -353,12 +403,11 @@ impl DeferredRecurrent<'_> {
                 self.plan.workspace.qk_l2,
                 self.workspace
                     .activated_convolution
-                    .as_device_ptr()
-                    .cast_const(),
+                    .as_const_ptr(),
                 self.workspace.activated_convolution.len(),
-                self.workspace.tiled_query.as_device_ptr(),
+                self.workspace.tiled_query.as_mut_ptr(),
                 self.workspace.tiled_query.len(),
-                self.workspace.tiled_key.as_device_ptr(),
+                self.workspace.tiled_key.as_mut_ptr(),
                 self.workspace.tiled_key.len(),
                 self.stream,
                 self.numerical_status,
@@ -372,10 +421,9 @@ impl DeferredRecurrent<'_> {
                 self.plan.workspace.value_layout,
                 self.workspace
                     .activated_convolution
-                    .as_device_ptr()
-                    .cast_const(),
+                    .as_const_ptr(),
                 self.workspace.activated_convolution.len(),
-                self.workspace.value_head_major.as_device_ptr(),
+                self.workspace.value_head_major.as_mut_ptr(),
                 self.workspace.value_head_major.len(),
                 self.stream,
                 self.numerical_status,
@@ -390,17 +438,17 @@ impl DeferredRecurrent<'_> {
         unsafe {
             kernels::decoder_ops::launch_recurrent_scalars_f32_checked(
                 self.plan.workspace.scalars,
-                self.workspace.alpha.as_device_ptr().cast_const(),
+                self.workspace.alpha.as_const_ptr(),
                 self.workspace.alpha.len(),
                 self.weights.dt.as_device_ptr().cast_const(),
                 self.weights.dt.len(),
                 self.weights.a.as_device_ptr().cast_const(),
                 self.weights.a.len(),
-                self.workspace.beta_projection.as_device_ptr().cast_const(),
+                self.workspace.beta_projection.as_const_ptr(),
                 self.workspace.beta_projection.len(),
-                self.workspace.beta.as_device_ptr(),
+                self.workspace.beta.as_mut_ptr(),
                 self.workspace.beta.len(),
-                self.workspace.log_decay.as_device_ptr(),
+                self.workspace.log_decay.as_mut_ptr(),
                 self.workspace.log_decay.len(),
                 self.stream,
                 self.numerical_status,
@@ -420,10 +468,9 @@ impl DeferredRecurrent<'_> {
                 self.plan.workspace.value_layout,
                 self.workspace
                     .recurrence_output
-                    .as_device_ptr()
-                    .cast_const(),
+                    .as_const_ptr(),
                 self.workspace.recurrence_output.len(),
-                self.workspace.token_major_recurrence_output.as_device_ptr(),
+                self.workspace.token_major_recurrence_output.as_mut_ptr(),
                 self.workspace.token_major_recurrence_output.len(),
                 self.stream,
                 self.numerical_status,
@@ -432,11 +479,11 @@ impl DeferredRecurrent<'_> {
         .context(NativeKernelSnafu)?;
         // SAFETY: each output head is an exact separate RMSNorm row.
         unsafe {
-            launch_rms_norm(
+            launch_rms_norm_view(
                 self.plan.workspace.output_norm,
-                &self.workspace.token_major_recurrence_output,
-                &self.weights.output_norm,
-                &self.workspace.normalized_output,
+                self.workspace.token_major_recurrence_output,
+                NativeBufferView::prefix(&self.weights.output_norm, self.weights.output_norm.len())?,
+                self.workspace.normalized_output,
                 self.stream,
                 self.numerical_status,
             )
@@ -444,20 +491,20 @@ impl DeferredRecurrent<'_> {
         // SAFETY: normalized recurrence output and Z are immutable distinct
         // inputs; gated_output is a separate owned exact span.
         unsafe {
-            launch_silu_mul(
+            launch_silu_mul_view(
                 self.plan.workspace.output_silu_product,
-                &self.workspace.z,
-                &self.workspace.normalized_output,
-                &self.workspace.gated_output,
+                self.workspace.z,
+                self.workspace.normalized_output,
+                self.workspace.gated_output,
                 self.stream,
                 self.numerical_status,
             )
         }?;
         // SAFETY: the checked output projection and its spans remain live.
         unsafe {
-            self.weights.output.launch_rows(
-                &self.workspace.gated_output,
-                &self.workspace.projected_attention,
+            self.weights.output.launch_rows_view(
+                self.workspace.gated_output,
+                self.workspace.projected_attention,
                 self.plan.recurrence.token_count(),
                 self.stream,
                 self.numerical_status,
@@ -465,11 +512,11 @@ impl DeferredRecurrent<'_> {
         }?;
         let finish = DeferredLayerFinish {
             input: self.input,
-            attention_projection: &self.workspace.projected_attention,
+            attention_projection: self.workspace.projected_attention,
             output: self.output,
             plan: self.finish_plan,
             weights: self.finish_weights,
-            workspace: self.finish_workspace,
+            workspace: self.finish_workspace.active(self.finish_plan.workspace)?,
             stream: self.stream,
             numerical_status: self.numerical_status,
         };
@@ -494,7 +541,7 @@ impl DeferredRecurrent<'_> {
         unsafe {
             kernels::causal_conv::launch_causal_conv_fwd_f32_checked(
                 self.plan.convolution,
-                self.workspace.qkv.as_device_ptr().cast_const(),
+                self.workspace.qkv.as_const_ptr(),
                 self.workspace.qkv.len(),
                 self.weights.convolution.as_device_ptr().cast_const(),
                 self.weights.convolution.len(),
@@ -502,7 +549,7 @@ impl DeferredRecurrent<'_> {
                 self.plan.convolution_history_elements(),
                 history_out,
                 self.plan.convolution_history_elements(),
-                self.workspace.raw_convolution.as_device_ptr(),
+                self.workspace.raw_convolution.as_mut_ptr(),
                 self.workspace.raw_convolution.len(),
                 self.stream,
                 self.numerical_status,
@@ -517,15 +564,15 @@ impl DeferredRecurrent<'_> {
         unsafe {
             kernels::gdn::launch_multi_head_recurrent_fwd_f32_checked(
                 self.plan.recurrence,
-                self.workspace.tiled_query.as_device_ptr().cast_const(),
+                self.workspace.tiled_query.as_const_ptr(),
                 self.workspace.tiled_query.len(),
-                self.workspace.tiled_key.as_device_ptr().cast_const(),
+                self.workspace.tiled_key.as_const_ptr(),
                 self.workspace.tiled_key.len(),
-                self.workspace.value_head_major.as_device_ptr().cast_const(),
+                self.workspace.value_head_major.as_const_ptr(),
                 self.workspace.value_head_major.len(),
-                self.workspace.beta.as_device_ptr().cast_const(),
+                self.workspace.beta.as_const_ptr(),
                 self.workspace.beta.len(),
-                self.workspace.log_decay.as_device_ptr().cast_const(),
+                self.workspace.log_decay.as_const_ptr(),
                 self.workspace.log_decay.len(),
                 self.plan.layout.gdn_scale(),
                 self.state
@@ -535,7 +582,7 @@ impl DeferredRecurrent<'_> {
                 self.state.committed_recurrent_state.len(),
                 self.state.staged_recurrent_state.as_device_ptr(),
                 self.state.staged_recurrent_state.len(),
-                self.workspace.recurrence_output.as_device_ptr(),
+                self.workspace.recurrence_output.as_mut_ptr(),
                 self.workspace.recurrence_output.len(),
                 self.stream,
                 self.numerical_status,
@@ -740,10 +787,15 @@ mod tests {
         let deferred = DeferredRecurrent {
             plan: &plan,
             weights: &resources.native_weights,
-            workspace: &resources.recurrent_workspace,
+            workspace: resources
+                .recurrent_workspace
+                .active(plan.workspace)
+                .map_err(|error| error.to_string())?,
             state: &resources.state,
-            input: &resources.input,
-            output: &resources.output,
+            input: NativeBufferView::prefix(&resources.input, hidden.len())
+                .map_err(|error| error.to_string())?,
+            output: NativeBufferView::prefix(&resources.output, hidden.len())
+                .map_err(|error| error.to_string())?,
             finish_plan: &finish,
             finish_weights: &resources.finish_weights,
             finish_workspace: &resources.finish_workspace,

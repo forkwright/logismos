@@ -45,14 +45,14 @@ pub(super) struct WorkspacePlan {
     pub(super) gated: usize,
     pub(super) output_projection: usize,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct ProjectionWeight {
     pub(super) name: String,
     pub(super) shape: kernels::row_gemv::RowGemvShape,
     pub(super) serialized_bytes: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct AttentionProjectionWeights {
     pub(super) q_gate: ProjectionWeight,
     pub(super) key: ProjectionWeight,
@@ -60,14 +60,14 @@ pub(super) struct AttentionProjectionWeights {
     pub(super) output: ProjectionWeight,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct F32Parameter {
     pub(super) name: String,
     pub(super) dimensions: Vec<u64>,
     pub(super) elements: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct AttentionNormalizationWeights {
     pub(super) input: F32Parameter,
     pub(super) query: F32Parameter,
@@ -131,8 +131,18 @@ impl DeviceFullAttentionPlan {
         max_context: usize,
         page_tokens: kernels::attention::NativePageTokens,
     ) -> Result<Self> {
+        Self::from_weights_rows(weights, block, max_context, page_tokens, 1)
+    }
+
+    pub(super) fn from_weights_rows(
+        weights: &Qwen35Weights,
+        block: usize,
+        max_context: usize,
+        page_tokens: kernels::attention::NativePageTokens,
+        token_count: usize,
+    ) -> Result<Self> {
         let layout = Layout::from_metadata(weights, max_context)?;
-        Self::from_layout(weights, layout, block, page_tokens)
+        Self::from_layout_rows(weights, layout, block, page_tokens, token_count)
     }
 
     pub(super) fn from_layout(
@@ -140,6 +150,16 @@ impl DeviceFullAttentionPlan {
         layout: Layout,
         block: usize,
         page_tokens: kernels::attention::NativePageTokens,
+    ) -> Result<Self> {
+        Self::from_layout_rows(weights, layout, block, page_tokens, 1)
+    }
+
+    pub(super) fn from_layout_rows(
+        weights: &Qwen35Weights,
+        layout: Layout,
+        block: usize,
+        page_tokens: kernels::attention::NativePageTokens,
+        token_count: usize,
     ) -> Result<Self> {
         if !layout.is_admitted_full_block(block) {
             return NativeSessionStateSnafu {
@@ -149,8 +169,8 @@ impl DeviceFullAttentionPlan {
         }
         let matrices = AttentionProjectionWeights::from_weights(weights, block)?;
         let norms = AttentionNormalizationWeights::from_weights(weights, layout, block)?;
-        let workspace = WorkspacePlan::from_layout(layout)?;
-        let finish = LayerFinishPlan::from_weights(weights, layout, block)?;
+        let workspace = WorkspacePlan::from_layout_rows(layout, token_count)?;
+        let finish = LayerFinishPlan::from_weights_rows(weights, layout, block, token_count)?;
         let kv = NativePagedKvPlan::try_from_geometry(
             PagedKvGeometry {
                 layers: 1,
@@ -176,8 +196,8 @@ impl DeviceFullAttentionPlan {
                 ],
                 "native scratch bytes",
             )?,
-            input: elements_bytes(layout.hidden, f32_bytes, "native input bytes")?,
-            output: elements_bytes(layout.hidden, f32_bytes, "native output bytes")?,
+            input: elements_bytes(workspace.hidden, f32_bytes, "native input bytes")?,
+            output: elements_bytes(workspace.hidden, f32_bytes, "native output bytes")?,
             controls: elements_bytes(
                 workspace.coefficient_elements()?,
                 f32_bytes,
@@ -212,6 +232,14 @@ impl DeviceFullAttentionPlan {
             kv,
             bytes,
         })
+    }
+
+    pub(super) fn active_workspace(&self, token_count: usize) -> Result<WorkspacePlan> {
+        WorkspacePlan::from_layout_rows(self.layout, token_count)
+    }
+
+    pub(super) fn active_finish(&self, token_count: usize) -> Result<LayerFinishPlan> {
+        self.finish.active(self.layout, token_count)
     }
 }
 
@@ -308,20 +336,38 @@ pub(super) fn f32_parameter(
 
 impl WorkspacePlan {
     fn from_layout(layout: Layout) -> Result<Self> {
+        Self::from_layout_rows(layout, 1)
+    }
+
+    pub(super) fn from_layout_rows(layout: Layout, token_count: usize) -> Result<Self> {
         let hidden_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(
-            1,
+            token_count,
             layout.hidden,
             layout.epsilon(),
         )
         .context(NativeKernelSnafu)?;
         let query_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(
-            layout.heads,
+            token_count
+                .checked_mul(layout.heads)
+                .ok_or_else(|| {
+                    ArithmeticOverflowSnafu {
+                        context: "native full-attention query-normalization rows",
+                    }
+                    .build()
+                })?,
             layout.key,
             layout.epsilon(),
         )
         .context(NativeKernelSnafu)?;
         let key_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(
-            layout.kv_heads,
+            token_count
+                .checked_mul(layout.kv_heads)
+                .ok_or_else(|| {
+                    ArithmeticOverflowSnafu {
+                        context: "native full-attention key-normalization rows",
+                    }
+                    .build()
+                })?,
             layout.key,
             layout.epsilon(),
         )
@@ -338,11 +384,25 @@ impl WorkspacePlan {
             layout.text_mrope().rotary_width(),
         )
         .context(NativeKernelSnafu)?;
-        let split =
-            kernels::decoder_ops::SplitQGateF32Plan::try_from_dimensions(layout.heads, layout.key)
-                .context(NativeKernelSnafu)?;
-        let gate = kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(layout.query_width)
-            .context(NativeKernelSnafu)?;
+        let split = kernels::decoder_ops::SplitQGateF32Plan::try_from_dimensions(
+            token_count.checked_mul(layout.heads).ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "native full-attention split rows",
+                }
+                .build()
+            })?,
+            layout.key,
+        )
+        .context(NativeKernelSnafu)?;
+        let gate = kernels::decoder_ops::ElementwiseF32Plan::try_from_elements(
+            token_count.checked_mul(layout.query_width).ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "native full-attention gated query elements",
+                }
+                .build()
+            })?,
+        )
+        .context(NativeKernelSnafu)?;
         Ok(Self {
             hidden_norm,
             query_norm,
@@ -351,17 +411,27 @@ impl WorkspacePlan {
             key_rotary,
             split,
             gate,
-            hidden: layout.hidden,
+            hidden: hidden_norm.elements(),
             q_gate: split.input_elements(),
             query: split.output_elements(),
             gate_values: split.output_elements(),
             normalized_query: query_norm.elements(),
-            key: layout.kv_width,
+            key: token_count.checked_mul(layout.kv_width).ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "native full-attention key elements",
+                }
+                .build()
+            })?,
             normalized_key: key_norm.elements(),
-            value: layout.kv_width,
+            value: token_count.checked_mul(layout.kv_width).ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "native full-attention value elements",
+                }
+                .build()
+            })?,
             attention: gate.elements(),
             gated: gate.elements(),
-            output_projection: layout.hidden,
+            output_projection: hidden_norm.elements(),
         })
     }
 
@@ -387,6 +457,13 @@ impl WorkspacePlan {
     pub(super) fn coefficient_elements(self) -> Result<usize> {
         self.query_rotary
             .coefficient_elements()
+            .checked_mul(self.hidden_norm.rows())
+            .ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "native mRoPE token-major coefficient rows",
+                }
+                .build()
+            })?
             .checked_mul(2)
             .ok_or_else(|| {
                 ArithmeticOverflowSnafu {
@@ -413,4 +490,49 @@ pub(super) fn sum(values: &[usize], context: &'static str) -> Result<usize> {
             .checked_add(*value)
             .ok_or_else(|| ArithmeticOverflowSnafu { context }.build())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkspacePlan;
+    use crate::qwen35::tests::{canonical_hybrid_fixture, verify_fixture};
+    use crate::qwen35_execution::Layout;
+    use crate::Qwen35Weights;
+
+    #[test]
+    fn full_attention_rows_own_token_major_active_geometry() -> core::result::Result<(), String> {
+        let artifact = verify_fixture(&canonical_hybrid_fixture()?)?;
+        let weights = Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let layout = Layout::from_metadata(&weights, 4).map_err(|error| error.to_string())?;
+        let capacity = WorkspacePlan::from_layout_rows(layout, 3).map_err(|error| error.to_string())?;
+        let active = WorkspacePlan::from_layout_rows(layout, 2).map_err(|error| error.to_string())?;
+
+        assert_eq!(capacity.hidden_norm.rows(), 3);
+        assert_eq!(active.hidden_norm.rows(), 2);
+        assert_eq!(active.hidden, 2 * layout.hidden);
+        assert_eq!(active.query_norm.rows(), 2 * layout.heads);
+        assert_eq!(active.key_norm.rows(), 2 * layout.kv_heads);
+        assert_eq!(active.split.heads(), 2 * layout.heads);
+        assert_eq!(active.attention, 2 * layout.query_width);
+        assert_eq!(active.key, 2 * layout.kv_width);
+        assert_eq!(active.value, 2 * layout.kv_width);
+        assert_eq!(
+            active.coefficient_elements().map_err(|error| error.to_string())?,
+            2 * active.query_rotary.coefficient_elements() * 2,
+            "MRoPE controls remain token-major despite one-row rotary launches"
+        );
+        assert!(
+            active.hidden <= capacity.hidden
+                && active.q_gate <= capacity.q_gate
+                && active.query <= capacity.query
+                && active.normalized_key <= capacity.normalized_key
+                && active.output_projection <= capacity.output_projection,
+            "every active plan is an exact prefix of its capacity allocation"
+        );
+        assert!(
+            WorkspacePlan::from_layout_rows(layout, 0).is_err(),
+            "zero-token geometry is refused before allocation"
+        );
+        Ok(())
+    }
 }

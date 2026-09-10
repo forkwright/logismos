@@ -6,7 +6,10 @@ use hipcore::{DeviceBuffer, Stream};
 use snafu::ResultExt;
 
 use super::custody::{NativeBufferSink, NativeBuildResult, NativeBuildScope};
-use super::dispatch::{launch_residual, launch_rms_norm, launch_silu_mul};
+use super::dispatch::{
+    launch_residual_view, launch_rms_norm_view, launch_silu_mul_view,
+};
+use super::resources::NativeBufferView;
 use super::plan::{
     F32Parameter, ProjectionWeight, dimension, elements_bytes, f32_parameter, projection, sum,
 };
@@ -15,7 +18,7 @@ use crate::error::NativeKernelSnafu;
 use crate::qwen35_execution::{Layout, block_name};
 use crate::{Qwen35Weights, Result};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct LayerFinishPlan {
     pub(super) post_attention_norm: kernels::decoder_ops::RmsNormF32Plan,
     pub(super) ffn: kernels::decoder_ops::ElementwiseF32Plan,
@@ -31,7 +34,7 @@ pub(super) struct LayerFinishDeviceDemand {
     pub(super) scratch: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct LayerFinishWeightPlan {
     pub(super) post_attention_norm: F32Parameter,
     pub(super) ffn_gate: ProjectionWeight,
@@ -65,14 +68,24 @@ pub(super) struct LayerFinishWorkspace {
     pub(super) ffn_down: DeviceBuffer<f32>,
 }
 
+/// Exact active scratch views borrowed from a capacity-owned finish workspace.
+pub(super) struct LayerFinishWorkspaceViews<'resources> {
+    attention_residual: NativeBufferView<'resources, f32>,
+    post_norm: NativeBufferView<'resources, f32>,
+    ffn_gate: NativeBufferView<'resources, f32>,
+    ffn_up: NativeBufferView<'resources, f32>,
+    ffn_product: NativeBufferView<'resources, f32>,
+    ffn_down: NativeBufferView<'resources, f32>,
+}
+
 /// Borrowed finish operands with no KV publication or resource-lifecycle authority.
 pub(super) struct DeferredLayerFinish<'resources> {
-    pub(super) input: &'resources DeviceBuffer<f32>,
-    pub(super) attention_projection: &'resources DeviceBuffer<f32>,
-    pub(super) output: &'resources DeviceBuffer<f32>,
+    pub(super) input: NativeBufferView<'resources, f32>,
+    pub(super) attention_projection: NativeBufferView<'resources, f32>,
+    pub(super) output: NativeBufferView<'resources, f32>,
     pub(super) plan: &'resources LayerFinishPlan,
     pub(super) weights: &'resources LayerFinishWeights,
-    pub(super) workspace: &'resources LayerFinishWorkspace,
+    pub(super) workspace: LayerFinishWorkspaceViews<'resources>,
     pub(super) stream: &'resources Stream,
     pub(super) numerical_status: &'resources kernels::numerical_status::NativeNumericalStatus,
 }
@@ -90,6 +103,32 @@ impl LayerFinishPlan {
         weights: &Qwen35Weights,
         layout: Layout,
         block: usize,
+        token_count: usize,
+    ) -> Result<Self> {
+        let weights = LayerFinishWeightPlan {
+            post_attention_norm: f32_parameter(
+                weights,
+                block_name(block, "post_attention_norm.weight"),
+                vec![dimension(
+                    layout.hidden,
+                    "native post-attention norm width",
+                )?],
+                layout.hidden,
+            )?,
+            ffn_gate: projection(weights, block_name(block, "ffn_gate.weight"))?,
+            ffn_up: projection(weights, block_name(block, "ffn_up.weight"))?,
+            ffn_down: projection(weights, block_name(block, "ffn_down.weight"))?,
+        };
+        Self::from_bound_weights(layout, weights, token_count)
+    }
+
+    pub(super) fn active(&self, layout: Layout, token_count: usize) -> Result<Self> {
+        Self::from_bound_weights(layout, self.weights.clone(), token_count)
+    }
+
+    fn from_bound_weights(
+        layout: Layout,
+        weights: LayerFinishWeightPlan,
         token_count: usize,
     ) -> Result<Self> {
         let post_attention_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(
@@ -113,20 +152,6 @@ impl LayerFinishPlan {
             post_attention_norm.elements(),
         )
         .context(NativeKernelSnafu)?;
-        let weights = LayerFinishWeightPlan {
-            post_attention_norm: f32_parameter(
-                weights,
-                block_name(block, "post_attention_norm.weight"),
-                vec![dimension(
-                    layout.hidden,
-                    "native post-attention norm width",
-                )?],
-                layout.hidden,
-            )?,
-            ffn_gate: projection(weights, block_name(block, "ffn_gate.weight"))?,
-            ffn_up: projection(weights, block_name(block, "ffn_up.weight"))?,
-            ffn_down: projection(weights, block_name(block, "ffn_down.weight"))?,
-        };
         let workspace = LayerFinishWorkspacePlan {
             attention_residual: residual.elements(),
             post_norm: post_attention_norm.elements(),
@@ -267,6 +292,23 @@ impl LayerFinishWorkspace {
         sink.push_f32(self.ffn_product);
         sink.push_f32(self.ffn_down);
     }
+
+    pub(super) fn active(
+        &self,
+        plan: LayerFinishWorkspacePlan,
+    ) -> Result<LayerFinishWorkspaceViews<'_>> {
+        Ok(LayerFinishWorkspaceViews {
+            attention_residual: NativeBufferView::prefix(
+                &self.attention_residual,
+                plan.attention_residual,
+            )?,
+            post_norm: NativeBufferView::prefix(&self.post_norm, plan.post_norm)?,
+            ffn_gate: NativeBufferView::prefix(&self.ffn_gate, plan.ffn_gate)?,
+            ffn_up: NativeBufferView::prefix(&self.ffn_up, plan.ffn_up)?,
+            ffn_product: NativeBufferView::prefix(&self.ffn_product, plan.ffn_product)?,
+            ffn_down: NativeBufferView::prefix(&self.ffn_down, plan.ffn_down)?,
+        })
+    }
 }
 
 impl DeferredLayerFinish<'_> {
@@ -281,22 +323,25 @@ impl DeferredLayerFinish<'_> {
         // SAFETY: the caller retains the exact checked input, attention
         // projection, output, weights, and scratch spans through completion.
         unsafe {
-            launch_residual(
+            launch_residual_view(
                 self.plan.residual,
                 self.input,
                 self.attention_projection,
-                &self.workspace.attention_residual,
+                self.workspace.attention_residual,
                 self.stream,
                 self.numerical_status,
             )
         }?;
         // SAFETY: the caller retains the exact checked operands and output.
         unsafe {
-            launch_rms_norm(
+            launch_rms_norm_view(
                 self.plan.post_attention_norm,
-                &self.workspace.attention_residual,
-                &self.weights.post_attention_norm,
-                &self.workspace.post_norm,
+                self.workspace.attention_residual,
+                NativeBufferView::prefix(
+                    &self.weights.post_attention_norm,
+                    self.weights.post_attention_norm.len(),
+                )?,
+                self.workspace.post_norm,
                 self.stream,
                 self.numerical_status,
             )
@@ -304,9 +349,9 @@ impl DeferredLayerFinish<'_> {
         // SAFETY: the checked matrix descriptor and exact owned spans remain
         // live on the ordered stream through completion.
         unsafe {
-            self.weights.ffn_gate.launch_rows(
-                &self.workspace.post_norm,
-                &self.workspace.ffn_gate,
+            self.weights.ffn_gate.launch_rows_view(
+                self.workspace.post_norm,
+                self.workspace.ffn_gate,
                 self.plan.post_attention_norm.rows(),
                 self.stream,
                 self.numerical_status,
@@ -315,9 +360,9 @@ impl DeferredLayerFinish<'_> {
         // SAFETY: the checked matrix descriptor and exact owned spans remain
         // live on the ordered stream through completion.
         unsafe {
-            self.weights.ffn_up.launch_rows(
-                &self.workspace.post_norm,
-                &self.workspace.ffn_up,
+            self.weights.ffn_up.launch_rows_view(
+                self.workspace.post_norm,
+                self.workspace.ffn_up,
                 self.plan.post_attention_norm.rows(),
                 self.stream,
                 self.numerical_status,
@@ -325,11 +370,11 @@ impl DeferredLayerFinish<'_> {
         }?;
         // SAFETY: the caller retains the exact checked operands and output.
         unsafe {
-            launch_silu_mul(
+            launch_silu_mul_view(
                 self.plan.ffn,
-                &self.workspace.ffn_gate,
-                &self.workspace.ffn_up,
-                &self.workspace.ffn_product,
+                self.workspace.ffn_gate,
+                self.workspace.ffn_up,
+                self.workspace.ffn_product,
                 self.stream,
                 self.numerical_status,
             )
@@ -337,9 +382,9 @@ impl DeferredLayerFinish<'_> {
         // SAFETY: the checked matrix descriptor and exact owned spans remain
         // live on the ordered stream through completion.
         unsafe {
-            self.weights.ffn_down.launch_rows(
-                &self.workspace.ffn_product,
-                &self.workspace.ffn_down,
+            self.weights.ffn_down.launch_rows_view(
+                self.workspace.ffn_product,
+                self.workspace.ffn_down,
                 self.plan.post_attention_norm.rows(),
                 self.stream,
                 self.numerical_status,
@@ -348,10 +393,10 @@ impl DeferredLayerFinish<'_> {
         // SAFETY: the caller retains the exact input and final output spans
         // through completion.
         unsafe {
-            launch_residual(
+            launch_residual_view(
                 self.plan.residual,
-                &self.workspace.attention_residual,
-                &self.workspace.ffn_down,
+                self.workspace.attention_residual,
+                self.workspace.ffn_down,
                 self.output,
                 self.stream,
                 self.numerical_status,
