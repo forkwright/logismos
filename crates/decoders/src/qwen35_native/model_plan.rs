@@ -110,14 +110,6 @@ struct ModelBlockPlans {
 }
 
 impl DeviceModelPlan {
-    pub(super) fn from_weights(
-        weights: &Qwen35Weights,
-        max_context: usize,
-        page_tokens: kernels::attention::NativePageTokens,
-    ) -> Result<Self> {
-        Self::from_weights_prefill(weights, max_context, 1, page_tokens)
-    }
-
     /// Bind one model's reusable workspace to a checked single-sequence chunk capacity.
     ///
     /// This retains the historical one-token constructor as an exact capacity-one
@@ -567,7 +559,7 @@ mod tests {
         let artifact = verify_fixture(fixture)?;
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
-        DeviceModelPlan::from_weights(&weights, CONTEXT, PAGE_TOKENS)
+        DeviceModelPlan::from_weights_prefill(&weights, CONTEXT, 1, PAGE_TOKENS)
             .map_err(|error| error.to_string())
     }
 
@@ -663,7 +655,7 @@ mod tests {
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
         assert!(
-            DeviceModelPlan::from_weights(&weights, 0, PAGE_TOKENS).is_err(),
+            DeviceModelPlan::from_weights_prefill(&weights, 0, 1, PAGE_TOKENS).is_err(),
             "the model plan must refuse an empty caller context before device allocation"
         );
         Ok(())
@@ -677,7 +669,7 @@ mod tests {
         let artifact = verify_fixture(&fixture)?;
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
-        let token = DeviceModelPlan::from_weights(&weights, CONTEXT, PAGE_TOKENS)
+        let token = DeviceModelPlan::from_weights_prefill(&weights, CONTEXT, 1, PAGE_TOKENS)
             .map_err(|error| error.to_string())?;
         let chunk = DeviceModelPlan::from_weights_prefill(&weights, CONTEXT, CAPACITY, PAGE_TOKENS)
             .map_err(|error| error.to_string())?;

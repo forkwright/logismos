@@ -11,13 +11,18 @@ use crate::qwen35::tests::{
 };
 use crate::{
     Qwen35NativeExecutionPlan, Qwen35NativeLayerPlan, Qwen35NativeLayerSessionState,
-    Qwen35NativeSessionState, Qwen35Weights,
+    Qwen35NativeExecutionSession, Qwen35NativeSessionState, Qwen35Weights,
 };
 
 const FULL_ATTENTION_BLOCK: usize = 3;
 const FIXTURE_CONTEXT: usize = 16;
 const WITNESS_STEPS: usize = 9;
 const MODEL_WITNESS_TOKENS: [u32; 9] = [2, 0, 4, 1, 3, 2, 4, 0, 1];
+const MODEL_PREFILL_CAPACITY: usize = 3;
+const MODEL_PREFILL_FIRST: [u32; 3] = [2, 0, 4];
+const MODEL_PREFILL_SHORT: [u32; 2] = [1, 3];
+const MODEL_PREFILL_PAGE_EDGE: [u32; 3] = [2, 4, 0];
+const MODEL_PREFILL_CONTINUATION: u32 = 1;
 
 /// Build deterministic, varied full-block rows without leaving the native f32 domain.
 ///
@@ -132,6 +137,96 @@ fn reserved_device_native_main_model_matches_oracle_and_excludes_nextn()
 
 #[test]
 #[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
+fn reserved_device_native_main_model_prefill_matches_terminal_f64_oracle_and_continues()
+-> core::result::Result<(), String> {
+    let fixture = canonical_hybrid_fixture_with_context_and_rotary(FIXTURE_CONTEXT, Some(64))?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let plan = Qwen35NativeExecutionPlan::try_from_weights_prefill(
+        &weights,
+        FIXTURE_CONTEXT,
+        MODEL_PREFILL_CAPACITY,
+        kernels::attention::NativePageTokens::B8,
+    )
+    .map_err(|error| error.to_string())?;
+    let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
+    // SAFETY: this ignored witness calls the standalone native capability only
+    // after an operator reserves the visible device and supplies the bounded
+    // normal-or-zero fixture domain. It is not evidence of a local GPU run.
+    let mut session = unsafe { plan.into_session(&device) }.map_err(|error| error.to_string())?;
+    let mut oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
+
+    assert_native_prefill_terminal(&mut session, &mut oracle, &MODEL_PREFILL_FIRST, "first chunk")?;
+    assert_native_prefill_terminal(&mut session, &mut oracle, &MODEL_PREFILL_SHORT, "short chunk")?;
+    assert_native_prefill_terminal(
+        &mut session,
+        &mut oracle,
+        &MODEL_PREFILL_PAGE_EDGE,
+        "page-edge chunk",
+    )?;
+    let expected = oracle.step(&[MODEL_PREFILL_CONTINUATION])?;
+    // SAFETY: the preceding chunks published only after completion. This T1
+    // continuation therefore observes their committed K/V and recurrent state.
+    let output = unsafe { session.step(MODEL_PREFILL_CONTINUATION) }
+        .map_err(|error| format!("native prefill T1 continuation: {error}"))?;
+    assert_native_terminal_logits(output, &expected, 1, "prefill T1 continuation")?;
+    assert_eq!(
+        session.state(),
+        Qwen35NativeSessionState::Ready,
+        "a completed prefill plus T1 continuation must publish once and restore readiness"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
+fn reserved_device_native_prefill_constructor_preserves_capacity_and_legacy_session_stays_t1()
+-> core::result::Result<(), String> {
+    let fixture = canonical_hybrid_fixture_with_context_and_rotary(FIXTURE_CONTEXT, Some(64))?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
+
+    let explicit = Qwen35NativeExecutionPlan::try_from_weights_prefill(
+        &weights,
+        FIXTURE_CONTEXT,
+        MODEL_PREFILL_CAPACITY,
+        kernels::attention::NativePageTokens::B8,
+    )
+    .map_err(|error| error.to_string())?;
+    // SAFETY: an admitted three-token transaction is the device witness that
+    // `try_from_weights_prefill(...).into_session` retained its exact capacity.
+    let mut explicit = unsafe { explicit.into_session(&device) }
+        .map_err(|error| error.to_string())?;
+    let mut oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
+    assert_native_prefill_terminal(
+        &mut explicit,
+        &mut oracle,
+        &MODEL_PREFILL_FIRST,
+        "explicit capacity handoff",
+    )?;
+
+    let legacy = Qwen35NativeExecutionPlan::try_from_weights(
+        &weights,
+        FIXTURE_CONTEXT,
+        kernels::attention::NativePageTokens::B8,
+    )
+    .map_err(|error| error.to_string())?;
+    // SAFETY: the resident model has no mutable stream state; this ignored
+    // witness owns the explicit device admission for its legacy session.
+    let model = unsafe { legacy.into_model(&device) }.map_err(|error| error.to_string())?;
+    let mut legacy = model.new_session().map_err(|error| error.to_string())?;
+    // SAFETY: geometry refusal precedes allocation, K/V reservation, and submission.
+    if unsafe { legacy.prefill(&MODEL_PREFILL_FIRST) }.is_ok()
+        || legacy.state() != Qwen35NativeSessionState::Ready
+    {
+        return Err("legacy model.new_session must retain its T1 capacity".to_string());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
 fn reserved_device_resident_model_creates_unequal_context_native_sessions()
 -> core::result::Result<(), String> {
     let fixture = canonical_hybrid_fixture_with_context_and_rotary(FIXTURE_CONTEXT, Some(64))?;
@@ -213,6 +308,38 @@ fn reserved_device_native_main_model_status_refuses_invalid_output_head_operand(
     )
 }
 
+#[test]
+#[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
+fn reserved_device_native_prefill_late_output_fault_returns_no_terminal_logits()
+-> core::result::Result<(), String> {
+    let fixture = canonical_hybrid_fixture_with_invalid_output_head_operand()?;
+    let payload = verify_fixture(&fixture)?;
+    let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
+    let plan = Qwen35NativeExecutionPlan::try_from_weights_prefill(
+        &weights,
+        MODEL_PREFILL_CAPACITY,
+        MODEL_PREFILL_CAPACITY,
+        kernels::attention::NativePageTokens::B8,
+    )
+    .map_err(|error| error.to_string())?;
+    let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
+    // SAFETY: the checked fixture has one deliberate late output-head numerical
+    // fault. This ignored witness retains the complete bundle until the status
+    // read proves the failed stream is idle.
+    let mut session = unsafe { plan.into_session(&device) }.map_err(|error| error.to_string())?;
+    // SAFETY: the fault is after the chunk has staged all prior model work. No
+    // terminal logits may escape and no retryable publication state may remain.
+    if unsafe { session.prefill(&MODEL_PREFILL_FIRST) }.is_ok() {
+        return Err("late output-head prefill fault unexpectedly returned logits".to_string());
+    }
+    assert_eq!(
+        session.state(),
+        Qwen35NativeSessionState::PoisonedKnownIdle,
+        "a synchronized late chunk fault must retain poisoned ownership rather than publish K/V, recurrent state, position, or logits"
+    );
+    Ok(())
+}
+
 fn native_main_model_status_fault_witness(
     fixture: &Fixture,
     fault_stage: &str,
@@ -292,4 +419,39 @@ fn native_main_model_witness(
         return Err("native exhausted context must refuse without a new submission".to_string());
     }
     Ok(())
+}
+
+fn assert_native_prefill_terminal(
+    session: &mut Qwen35NativeExecutionSession,
+    oracle: &mut CanonicalHybridOracle,
+    tokens: &[u32],
+    label: &str,
+) -> core::result::Result<(), String> {
+    let expected = oracle.step(tokens)?;
+    // SAFETY: the ignored caller owns this exclusive session and has supplied
+    // the bounded fixture's declared device numerical-domain preconditions.
+    let output = unsafe { session.prefill(tokens) }
+        .map_err(|error| format!("native prefill {label}: {error}"))?;
+    assert_native_terminal_logits(output, &expected, tokens.len(), label)
+}
+
+fn assert_native_terminal_logits(
+    output: DeviceBuffer<f32>,
+    expected: &[f64],
+    token_count: usize,
+    label: &str,
+) -> core::result::Result<(), String> {
+    let vocabulary = expected
+        .len()
+        .checked_div(token_count)
+        .filter(|width| *width != 0)
+        .ok_or_else(|| "f64 oracle must return one nonempty logit row per token".to_string())?;
+    let final_expected = expected
+        .get(expected.len() - vocabulary..)
+        .ok_or_else(|| "f64 oracle final-token selection must remain in bounds".to_string())?;
+    let mut actual = vec![0.0_f32; vocabulary];
+    output
+        .copy_to_host(&mut actual)
+        .map_err(|error| format!("read native terminal logits {label}: {error}"))?;
+    assert_f32_matches_f64(&actual, final_expected, label)
 }

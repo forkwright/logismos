@@ -705,10 +705,6 @@ impl NativeResidentModelResources {
         })
     }
 
-    pub(super) fn plan_session(&self, max_context: usize) -> Result<DeviceModelPlan> {
-        self.plan_prefill_session(max_context, 1)
-    }
-
     pub(super) fn plan_prefill_session(
         &self,
         max_context: usize,
@@ -876,10 +872,6 @@ impl ModelSessionResources {
             resident: Some(ResidentRetention::new(model)),
             creation_failure: failed_step_creation,
         }
-    }
-
-    pub(super) fn prepare_step(&mut self, token: u32) -> Result<()> {
-        self.prepare_prefill(core::slice::from_ref(&token))
     }
 
     pub(super) fn prepare_prefill(&mut self, tokens: &[u32]) -> Result<()> {
@@ -1487,7 +1479,12 @@ mod tests {
         let artifact = verify_fixture(&canonical_hybrid_fixture_with_context(RESIDENT_CONTEXT)?)?;
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
-        let resident = DeviceModelPlan::from_weights(&weights, RESIDENT_CONTEXT, PAGE_TOKENS)
+        let resident = DeviceModelPlan::from_weights_prefill(
+            &weights,
+            RESIDENT_CONTEXT,
+            1,
+            PAGE_TOKENS,
+        )
             .map_err(|error| error.to_string())?;
         let session = derive_session_plan(&weights, &resident, SESSION_CONTEXT, 1)
             .map_err(|error| error.to_string())?;

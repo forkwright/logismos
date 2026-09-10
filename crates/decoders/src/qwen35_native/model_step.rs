@@ -134,7 +134,14 @@ mod tests {
         let plan = model_plan()?;
         let invalid = u32::try_from(plan.layout.vocabulary()).map_err(|error| error.to_string())?;
 
-        assert!(ModelChunkPlan::from_model(&plan, 0, &[0, invalid]).is_err());
+        assert!(ModelChunkPlan::from_model(&plan, 0, &[0, 1, invalid]).is_err());
+        let retry = ModelChunkPlan::from_model(&plan, 0, &[0, 1])
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            retry.packed.committed_offset(0),
+            Some(0),
+            "an invalid final token must not advance the action-free chunk position"
+        );
         Ok(())
     }
 

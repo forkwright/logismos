@@ -689,6 +689,11 @@ impl<'weights> Qwen35NativeExecutionPlan<'weights> {
     /// The chunk bound controls only transient per-call resources. The cache and
     /// recurrent active/staged state retain their independently checked context
     /// and layer extents.
+    ///
+    /// # Errors
+    ///
+    /// Refuses zero or context-exceeding chunk capacity, unsupported verified
+    /// model geometry, and unrepresentable resource extents before allocation.
     pub fn try_from_weights_prefill(
         weights: &'weights Qwen35Weights,
         max_context: usize,
@@ -803,6 +808,11 @@ impl Qwen35NativeExecutionModel {
     /// This does not allocate a stream or mutable buffer. It may not exceed the
     /// resident immutable model's checked context ceiling, but a resident model
     /// does not freeze later session chunk capacity.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a context above the resident ceiling, invalid chunk capacity, or
+    /// a descriptor that cannot bind the resident immutable uploads.
     pub fn plan_prefill_session(
         &self,
         max_context: usize,
@@ -833,7 +843,7 @@ impl Qwen35NativeExecutionModel {
         &self,
     ) -> core::result::Result<Qwen35NativeExecutionSession, NativeBuildFailure> {
         let plan = self
-            .plan_session(self.resources.context_ceiling())
+            .plan_prefill_session(self.resources.context_ceiling(), 1)
             .map_err(|error| {
                 NativeBuildFailure::session(
                     NativeBuildSource::decoder(error),
@@ -1124,6 +1134,12 @@ impl Qwen35NativeExecutionSession {
     /// reservation, or submission. After submission, one stream completion and
     /// status read precede the single model-wide publication of K/V, recurrent
     /// state, position, and terminal-token logits.
+    ///
+    /// # Errors
+    ///
+    /// Refuses empty, over-capacity, context-exceeding, or invalid-vocabulary
+    /// chunks without submission. Any failure after submission poisons the
+    /// complete owned session bundle and returns no partial logits.
     ///
     /// # Safety
     ///
