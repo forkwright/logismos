@@ -2,6 +2,62 @@
 
 All notable changes to logismos are recorded here.
 
+## [2.0.0](https://github.com/forkwright/logismos/compare/v1.0.11...v2.0.0) (2026-09-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* **runtime:** supporting taxis/cache/kernel APIs now return typed failures where construction or numerical success was previously unchecked. `Shape`/`Layout`/`Tensor` use checked element counts; `DType` uses checked byte counts; `Tensor::from_cpu`, `Layout::from_parts`, `CacheLayout::new` and `FlatKvCache::new` are fallible. The old alternate `try_from_cpu` entry is consolidated, public cache fields are private, fp32 softmax and unit normalization return `Result`, and embedding normalization retains the shared typed kernel cause. In-tree consumers and tests are migrated.
+* **text:** decode processors, samplers and chain methods now return typed errors; policy construction is validated. Empty, NaN, positive-infinity and fully masked logits no longer silently select token zero. The in-tree consumer is migrated. The stable core trait/error surface is unchanged.
+* **runtime:** the direct Rust library target changes from `core` to `logismos_core`. Cargo package identity and public facade/traits/errors are unchanged. Direct consumers using the old library-target import must migrate; existing project-qualified dependency aliases remain valid.
+* **runtime:** cpu_f32::rms_norm returns kernels::Result<Vec<f32>>; transformers::Error::Kernel exposes a typed source. The unreleased Qwen35Weights::project_q8_0 is replaced by descriptor-driven project. Stable core traits, HIP FFI, and tolerance defaults are unchanged.
+
+### Features
+
+* add agent-aware admission and artifact observations ([#154](https://github.com/forkwright/logismos/issues/154)) ([f558245](https://github.com/forkwright/logismos/commit/f558245960b65f1e96585170788aa0a54966caaf))
+* add bounded native Qwen3 CPU reranking ([#165](https://github.com/forkwright/logismos/issues/165)) ([e9b6537](https://github.com/forkwright/logismos/commit/e9b65371f066f22591a3f79a0a024486b89372e0))
+* add observation-bound model structure and q8 decoding ([#156](https://github.com/forkwright/logismos/issues/156)) ([f6a21d7](https://github.com/forkwright/logismos/commit/f6a21d707a683f03a3dcc337a1882d6d0f6c06cb))
+* bind native host accounting and recycled logits ownership ([#191](https://github.com/forkwright/logismos/issues/191)) ([c75a1d9](https://github.com/forkwright/logismos/commit/c75a1d915671c94f5e547d3c61c6671efad5d68f))
+* bind native q8 execution to verified artifacts ([#158](https://github.com/forkwright/logismos/issues/158)) ([109730d](https://github.com/forkwright/logismos/commit/109730d77c8791c70687a350553724ecf621c609))
+* bind shared native residency and prepared request ownership ([#189](https://github.com/forkwright/logismos/issues/189)) ([e9a7238](https://github.com/forkwright/logismos/commit/e9a72383809a4006e564030fdae2207da64b6024))
+* **cache:** integrate execution-private paged KV ([#183](https://github.com/forkwright/logismos/issues/183)) ([ea920d5](https://github.com/forkwright/logismos/commit/ea920d577b9739a5741b3027772bfa467a899fec))
+* compose native gfx1100 full-attention layers ([#185](https://github.com/forkwright/logismos/issues/185)) ([6d602a3](https://github.com/forkwright/logismos/commit/6d602a394d186d66ea8dfeb0d8cb6c616ec1769b))
+* **decoders:** execute bounded native model chunks ([#196](https://github.com/forkwright/logismos/issues/196)) ([4e28481](https://github.com/forkwright/logismos/commit/4e2848185e51c2b72b9a4c337d76bf8b5e81b7cd))
+* **decoders:** publish CPU sequence batches atomically ([#198](https://github.com/forkwright/logismos/issues/198)) ([2d324f9](https://github.com/forkwright/logismos/commit/2d324f92330303ba9eeaa83c4b768550b677bbea))
+* **decoders:** stage native single-sequence recurrent chunks ([#195](https://github.com/forkwright/logismos/issues/195)) ([be44c41](https://github.com/forkwright/logismos/commit/be44c41459d252d4fe5cac503d5da1167c35fc84))
+* derive native Qwen3 CPU retrieval requirements ([#166](https://github.com/forkwright/logismos/issues/166)) ([2263ff4](https://github.com/forkwright/logismos/commit/2263ff4e7ba130cb32764f659c8d9eaa24488397))
+* **embed:** execute bounded native Qwen3 CPU embeddings ([#164](https://github.com/forkwright/logismos/issues/164)) ([eab451b](https://github.com/forkwright/logismos/commit/eab451b89387be587ffff4d32a69ef884941e9f7)), closes [#150](https://github.com/forkwright/logismos/issues/150)
+* establish agent-aware gfx1100 compute foundations ([a0f4250](https://github.com/forkwright/logismos/commit/a0f42509403290ce3d381e718c9ab776e5268074))
+* execute native gfx1100 hybrid main models ([#187](https://github.com/forkwright/logismos/issues/187)) ([0c1e4a9](https://github.com/forkwright/logismos/commit/0c1e4a965f3bd57f331a365749e2e4850c08b91a))
+* expose verified native text preparation ([#176](https://github.com/forkwright/logismos/issues/176)) ([aeb6211](https://github.com/forkwright/logismos/commit/aeb6211ade98cff2187fb8f62471bc9d96eab6e1))
+* **hermeneus:** execute bounded native prompt chunks ([#197](https://github.com/forkwright/logismos/issues/197)) ([08cfa58](https://github.com/forkwright/logismos/commit/08cfa5899a6982c8fc69d1e2abc9f491d23324a4))
+* inspect exact IQ4 artifacts and extend bounded emulation ([#155](https://github.com/forkwright/logismos/issues/155)) ([fee3c55](https://github.com/forkwright/logismos/commit/fee3c556a590203c92317d5cc927f7b3c6dbd5f1))
+* **kernels:** add staged causal convolution HIP step ([#181](https://github.com/forkwright/logismos/issues/181)) ([022436f](https://github.com/forkwright/logismos/commit/022436fa0024ba09a4d3e7e2afc8c5a931b4b16c))
+* **kernels:** add staged grouped GDN decode step ([#180](https://github.com/forkwright/logismos/issues/180)) ([4e7c2da](https://github.com/forkwright/logismos/commit/4e7c2da23a0b9c08c8388c7e13b90e21d33df2c2))
+* **kernels:** compose checked packed CPU prefill ([#194](https://github.com/forkwright/logismos/issues/194)) ([e6dd128](https://github.com/forkwright/logismos/commit/e6dd128a742a64a8bb1fcc961615f0df90247964)), closes [#46](https://github.com/forkwright/logismos/issues/46) [#150](https://github.com/forkwright/logismos/issues/150)
+* **kernels:** generalize native serialized-row GEMV ([#182](https://github.com/forkwright/logismos/issues/182)) ([8af8165](https://github.com/forkwright/logismos/commit/8af8165b98244b5ea7396d5c0d3c5a22bc613fd5))
+* **kernels:** integrate checked paged decode attention ([#184](https://github.com/forkwright/logismos/issues/184)) ([52dde57](https://github.com/forkwright/logismos/commit/52dde571de649fdbf0d2baf55b3ebdff23df104a))
+* own shared native text execution and teardown ([#192](https://github.com/forkwright/logismos/issues/192)) ([6eb1a12](https://github.com/forkwright/logismos/commit/6eb1a12c5520248f6f4c62fa9d798c8f1e575767))
+* prepare native recurrent hybrid composition ([#186](https://github.com/forkwright/logismos/issues/186)) ([32fcf8b](https://github.com/forkwright/logismos/commit/32fcf8b55a1b5d71eac90f53b995d9a48a56785c))
+* prepare native text requests and Q8 GPU projection ([#167](https://github.com/forkwright/logismos/issues/167)) ([bb1e746](https://github.com/forkwright/logismos/commit/bb1e7468c3397d2c74ec27f5798d69bb9df3bd81))
+* preserve native and generated-output resource custody ([#190](https://github.com/forkwright/logismos/issues/190)) ([6d4156f](https://github.com/forkwright/logismos/commit/6d4156f3653886de57b18ab9bd048272d59255bb))
+* refuse invalid native arithmetic before publication ([#188](https://github.com/forkwright/logismos/issues/188)) ([981ce29](https://github.com/forkwright/logismos/commit/981ce290cf0d8d48363f336b200a80ed90139e94))
+* **runtime:** execute mixed-weight recurrent CPU paths ([#159](https://github.com/forkwright/logismos/issues/159)) ([ec69f3d](https://github.com/forkwright/logismos/commit/ec69f3dbe4e2d319d8c095a1a4767e986cd7c804))
+* **runtime:** execute native hybrid CPU model paths ([#162](https://github.com/forkwright/logismos/issues/162)) ([e1b5203](https://github.com/forkwright/logismos/commit/e1b5203b0afbc09bdd48ce57d42ae7977693bbb3))
+* **sched:** retire admissions without revoking peer workloads ([#179](https://github.com/forkwright/logismos/issues/179)) ([9b1d7bd](https://github.com/forkwright/logismos/commit/9b1d7bd4ba45338868246fc5ccaa8b2a5046fb44)), closes [#174](https://github.com/forkwright/logismos/issues/174)
+* **text:** add bounded native CPU generation ([#163](https://github.com/forkwright/logismos/issues/163)) ([8fe4e6d](https://github.com/forkwright/logismos/commit/8fe4e6d8c64f0a7f7e6e851548c0a6d63a127768))
+
+
+### Bug Fixes
+
+* **ci:** repair release-checks caller permission ([041dee5](https://github.com/forkwright/logismos/commit/041dee511bbd3c1cef2f89ef56dfb5e675acce01))
+* **runtime:** enforce checked tensor and numerical boundaries ([#193](https://github.com/forkwright/logismos/issues/193)) ([51b965d](https://github.com/forkwright/logismos/commit/51b965dde7e06170cf02c142540a31867a560a7c))
+
+
+### Documentation
+
+* point planning guidance at private corpus ([#157](https://github.com/forkwright/logismos/issues/157)) ([cb54330](https://github.com/forkwright/logismos/commit/cb543306046351a630348999152d397fb8304ea0))
+
 ## [1.0.11](https://github.com/forkwright/logismos/compare/v1.0.10...v1.0.11) (2026-09-03)
 
 
