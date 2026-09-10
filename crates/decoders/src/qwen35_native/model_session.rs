@@ -618,7 +618,7 @@ impl Qwen35NativeExecutionDeviceDemand {
     }
 
     /// Checked total requested device bytes for one resident model, one session,
-    /// one token's controls, and one returned logits buffer.
+    /// its admitted maximum chunk controls, and one returned terminal logits buffer.
     #[must_use]
     pub const fn total_bytes(self) -> usize {
         self.total
@@ -640,7 +640,7 @@ impl Qwen35NativeExecutionDeviceDemand {
         self.total - self.resident_bytes() - self.step_bytes() - self.output_bytes()
     }
 
-    /// Requested one-token control-buffer bytes.
+    /// Requested maximum-chunk control-buffer bytes.
     #[must_use]
     pub const fn step_bytes(self) -> usize {
         self.bytes.mrope_controls
@@ -681,7 +681,26 @@ impl<'weights> Qwen35NativeExecutionPlan<'weights> {
         max_context: usize,
         page_tokens: kernels::attention::NativePageTokens,
     ) -> Result<Self> {
-        let plan = DeviceModelPlan::from_weights(weights, max_context, page_tokens)?;
+        Self::try_from_weights_prefill(weights, max_context, 1, page_tokens)
+    }
+
+    /// Derive a checked native main-model plan with a bounded B=1 chunk workspace.
+    ///
+    /// The chunk bound controls only transient per-call resources. The cache and
+    /// recurrent active/staged state retain their independently checked context
+    /// and layer extents.
+    pub fn try_from_weights_prefill(
+        weights: &'weights Qwen35Weights,
+        max_context: usize,
+        max_chunk_tokens: usize,
+        page_tokens: kernels::attention::NativePageTokens,
+    ) -> Result<Self> {
+        let plan = DeviceModelPlan::from_weights_prefill(
+            weights,
+            max_context,
+            max_chunk_tokens,
+            page_tokens,
+        )?;
         let demand = Qwen35NativeExecutionDeviceDemand::from_bytes(plan.bytes)?;
         Ok(Self {
             weights,
@@ -734,9 +753,21 @@ impl<'weights> Qwen35NativeExecutionPlan<'weights> {
         self,
         device: &Device,
     ) -> core::result::Result<Qwen35NativeExecutionSession, NativeBuildFailure> {
+        let max_context = self.plan.layout.max_context();
+        let max_chunk_tokens = self.plan.max_chunk_tokens;
         // SAFETY: the caller supplies the qualified device required to upload the immutable model.
         let model = unsafe { self.into_model(device) }?;
-        model.new_session()
+        let session = model
+            .plan_prefill_session(max_context, max_chunk_tokens)
+            .map_err(|error| {
+                NativeBuildFailure::session(
+                    NativeBuildSource::decoder(error),
+                    NativeBuildScope::new(),
+                    None,
+                    ResidentRetention::new(Arc::clone(&model.resources)),
+                )
+            })?;
+        session.into_session()
     }
 }
 
@@ -764,7 +795,22 @@ impl Qwen35NativeExecutionModel {
     /// Refuses invalid context, a request above the resident ceiling, or a
     /// descriptor that cannot bind the resident's immutable uploads.
     pub fn plan_session(&self, max_context: usize) -> Result<Qwen35NativeExecutionSessionPlan> {
-        let plan = self.resources.plan_session(max_context)?;
+        self.plan_prefill_session(max_context, 1)
+    }
+
+    /// Derive a mutable-session plan with an explicit B=1 chunk capacity.
+    ///
+    /// This does not allocate a stream or mutable buffer. It may not exceed the
+    /// resident immutable model's checked context ceiling, but a resident model
+    /// does not freeze later session chunk capacity.
+    pub fn plan_prefill_session(
+        &self,
+        max_context: usize,
+        max_chunk_tokens: usize,
+    ) -> Result<Qwen35NativeExecutionSessionPlan> {
+        let plan = self
+            .resources
+            .plan_prefill_session(max_context, max_chunk_tokens)?;
         let demand = Qwen35NativeExecutionDeviceDemand::from_bytes(plan.bytes)?;
         Ok(Qwen35NativeExecutionSessionPlan {
             model: Arc::clone(&self.resources),
@@ -867,6 +913,12 @@ impl Qwen35NativeExecutionSessionPlan {
     #[must_use]
     pub const fn max_context(&self) -> usize {
         self.plan.layout.max_context()
+    }
+
+    /// Return the maximum B=1 token count accepted by one prefill transaction.
+    #[must_use]
+    pub const fn max_chunk_tokens(&self) -> usize {
+        self.plan.max_chunk_tokens
     }
 
     /// Return this use's exact requested device extents.
@@ -1039,7 +1091,7 @@ impl Qwen35NativeExecutionSession {
         })
     }
 
-    /// Execute one token through all native main blocks and return its logits.
+    /// Execute one token through the same transaction as [`Self::prefill`].
     ///
     /// The blocking step covers embedding, every admitted full or recurrent
     /// main block, final normalization, and the distinct output head. It does
@@ -1062,10 +1114,27 @@ impl Qwen35NativeExecutionSession {
     /// parity, performance, physical-GPU qualification, capacity, artifact
     /// quality, or serving safety.
     pub unsafe fn step(&mut self, token: u32) -> Result<DeviceBuffer<f32>> {
+        // SAFETY: this delegates unchanged to the bounded B=1 transaction.
+        unsafe { self.prefill(&[token]) }
+    }
+
+    /// Execute one bounded B=1 token chunk through all native main blocks.
+    ///
+    /// Preflight validates the entire chunk before any allocation, cache
+    /// reservation, or submission. After submission, one stream completion and
+    /// status read precede the single model-wide publication of K/V, recurrent
+    /// state, position, and terminal-token logits.
+    ///
+    /// # Safety
+    ///
+    /// The caller guarantees the same qualified device and numerical contract
+    /// required by [`Self::step`]. This is a standalone execution capability,
+    /// not a serving or text ABI.
+    pub unsafe fn prefill(&mut self, tokens: &[u32]) -> Result<DeviceBuffer<f32>> {
         let mut in_flight = self.owner.begin().map_err(begin_error)?;
         let (preparation, requires_teardown) = {
             let resources = in_flight.resource().map_err(completion_error)?;
-            let preparation = resources.prepare_step(token);
+            let preparation = resources.prepare_prefill(tokens);
             (preparation, resources.requires_teardown())
         };
         if let Err(error) = preparation {
@@ -1093,7 +1162,9 @@ fn publish_completed_step(resources: &mut ModelSessionResources) -> Result<Devic
 
 #[cfg(test)]
 mod tests {
-    use super::Qwen35NativeExecutionDeviceDemand;
+    use super::{Qwen35NativeExecutionDeviceDemand, Qwen35NativeExecutionPlan};
+    use crate::Qwen35Weights;
+    use crate::qwen35::tests::{canonical_hybrid_fixture_with_context, verify_fixture};
     use crate::qwen35_native::model_plan::ModelDeviceByteDemand;
 
     #[test]
@@ -1133,6 +1204,46 @@ mod tests {
                 + demand.step_bytes()
                 + demand.output_bytes(),
             "all demand categories must derive from the one checked resource plan"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_prefill_plan_retains_capacity_in_its_checked_demand()
+    -> Result<(), String> {
+        const CONTEXT: usize = 16;
+        const CAPACITY: usize = 3;
+        let artifact = verify_fixture(&canonical_hybrid_fixture_with_context(CONTEXT)?)?;
+        let weights =
+            Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let token = Qwen35NativeExecutionPlan::try_from_weights(
+            &weights,
+            CONTEXT,
+            kernels::attention::NativePageTokens::B8,
+        )
+        .map_err(|error| error.to_string())?;
+        let chunk = Qwen35NativeExecutionPlan::try_from_weights_prefill(
+            &weights,
+            CONTEXT,
+            CAPACITY,
+            kernels::attention::NativePageTokens::B8,
+        )
+        .map_err(|error| error.to_string())?;
+
+        assert_eq!(chunk.demand.weight_bytes(), token.demand.weight_bytes());
+        assert_eq!(chunk.demand.key_value_bytes(), token.demand.key_value_bytes());
+        assert_eq!(chunk.demand.page_table_bytes(), token.demand.page_table_bytes());
+        assert_eq!(
+            chunk.demand.recurrent_history_active_bytes(),
+            token.demand.recurrent_history_active_bytes()
+        );
+        assert_eq!(
+            chunk.demand.hidden_row_bytes(),
+            token.demand.hidden_row_bytes() * CAPACITY
+        );
+        assert_eq!(
+            chunk.demand.mrope_control_bytes(),
+            token.demand.mrope_control_bytes() * CAPACITY
         );
         Ok(())
     }
