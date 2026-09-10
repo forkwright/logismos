@@ -137,20 +137,13 @@ impl<'execution, 'tokens> Qwen35BatchExecutionPlan<'execution, 'tokens> {
         stage_batch(executions, token_ids, &packed, &mut pending)?;
 
         let mut prepared_owners = reserve("batch prepared execution owners", sequence_count)?;
-        let mut prepared_commits = reserve("batch prepared cache commits", sequence_count)?;
         let mut results = reserve("batch grouped logits", sequence_count)?;
         for pending in pending {
-            let (prepared_owner, prepared_commit, logits) = pending.prepare()?;
+            let (prepared_owner, logits) = pending.prepare()?;
             prepared_owners.push(prepared_owner);
-            prepared_commits.push(prepared_commit);
             results.push(logits);
         }
 
-        for prepared_commit in prepared_commits {
-            if let Some(prepared_commit) = prepared_commit {
-                prepared_commit.commit();
-            }
-        }
         for prepared_owner in prepared_owners {
             prepared_owner.publish();
         }
@@ -226,13 +219,7 @@ impl<'execution> PendingExecution<'execution> {
         })
     }
 
-    pub(super) fn prepare(
-        self,
-    ) -> Result<(
-        PreparedExecution<'execution>,
-        Option<PagedPreparedCommit<'execution>>,
-        Vec<f32>,
-    )> {
+    pub(super) fn prepare(self) -> Result<(PreparedExecution<'execution>, Vec<f32>)> {
         let Self {
             target_layers,
             target_position,
@@ -248,8 +235,8 @@ impl<'execution> PendingExecution<'execution> {
                 target_layers,
                 target_position,
                 staged,
+                prepared_commit,
             },
-            prepared_commit,
             logits,
         ))
     }
@@ -259,6 +246,7 @@ pub(super) struct PreparedExecution<'execution> {
     target_layers: &'execution mut Vec<LayerState>,
     target_position: &'execution mut usize,
     staged: StagedExecution,
+    prepared_commit: Option<PagedPreparedCommit<'execution>>,
 }
 
 impl PreparedExecution<'_> {
@@ -267,7 +255,11 @@ impl PreparedExecution<'_> {
             target_layers,
             target_position,
             staged,
+            prepared_commit,
         } = self;
+        if let Some(prepared_commit) = prepared_commit {
+            prepared_commit.commit();
+        }
         let StagedExecution {
             layers, position, ..
         } = staged;

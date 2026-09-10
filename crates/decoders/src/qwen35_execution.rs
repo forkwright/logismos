@@ -230,10 +230,7 @@ impl Qwen35Execution {
             &packed,
             0,
         )?;
-        let (prepared_owner, prepared_commit, logits) = pending.prepare()?;
-        if let Some(prepared_commit) = prepared_commit {
-            prepared_commit.commit();
-        }
+        let (prepared_owner, logits) = pending.prepare()?;
         prepared_owner.publish();
         Ok(logits)
     }
