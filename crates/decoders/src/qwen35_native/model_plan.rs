@@ -513,8 +513,8 @@ mod tests {
             weights: 28_492,
             // One full workspace, without the one common layer-finish workspace.
             full_workspace: 17_432,
-            // One reusable recurrent workspace: 118 f32 values.
-            recurrent_workspace: 472,
+            // 118 trunk values plus two simultaneous Hv=4, V=2 layout buffers.
+            recurrent_workspace: 536,
             // One common layer-finish workspace: 24 f32 values.
             finish_workspace: 96,
             // Two H=3 rows, then one final normalized H=3 row and V=5 logits.
@@ -539,7 +539,7 @@ mod tests {
         );
         assert_eq!(
             plan.bytes.total().map_err(|error| error.to_string())?,
-            80_600_usize
+            80_664_usize
                 .checked_add(kernels::numerical_status::NativeNumericalStatus::byte_demand())
                 .ok_or("hand-derived numerical status total overflow")?,
             "hand-derived canonical model-device allocation"
