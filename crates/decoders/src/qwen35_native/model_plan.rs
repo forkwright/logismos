@@ -21,11 +21,15 @@ use crate::{Qwen35Weights, Result};
 /// One verified main block in artifact order, excluding terminal `NextN` blocks.
 #[derive(Debug)]
 pub(super) enum NativeBlockPlan {
-    Full(DeviceFullAttentionPlan),
-    Recurrent {
-        plan: DeviceRecurrentPlan,
-        finish: LayerFinishPlan,
-    },
+    Full(Box<DeviceFullAttentionPlan>),
+    Recurrent(Box<NativeRecurrentBlockPlan>),
+}
+
+/// One checked recurrent block and its common finish descriptor.
+#[derive(Debug)]
+pub(super) struct NativeRecurrentBlockPlan {
+    pub(super) plan: DeviceRecurrentPlan,
+    pub(super) finish: LayerFinishPlan,
 }
 
 /// Checked requested device bytes for one native main-model resource bundle.
@@ -224,7 +228,7 @@ impl ModelBlockPlans {
             }
             .build()
         })?;
-        self.layers.push(NativeBlockPlan::Full(plan));
+        self.layers.push(NativeBlockPlan::Full(Box::new(plan)));
         Ok(())
     }
 
@@ -258,8 +262,9 @@ impl ModelBlockPlans {
             plan.recurrent_state_elements(),
             "native recurrent state elements",
         )?;
-        self.layers
-            .push(NativeBlockPlan::Recurrent { plan, finish });
+        self.layers.push(NativeBlockPlan::Recurrent(Box::new(
+            NativeRecurrentBlockPlan { plan, finish },
+        )));
         Ok(())
     }
 
@@ -501,9 +506,9 @@ mod tests {
         assert_eq!(plan.output_norm.name, OUTPUT_NORM);
         assert_eq!(plan.layers.len(), plan.layout.main_block_count());
         assert_eq!(plan.layers.len(), 4, "terminal NextN must be excluded");
-        assert!(matches!(&plan.layers[0], NativeBlockPlan::Recurrent { .. }));
-        assert!(matches!(&plan.layers[1], NativeBlockPlan::Recurrent { .. }));
-        assert!(matches!(&plan.layers[2], NativeBlockPlan::Recurrent { .. }));
+        assert!(matches!(&plan.layers[0], NativeBlockPlan::Recurrent(_)));
+        assert!(matches!(&plan.layers[1], NativeBlockPlan::Recurrent(_)));
+        assert!(matches!(&plan.layers[2], NativeBlockPlan::Recurrent(_)));
         assert!(matches!(&plan.layers[3], NativeBlockPlan::Full(_)));
         assert!(plan.full_workspace.is_some());
         assert!(plan.recurrent_workspace.is_some());

@@ -617,6 +617,100 @@ mod tests {
         fn retain_unconfirmed(self) {
             core::mem::forget(self);
         }
+
+        fn build(
+            device: &Device,
+            weights: &Qwen35Weights,
+            plan: &DeviceRecurrentPlan,
+            finish: &LayerFinishPlan,
+            hidden: &[f32],
+        ) -> core::result::Result<Self, String> {
+            let stream =
+                Stream::new_tracked(device).map_err(|error| format!("create stream: {error}"))?;
+            let scope = NativeBuildScope::new();
+            let numerical_status = scope.guard(
+                build_numerical_status(device, &scope).map_err(|error| error.to_string())?,
+                |status, sink| sink.push_u32(status.into_buffer()),
+            );
+            let native_weights = scope.guard(
+                NativeRecurrentWeights::upload(weights, plan, device, &scope)
+                    .map_err(|error| error.to_string())?,
+                NativeRecurrentWeights::into_buffer_sink,
+            );
+            let recurrent_workspace = scope.guard(
+                NativeRecurrentWorkspace::new(&plan.workspace, device, &scope)
+                    .map_err(|error| error.to_string())?,
+                NativeRecurrentWorkspace::into_buffer_sink,
+            );
+            let state = scope.guard(
+                NativeRecurrentState::new(plan, device, &scope)
+                    .map_err(|error| error.to_string())?,
+                NativeRecurrentState::into_buffer_sink,
+            );
+            let finish_weights = scope.guard(
+                LayerFinishWeights::upload(weights, finish, device, &scope)
+                    .map_err(|error| error.to_string())?,
+                LayerFinishWeights::into_buffer_sink,
+            );
+            let finish_workspace = scope.guard(
+                LayerFinishWorkspace::new(finish.workspace, device, &scope)
+                    .map_err(|error| error.to_string())?,
+                LayerFinishWorkspace::into_buffer_sink,
+            );
+            let mut input = scope
+                .allocate_f32(device, hidden.len())
+                .map_err(|error| error.to_string())?;
+            input
+                .copy_from_host(hidden)
+                .map_err(|error| format!("upload recurrent rows: {error}"))?;
+            let output = scope
+                .allocate_f32(device, hidden.len())
+                .map_err(|error| error.to_string())?;
+
+            Ok(Self {
+                stream,
+                numerical_status: numerical_status.commit(),
+                native_weights: native_weights.commit(),
+                recurrent_workspace: recurrent_workspace.commit(),
+                state: state.commit(),
+                finish_weights: finish_weights.commit(),
+                finish_workspace: finish_workspace.commit(),
+                input: input.commit(),
+                output: output.commit(),
+            })
+        }
+
+        fn assert_matches(
+            &self,
+            expected_hidden: &[f64],
+            expected_history: &[f64],
+            expected_state: &[f64],
+        ) -> core::result::Result<(), String> {
+            let actual_hidden = copy_to_host(&self.output, "native recurrent hidden")?;
+            let actual_history = match &self.state.staged_convolution_history {
+                Some(history) => copy_to_host(history, "native recurrent staged history")?,
+                None => Vec::new(),
+            };
+            let actual_state = copy_to_host(
+                &self.state.staged_recurrent_state,
+                "native recurrent staged GDN state",
+            )?;
+            assert_f32_matches_f64(
+                &actual_hidden,
+                expected_hidden,
+                "native recurrent complete rows",
+            )?;
+            assert_f32_matches_f64(
+                &actual_history,
+                expected_history,
+                "native recurrent staged history",
+            )?;
+            assert_f32_matches_f64(
+                &actual_state,
+                expected_state,
+                "native recurrent staged GDN state",
+            )
+        }
     }
 
     #[test]
@@ -641,58 +735,8 @@ mod tests {
             cpu_recurrent_expectations(&weights, &fixture, &hidden, &packed)?;
 
         let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
-        let stream =
-            Stream::new_tracked(&device).map_err(|error| format!("create stream: {error}"))?;
-        let scope = NativeBuildScope::new();
-        let numerical_status = scope.guard(
-            build_numerical_status(&device, &scope).map_err(|error| error.to_string())?,
-            |status, sink| sink.push_u32(status.into_buffer()),
-        );
-        let native_weights = scope.guard(
-            NativeRecurrentWeights::upload(&weights, &plan, &device, &scope)
-                .map_err(|error| error.to_string())?,
-            NativeRecurrentWeights::into_buffer_sink,
-        );
-        let recurrent_workspace = scope.guard(
-            NativeRecurrentWorkspace::new(&plan.workspace, &device, &scope)
-                .map_err(|error| error.to_string())?,
-            NativeRecurrentWorkspace::into_buffer_sink,
-        );
-        let state = scope.guard(
-            NativeRecurrentState::new(&plan, &device, &scope).map_err(|error| error.to_string())?,
-            NativeRecurrentState::into_buffer_sink,
-        );
-        let finish_weights = scope.guard(
-            LayerFinishWeights::upload(&weights, &finish, &device, &scope)
-                .map_err(|error| error.to_string())?,
-            LayerFinishWeights::into_buffer_sink,
-        );
-        let finish_workspace = scope.guard(
-            LayerFinishWorkspace::new(finish.workspace, &device, &scope)
-                .map_err(|error| error.to_string())?,
-            LayerFinishWorkspace::into_buffer_sink,
-        );
-        let mut input = scope
-            .allocate_f32(&device, hidden.len())
-            .map_err(|error| error.to_string())?;
-        input
-            .copy_from_host(&hidden)
-            .map_err(|error| format!("upload recurrent rows: {error}"))?;
-        let output = scope
-            .allocate_f32(&device, hidden.len())
-            .map_err(|error| error.to_string())?;
-
-        let resources = RecurrentWitnessResources {
-            stream,
-            numerical_status: numerical_status.commit(),
-            native_weights: native_weights.commit(),
-            recurrent_workspace: recurrent_workspace.commit(),
-            state: state.commit(),
-            finish_weights: finish_weights.commit(),
-            finish_workspace: finish_workspace.commit(),
-            input: input.commit(),
-            output: output.commit(),
-        };
+        let resources =
+            RecurrentWitnessResources::build(&device, &weights, &plan, &finish, &hidden)?;
         let deferred = DeferredRecurrent {
             plan: &plan,
             weights: &resources.native_weights,
@@ -724,31 +768,7 @@ mod tests {
             .read_after_synchronization()
             .map_err(|error| error.to_string())?;
 
-        let actual_hidden = copy_to_host(&resources.output, "native recurrent hidden")?;
-        let actual_history = match &resources.state.staged_convolution_history {
-            Some(history) => copy_to_host(history, "native recurrent staged history")?,
-            None => Vec::new(),
-        };
-        let actual_state = copy_to_host(
-            &resources.state.staged_recurrent_state,
-            "native recurrent staged GDN state",
-        )?;
-        assert_f32_matches_f64(
-            &actual_hidden,
-            &expected_hidden,
-            "native recurrent complete rows",
-        )?;
-        assert_f32_matches_f64(
-            &actual_history,
-            &expected_history,
-            "native recurrent staged history",
-        )?;
-        assert_f32_matches_f64(
-            &actual_state,
-            &expected_state,
-            "native recurrent staged GDN state",
-        )?;
-        Ok(())
+        resources.assert_matches(&expected_hidden, &expected_history, &expected_state)
     }
 
     fn recurrent_witness_input(
