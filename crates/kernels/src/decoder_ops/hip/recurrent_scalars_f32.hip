@@ -1,6 +1,7 @@
-// WHY: T=1 recurrent scalars retain the CPU operation order exactly.
+// WHY: recurrent scalars retain the CPU operation order exactly.
 
 #include <cstddef>
+#include <cstdint>
 #include <hip/hip_runtime.h>
 
 #include "numerical_status.h"
@@ -45,26 +46,34 @@ __global__ void recurrent_scalars_f32_kernel(
     const float* beta_projection,
     float* beta,
     float* log_decay,
+    const unsigned int token_count,
     const unsigned int value_heads,
     std::uint32_t* numerical_status) {
-    const size_t head = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (head >= static_cast<size_t>(value_heads)) return;
-    const float alpha_value = alpha[head];
+    const size_t element = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x)
+        + static_cast<size_t>(threadIdx.x);
+    const size_t tokens = static_cast<size_t>(token_count);
+    const size_t heads = static_cast<size_t>(value_heads);
+    const size_t elements = tokens * heads;
+    if (element >= elements) return;
+    const size_t token = element / heads;
+    const size_t head = element - token * heads;
+    const size_t output_index = head * tokens + token;
+    const float alpha_value = alpha[element];
     const float dt_value = dt[head];
     const float a_value = a[head];
-    const float beta_projection_value = beta_projection[head];
+    const float beta_projection_value = beta_projection[element];
     logismos_status_input(alpha_value, numerical_status);
     logismos_status_input(dt_value, numerical_status);
     logismos_status_input(a_value, numerical_status);
     logismos_status_input(beta_projection_value, numerical_status);
-    beta[head] = stable_sigmoid(beta_projection_value, numerical_status);
+    beta[output_index] = stable_sigmoid(beta_projection_value, numerical_status);
     const float alpha_plus_dt = logismos_status_add(alpha_value, dt_value, numerical_status);
-    log_decay[head] = logismos_status_mul(
+    log_decay[output_index] = logismos_status_mul(
         a_value, stable_softplus(alpha_plus_dt, numerical_status), numerical_status);
 }
 
-unsigned int blocks_for(const size_t value_heads) {
-    return static_cast<unsigned int>((value_heads + kThreads - 1) / kThreads);
+unsigned int blocks_for(const size_t elements) {
+    return static_cast<unsigned int>((elements - 1U) / kThreads + 1U);
 }
 }
 
@@ -75,16 +84,19 @@ extern "C" hipError_t logismos_launch_recurrent_scalars_f32(
     const void* beta_projection,
     void* beta,
     void* log_decay,
+    const unsigned int token_count,
     const unsigned int value_heads,
     void* numerical_status,
     hipStream_t stream) {
-    recurrent_scalars_f32_kernel<<<dim3(blocks_for(value_heads)), dim3(kThreads), 0, stream>>>(
+    const size_t elements = static_cast<size_t>(token_count) * static_cast<size_t>(value_heads);
+    recurrent_scalars_f32_kernel<<<dim3(blocks_for(elements)), dim3(kThreads), 0, stream>>>(
         reinterpret_cast<const float*>(alpha),
         reinterpret_cast<const float*>(dt),
         reinterpret_cast<const float*>(a),
         reinterpret_cast<const float*>(beta_projection),
         reinterpret_cast<float*>(beta),
         reinterpret_cast<float*>(log_decay),
+        token_count,
         value_heads,
         reinterpret_cast<std::uint32_t*>(numerical_status));
     return hipGetLastError();

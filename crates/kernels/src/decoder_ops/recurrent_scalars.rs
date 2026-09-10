@@ -1,4 +1,4 @@
-//! Checked T=1 recurrent beta and log-decay scalar operation.
+//! Checked token-aware recurrent beta and log-decay scalar operation.
 
 #[cfg(not(logismos_no_gpu_kernels))]
 use core::ffi::c_void;
@@ -19,45 +19,77 @@ unsafe extern "C" {
         beta_projection_f32: *const c_void,
         beta_f32: *mut c_void,
         log_decay_f32: *mut c_void,
+        token_count: u32,
         value_heads: u32,
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
 }
 
-/// Checked T=1 value-head geometry for Qwen3.5 recurrent scalars.
+/// Checked token-row scalar geometry: alpha and beta projection are `[T, Hv]`,
+/// while immutable `dt` and `A` weights are `[Hv]`; outputs are `[Hv, T]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecurrentScalarsF32Plan {
+    token_count: usize,
     value_heads: usize,
+    elements: usize,
+    token_count_u32: u32,
     value_heads_u32: u32,
 }
 
 impl RecurrentScalarsF32Plan {
-    /// Admit one nonempty T=1 vector of recurrent value-head scalars.
+    /// Admit one nonempty token-major scalar input with head-major outputs.
     ///
     /// # Errors
     ///
     /// Returns [`crate::Error::UnsupportedShape`] when `value_heads` is zero,
     /// cannot form the exact f32 operand/output layout, cannot fit the HIP ABI,
     /// or cannot fit the fixed elementwise launch grid.
-    pub fn try_from_value_heads(value_heads: usize) -> Result<Self> {
+    pub fn try_from_token_rows(token_count: usize, value_heads: usize) -> Result<Self> {
+        super::validate_nonzero(RECURRENT_SCALARS_KERNEL, "token_count", token_count)?;
         super::validate_nonzero(RECURRENT_SCALARS_KERNEL, "value_heads", value_heads)?;
+        let elements = super::checked_product(
+            RECURRENT_SCALARS_KERNEL,
+            token_count,
+            value_heads,
+            "token_count * value_heads",
+        )?;
         super::validate_f32_layout(
             RECURRENT_SCALARS_KERNEL,
             "recurrent scalar operands and outputs",
-            value_heads,
+            elements,
         )?;
-        super::validate_grid(RECURRENT_SCALARS_KERNEL, value_heads, ELEMENTWISE_THREADS)?;
+        super::validate_grid(RECURRENT_SCALARS_KERNEL, elements, ELEMENTWISE_THREADS)?;
         Ok(Self {
+            token_count,
             value_heads,
+            elements,
+            token_count_u32: super::abi_u32(RECURRENT_SCALARS_KERNEL, "token_count", token_count)?,
             value_heads_u32: super::abi_u32(RECURRENT_SCALARS_KERNEL, "value_heads", value_heads)?,
         })
+    }
+
+    /// Admit the legacy one-token scalar geometry.
+    pub fn try_from_value_heads(value_heads: usize) -> Result<Self> {
+        Self::try_from_token_rows(1, value_heads)
+    }
+
+    /// Return the admitted token count.
+    #[must_use]
+    pub const fn token_count(self) -> usize {
+        self.token_count
     }
 
     /// Return the exact T=1 scalar count and value-head count.
     #[must_use]
     pub const fn value_heads(self) -> usize {
         self.value_heads
+    }
+
+    /// Return the exact total scalar extent in either input or output layout.
+    #[must_use]
+    pub const fn elements(self) -> usize {
+        self.elements
     }
 }
 
@@ -257,6 +289,7 @@ unsafe fn launch_recurrent_scalars_f32_with_status(
                 beta_projection_f32.cast::<c_void>(),
                 beta_f32.cast::<c_void>(),
                 log_decay_f32.cast::<c_void>(),
+                plan.token_count_u32,
                 plan.value_heads_u32,
                 numerical_status,
                 stream.raw().cast::<c_void>(),
@@ -286,10 +319,15 @@ fn validate_recurrent_scalars_launch(
     log_decay_f32: *mut f32,
     log_decay_elements: usize,
 ) -> Result<()> {
-    let expected = plan.value_heads;
+    let expected = plan.elements;
     super::validate_length(RECURRENT_SCALARS_KERNEL, "alpha", alpha_elements, expected)?;
-    super::validate_length(RECURRENT_SCALARS_KERNEL, "dt", dt_elements, expected)?;
-    super::validate_length(RECURRENT_SCALARS_KERNEL, "a", a_elements, expected)?;
+    super::validate_length(
+        RECURRENT_SCALARS_KERNEL,
+        "dt",
+        dt_elements,
+        plan.value_heads,
+    )?;
+    super::validate_length(RECURRENT_SCALARS_KERNEL, "a", a_elements, plan.value_heads)?;
     super::validate_length(
         RECURRENT_SCALARS_KERNEL,
         "beta projection",
@@ -350,26 +388,25 @@ fn recurrent_scalars_native_order_reference(
     a: &[f32],
     beta_projection: &[f32],
 ) -> Result<(Vec<f32>, Vec<f32>)> {
-    let expected = plan.value_heads;
-    for (name, values) in [
-        ("alpha", alpha),
-        ("dt", dt),
-        ("a", a),
-        ("beta projection", beta_projection),
-    ] {
+    let expected = plan.elements;
+    for (name, values) in [("alpha", alpha), ("beta projection", beta_projection)] {
         super::validate_reference_length(RECURRENT_SCALARS_KERNEL, name, values.len(), expected)?;
     }
+    super::validate_reference_length(RECURRENT_SCALARS_KERNEL, "dt", dt.len(), plan.value_heads)?;
+    super::validate_reference_length(RECURRENT_SCALARS_KERNEL, "a", a.len(), plan.value_heads)?;
     let mut beta = super::reserve_native_reference("recurrent beta reference", expected)?;
     let mut log_decay = super::reserve_native_reference("recurrent log-decay reference", expected)?;
-    for (((alpha_value, dt_value), a_value), beta_value) in alpha
-        .iter()
-        .zip(dt.iter())
-        .zip(a.iter())
-        .zip(beta_projection.iter())
-    {
-        beta.push(stable_sigmoid_f32(*beta_value));
-        let alpha_plus_dt = *alpha_value + *dt_value;
-        log_decay.push(*a_value * stable_softplus_f32(alpha_plus_dt));
+    for head in 0..plan.value_heads {
+        for token in 0..plan.token_count {
+            let input_index = token * plan.value_heads + head;
+            let alpha_value = alpha[input_index];
+            let dt_value = dt[head];
+            let beta_value = beta_projection[input_index];
+            let a_value = a[head];
+            beta.push(stable_sigmoid_f32(beta_value));
+            let alpha_plus_dt = alpha_value + dt_value;
+            log_decay.push(a_value * stable_softplus_f32(alpha_plus_dt));
+        }
     }
     Ok((beta, log_decay))
 }
@@ -480,6 +517,44 @@ mod tests {
             log_decay, scale_mutated_log_decay,
             "log decay must preserve the per-head A scale"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn token_rows_transpose_scalars_head_major_without_reusing_t1_order()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let plan = RecurrentScalarsF32Plan::try_from_token_rows(3, 2)?;
+        let alpha = [-2.0_f32, 1.0, -1.0, 2.0, 0.5, -0.5];
+        let dt = [0.25_f32, -0.5];
+        let a = [-1.0_f32, 0.5];
+        let beta_projection = [-3.0_f32, 2.0, -2.0, 1.0, -1.0, 0.0];
+        let (beta, log_decay) =
+            recurrent_scalars_native_order_reference(plan, &alpha, &dt, &a, &beta_projection)?;
+        let mut expected_beta = Vec::new();
+        let mut expected_log_decay = Vec::new();
+        for head in 0..2 {
+            for token in 0..3 {
+                let index = token * 2 + head;
+                let projection = f64::from(beta_projection[index]);
+                expected_beta.push(1.0 / (1.0 + (-projection).exp()));
+                let sum = f64::from(alpha[index]) + f64::from(dt[head]);
+                expected_log_decay
+                    .push(f64::from(a[head]) * (sum.max(0.0) + (-sum.abs()).exp().ln_1p()));
+            }
+        }
+        assert_close_f64(&beta, &expected_beta, "T=3 beta head-major order");
+        assert_close_f64(
+            &log_decay,
+            &expected_log_decay,
+            "T=3 decay head-major order",
+        );
+        assert_ne!(
+            beta[1].to_bits(),
+            stable_sigmoid_f32(beta_projection[1]).to_bits(),
+            "head-major T=3 output must not retain token-major input order"
+        );
+        assert!(RecurrentScalarsF32Plan::try_from_token_rows(0, 2).is_err());
+        assert!(RecurrentScalarsF32Plan::try_from_token_rows(usize::MAX, 2).is_err());
         Ok(())
     }
 

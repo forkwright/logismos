@@ -44,6 +44,7 @@ unsafe extern "C" {
         state_out_f32: *mut c_void,
         output_f32: *mut c_void,
         scale: f32,
+        token_count: u32,
         key_head_count: u32,
         value_head_count: u32,
         key_dim: u32,
@@ -1101,6 +1102,7 @@ pub unsafe fn launch_multi_head_recurrent_step_f32(
             output_f32,
             output_elements,
             stream,
+            true,
             None,
         )
     }
@@ -1167,6 +1169,7 @@ pub unsafe fn launch_multi_head_recurrent_step_f32_checked(
             output_f32,
             output_elements,
             stream,
+            true,
             Some(status),
         )
     }
@@ -1197,12 +1200,14 @@ unsafe fn launch_multi_head_recurrent_step_f32_impl(
     output_f32: *mut f32,
     output_elements: usize,
     stream: &Stream,
+    require_single_token: bool,
     status: Option<&crate::numerical_status::NativeNumericalStatus>,
 ) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (
             status,
+            require_single_token,
             plan,
             q_f32,
             q_elements,
@@ -1228,7 +1233,7 @@ unsafe fn launch_multi_head_recurrent_step_f32_impl(
 
     #[cfg(not(logismos_no_gpu_kernels))]
     {
-        let abi = validate_gdn_step_launch(
+        let abi = validate_gdn_step_launch_with_domain(
             plan,
             q_f32,
             q_elements,
@@ -1247,6 +1252,7 @@ unsafe fn launch_multi_head_recurrent_step_f32_impl(
             state_out_elements,
             output_f32,
             output_elements,
+            require_single_token,
         )?;
         let numerical_status = match status {
             Some(status) => {
@@ -1271,6 +1277,7 @@ unsafe fn launch_multi_head_recurrent_step_f32_impl(
                 state_out_f32.cast::<c_void>(),
                 output_f32.cast::<c_void>(),
                 scale,
+                abi.token_count,
                 abi.key_head_count,
                 abi.value_head_count,
                 abi.key_dim,
@@ -1292,6 +1299,67 @@ unsafe fn launch_multi_head_recurrent_step_f32_impl(
     }
 }
 
+/// Launch a dense grouped-GDN chunk with serial device time.
+///
+/// This private native-composition primitive admits the token count in `plan`;
+/// Q/K, V, scalars, and output are token-bearing head-major buffers, while
+/// state remains one immutable/staged `[Hv, K, V]` pair. It has no sequence,
+/// context, or publication authority.
+#[cfg(feature = "gpu")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dense forward retains the staged GDN ABI"
+)]
+pub unsafe fn launch_multi_head_recurrent_fwd_f32_checked(
+    plan: MultiHeadRecurrentAllocationPlan,
+    q_f32: *const f32,
+    q_elements: usize,
+    k_f32: *const f32,
+    k_elements: usize,
+    v_f32: *const f32,
+    v_elements: usize,
+    beta_f32: *const f32,
+    beta_elements: usize,
+    g_f32: *const f32,
+    g_elements: usize,
+    scale: f32,
+    state_in_f32: *const f32,
+    state_in_elements: usize,
+    state_out_f32: *mut f32,
+    state_out_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &crate::numerical_status::NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: the caller retains the same device, lifetime, and status contract as the step API.
+    unsafe {
+        launch_multi_head_recurrent_step_f32_impl(
+            plan,
+            q_f32,
+            q_elements,
+            k_f32,
+            k_elements,
+            v_f32,
+            v_elements,
+            beta_f32,
+            beta_elements,
+            g_f32,
+            g_elements,
+            scale,
+            state_in_f32,
+            state_in_elements,
+            state_out_f32,
+            state_out_elements,
+            output_f32,
+            output_elements,
+            stream,
+            false,
+            Some(status),
+        )
+    }
+}
+
 #[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
 fn no_gpu_gdn_step_refusal() -> Result<()> {
     NoGpuBuildSnafu {
@@ -1303,6 +1371,7 @@ fn no_gpu_gdn_step_refusal() -> Result<()> {
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 #[derive(Clone, Copy)]
 struct GdnStepAbi {
+    token_count: u32,
     key_head_count: u32,
     value_head_count: u32,
     key_dim: u32,
@@ -1334,7 +1403,56 @@ fn validate_gdn_step_launch(
     output_f32: *mut f32,
     output_elements: usize,
 ) -> Result<GdnStepAbi> {
-    if plan.token_count() != 1 {
+    validate_gdn_step_launch_with_domain(
+        plan,
+        q_f32,
+        q_elements,
+        k_f32,
+        k_elements,
+        v_f32,
+        v_elements,
+        beta_f32,
+        beta_elements,
+        g_f32,
+        g_elements,
+        scale,
+        state_in_f32,
+        state_in_elements,
+        state_out_f32,
+        state_out_elements,
+        output_f32,
+        output_elements,
+        true,
+    )
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validation receives the fixed raw staged GDN ABI without constructing a second shape owner"
+)]
+fn validate_gdn_step_launch_with_domain(
+    plan: MultiHeadRecurrentAllocationPlan,
+    q_f32: *const f32,
+    q_elements: usize,
+    k_f32: *const f32,
+    k_elements: usize,
+    v_f32: *const f32,
+    v_elements: usize,
+    beta_f32: *const f32,
+    beta_elements: usize,
+    g_f32: *const f32,
+    g_elements: usize,
+    scale: f32,
+    state_in_f32: *const f32,
+    state_in_elements: usize,
+    state_out_f32: *mut f32,
+    state_out_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    require_single_token: bool,
+) -> Result<GdnStepAbi> {
+    if require_single_token && plan.token_count() != 1 {
         return unsupported_gdn_step_shape(format!(
             "only dense-f32 T=1 decode steps are supported, got T={}",
             plan.token_count()
@@ -1394,6 +1512,7 @@ fn validate_gdn_step_launch(
     reject_overlapping_f32_spans(GDN_GROUPED_STEP_KERNEL, state_out, output)?;
 
     Ok(GdnStepAbi {
+        token_count: gdn_step_u32("token_count", plan.token_count())?,
         key_head_count: gdn_step_u32("key_head_count", plan.key_head_count())?,
         value_head_count: gdn_step_u32("value_head_count", plan.value_head_count())?,
         key_dim: gdn_step_u32("key_dim", plan.key_dim())?,
@@ -1580,6 +1699,71 @@ mod tests {
     const VALUE_DIM: usize = 3;
     const SCALE: f32 = 0.5;
     const ORACLE_TOLERANCE: f32 = 1e-5;
+
+    #[test]
+    fn dense_native_admission_accepts_t3_but_legacy_step_stays_t1() -> Result<()> {
+        let plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(3, 1, 1, 2, 2)
+            .map_err(|error| unsupported_gdn_step_shape(error.to_string()))?;
+        let q = [0.0_f32; 6];
+        let k = [0.0_f32; 6];
+        let v = [0.0_f32; 6];
+        let beta = [0.0_f32; 3];
+        let g = [0.0_f32; 3];
+        let state_in = [0.0_f32; 4];
+        let mut state_out = [0.0_f32; 4];
+        let mut output = [0.0_f32; 6];
+        assert!(
+            validate_gdn_step_launch(
+                plan,
+                q.as_ptr(),
+                q.len(),
+                k.as_ptr(),
+                k.len(),
+                v.as_ptr(),
+                v.len(),
+                beta.as_ptr(),
+                beta.len(),
+                g.as_ptr(),
+                g.len(),
+                1.0,
+                state_in.as_ptr(),
+                state_in.len(),
+                state_out.as_mut_ptr(),
+                state_out.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_gdn_step_launch_with_domain(
+                plan,
+                q.as_ptr(),
+                q.len(),
+                k.as_ptr(),
+                k.len(),
+                v.as_ptr(),
+                v.len(),
+                beta.as_ptr(),
+                beta.len(),
+                g.as_ptr(),
+                g.len(),
+                1.0,
+                state_in.as_ptr(),
+                state_in.len(),
+                state_out.as_mut_ptr(),
+                state_out.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            MultiHeadRecurrentAllocationPlan::try_from_dimensions(usize::MAX, 1, 1, 2, 2).is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn recurrence_matches_independent_f64_oracle() -> GdnResult<()> {

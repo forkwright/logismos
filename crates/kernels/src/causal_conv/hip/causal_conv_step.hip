@@ -1,4 +1,4 @@
-// NOTE: one-token dense-f32 causal-convolution correctness kernel.
+// NOTE: dense-f32 causal-convolution correctness kernel with serial device time.
 //
 // One thread owns one channel and serializes oldest-to-newest tap products and
 // additions. This is a staged primitive, not model or decoder integration.
@@ -21,6 +21,7 @@ extern "C" __global__ void logismos_causal_conv_step_f32_kernel(
     const float* __restrict__ history_in_f32,
     float* __restrict__ history_out_f32,
     float* __restrict__ output_f32,
+    std::uint32_t token_count,
     std::uint32_t channel_count,
     std::uint32_t width,
     std::uint32_t* status)
@@ -35,39 +36,30 @@ extern "C" __global__ void logismos_causal_conv_step_f32_kernel(
     const auto channel_index = static_cast<std::size_t>(channel);
     const auto width_index = static_cast<std::size_t>(width);
     const auto weight_start = channel_index * width_index;
-    float accumulator = 0.0f;
-
-    if (width == 1U) {
-        accumulator = logismos_status_add(
-            accumulator,
-            logismos_status_mul(
-                logismos_status_input(input_f32[channel_index], status),
-                logismos_status_input(weights_f32[weight_start], status), status),
-            status);
-        output_f32[channel_index] = logismos_status_result(accumulator, status);
-        return;
-    }
-
     const auto history_width = width_index - 1U;
     const auto history_start = channel_index * history_width;
-    // SAFETY: the Rust allocation-plan and span checks establish exact
-    // non-aliasing device extents before this raw pointer arithmetic.
-    for (std::size_t tap = 0; tap < history_width; ++tap) {
-        const float product = logismos_status_mul(
-            logismos_status_input(history_in_f32[history_start + tap], status),
-            logismos_status_input(weights_f32[weight_start + tap], status), status);
-        accumulator = logismos_status_add(accumulator, product, status);
+    for (std::size_t token = 0; token < static_cast<std::size_t>(token_count); ++token) {
+        float accumulator = 0.0f;
+        for (std::size_t tap = 0; tap < width_index; ++tap) {
+            const std::size_t position = token + tap;
+            const float sample = position < history_width
+                ? logismos_status_input(history_in_f32[history_start + position], status)
+                : logismos_status_input(
+                    input_f32[(position - history_width) * static_cast<std::size_t>(channel_count) + channel_index],
+                    status);
+            const float product = logismos_status_mul(sample, logismos_status_input(weights_f32[weight_start + tap], status), status);
+            accumulator = logismos_status_add(accumulator, product, status);
+        }
+        output_f32[token * static_cast<std::size_t>(channel_count) + channel_index] =
+            logismos_status_result(accumulator, status);
     }
-    const float current_product = logismos_status_mul(
-        logismos_status_input(input_f32[channel_index], status),
-        logismos_status_input(weights_f32[weight_start + history_width], status), status);
-    accumulator = logismos_status_add(accumulator, current_product, status);
-    output_f32[channel_index] = logismos_status_result(accumulator, status);
-
     for (std::size_t history_index = 0; history_index < history_width; ++history_index) {
-        const float next_history = history_index + 1U < history_width
-            ? logismos_status_input(history_in_f32[history_start + history_index + 1U], status)
-            : logismos_status_input(input_f32[channel_index], status);
+        const std::size_t position = static_cast<std::size_t>(token_count) + history_index;
+        const float next_history = position < history_width
+            ? logismos_status_input(history_in_f32[history_start + position], status)
+            : logismos_status_input(
+                input_f32[(position - history_width) * static_cast<std::size_t>(channel_count) + channel_index],
+                status);
         history_out_f32[history_start + history_index] = logismos_status_result(next_history, status);
     }
 }
