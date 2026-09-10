@@ -366,6 +366,18 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// A multi-session execution request violates its aggregate ownership contract.
+    #[snafu(display("qwen35 execution batch sequence {sequence} violates {rule}"))]
+    ExecutionBatch {
+        /// Zero-based sequence responsible for the refused aggregate relation.
+        sequence: usize,
+        /// Aggregate invariant that refused the request.
+        rule: &'static str,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// A token identifier does not name one row of the artifact vocabulary.
     #[snafu(display("qwen35 token id {token_id} is outside vocabulary {vocabulary}"))]
     ExecutionToken {

@@ -350,12 +350,6 @@ impl PagedKvLedger {
         })
     }
 
-    fn commit(&mut self, reservation: &mut AppendReservation) -> Result<()> {
-        self.validate_commit(reservation)?;
-        self.publish_commit(reservation);
-        Ok(())
-    }
-
     fn validate_commit(&self, reservation: &AppendReservation) -> Result<()> {
         for (layer, written_tokens) in self.staged_rows.iter().copied().enumerate() {
             if written_tokens != reservation.append_tokens {
@@ -660,6 +654,12 @@ pub struct PagedAppend<'a> {
     committed: bool,
 }
 
+/// Verified CPU append publication that still rolls back when dropped.
+#[derive(Debug)]
+pub struct PagedPreparedCommit<'a> {
+    append: PagedAppend<'a>,
+}
+
 #[derive(Debug)]
 struct PagedWriteLocation {
     page: usize,
@@ -715,7 +715,7 @@ impl NativePreparedCommit {
     }
 }
 
-impl PagedAppend<'_> {
+impl<'a> PagedAppend<'a> {
     /// Write one contiguous transaction-relative K/V row for one layer.
     pub fn write_layer_row(
         &mut self,
@@ -789,10 +789,27 @@ impl PagedAppend<'_> {
             tokens,
         })
     }
-    /// Publish only after every layer owns every requested row.
-    pub fn commit(mut self) -> Result<()> {
-        self.pool.ledger.commit(&mut self.reservation)?;
-        self.committed = true;
+    /// Verify every layer before retaining this append for infallible publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::PagedIncompleteAppend`] when any layer lacks an active
+    /// transaction row. On error, consuming this append restores its staged
+    /// logical state through the existing rollback guard.
+    pub fn prepare_commit(self) -> Result<PagedPreparedCommit<'a>> {
+        self.pool.ledger.validate_commit(&self.reservation)?;
+        Ok(PagedPreparedCommit { append: self })
+    }
+
+    /// Validate and publish this append through the prepared-commit path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::PagedIncompleteAppend`] when any layer lacks an active
+    /// transaction row. On error, the append rollback guard restores staged
+    /// logical state.
+    pub fn commit(self) -> Result<()> {
+        self.prepare_commit()?.commit();
         Ok(())
     }
     fn check_row(&self, layer: usize, kind: &'static str, row: &[f32]) -> Result<()> {
@@ -806,6 +823,17 @@ impl PagedAppend<'_> {
             .fail();
         }
         Ok(())
+    }
+}
+
+impl PagedPreparedCommit<'_> {
+    /// Publish this previously verified append without another fallible step.
+    pub fn commit(mut self) {
+        self.append
+            .pool
+            .ledger
+            .publish_commit(&mut self.append.reservation);
+        self.append.committed = true;
     }
 }
 
@@ -2082,7 +2110,7 @@ mod tests {
             )?;
             assert_staged_inventory(&incomplete);
             assert!(matches!(
-                incomplete.commit(),
+                incomplete.prepare_commit(),
                 Err(Error::PagedIncompleteAppend { .. })
             ));
         }
@@ -2117,6 +2145,16 @@ mod tests {
             retry.commit()?;
         }
         Ok(())
+    }
+
+    fn prepare_all(
+        pool: &mut PagedKvPool,
+        start: usize,
+        tokens: usize,
+    ) -> Result<PagedPreparedCommit<'_>> {
+        let mut append = pool.begin_append(tokens)?;
+        write_all(&mut append, start, tokens)?;
+        append.prepare_commit()
     }
 
     fn exercise_partial_tail_rollback(page_tokens: usize, plan: PagedKvPlan) -> Result<()> {
@@ -2209,6 +2247,76 @@ mod tests {
                 page_tokens + 1,
                 page_tokens,
             )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn all_page_sizes_support_prepared_cpu_commit_aggregates() -> Result<()> {
+        const APPEND_TOKENS: usize = 2;
+
+        for (page_tokens, page) in [
+            (8, PageTokens::B8),
+            (16, PageTokens::B16),
+            (32, PageTokens::B32),
+        ] {
+            let start = page_tokens - 1;
+            let plan = PagedKvPlan::new(geometry(page_tokens * 2 + 1), page)?;
+            let mut first_pool = PagedKvPool::new(plan)?;
+            let mut first_model = empty_model();
+            seed_partial_tail(&mut first_pool, &mut first_model, start)?;
+            let first_tail = tail_witness(&first_pool)?;
+
+            {
+                let mut incomplete = first_pool.begin_append(APPEND_TOKENS)?;
+                write_layer(&mut incomplete, 0, start, APPEND_TOKENS)?;
+                assert!(
+                    matches!(
+                        incomplete.prepare_commit(),
+                        Err(Error::PagedIncompleteAppend { .. })
+                    ),
+                    "incomplete preparation must keep publication unpublished"
+                );
+            }
+            assert_tail_restored(&first_pool, &first_model, &first_tail)?;
+
+            {
+                let prepared = prepare_all(&mut first_pool, start, APPEND_TOKENS)?;
+                drop(prepared);
+            }
+            assert_tail_restored(&first_pool, &first_model, &first_tail)?;
+
+            let mut second_pool = PagedKvPool::new(plan)?;
+            let mut second_model = empty_model();
+            seed_partial_tail(&mut second_pool, &mut second_model, start)?;
+            let second_tail = tail_witness(&second_pool)?;
+
+            let first_prepared = prepare_all(&mut first_pool, start, APPEND_TOKENS)?;
+            {
+                let mut incomplete = second_pool.begin_append(APPEND_TOKENS)?;
+                write_layer(&mut incomplete, 0, start, APPEND_TOKENS)?;
+                assert!(
+                    matches!(
+                        incomplete.prepare_commit(),
+                        Err(Error::PagedIncompleteAppend { .. })
+                    ),
+                    "a second aggregate member must reject incomplete preparation"
+                );
+            }
+            drop(first_prepared);
+            assert_tail_restored(&first_pool, &first_model, &first_tail)?;
+            assert_tail_restored(&second_pool, &second_model, &second_tail)?;
+
+            let first_prepared = prepare_all(&mut first_pool, start, APPEND_TOKENS)?;
+            let second_prepared = prepare_all(&mut second_pool, start, APPEND_TOKENS)?;
+            first_prepared.commit();
+            second_prepared.commit();
+            append_model(&mut first_model, start, APPEND_TOKENS);
+            append_model(&mut second_model, start, APPEND_TOKENS);
+            assert_inventory(&first_pool, None);
+            assert_inventory(&second_pool, None);
+            assert_committed_matches(&first_pool, &first_model)?;
+            assert_committed_matches(&second_pool, &second_model)?;
         }
         Ok(())
     }

@@ -58,7 +58,9 @@ pub use crate::paged::{
     NativePagedAppend, NativePagedKvBuffers, NativePagedKvPlan, NativePagedKvPool,
     NativePagedKvPoolBindingError, NativePagedLayerKv,
 };
-pub use crate::paged::{PagedAppend, PagedKvGeometry, PagedKvPlan, PagedKvPool, PagedLayerKv};
+pub use crate::paged::{
+    PagedAppend, PagedKvGeometry, PagedKvPlan, PagedKvPool, PagedLayerKv, PagedPreparedCommit,
+};
 
 /// Legacy unshared tensor KV-cache contract.
 ///

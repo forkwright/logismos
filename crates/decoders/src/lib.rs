@@ -41,7 +41,9 @@ pub use crate::qwen3::{Qwen3Execution, Qwen3Weights};
 pub use crate::qwen3_rank::{Qwen3RankExecution, Qwen3RankWeights};
 pub use crate::qwen3_requirements::Qwen3CpuRequirements;
 pub use crate::qwen35::Qwen35StructuralProfile;
-pub use crate::qwen35_execution::{Qwen35Execution, Qwen35ExecutionPlan, Qwen35LogitSelection};
+pub use crate::qwen35_execution::{
+    Qwen35BatchExecutionPlan, Qwen35Execution, Qwen35ExecutionPlan, Qwen35LogitSelection,
+};
 #[cfg(feature = "gpu")]
 pub use crate::qwen35_native::{
     NativeBuildFailure, NativeBuildRelease, NativeBuildReleaseState, NativeBuildSource,
@@ -53,7 +55,7 @@ pub use crate::qwen35_native::{
     Qwen35NativeSessionState,
 };
 pub use crate::qwen35_recurrent::Qwen35RecurrentExecution;
-pub use crate::qwen35_requirements::Qwen35CpuRequirements;
+pub use crate::qwen35_requirements::{Qwen35BatchCpuRequirements, Qwen35CpuRequirements};
 pub use crate::qwen35_weights::Qwen35Weights;
 
 #[cfg(test)]
