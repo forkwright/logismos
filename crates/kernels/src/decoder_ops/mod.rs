@@ -4,7 +4,9 @@ mod recurrent_layout;
 mod recurrent_scalars;
 
 pub use recurrent_layout::{
-    RecurrentQkL2F32Plan, launch_recurrent_qk_l2_f32, launch_recurrent_qk_l2_f32_checked,
+    RecurrentQkL2F32Plan, RecurrentValueLayoutF32Plan, launch_recurrent_qk_l2_f32,
+    launch_recurrent_qk_l2_f32_checked, launch_recurrent_values_to_head_major_f32_checked,
+    launch_recurrent_values_to_token_major_f32_checked,
 };
 pub use recurrent_scalars::{
     RecurrentScalarsF32Plan, launch_recurrent_scalars_f32, launch_recurrent_scalars_f32_checked,

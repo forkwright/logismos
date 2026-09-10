@@ -36,6 +36,7 @@ unsafe extern "C" {
         history_in_f32: *const c_void,
         history_out_f32: *mut c_void,
         output_f32: *mut c_void,
+        token_count: u32,
         channel_count: u32,
         width: u32,
         numerical_status: *mut c_void,
@@ -617,6 +618,7 @@ pub unsafe fn launch_causal_conv_step_f32(
             output_f32,
             output_elements,
             stream,
+            true,
             None,
         )
     }
@@ -669,6 +671,7 @@ pub unsafe fn launch_causal_conv_step_f32_checked(
             output_f32,
             output_elements,
             stream,
+            true,
             Some(status),
         )
     }
@@ -692,12 +695,14 @@ unsafe fn launch_causal_conv_step_f32_impl(
     output_f32: *mut f32,
     output_elements: usize,
     stream: &Stream,
+    require_single_token: bool,
     status: Option<&crate::numerical_status::NativeNumericalStatus>,
 ) -> Result<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (
             status,
+            require_single_token,
             plan,
             input_f32,
             input_elements,
@@ -716,7 +721,7 @@ unsafe fn launch_causal_conv_step_f32_impl(
 
     #[cfg(not(logismos_no_gpu_kernels))]
     {
-        let abi = validate_causal_conv_step_launch(
+        let abi = validate_causal_conv_step_launch_with_domain(
             plan,
             input_f32,
             input_elements,
@@ -728,6 +733,7 @@ unsafe fn launch_causal_conv_step_f32_impl(
             history_out_elements,
             output_f32,
             output_elements,
+            require_single_token,
         )?;
         let numerical_status = match status {
             Some(status) => {
@@ -748,6 +754,7 @@ unsafe fn launch_causal_conv_step_f32_impl(
                 history_in_f32.cast::<c_void>(),
                 history_out_f32.cast::<c_void>(),
                 output_f32.cast::<c_void>(),
+                abi.token_count,
                 abi.channel_count,
                 abi.width,
                 numerical_status,
@@ -767,6 +774,53 @@ unsafe fn launch_causal_conv_step_f32_impl(
     }
 }
 
+/// Launch one dense causal-convolution chunk with serial device time.
+///
+/// Unlike [`launch_causal_conv_step_f32`], this private native-composition
+/// primitive admits any nonzero `T` represented by `plan`; input and output
+/// are `[T, C]` and histories remain one immutable/staged `[C, W - 1]` pair.
+/// It carries no sequence or context authority.
+#[cfg(feature = "gpu")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dense forward retains the staged causal-convolution ABI"
+)]
+pub unsafe fn launch_causal_conv_fwd_f32_checked(
+    plan: CausalConvAllocationPlan,
+    input_f32: *const f32,
+    input_elements: usize,
+    weights_f32: *const f32,
+    weight_elements: usize,
+    history_in_f32: *const f32,
+    history_in_elements: usize,
+    history_out_f32: *mut f32,
+    history_out_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    stream: &Stream,
+    status: &crate::numerical_status::NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: the caller retains the same device, lifetime, and status contract as the step API.
+    unsafe {
+        launch_causal_conv_step_f32_impl(
+            plan,
+            input_f32,
+            input_elements,
+            weights_f32,
+            weight_elements,
+            history_in_f32,
+            history_in_elements,
+            history_out_f32,
+            history_out_elements,
+            output_f32,
+            output_elements,
+            stream,
+            false,
+            Some(status),
+        )
+    }
+}
+
 #[cfg(all(feature = "gpu", logismos_no_gpu_kernels))]
 fn no_gpu_causal_conv_step_refusal() -> Result<()> {
     NoGpuBuildSnafu {
@@ -778,11 +832,12 @@ fn no_gpu_causal_conv_step_refusal() -> Result<()> {
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 #[derive(Clone, Copy)]
 struct CausalConvStepAbi {
+    token_count: u32,
     channel_count: u32,
     width: u32,
 }
 
-#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[cfg(all(feature = "gpu", test))]
 #[expect(
     clippy::too_many_arguments,
     reason = "validation receives the fixed raw staged causal-convolution ABI without constructing a second shape owner"
@@ -800,7 +855,42 @@ fn validate_causal_conv_step_launch(
     output_f32: *mut f32,
     output_elements: usize,
 ) -> Result<CausalConvStepAbi> {
-    if plan.token_count() != 1 {
+    validate_causal_conv_step_launch_with_domain(
+        plan,
+        input_f32,
+        input_elements,
+        weights_f32,
+        weight_elements,
+        history_in_f32,
+        history_in_elements,
+        history_out_f32,
+        history_out_elements,
+        output_f32,
+        output_elements,
+        true,
+    )
+}
+
+#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validation receives the fixed raw staged causal-convolution ABI without constructing a second shape owner"
+)]
+fn validate_causal_conv_step_launch_with_domain(
+    plan: CausalConvAllocationPlan,
+    input_f32: *const f32,
+    input_elements: usize,
+    weights_f32: *const f32,
+    weight_elements: usize,
+    history_in_f32: *const f32,
+    history_in_elements: usize,
+    history_out_f32: *mut f32,
+    history_out_elements: usize,
+    output_f32: *mut f32,
+    output_elements: usize,
+    require_single_token: bool,
+) -> Result<CausalConvStepAbi> {
+    if require_single_token && plan.token_count() != 1 {
         return unsupported_causal_conv_step_shape(format!(
             "only dense-f32 T=1 decode steps are supported, got T={}",
             plan.token_count()
@@ -846,6 +936,7 @@ fn validate_causal_conv_step_launch(
     reject_overlapping_f32_spans(CAUSAL_CONV_STEP_KERNEL, history_out, output)?;
 
     Ok(CausalConvStepAbi {
+        token_count: causal_conv_step_u32("token_count", plan.token_count())?,
         channel_count: causal_conv_step_u32("channel_count", plan.channel_count())?,
         width: causal_conv_step_u32("width", plan.width())?,
     })
@@ -975,6 +1066,51 @@ mod tests {
     const TOKEN_COUNT: usize = 4;
     const WIDTH: usize = 3;
     const ORACLE_TOLERANCE: f64 = 1e-6;
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn dense_native_admission_accepts_t3_but_legacy_step_stays_t1()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let plan = CausalConvAllocationPlan::try_from_dimensions(3, 2, 2)?;
+        let input = [0.0_f32; 6];
+        let weights = [0.0_f32; 4];
+        let history_in = [0.0_f32; 2];
+        let mut history_out = [0.0_f32; 2];
+        let mut output = [0.0_f32; 6];
+        assert!(
+            validate_causal_conv_step_launch(
+                plan,
+                input.as_ptr(),
+                input.len(),
+                weights.as_ptr(),
+                weights.len(),
+                history_in.as_ptr(),
+                history_in.len(),
+                history_out.as_mut_ptr(),
+                history_out.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+            .is_err()
+        );
+        let dense_abi = validate_causal_conv_step_launch_with_domain(
+            plan,
+            input.as_ptr(),
+            input.len(),
+            weights.as_ptr(),
+            weights.len(),
+            history_in.as_ptr(),
+            history_in.len(),
+            history_out.as_mut_ptr(),
+            history_out.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            false,
+        )?;
+        assert_eq!(dense_abi.token_count, 3, "dense ABI must retain T=3");
+        assert!(CausalConvAllocationPlan::try_from_dimensions(usize::MAX, 2, 2).is_err());
+        Ok(())
+    }
 
     #[test]
     fn asymmetric_taps_pin_oldest_to_newest_order() -> CausalConvResult<()> {

@@ -1067,7 +1067,7 @@ impl ModelSessionResources {
                     })?;
                 }
                 (
-                    NativeBlockPlan::Recurrent { plan, finish },
+                    NativeBlockPlan::Recurrent(recurrent),
                     NativeModelLayer::Recurrent(resources),
                     NativeSessionLayer::Recurrent(state),
                 ) => {
@@ -1078,13 +1078,13 @@ impl ModelSessionResources {
                         .build()
                     })?;
                     let deferred = DeferredRecurrent {
-                        plan,
+                        plan: &recurrent.plan,
                         weights: &resources.weights,
                         workspace,
                         state,
                         input,
                         output,
-                        finish_plan: finish,
+                        finish_plan: &recurrent.finish,
                         finish_weights: &resources.finish,
                         finish_workspace: &self.finish_workspace,
                         stream: &self.stream,
@@ -1305,10 +1305,7 @@ fn same_layer_roles(session: &[NativeBlockPlan], resident: &[NativeBlockPlan]) -
             matches!(
                 (session, resident),
                 (NativeBlockPlan::Full(_), NativeBlockPlan::Full(_))
-                    | (
-                        NativeBlockPlan::Recurrent { .. },
-                        NativeBlockPlan::Recurrent { .. }
-                    )
+                    | (NativeBlockPlan::Recurrent(_), NativeBlockPlan::Recurrent(_))
             )
         })
 }
@@ -1333,13 +1330,13 @@ fn upload_resident_layers(
             NativeBlockPlan::Full(plan) => NativeModelLayer::Full(Box::new(NativeWeights::upload(
                 weights, plan, device, scope,
             )?)),
-            NativeBlockPlan::Recurrent { plan, finish } => {
+            NativeBlockPlan::Recurrent(block) => {
                 let recurrent = scope.guard(
-                    NativeRecurrentWeights::upload(weights, plan, device, scope)?,
+                    NativeRecurrentWeights::upload(weights, &block.plan, device, scope)?,
                     NativeRecurrentWeights::into_buffer_sink,
                 );
                 let finish = scope.guard(
-                    LayerFinishWeights::upload(weights, finish, device, scope)?,
+                    LayerFinishWeights::upload(weights, &block.finish, device, scope)?,
                     LayerFinishWeights::into_buffer_sink,
                 );
                 NativeModelLayer::Recurrent(Box::new(NativeRecurrentLayerWeights {
@@ -1377,9 +1374,9 @@ fn allocate_session_layers(
     for block in &plan.layers {
         layers.push(match block {
             NativeBlockPlan::Full(_) => NativeSessionLayer::Full,
-            NativeBlockPlan::Recurrent { plan, .. } => {
-                NativeSessionLayer::Recurrent(NativeRecurrentState::new(plan, device, scope)?)
-            }
+            NativeBlockPlan::Recurrent(recurrent) => NativeSessionLayer::Recurrent(
+                NativeRecurrentState::new(&recurrent.plan, device, scope)?,
+            ),
         });
     }
     if layers.len() != plan.layers.len() {

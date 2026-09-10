@@ -2147,12 +2147,30 @@ impl CanonicalHybridOracle {
         block: usize,
         input: &[f64],
     ) -> std::result::Result<Vec<f64>, String> {
+        self.block_step(block, input, true)
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn recurrent_block_step(
+        &mut self,
+        block: usize,
+        input: &[f64],
+    ) -> std::result::Result<Vec<f64>, String> {
+        self.block_step(block, input, false)
+    }
+
+    fn block_step(
+        &mut self,
+        block: usize,
+        input: &[f64],
+        full: bool,
+    ) -> std::result::Result<Vec<f64>, String> {
         if block >= self.layout.main_blocks
             || input.len() != self.layout.hidden
-            || !(block + 1).is_multiple_of(self.layout.full_interval)
+            || (block + 1).is_multiple_of(self.layout.full_interval) != full
         {
             return Err(
-                "canonical full-block input is outside the main-block hidden shape".to_string(),
+                "canonical block input is outside the selected main-block hidden shape".to_string(),
             );
         }
         let output = self.block(block, input)?;

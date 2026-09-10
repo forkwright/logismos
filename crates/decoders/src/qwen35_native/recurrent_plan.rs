@@ -11,6 +11,8 @@ use crate::error::{
 };
 use crate::qwen35::recurrent_layernorm_rms_epsilon;
 use crate::qwen35_recurrent::{ExecutionLayout, RecurrentTensorRole, recurrent_tensor_name};
+#[cfg(test)]
+use kernels::PackedPrefillPlan;
 
 /// One verified matrix descriptor used by a native recurrent block.
 #[derive(Debug)]
@@ -38,6 +40,7 @@ pub(super) struct RecurrentWorkspacePlan {
     pub(super) input_norm: kernels::decoder_ops::RmsNormF32Plan,
     pub(super) convolution_silu: kernels::decoder_ops::ElementwiseF32Plan,
     pub(super) qk_l2: kernels::decoder_ops::RecurrentQkL2F32Plan,
+    pub(super) value_layout: kernels::decoder_ops::RecurrentValueLayoutF32Plan,
     pub(super) scalars: kernels::decoder_ops::RecurrentScalarsF32Plan,
     pub(super) output_norm: kernels::decoder_ops::RmsNormF32Plan,
     pub(super) output_silu_product: kernels::decoder_ops::ElementwiseF32Plan,
@@ -50,14 +53,14 @@ pub(super) struct RecurrentWorkspacePlan {
     pub(super) activated_convolution: usize,
     pub(super) tiled_query: usize,
     pub(super) tiled_key: usize,
+    pub(super) value_head_major: usize,
     pub(super) beta: usize,
     pub(super) log_decay: usize,
     pub(super) recurrence_output: usize,
+    pub(super) token_major_recurrence_output: usize,
     pub(super) normalized_output: usize,
     pub(super) gated_output: usize,
     pub(super) projected_attention: usize,
-    pub(super) value_tail_offset: usize,
-    pub(super) value_tail_elements: usize,
     elements: usize,
 }
 
@@ -68,6 +71,7 @@ struct RecurrentOperationPlans {
     recurrence: kernels::MultiHeadRecurrentAllocationPlan,
     convolution_silu: kernels::decoder_ops::ElementwiseF32Plan,
     qk_l2: kernels::decoder_ops::RecurrentQkL2F32Plan,
+    value_layout: kernels::decoder_ops::RecurrentValueLayoutF32Plan,
     scalars: kernels::decoder_ops::RecurrentScalarsF32Plan,
     output_norm: kernels::decoder_ops::RmsNormF32Plan,
     output_silu_product: kernels::decoder_ops::ElementwiseF32Plan,
@@ -104,6 +108,34 @@ impl DeviceRecurrentPlan {
     /// No device allocation, upload, submission, state mutation, or cache
     /// publication occurs here.
     pub(super) fn from_weights(weights: &Qwen35Weights, block: usize) -> Result<Self> {
+        Self::from_token_count(weights, block, 1)
+    }
+
+    /// Bind one test-only single-sequence packed recurrent chunk to native descriptors.
+    ///
+    /// The packed descriptor remains borrowed at this boundary: its existing
+    /// context admission is consumed as geometry, never copied into model
+    /// position, grant, or publication state.
+    ///
+    /// The production native model has no chunk entrypoint yet. Keeping this
+    /// constructor test-only makes that absence explicit while letting the
+    /// reserved-device witness exercise the private block body.
+    #[cfg(test)]
+    pub(super) fn from_packed_prefill(
+        weights: &Qwen35Weights,
+        block: usize,
+        packed: &PackedPrefillPlan,
+    ) -> Result<Self> {
+        if packed.sequence_count() != 1 {
+            return NativeSessionStateSnafu {
+                rule: "native recurrent packed chunk requires exactly one sequence",
+            }
+            .fail();
+        }
+        Self::from_token_count(weights, block, packed.total_tokens())
+    }
+
+    fn from_token_count(weights: &Qwen35Weights, block: usize, token_count: usize) -> Result<Self> {
         let block_index = u64::try_from(block).map_err(|_| {
             ArithmeticOverflowSnafu {
                 context: "native recurrent block index",
@@ -115,20 +147,21 @@ impl DeviceRecurrentPlan {
         layout.validate_recurrent_block(block_index)?;
 
         let convolution = kernels::CausalConvAllocationPlan::try_from_dimensions(
-            1,
+            token_count,
             layout.convolution_width(),
             layout.convolution_kernel(),
         )
         .context(RecurrentConvolutionSnafu)?;
         let recurrence = kernels::MultiHeadRecurrentAllocationPlan::try_from_dimensions(
-            1,
+            token_count,
             layout.value_head_count(),
             layout.value_head_count(),
             layout.key_dim(),
             layout.value_dim(),
         )
         .context(RecurrentGdnSnafu)?;
-        let workspace = RecurrentWorkspacePlan::from_layout(layout, convolution, recurrence)?;
+        let workspace =
+            RecurrentWorkspacePlan::from_layout(layout, token_count, convolution, recurrence)?;
         let matrices = RecurrentProjectionWeights::from_weights(weights, block_index)?;
         let parameters =
             RecurrentF32Parameters::from_weights(weights, block_index, layout, convolution)?;
@@ -273,11 +306,12 @@ impl RecurrentF32Parameters {
 impl RecurrentWorkspacePlan {
     fn from_layout(
         layout: ExecutionLayout,
+        token_count: usize,
         convolution: kernels::CausalConvAllocationPlan,
         recurrence: kernels::MultiHeadRecurrentAllocationPlan,
     ) -> Result<Self> {
         let input_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(
-            1,
+            token_count,
             layout.hidden(),
             layout.epsilon(),
         )
@@ -286,20 +320,34 @@ impl RecurrentWorkspacePlan {
             convolution.output_elements(),
         )
         .context(NativeKernelSnafu)?;
-        let qk_l2 = kernels::decoder_ops::RecurrentQkL2F32Plan::try_from_dimensions(
-            convolution_silu.elements(),
+        let qk_l2 = kernels::decoder_ops::RecurrentQkL2F32Plan::try_from_token_rows(
+            token_count,
+            layout.convolution_width(),
             layout.key_head_count(),
             layout.value_head_count(),
             layout.key_dim(),
             layout.epsilon(),
         )
         .context(NativeKernelSnafu)?;
-        let scalars = kernels::decoder_ops::RecurrentScalarsF32Plan::try_from_value_heads(
+        let value_layout = kernels::decoder_ops::RecurrentValueLayoutF32Plan::try_from_qk_plan(
+            qk_l2,
+            layout.value_dim(),
+        )
+        .context(NativeKernelSnafu)?;
+        let scalars = kernels::decoder_ops::RecurrentScalarsF32Plan::try_from_token_rows(
+            token_count,
             layout.value_head_count(),
         )
         .context(NativeKernelSnafu)?;
         let output_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(
-            layout.value_head_count(),
+            token_count
+                .checked_mul(layout.value_head_count())
+                .ok_or_else(|| {
+                    ArithmeticOverflowSnafu {
+                        context: "native recurrent output-normalization rows",
+                    }
+                    .build()
+                })?,
             layout.value_dim(),
             layout.epsilon(),
         )
@@ -314,6 +362,7 @@ impl RecurrentWorkspacePlan {
             recurrence,
             convolution_silu,
             qk_l2,
+            value_layout,
             scalars,
             output_norm,
             output_silu_product,
@@ -321,19 +370,21 @@ impl RecurrentWorkspacePlan {
     }
 
     fn from_operations(operations: &RecurrentOperationPlans) -> Result<Self> {
-        let (value_tail_offset, value_tail_elements) = validate_operations(operations)?;
+        validate_operations(operations)?;
         let normalized_hidden = operations.input_norm.elements();
         let qkv = operations.convolution.output_elements();
         let z = operations.recurrence.output_elements();
-        let alpha = operations.scalars.value_heads();
-        let beta_projection = operations.scalars.value_heads();
+        let alpha = operations.scalars.elements();
+        let beta_projection = operations.scalars.elements();
         let raw_convolution = operations.convolution.output_elements();
         let activated_convolution = operations.convolution_silu.elements();
         let tiled_query = operations.qk_l2.output_elements();
         let tiled_key = operations.qk_l2.output_elements();
-        let beta = operations.scalars.value_heads();
-        let log_decay = operations.scalars.value_heads();
+        let value_head_major = operations.recurrence.output_elements();
+        let beta = operations.scalars.elements();
+        let log_decay = operations.scalars.elements();
         let recurrence_output = operations.recurrence.output_elements();
+        let token_major_recurrence_output = operations.recurrence.output_elements();
         let normalized_output = operations.output_norm.elements();
         let gated_output = operations.output_silu_product.elements();
         let projected_attention = operations.input_norm.elements();
@@ -348,9 +399,11 @@ impl RecurrentWorkspacePlan {
                 activated_convolution,
                 tiled_query,
                 tiled_key,
+                value_head_major,
                 beta,
                 log_decay,
                 recurrence_output,
+                token_major_recurrence_output,
                 normalized_output,
                 gated_output,
                 projected_attention,
@@ -362,6 +415,7 @@ impl RecurrentWorkspacePlan {
             input_norm: operations.input_norm,
             convolution_silu: operations.convolution_silu,
             qk_l2: operations.qk_l2,
+            value_layout: operations.value_layout,
             scalars: operations.scalars,
             output_norm: operations.output_norm,
             output_silu_product: operations.output_silu_product,
@@ -374,55 +428,39 @@ impl RecurrentWorkspacePlan {
             activated_convolution,
             tiled_query,
             tiled_key,
+            value_head_major,
             beta,
             log_decay,
             recurrence_output,
+            token_major_recurrence_output,
             normalized_output,
             gated_output,
             projected_attention,
-            value_tail_offset,
-            value_tail_elements,
             elements,
         })
     }
 }
 
-fn validate_operations(operations: &RecurrentOperationPlans) -> Result<(usize, usize)> {
+fn validate_operations(operations: &RecurrentOperationPlans) -> Result<()> {
     if operations.qk_l2.output_elements() != operations.recurrence.query_and_key_elements()
-        || operations.scalars.value_heads() != operations.recurrence.scalar_elements()
+        || operations.value_layout.elements() != operations.recurrence.output_elements()
+        || operations.scalars.elements() != operations.recurrence.scalar_elements()
         || operations.output_norm.elements() != operations.recurrence.output_elements()
+        || operations.qk_l2.convolved_elements() != operations.convolution_silu.elements()
+        || operations.value_layout.convolved_elements() != operations.convolution_silu.elements()
     {
         return NativeSessionStateSnafu {
             rule: "native recurrent kernel plans must share the CPU-derived equal-head layout",
         }
         .fail();
     }
-    let value_tail_offset = operations
-        .qk_l2
-        .source_elements()
-        .checked_mul(2)
-        .ok_or_else(|| {
-            ArithmeticOverflowSnafu {
-                context: "native recurrent activated-convolution V offset",
-            }
-            .build()
-        })?;
-    let value_tail_elements = operations.recurrence.output_elements();
-    let value_tail_end = value_tail_offset
-        .checked_add(value_tail_elements)
-        .ok_or_else(|| {
-            ArithmeticOverflowSnafu {
-                context: "native recurrent activated-convolution V end",
-            }
-            .build()
-        })?;
-    if value_tail_end != operations.convolution_silu.elements() {
+    if operations.value_layout.value_offset() != operations.qk_l2.qk_prefix_elements() {
         return NativeSessionStateSnafu {
-            rule: "native recurrent V must be the exact activated-convolution tail",
+            rule: "native recurrent V gather must begin after every row's Q/K prefix",
         }
         .fail();
     }
-    Ok((value_tail_offset, value_tail_elements))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -430,6 +468,7 @@ mod tests {
     use super::{DeviceRecurrentPlan, RecurrentOperationPlans, RecurrentWorkspacePlan, sum};
     use crate::Qwen35Weights;
     use crate::qwen35::tests::{canonical_hybrid_fixture, verify_fixture};
+    use kernels::PackedPrefillPlan;
 
     #[test]
     fn verified_recurrent_plan_reuses_the_cpu_layout_and_tensor_roles()
@@ -442,13 +481,13 @@ mod tests {
 
         assert_eq!(plan.workspace.qkv, plan.convolution.output_elements());
         assert_eq!(
-            plan.workspace.value_tail_elements,
+            plan.workspace.value_layout.elements(),
             plan.recurrence.output_elements()
         );
         assert_eq!(
-            plan.workspace.value_tail_offset + plan.workspace.value_tail_elements,
-            plan.workspace.activated_convolution,
-            "V must remain an activated-convolution tail view"
+            plan.workspace.value_layout.value_offset(),
+            plan.workspace.qk_l2.qk_prefix_elements(),
+            "V must begin after each activated-convolution row's Q/K prefix"
         );
         assert_eq!(plan.matrices.qkv.name, "blk.0.attn_qkv.weight");
         assert_eq!(plan.matrices.output.name, "blk.0.ssm_out.weight");
@@ -485,6 +524,108 @@ mod tests {
     }
 
     #[test]
+    fn packed_native_recurrent_plan_derives_every_token_bearing_owner()
+    -> core::result::Result<(), String> {
+        let artifact = verify_fixture(&canonical_hybrid_fixture()?)?;
+        let weights =
+            Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+
+        for token_count in [1_usize, 2, 3] {
+            let packed = PackedPrefillPlan::new(&[token_count], &[0], token_count)
+                .map_err(|error| error.to_string())?;
+            let plan = DeviceRecurrentPlan::from_packed_prefill(&weights, 0, &packed)
+                .map_err(|error| error.to_string())?;
+            let workspace = plan.workspace;
+
+            assert_eq!(plan.convolution.token_count(), token_count);
+            assert_eq!(plan.recurrence.token_count(), token_count);
+            assert_eq!(
+                workspace.normalized_hidden,
+                token_count * plan.layout.hidden()
+            );
+            assert_eq!(workspace.qkv, plan.convolution.output_elements());
+            assert_eq!(
+                workspace.raw_convolution,
+                plan.convolution.output_elements()
+            );
+            assert_eq!(
+                workspace.activated_convolution,
+                plan.convolution.output_elements()
+            );
+            assert_eq!(
+                workspace.value_head_major,
+                plan.recurrence.output_elements()
+            );
+            assert_eq!(
+                workspace.recurrence_output,
+                plan.recurrence.output_elements()
+            );
+            assert_eq!(
+                workspace.token_major_recurrence_output,
+                plan.recurrence.output_elements()
+            );
+            assert_eq!(workspace.beta, plan.recurrence.scalar_elements());
+            assert_eq!(workspace.log_decay, plan.recurrence.scalar_elements());
+            assert_eq!(
+                workspace.projected_attention,
+                token_count * plan.layout.hidden()
+            );
+            assert_eq!(
+                workspace.elements(),
+                sum(
+                    &[
+                        workspace.normalized_hidden,
+                        workspace.qkv,
+                        workspace.z,
+                        workspace.alpha,
+                        workspace.beta_projection,
+                        workspace.raw_convolution,
+                        workspace.activated_convolution,
+                        workspace.tiled_query,
+                        workspace.tiled_key,
+                        workspace.value_head_major,
+                        workspace.beta,
+                        workspace.log_decay,
+                        workspace.recurrence_output,
+                        workspace.token_major_recurrence_output,
+                        workspace.normalized_output,
+                        workspace.gated_output,
+                        workspace.projected_attention,
+                    ],
+                    "native recurrent test workspace elements",
+                )
+                .map_err(|error| error.to_string())?,
+                "the demand must enumerate every concurrent workspace owner"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_native_recurrent_plan_refuses_multi_sequence_before_device_ownership()
+    -> core::result::Result<(), String> {
+        let artifact = verify_fixture(&canonical_hybrid_fixture()?)?;
+        let weights =
+            Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let packed =
+            PackedPrefillPlan::new(&[1, 1], &[0, 0], 1).map_err(|error| error.to_string())?;
+
+        assert!(
+            DeviceRecurrentPlan::from_packed_prefill(&weights, 0, &packed).is_err(),
+            "the B=1 native owner must refuse before any device allocation or submission"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn packed_context_refusal_precedes_native_chunk_planning() {
+        assert!(
+            PackedPrefillPlan::new(&[2], &[1], 2).is_err(),
+            "the borrowed packed descriptor remains the sole context authority"
+        );
+    }
+
+    #[test]
     fn recurrent_workspace_keeps_unequal_key_and_value_widths_distinct()
     -> core::result::Result<(), String> {
         let convolution = kernels::CausalConvAllocationPlan::try_from_dimensions(1, 14, 1)
@@ -498,6 +639,9 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let qk_l2 =
             kernels::decoder_ops::RecurrentQkL2F32Plan::try_from_dimensions(14, 1, 2, 3, 0.5)
+                .map_err(|error| error.to_string())?;
+        let value_layout =
+            kernels::decoder_ops::RecurrentValueLayoutF32Plan::try_from_qk_plan(qk_l2, 4)
                 .map_err(|error| error.to_string())?;
         let scalars = kernels::decoder_ops::RecurrentScalarsF32Plan::try_from_value_heads(2)
             .map_err(|error| error.to_string())?;
@@ -513,6 +657,7 @@ mod tests {
             recurrence,
             convolution_silu,
             qk_l2,
+            value_layout,
             scalars,
             output_norm,
             output_silu_product,
@@ -521,10 +666,7 @@ mod tests {
 
         assert_eq!(workspace.tiled_query, 6);
         assert_eq!(workspace.recurrence_output, 8);
-        assert_eq!(
-            workspace.value_tail_offset + workspace.value_tail_elements,
-            14
-        );
+        assert_eq!(workspace.value_layout.elements(), 8);
         Ok(())
     }
 }

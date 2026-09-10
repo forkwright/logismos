@@ -222,15 +222,22 @@ __device__ float decode_iq4_xs_element(
         status);
 }
 
-__device__ bool checked_row_index(int rows, std::size_t* row)
+__device__ bool checked_projection_index(
+    int rows,
+    int tokens,
+    std::size_t* token,
+    std::size_t* row)
 {
     const std::size_t candidate = static_cast<std::size_t>(blockIdx.x)
         * static_cast<std::size_t>(blockDim.x)
         + static_cast<std::size_t>(threadIdx.x);
-    if (candidate >= static_cast<std::size_t>(rows)) {
+    const std::size_t row_count = static_cast<std::size_t>(rows);
+    const std::size_t work_items = row_count * static_cast<std::size_t>(tokens);
+    if (candidate >= work_items) {
         return false;
     }
-    *row = candidate;
+    *token = candidate / row_count;
+    *row = candidate % row_count;
     return true;
 }
 
@@ -433,12 +440,18 @@ extern "C" __global__ void logismos_f32_row_gemv_f32_kernel(
     float* output,
     int rows,
     int width,
+    int tokens,
     std::uint32_t* status)
 {
+    std::size_t token = 0;
     std::size_t row = 0;
-    if (checked_row_index(rows, &row)) {
-        output[row] = dot_f32(
-            matrix, activations, row, static_cast<std::size_t>(width), status);
+    if (checked_projection_index(rows, tokens, &token, &row)) {
+        output[token * static_cast<std::size_t>(rows) + row] = dot_f32(
+            matrix,
+            activations + token * static_cast<std::size_t>(width),
+            row,
+            static_cast<std::size_t>(width),
+            status);
     }
 }
 
@@ -448,12 +461,18 @@ extern "C" __global__ void logismos_q8_0_row_gemv_f32_kernel(
     float* output,
     int rows,
     int width,
+    int tokens,
     std::uint32_t* status)
 {
+    std::size_t token = 0;
     std::size_t row = 0;
-    if (checked_row_index(rows, &row)) {
-        output[row] = dot_q8_0(
-            matrix, activations, row, static_cast<std::size_t>(width), status);
+    if (checked_projection_index(rows, tokens, &token, &row)) {
+        output[token * static_cast<std::size_t>(rows) + row] = dot_q8_0(
+            matrix,
+            activations + token * static_cast<std::size_t>(width),
+            row,
+            static_cast<std::size_t>(width),
+            status);
     }
 }
 
@@ -463,12 +482,18 @@ extern "C" __global__ void logismos_q4_k_row_gemv_f32_kernel(
     float* output,
     int rows,
     int width,
+    int tokens,
     std::uint32_t* status)
 {
+    std::size_t token = 0;
     std::size_t row = 0;
-    if (checked_row_index(rows, &row)) {
-        output[row] = dot_q4_k(
-            matrix, activations, row, static_cast<std::size_t>(width), status);
+    if (checked_projection_index(rows, tokens, &token, &row)) {
+        output[token * static_cast<std::size_t>(rows) + row] = dot_q4_k(
+            matrix,
+            activations + token * static_cast<std::size_t>(width),
+            row,
+            static_cast<std::size_t>(width),
+            status);
     }
 }
 
@@ -478,12 +503,18 @@ extern "C" __global__ void logismos_q5_k_row_gemv_f32_kernel(
     float* output,
     int rows,
     int width,
+    int tokens,
     std::uint32_t* status)
 {
+    std::size_t token = 0;
     std::size_t row = 0;
-    if (checked_row_index(rows, &row)) {
-        output[row] = dot_q5_k(
-            matrix, activations, row, static_cast<std::size_t>(width), status);
+    if (checked_projection_index(rows, tokens, &token, &row)) {
+        output[token * static_cast<std::size_t>(rows) + row] = dot_q5_k(
+            matrix,
+            activations + token * static_cast<std::size_t>(width),
+            row,
+            static_cast<std::size_t>(width),
+            status);
     }
 }
 
@@ -493,12 +524,18 @@ extern "C" __global__ void logismos_q6_k_row_gemv_f32_kernel(
     float* output,
     int rows,
     int width,
+    int tokens,
     std::uint32_t* status)
 {
+    std::size_t token = 0;
     std::size_t row = 0;
-    if (checked_row_index(rows, &row)) {
-        output[row] = dot_q6_k(
-            matrix, activations, row, static_cast<std::size_t>(width), status);
+    if (checked_projection_index(rows, tokens, &token, &row)) {
+        output[token * static_cast<std::size_t>(rows) + row] = dot_q6_k(
+            matrix,
+            activations + token * static_cast<std::size_t>(width),
+            row,
+            static_cast<std::size_t>(width),
+            status);
     }
 }
 
@@ -508,12 +545,18 @@ extern "C" __global__ void logismos_iq4_nl_row_gemv_f32_kernel(
     float* output,
     int rows,
     int width,
+    int tokens,
     std::uint32_t* status)
 {
+    std::size_t token = 0;
     std::size_t row = 0;
-    if (checked_row_index(rows, &row)) {
-        output[row] = dot_iq4_nl(
-            matrix, activations, row, static_cast<std::size_t>(width), status);
+    if (checked_projection_index(rows, tokens, &token, &row)) {
+        output[token * static_cast<std::size_t>(rows) + row] = dot_iq4_nl(
+            matrix,
+            activations + token * static_cast<std::size_t>(width),
+            row,
+            static_cast<std::size_t>(width),
+            status);
     }
 }
 
@@ -523,12 +566,18 @@ extern "C" __global__ void logismos_iq4_xs_row_gemv_f32_kernel(
     float* output,
     int rows,
     int width,
+    int tokens,
     std::uint32_t* status)
 {
+    std::size_t token = 0;
     std::size_t row = 0;
-    if (checked_row_index(rows, &row)) {
-        output[row] = dot_iq4_xs(
-            matrix, activations, row, static_cast<std::size_t>(width), status);
+    if (checked_projection_index(rows, tokens, &token, &row)) {
+        output[token * static_cast<std::size_t>(rows) + row] = dot_iq4_xs(
+            matrix,
+            activations + token * static_cast<std::size_t>(width),
+            row,
+            static_cast<std::size_t>(width),
+            status);
     }
 }
 

@@ -4,7 +4,7 @@ use snafu::ResultExt;
 
 use crate::Result;
 use crate::error::{QuantSnafu, UnsupportedShapeSnafu};
-use crate::row_gemv::{KERNEL, RowGemvShape, reserve_output};
+use crate::row_gemv::{KERNEL, RowGemvBatchPlan, RowGemvShape, reserve_output};
 
 /// Compute `matrix[rows, width] * activations[width]` from serialized rows.
 ///
@@ -16,24 +16,123 @@ use crate::row_gemv::{KERNEL, RowGemvShape, reserve_output};
 /// Returns [`crate::Error`] when checked extents differ from `shape`, or when
 /// a serialized row, activation, product, or accumulation is invalid.
 pub fn row_gemv_f32(matrix: &[u8], activations: &[f32], shape: RowGemvShape) -> Result<Vec<f32>> {
-    if matrix.len() != shape.matrix_bytes() || activations.len() != shape.width() {
+    let batch = RowGemvBatchPlan::try_from_shape(shape, 1, activations.len(), shape.rows())?;
+    row_gemv_f32_rows(matrix, activations, batch)
+}
+
+/// Compute independent serialized row-major projections for every input row.
+///
+/// Each output row delegates byte geometry, decoding, finite checks, and
+/// serial f32 arithmetic to the authoritative `quant` format owner.
+///
+/// # Errors
+///
+/// Returns [`crate::Error`] when supplied spans differ from `batch`, or when
+/// a serialized row, activation, product, or accumulation is invalid.
+pub fn row_gemv_f32_rows(
+    matrix: &[u8],
+    activations: &[f32],
+    batch: RowGemvBatchPlan,
+) -> Result<Vec<f32>> {
+    let shape = batch.shape();
+    if matrix.len() != shape.matrix_bytes() || activations.len() != batch.input_elements() {
         return UnsupportedShapeSnafu {
             kernel: KERNEL,
-            msg: "buffer extents differ from the checked serialized-row GEMV shape".to_string(),
+            msg: "buffer extents differ from the checked serialized-row GEMV batch".to_string(),
         }
         .fail();
     }
-    let mut output = reserve_output(shape.rows())?;
-    for row in matrix.chunks_exact(shape.row_bytes()) {
-        output.push(quant::row_dot_f32(shape.format(), row, activations).context(QuantSnafu)?);
+    let mut output = reserve_output(batch.output_elements())?;
+    for activation in activations.chunks_exact(shape.width()) {
+        for row in matrix.chunks_exact(shape.row_bytes()) {
+            output.push(quant::row_dot_f32(shape.format(), row, activation).context(QuantSnafu)?);
+        }
     }
     Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::row_gemv_f32;
-    use crate::row_gemv::RowGemvShape;
+    use super::{row_gemv_f32, row_gemv_f32_rows};
+    use crate::row_gemv::{RowGemvBatchPlan, RowGemvShape};
+
+    #[test]
+    fn batched_f32_rows_preserve_each_token_projection_and_t1_compatibility()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let matrix = [
+            1.0_f32.to_le_bytes(),
+            2.0_f32.to_le_bytes(),
+            (-1.0_f32).to_le_bytes(),
+            0.5_f32.to_le_bytes(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let shape = RowGemvShape::new(quant::RowFormat::F32, 2, 2, matrix.len(), 2, 2)?;
+        let activations = [3.0_f32, 4.0, -2.0, 6.0, 0.5, -8.0];
+        for tokens in 1..=3 {
+            let input = &activations[..tokens * shape.width()];
+            let batch = RowGemvBatchPlan::try_from_shape(
+                shape,
+                tokens,
+                input.len(),
+                tokens * shape.rows(),
+            )?;
+            let actual = row_gemv_f32_rows(&matrix, input, batch)?;
+            let expected = input.chunks_exact(shape.width()).try_fold(
+                Vec::new(),
+                |mut expected, token| -> crate::Result<Vec<f32>> {
+                    expected.extend(row_gemv_f32(&matrix, token, shape)?);
+                    Ok(expected)
+                },
+            )?;
+            assert_eq!(actual, expected, "T={tokens}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batched_rows_match_the_independent_f64_oracle_for_every_format()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        for format in formats() {
+            let fixture = fixture(format)?;
+            let tokens = 2;
+            let mut activations = fixture.activations.clone();
+            activations.extend(fixture.activations.iter().map(|value| -*value));
+            let shape = RowGemvShape::new(
+                format,
+                fixture.rows,
+                fixture.width,
+                fixture.matrix.len(),
+                fixture.width,
+                fixture.rows,
+            )?;
+            let batch = RowGemvBatchPlan::try_from_shape(
+                shape,
+                tokens,
+                activations.len(),
+                tokens * fixture.rows,
+            )?;
+            let actual = row_gemv_f32_rows(&fixture.matrix, &activations, batch)?;
+            let expected = activations.chunks_exact(fixture.width).try_fold(
+                Vec::new(),
+                |mut expected,
+                 activation|
+                 -> core::result::Result<Vec<f64>, Box<dyn std::error::Error>> {
+                    expected.extend(oracle_matrix(
+                        format,
+                        &fixture.matrix,
+                        fixture.rows,
+                        fixture.width,
+                        activation,
+                    )?);
+                    Ok(expected)
+                },
+            )?;
+            assert_close(&actual, &expected, format.to_string().as_str());
+        }
+        Ok(())
+    }
 
     #[test]
     fn every_executable_format_matches_an_independent_f64_serial_oracle()

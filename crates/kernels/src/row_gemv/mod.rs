@@ -23,6 +23,7 @@ use crate::error::NoGpuBuildSnafu;
 use crate::error::{QuantSnafu, Result, RowGemvAllocationSnafu, UnsupportedShapeSnafu};
 
 const KERNEL: &str = "row_gemv_f32";
+const ROW_GEMV_THREADS_PER_BLOCK: usize = 256;
 
 #[cfg(all(feature = "gpu", not(logismos_no_gpu_kernels)))]
 unsafe extern "C" {
@@ -32,6 +33,7 @@ unsafe extern "C" {
         output: *mut c_void,
         rows: i32,
         width: i32,
+        tokens: i32,
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
@@ -41,6 +43,7 @@ unsafe extern "C" {
         output: *mut c_void,
         rows: i32,
         width: i32,
+        tokens: i32,
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
@@ -50,6 +53,7 @@ unsafe extern "C" {
         output: *mut c_void,
         rows: i32,
         width: i32,
+        tokens: i32,
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
@@ -59,6 +63,7 @@ unsafe extern "C" {
         output: *mut c_void,
         rows: i32,
         width: i32,
+        tokens: i32,
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
@@ -68,6 +73,7 @@ unsafe extern "C" {
         output: *mut c_void,
         rows: i32,
         width: i32,
+        tokens: i32,
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
@@ -77,6 +83,7 @@ unsafe extern "C" {
         output: *mut c_void,
         rows: i32,
         width: i32,
+        tokens: i32,
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
@@ -86,6 +93,7 @@ unsafe extern "C" {
         output: *mut c_void,
         rows: i32,
         width: i32,
+        tokens: i32,
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
@@ -238,6 +246,115 @@ impl RowGemvShape {
     }
 }
 
+/// Checked `[tokens, width]` to `[tokens, rows]` geometry for one matrix shape.
+///
+/// The source [`RowGemvShape`] remains the only owner of serialized matrix
+/// layout and one-token projection dimensions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RowGemvBatchPlan {
+    shape: RowGemvShape,
+    tokens: usize,
+    input_elements: usize,
+    output_elements: usize,
+    tokens_i32: i32,
+}
+
+impl RowGemvBatchPlan {
+    /// Derive and validate exact dense input/output extents for `token_count`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::UnsupportedShape`] when token count is zero,
+    /// extents overflow, supplied spans differ from the derived extents, or a
+    /// launch dimension cannot cross the HIP ABI.
+    pub fn try_from_shape(
+        shape: RowGemvShape,
+        token_count: usize,
+        input_elements: usize,
+        output_elements: usize,
+    ) -> Result<Self> {
+        if token_count == 0 {
+            return unsupported_shape("token count must be positive");
+        }
+        let derived_input = token_count.checked_mul(shape.width).ok_or_else(|| {
+            UnsupportedShapeSnafu {
+                kernel: KERNEL,
+                msg: format!(
+                    "token count * activation width overflows usize ({token_count} * {})",
+                    shape.width
+                ),
+            }
+            .build()
+        })?;
+        let derived_output = token_count.checked_mul(shape.rows).ok_or_else(|| {
+            UnsupportedShapeSnafu {
+                kernel: KERNEL,
+                msg: format!(
+                    "token count * output rows overflows usize ({token_count} * {})",
+                    shape.rows
+                ),
+            }
+            .build()
+        })?;
+        checked_layout::<f32>(derived_input, "batched activation length")?;
+        checked_layout::<f32>(derived_output, "batched output length")?;
+        let blocks = derived_output
+            .checked_add(ROW_GEMV_THREADS_PER_BLOCK - 1)
+            .ok_or_else(|| {
+                UnsupportedShapeSnafu {
+                    kernel: KERNEL,
+                    msg: "batched projection launch blocks overflow usize".to_string(),
+                }
+                .build()
+            })?
+            / ROW_GEMV_THREADS_PER_BLOCK;
+        u32::try_from(blocks).map_err(|_| abi_error("batched projection grid blocks", blocks))?;
+        if input_elements != derived_input {
+            return unsupported_shape(format!(
+                "batched activation length {input_elements} must equal {derived_input}"
+            ));
+        }
+        if output_elements != derived_output {
+            return unsupported_shape(format!(
+                "batched output length {output_elements} must equal {derived_output}"
+            ));
+        }
+        let tokens_i32 =
+            i32::try_from(token_count).map_err(|_| abi_error("token count", token_count))?;
+        Ok(Self {
+            shape,
+            tokens: token_count,
+            input_elements: derived_input,
+            output_elements: derived_output,
+            tokens_i32,
+        })
+    }
+
+    /// Return the sole serialized matrix-shape authority.
+    #[must_use]
+    pub const fn shape(self) -> RowGemvShape {
+        self.shape
+    }
+
+    /// Return the number of independent input rows.
+    #[must_use]
+    pub const fn tokens(self) -> usize {
+        self.tokens
+    }
+
+    /// Return the exact dense input span in f32 elements.
+    #[must_use]
+    pub const fn input_elements(self) -> usize {
+        self.input_elements
+    }
+
+    /// Return the exact dense output span in f32 elements.
+    #[must_use]
+    pub const fn output_elements(self) -> usize {
+        self.output_elements
+    }
+}
+
 /// Checked selected-row lookup geometry derived from one serialized matrix shape.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RowDecodePlan {
@@ -377,10 +494,11 @@ pub unsafe fn launch_row_gemv_f32(
     output_len: usize,
     stream: &Stream,
 ) -> Result<()> {
+    let batch = RowGemvBatchPlan::try_from_shape(shape, 1, activation_len, output_len)?;
     // SAFETY: the raw caller retains the documented allocation and numerical obligations.
     unsafe {
-        launch_row_gemv_f32_impl(
-            shape,
+        launch_row_gemv_f32_rows_impl(
+            batch,
             matrix,
             matrix_bytes,
             activations,
@@ -426,10 +544,50 @@ pub unsafe fn launch_row_gemv_f32_checked(
     stream: &Stream,
     status: &NativeNumericalStatus,
 ) -> Result<()> {
+    let batch = RowGemvBatchPlan::try_from_shape(shape, 1, activation_len, output_len)?;
     // SAFETY: the checked caller retains all device and status allocation obligations.
     unsafe {
-        launch_row_gemv_f32_impl(
-            shape,
+        launch_row_gemv_f32_rows_impl(
+            batch,
+            matrix,
+            matrix_bytes,
+            activations,
+            activation_len,
+            output,
+            output_len,
+            stream,
+            Some(status),
+        )
+    }
+}
+
+/// Launch a checked batched serialized row-major projection on `stream`.
+///
+/// Each `(token, output row)` preserves the format owner's original serial
+/// decode, product, and accumulation order. This is a correctness primitive,
+/// not a batched GEMM path.
+///
+/// # Safety
+///
+/// `matrix`, `activations`, and `output` must identify the exact distinct
+/// device spans admitted by `batch` on `stream`'s device and remain live
+/// through completion. `status` is a distinct live allocation on that device.
+#[cfg(feature = "gpu")]
+pub unsafe fn launch_row_gemv_f32_rows_checked(
+    batch: RowGemvBatchPlan,
+    matrix: *const u8,
+    matrix_bytes: usize,
+    activations: *const f32,
+    activation_len: usize,
+    output: *mut f32,
+    output_len: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    // SAFETY: the caller retains the documented checked device and status obligations.
+    unsafe {
+        launch_row_gemv_f32_rows_impl(
+            batch,
             matrix,
             matrix_bytes,
             activations,
@@ -447,8 +605,8 @@ pub unsafe fn launch_row_gemv_f32_checked(
     clippy::too_many_arguments,
     reason = "one launch owner validates both raw and checked serialized-row GEMV calls"
 )]
-unsafe fn launch_row_gemv_f32_impl(
-    shape: RowGemvShape,
+unsafe fn launch_row_gemv_f32_rows_impl(
+    batch: RowGemvBatchPlan,
     matrix: *const u8,
     matrix_bytes: usize,
     activations: *const f32,
@@ -461,7 +619,7 @@ unsafe fn launch_row_gemv_f32_impl(
     #[cfg(logismos_no_gpu_kernels)]
     {
         let _ = (
-            shape,
+            batch,
             matrix,
             matrix_bytes,
             activations,
@@ -477,7 +635,7 @@ unsafe fn launch_row_gemv_f32_impl(
     #[cfg(not(logismos_no_gpu_kernels))]
     {
         validate_device_buffers(
-            shape,
+            batch,
             matrix,
             matrix_bytes,
             activations,
@@ -485,8 +643,10 @@ unsafe fn launch_row_gemv_f32_impl(
             output,
             output_len,
         )?;
-        let rows = i32::try_from(shape.rows).map_err(|_| abi_error("rows", shape.rows))?;
-        let width = i32::try_from(shape.width).map_err(|_| abi_error("width", shape.width))?;
+        let rows =
+            i32::try_from(batch.shape.rows).map_err(|_| abi_error("rows", batch.shape.rows))?;
+        let width =
+            i32::try_from(batch.shape.width).map_err(|_| abi_error("width", batch.shape.width))?;
         let numerical_status = match status {
             Some(status) => {
                 // SAFETY: the caller retains this distinct status on the stream device.
@@ -500,12 +660,13 @@ unsafe fn launch_row_gemv_f32_impl(
         // the sole private format dispatch.
         let code = unsafe {
             launch_format(
-                shape.format,
+                batch.shape.format,
                 matrix.cast::<c_void>(),
                 activations.cast::<c_void>(),
                 output.cast::<c_void>(),
                 rows,
                 width,
+                batch.tokens_i32,
                 numerical_status,
                 stream.raw().cast::<c_void>(),
             )?
@@ -663,6 +824,7 @@ unsafe fn launch_format(
     output: *mut c_void,
     rows: i32,
     width: i32,
+    tokens: i32,
     numerical_status: *mut c_void,
     stream: *mut c_void,
 ) -> Result<u32> {
@@ -676,6 +838,7 @@ unsafe fn launch_format(
                 output,
                 rows,
                 width,
+                tokens,
                 numerical_status,
                 stream,
             )),
@@ -685,6 +848,7 @@ unsafe fn launch_format(
                 output,
                 rows,
                 width,
+                tokens,
                 numerical_status,
                 stream,
             )),
@@ -694,6 +858,7 @@ unsafe fn launch_format(
                 output,
                 rows,
                 width,
+                tokens,
                 numerical_status,
                 stream,
             )),
@@ -703,6 +868,7 @@ unsafe fn launch_format(
                 output,
                 rows,
                 width,
+                tokens,
                 numerical_status,
                 stream,
             )),
@@ -712,6 +878,7 @@ unsafe fn launch_format(
                 output,
                 rows,
                 width,
+                tokens,
                 numerical_status,
                 stream,
             )),
@@ -721,6 +888,7 @@ unsafe fn launch_format(
                 output,
                 rows,
                 width,
+                tokens,
                 numerical_status,
                 stream,
             )),
@@ -730,6 +898,7 @@ unsafe fn launch_format(
                 output,
                 rows,
                 width,
+                tokens,
                 numerical_status,
                 stream,
             )),
@@ -815,7 +984,7 @@ unsafe fn launch_decode_format(
 
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 fn validate_device_buffers(
-    shape: RowGemvShape,
+    batch: RowGemvBatchPlan,
     matrix: *const u8,
     matrix_bytes: usize,
     activations: *const f32,
@@ -823,27 +992,29 @@ fn validate_device_buffers(
     output: *mut f32,
     output_len: usize,
 ) -> Result<()> {
-    if matrix_bytes != shape.matrix_bytes {
+    if matrix_bytes != batch.shape.matrix_bytes {
         return unsupported_shape(format!(
             "matrix byte length {matrix_bytes} must equal checked {}",
-            shape.matrix_bytes
+            batch.shape.matrix_bytes
         ));
     }
-    if activation_len != shape.width {
+    if activation_len != batch.input_elements {
         return unsupported_shape(format!(
             "activation length {activation_len} must equal checked {}",
-            shape.width
+            batch.input_elements
         ));
     }
-    if output_len != shape.rows {
+    if output_len != batch.output_elements {
         return unsupported_shape(format!(
             "output length {output_len} must equal checked {}",
-            shape.rows
+            batch.output_elements
         ));
     }
-    let matrix = checked_u8_device_span(KERNEL, matrix, shape.matrix_bytes, "matrix")?;
-    let activations = checked_f32_device_span(KERNEL, activations, shape.width, "activations")?;
-    let output = checked_f32_device_span(KERNEL, output.cast_const(), shape.rows, "output")?;
+    let matrix = checked_u8_device_span(KERNEL, matrix, batch.shape.matrix_bytes, "matrix")?;
+    let activations =
+        checked_f32_device_span(KERNEL, activations, batch.input_elements, "activations")?;
+    let output =
+        checked_f32_device_span(KERNEL, output.cast_const(), batch.output_elements, "output")?;
     reject_overlapping_device_spans(KERNEL, output, matrix)?;
     reject_overlapping_device_spans(KERNEL, output, activations)
 }
@@ -895,9 +1066,42 @@ pub(crate) fn reserve_output(rows: usize) -> Result<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{KERNEL, RowDecodePlan, RowGemvShape};
+    use super::{KERNEL, RowDecodePlan, RowGemvBatchPlan, RowGemvShape};
     use crate::Error;
     use crate::numerical_status::NativeNumericalStatusCategory;
+
+    #[test]
+    fn batch_plan_derives_t1_t2_t3_extents_from_one_matrix_shape()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let shape = RowGemvShape::new(quant::RowFormat::F32, 2, 3, 24, 3, 2)?;
+        for tokens in 1..=3 {
+            let batch = RowGemvBatchPlan::try_from_shape(shape, tokens, tokens * 3, tokens * 2)?;
+            assert_eq!(batch.shape(), shape);
+            assert_eq!(batch.tokens(), tokens);
+            assert_eq!(batch.input_elements(), tokens * 3);
+            assert_eq!(batch.output_elements(), tokens * 2);
+        }
+        assert!(RowGemvBatchPlan::try_from_shape(shape, 2, 5, 4).is_err());
+        assert!(RowGemvBatchPlan::try_from_shape(shape, 2, 6, 3).is_err());
+        assert!(RowGemvBatchPlan::try_from_shape(shape, 0, 0, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn batch_plan_widens_representable_token_row_products_without_allocating()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let rows = usize::try_from(i32::MAX)?;
+        let matrix_bytes = rows
+            .checked_mul(core::mem::size_of::<f32>())
+            .ok_or_else(|| std::io::Error::other("matrix bytes"))?;
+        let shape = RowGemvShape::new(quant::RowFormat::F32, rows, 1, matrix_bytes, 1, rows)?;
+        let outputs = rows
+            .checked_mul(2)
+            .ok_or_else(|| std::io::Error::other("output elements"))?;
+        let batch = RowGemvBatchPlan::try_from_shape(shape, 2, 2, outputs)?;
+        assert_eq!(batch.output_elements(), outputs);
+        Ok(())
+    }
 
     #[test]
     fn shape_uses_the_format_owner_for_every_supported_row_layout()
@@ -1113,8 +1317,9 @@ mod tests {
         let activations = [0.0_f32; 2];
         let mut output = [0.0_f32; 2];
         let shape = RowGemvShape::new(quant::RowFormat::F32, 2, 2, 16, 2, 2)?;
+        let batch = RowGemvBatchPlan::try_from_shape(shape, 1, activations.len(), output.len())?;
         super::validate_device_buffers(
-            shape,
+            batch,
             matrix.as_ptr(),
             matrix.len(),
             activations.as_ptr(),
@@ -1124,7 +1329,7 @@ mod tests {
         )?;
         let misaligned_matrix = [0.0_f32; 5];
         super::validate_device_buffers(
-            shape,
+            batch,
             misaligned_matrix.as_ptr().cast::<u8>().wrapping_byte_add(1),
             matrix.len(),
             activations.as_ptr(),
@@ -1132,9 +1337,52 @@ mod tests {
             output.as_mut_ptr(),
             output.len(),
         )?;
+        let batched_activations = [0.0_f32; 4];
+        let mut batched_output = [0.0_f32; 4];
+        let batch_two = RowGemvBatchPlan::try_from_shape(
+            shape,
+            2,
+            batched_activations.len(),
+            batched_output.len(),
+        )?;
+        super::validate_device_buffers(
+            batch_two,
+            matrix.as_ptr(),
+            matrix.len(),
+            batched_activations.as_ptr(),
+            batched_activations.len(),
+            batched_output.as_mut_ptr(),
+            batched_output.len(),
+        )?;
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch_two,
+                matrix.as_ptr(),
+                matrix.len(),
+                batched_activations.as_ptr(),
+                batched_activations.len() - 1,
+                batched_output.as_mut_ptr(),
+                batched_output.len(),
+            )
+            .is_err(),
+            "T=2 activation span must equal the batch-derived extent"
+        );
+        assert!(
+            super::validate_device_buffers(
+                batch_two,
+                matrix.as_ptr(),
+                matrix.len(),
+                batched_activations.as_ptr(),
+                batched_activations.len(),
+                batched_output.as_mut_ptr(),
+                batched_output.len() - 1,
+            )
+            .is_err(),
+            "T=2 output span must equal the batch-derived extent"
+        );
+        assert!(
+            super::validate_device_buffers(
+                batch,
                 matrix.as_ptr(),
                 matrix.len() - 1,
                 activations.as_ptr(),
@@ -1146,7 +1394,7 @@ mod tests {
         );
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch,
                 matrix.as_ptr(),
                 matrix.len(),
                 activations.as_ptr(),
@@ -1158,7 +1406,7 @@ mod tests {
         );
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch,
                 matrix.as_ptr(),
                 matrix.len(),
                 activations.as_ptr(),
@@ -1170,7 +1418,7 @@ mod tests {
         );
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch,
                 core::ptr::null(),
                 matrix.len(),
                 activations.as_ptr(),
@@ -1182,7 +1430,7 @@ mod tests {
         );
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch,
                 matrix.as_ptr(),
                 matrix.len(),
                 activations.as_ptr(),
@@ -1194,7 +1442,7 @@ mod tests {
         );
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch,
                 matrix.as_ptr(),
                 matrix.len(),
                 activations.as_ptr(),
@@ -1207,7 +1455,7 @@ mod tests {
         let mut aligned_matrix = [0.0_f32; 4];
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch,
                 aligned_matrix.as_ptr().cast::<u8>(),
                 matrix.len(),
                 activations.as_ptr(),

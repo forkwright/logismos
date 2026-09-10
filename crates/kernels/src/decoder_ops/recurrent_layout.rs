@@ -1,10 +1,10 @@
-//! Checked T=1 Qwen recurrent Q/K arrangement and L2 normalization.
+//! Checked token-aware Qwen recurrent Q/K arrangement and L2 normalization.
 //!
 //! The operation consumes the already-SiLU-activated causal-convolution row.
 //! It selects its leading Q and K source spans and writes the Qwen-specific
-//! modulo-tiled, head-major `[value_heads, key_width]` outputs required by the
-//! staged GDN step. It deliberately does not arrange V: for `T = 1`, V's
-//! contiguous convolution tail already has the GDN row layout.
+//! modulo-tiled, head-major `[value_heads, T, key_width]` outputs required by
+//! staged GDN. V is gathered separately because every convolution row carries
+//! its own Q/K prefix.
 
 #[cfg(not(logismos_no_gpu_kernels))]
 use core::ffi::c_void;
@@ -30,6 +30,8 @@ unsafe extern "C" {
         convolved_f32: *const c_void,
         query_f32: *mut c_void,
         key_f32: *mut c_void,
+        token_count: u32,
+        convolved_row_elements: u32,
         source_key_heads: u32,
         value_heads: u32,
         key_width: u32,
@@ -37,9 +39,31 @@ unsafe extern "C" {
         numerical_status: *mut c_void,
         stream: *mut c_void,
     ) -> u32;
+
+    fn logismos_launch_decoder_recurrent_values_to_head_major_f32(
+        convolved_f32: *const c_void,
+        values_f32: *mut c_void,
+        token_count: u32,
+        convolved_row_elements: u32,
+        value_heads: u32,
+        value_width: u32,
+        value_offset: u32,
+        numerical_status: *mut c_void,
+        stream: *mut c_void,
+    ) -> u32;
+
+    fn logismos_launch_decoder_recurrent_values_to_token_major_f32(
+        head_major_f32: *const c_void,
+        token_major_f32: *mut c_void,
+        token_count: u32,
+        value_heads: u32,
+        value_width: u32,
+        numerical_status: *mut c_void,
+        stream: *mut c_void,
+    ) -> u32;
 }
 
-/// Checked T=1 Q/K source and modulo-tiled output geometry for Qwen recurrence.
+/// Checked `[T, row]` Q/K source and modulo-tiled output geometry for Qwen recurrence.
 ///
 /// The two source spans are consecutive within an already-SiLU convolution
 /// row: Q is `[0, source_elements)` and K immediately follows it. Each target
@@ -47,20 +71,25 @@ unsafe extern "C" {
 /// pinned tiling order, which differs from grouped GDN's floor mapping.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RecurrentQkL2F32Plan {
+    token_count: usize,
     convolved_elements: usize,
+    convolved_row_elements: usize,
     source_key_heads: usize,
     value_heads: usize,
     key_width: usize,
     source_elements: usize,
+    qk_prefix_elements: usize,
     output_elements: usize,
     epsilon: f32,
+    token_count_u32: u32,
+    convolved_row_elements_u32: u32,
     source_key_heads_u32: u32,
     value_heads_u32: u32,
     key_width_u32: u32,
 }
 
 impl RecurrentQkL2F32Plan {
-    /// Admit one already-activated T=1 convolution row and its Qwen Q/K layout.
+    /// Admit already-activated `[T, row]` convolution rows and their Qwen Q/K layout.
     ///
     /// # Errors
     ///
@@ -69,14 +98,16 @@ impl RecurrentQkL2F32Plan {
     /// source spans do not fit the convolution row, a product or Rust f32
     /// layout overflows, a HIP ABI dimension is unrepresentable, or `epsilon`
     /// is not positive normal finite f32.
-    pub fn try_from_dimensions(
-        convolved_elements: usize,
+    pub fn try_from_token_rows(
+        token_count: usize,
+        convolved_row_elements: usize,
         source_key_heads: usize,
         value_heads: usize,
         key_width: usize,
         epsilon: f32,
     ) -> Result<Self> {
-        validate_nonzero("convolved_elements", convolved_elements)?;
+        validate_nonzero("token_count", token_count)?;
+        validate_nonzero("convolved_row_elements", convolved_row_elements)?;
         validate_nonzero("source_key_heads", source_key_heads)?;
         validate_nonzero("value_heads", value_heads)?;
         validate_nonzero("key_width", key_width)?;
@@ -90,36 +121,87 @@ impl RecurrentQkL2F32Plan {
         let source_elements =
             checked_product(source_key_heads, key_width, "source_key_heads * key_width")?;
         let qk_source_elements = checked_product(source_elements, 2, "Q/K source elements")?;
-        if convolved_elements < qk_source_elements {
+        if convolved_row_elements < qk_source_elements {
             return unsupported_shape(format!(
-                "convolved row length {convolved_elements} cannot contain Q/K source prefix {qk_source_elements}"
+                "convolved row length {convolved_row_elements} cannot contain Q/K source prefix {qk_source_elements}"
             ));
         }
-        let output_elements = checked_product(value_heads, key_width, "value_heads * key_width")?;
-        validate_f32_layout("convolved row", convolved_elements)?;
+        let per_token_output = checked_product(value_heads, key_width, "value_heads * key_width")?;
+        let output_elements = checked_product(
+            token_count,
+            per_token_output,
+            "token_count * value_heads * key_width",
+        )?;
+        let convolved_elements = checked_product(
+            token_count,
+            convolved_row_elements,
+            "token_count * convolved_row_elements",
+        )?;
+        validate_f32_layout("convolved rows", convolved_elements)?;
         validate_f32_layout("Q source", source_elements)?;
         validate_f32_layout("K source", source_elements)?;
         validate_f32_layout("tiled Q output", output_elements)?;
         validate_f32_layout("tiled K output", output_elements)?;
 
         Ok(Self {
+            token_count,
             convolved_elements,
+            convolved_row_elements,
             source_key_heads,
             value_heads,
             key_width,
             source_elements,
+            qk_prefix_elements: qk_source_elements,
             output_elements,
             epsilon,
+            token_count_u32: abi_u32("token_count", token_count)?,
+            convolved_row_elements_u32: abi_u32("convolved_row_elements", convolved_row_elements)?,
             source_key_heads_u32: abi_u32("source_key_heads", source_key_heads)?,
             value_heads_u32: abi_u32("value_heads", value_heads)?,
             key_width_u32: abi_u32("key_width", key_width)?,
         })
     }
 
+    /// Admit the legacy one-token convolution row geometry.
+    pub fn try_from_dimensions(
+        convolved_elements: usize,
+        source_key_heads: usize,
+        value_heads: usize,
+        key_width: usize,
+        epsilon: f32,
+    ) -> Result<Self> {
+        Self::try_from_token_rows(
+            1,
+            convolved_elements,
+            source_key_heads,
+            value_heads,
+            key_width,
+            epsilon,
+        )
+    }
+
+    /// Return the admitted token count.
+    #[must_use]
+    pub const fn token_count(self) -> usize {
+        self.token_count
+    }
+
     /// Return the exact already-activated convolution-row extent.
     #[must_use]
     pub const fn convolved_elements(self) -> usize {
         self.convolved_elements
+    }
+
+    /// Return the exact per-token activated convolution-row extent.
+    #[must_use]
+    pub const fn convolved_row_elements(self) -> usize {
+        self.convolved_row_elements
+    }
+
+    /// Return the checked Q/K prefix in each convolution row.
+    #[must_use]
+    pub const fn qk_prefix_elements(self) -> usize {
+        self.qk_prefix_elements
     }
 
     /// Return the source Q/K head count before Qwen modulo tiling.
@@ -156,6 +238,125 @@ impl RecurrentQkL2F32Plan {
     #[must_use]
     pub const fn epsilon(self) -> f32 {
         self.epsilon
+    }
+}
+
+/// Checked gather geometry for values in an activated `[T, row]` convolution.
+///
+/// `value_offset` is the checked Q/K prefix; each row's value tail is gathered
+/// into compact head-major `[Hv, T, V]` storage rather than reinterpreting a
+/// flat tail across rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecurrentValueLayoutF32Plan {
+    token_count: usize,
+    convolved_row_elements: usize,
+    value_heads: usize,
+    value_width: usize,
+    value_offset: usize,
+    convolved_elements: usize,
+    elements: usize,
+    token_count_u32: u32,
+    convolved_row_elements_u32: u32,
+    value_heads_u32: u32,
+    value_width_u32: u32,
+    value_offset_u32: u32,
+}
+
+impl RecurrentValueLayoutF32Plan {
+    /// Derive the exact value-tail gather from checked Q/K row geometry.
+    pub fn try_from_qk_plan(qk: RecurrentQkL2F32Plan, value_width: usize) -> Result<Self> {
+        Self::try_from_convolved_rows(
+            qk.token_count,
+            qk.convolved_row_elements,
+            qk.value_heads,
+            value_width,
+            qk.qk_prefix_elements,
+        )
+    }
+
+    /// Admit a checked exact-tail convolution-row value gather.
+    ///
+    /// Native recurrent composition should use [`Self::try_from_qk_plan`] so
+    /// the row prefix comes from the Q/K owner rather than a duplicate model
+    /// expression. This lower-level constructor remains useful to qualify the
+    /// independently checked layout boundary.
+    pub fn try_from_convolved_rows(
+        token_count: usize,
+        convolved_row_elements: usize,
+        value_heads: usize,
+        value_width: usize,
+        value_offset: usize,
+    ) -> Result<Self> {
+        validate_nonzero("token_count", token_count)?;
+        validate_nonzero("convolved_row_elements", convolved_row_elements)?;
+        validate_nonzero("value_heads", value_heads)?;
+        validate_nonzero("value_width", value_width)?;
+        let elements = checked_product(
+            checked_product(token_count, value_heads, "token_count * value_heads")?,
+            value_width,
+            "token_count * value_heads * value_width",
+        )?;
+        let value_end = value_offset
+            .checked_add(checked_product(
+                value_heads,
+                value_width,
+                "value_heads * value_width",
+            )?)
+            .ok_or_else(|| {
+                UnsupportedShapeSnafu {
+                    kernel: RECURRENT_QK_L2_KERNEL,
+                    msg: "value offset plus value tail overflows usize".to_owned(),
+                }
+                .build()
+            })?;
+        if value_end != convolved_row_elements {
+            return unsupported_shape(format!(
+                "value tail [{value_offset}, {value_end}) must end at convolved row {convolved_row_elements}"
+            ));
+        }
+        let convolved_elements = checked_product(
+            token_count,
+            convolved_row_elements,
+            "token_count * convolved_row_elements",
+        )?;
+        validate_f32_layout("convolved rows", convolved_elements)?;
+        validate_f32_layout("compact recurrent values", elements)?;
+        super::validate_grid(RECURRENT_QK_L2_KERNEL, elements, super::ELEMENTWISE_THREADS)?;
+        Ok(Self {
+            token_count,
+            convolved_row_elements,
+            value_heads,
+            value_width,
+            value_offset,
+            convolved_elements,
+            elements,
+            token_count_u32: abi_u32("token_count", token_count)?,
+            convolved_row_elements_u32: abi_u32("convolved_row_elements", convolved_row_elements)?,
+            value_heads_u32: abi_u32("value_heads", value_heads)?,
+            value_width_u32: abi_u32("value_width", value_width)?,
+            value_offset_u32: abi_u32("value_offset", value_offset)?,
+        })
+    }
+
+    /// Return the admitted number of token rows.
+    #[must_use]
+    pub const fn token_count(self) -> usize {
+        self.token_count
+    }
+    /// Return the exact activated convolution source extent across all rows.
+    #[must_use]
+    pub const fn convolved_elements(self) -> usize {
+        self.convolved_elements
+    }
+    /// Return the exact compact `[Hv, T, V]` or `[T, Hv, V]` extent.
+    #[must_use]
+    pub const fn elements(self) -> usize {
+        self.elements
+    }
+    /// Return the checked per-row start of the exact value tail.
+    #[must_use]
+    pub const fn value_offset(self) -> usize {
+        self.value_offset
     }
 }
 
@@ -298,6 +499,8 @@ unsafe fn launch_recurrent_qk_l2_f32_with_status(
                 convolved_f32.cast::<c_void>(),
                 query_f32.cast::<c_void>(),
                 key_f32.cast::<c_void>(),
+                plan.token_count_u32,
+                plan.convolved_row_elements_u32,
                 plan.source_key_heads_u32,
                 plan.value_heads_u32,
                 plan.key_width_u32,
@@ -308,6 +511,179 @@ unsafe fn launch_recurrent_qk_l2_f32_with_status(
         };
         launch_result(code)
     }
+}
+
+/// Gather the value tail from every activated convolution row into compact
+/// head-major `[Hv, T, V]` storage while recording numerical failures.
+///
+/// # Safety
+///
+/// The input and output device spans must meet their exact plan extents,
+/// remain live on `stream` through completion, and not overlap.
+pub unsafe fn launch_recurrent_values_to_head_major_f32_checked(
+    plan: RecurrentValueLayoutF32Plan,
+    convolved_f32: *const f32,
+    convolved_elements: usize,
+    values_f32: *mut f32,
+    values_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = (
+            plan,
+            convolved_f32,
+            convolved_elements,
+            values_f32,
+            values_elements,
+            stream,
+            status,
+        );
+        no_gpu_refusal()
+    }
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        validate_value_gather_launch(
+            plan,
+            convolved_f32,
+            convolved_elements,
+            values_f32,
+            values_elements,
+        )?;
+        stream.make_current()?;
+        // SAFETY: checked spans establish exact ABI extents and nonaliasing; caller retains stream lifetime.
+        let code = unsafe {
+            logismos_launch_decoder_recurrent_values_to_head_major_f32(
+                convolved_f32.cast(),
+                values_f32.cast(),
+                plan.token_count_u32,
+                plan.convolved_row_elements_u32,
+                plan.value_heads_u32,
+                plan.value_width_u32,
+                plan.value_offset_u32,
+                status.as_device_ptr().cast(),
+                stream.raw().cast(),
+            )
+        };
+        launch_result(code)
+    }
+}
+
+/// Transform compact recurrent output `[Hv, T, V]` to token-major `[T, Hv, V]`.
+///
+/// # Safety
+///
+/// The input and output device spans must meet their exact plan extents,
+/// remain live on `stream` through completion, and not overlap.
+pub unsafe fn launch_recurrent_values_to_token_major_f32_checked(
+    plan: RecurrentValueLayoutF32Plan,
+    head_major_f32: *const f32,
+    head_major_elements: usize,
+    token_major_f32: *mut f32,
+    token_major_elements: usize,
+    stream: &Stream,
+    status: &NativeNumericalStatus,
+) -> Result<()> {
+    #[cfg(logismos_no_gpu_kernels)]
+    {
+        let _ = (
+            plan,
+            head_major_f32,
+            head_major_elements,
+            token_major_f32,
+            token_major_elements,
+            stream,
+            status,
+        );
+        no_gpu_refusal()
+    }
+    #[cfg(not(logismos_no_gpu_kernels))]
+    {
+        validate_compact_layout_launch(
+            plan,
+            head_major_f32,
+            head_major_elements,
+            token_major_f32,
+            token_major_elements,
+        )?;
+        stream.make_current()?;
+        // SAFETY: checked spans establish exact ABI extents and nonaliasing; caller retains stream lifetime.
+        let code = unsafe {
+            logismos_launch_decoder_recurrent_values_to_token_major_f32(
+                head_major_f32.cast(),
+                token_major_f32.cast(),
+                plan.token_count_u32,
+                plan.value_heads_u32,
+                plan.value_width_u32,
+                status.as_device_ptr().cast(),
+                stream.raw().cast(),
+            )
+        };
+        launch_result(code)
+    }
+}
+
+#[cfg(any(test, not(logismos_no_gpu_kernels)))]
+fn validate_value_gather_launch(
+    plan: RecurrentValueLayoutF32Plan,
+    convolved_f32: *const f32,
+    convolved_elements: usize,
+    values_f32: *mut f32,
+    values_elements: usize,
+) -> Result<()> {
+    validate_length(
+        "convolved rows",
+        convolved_elements,
+        plan.convolved_elements,
+    )?;
+    validate_length("head-major values", values_elements, plan.elements)?;
+    let convolved = checked_f32_device_span(
+        RECURRENT_QK_L2_KERNEL,
+        convolved_f32,
+        convolved_elements,
+        "convolved rows",
+    )?;
+    let values = checked_f32_device_span(
+        RECURRENT_QK_L2_KERNEL,
+        values_f32.cast_const(),
+        values_elements,
+        "head-major values",
+    )?;
+    reject_overlapping_f32_spans(RECURRENT_QK_L2_KERNEL, convolved, values)
+}
+
+#[cfg(any(test, not(logismos_no_gpu_kernels)))]
+fn validate_compact_layout_launch(
+    plan: RecurrentValueLayoutF32Plan,
+    head_major_f32: *const f32,
+    head_major_elements: usize,
+    token_major_f32: *mut f32,
+    token_major_elements: usize,
+) -> Result<()> {
+    validate_length(
+        "head-major recurrent output",
+        head_major_elements,
+        plan.elements,
+    )?;
+    validate_length(
+        "token-major recurrent output",
+        token_major_elements,
+        plan.elements,
+    )?;
+    let head_major = checked_f32_device_span(
+        RECURRENT_QK_L2_KERNEL,
+        head_major_f32,
+        head_major_elements,
+        "head-major recurrent output",
+    )?;
+    let token_major = checked_f32_device_span(
+        RECURRENT_QK_L2_KERNEL,
+        token_major_f32.cast_const(),
+        token_major_elements,
+        "token-major recurrent output",
+    )?;
+    reject_overlapping_f32_spans(RECURRENT_QK_L2_KERNEL, head_major, token_major)
 }
 
 #[cfg(logismos_no_gpu_kernels)]
@@ -456,52 +832,67 @@ fn native_order_reference(
     let mut key = reserve_reference(plan.output_elements)?;
     for value_head in 0..plan.value_heads {
         let source_head = value_head % plan.source_key_heads;
-        let source_start = checked_product(source_head, plan.key_width, "source head offset")?;
-        let source_end = source_start.checked_add(plan.key_width).ok_or_else(|| {
-            UnsupportedShapeSnafu {
-                kernel: RECURRENT_QK_L2_KERNEL,
-                msg: "source head end overflows usize".to_owned(),
-            }
-            .build()
-        })?;
-        let key_start = plan
-            .source_elements
-            .checked_add(source_start)
-            .ok_or_else(|| {
+        for token in 0..plan.token_count {
+            let row_start =
+                checked_product(token, plan.convolved_row_elements, "convolved row offset")?;
+            let source_start = row_start
+                .checked_add(checked_product(
+                    source_head,
+                    plan.key_width,
+                    "source head offset",
+                )?)
+                .ok_or_else(|| {
+                    UnsupportedShapeSnafu {
+                        kernel: RECURRENT_QK_L2_KERNEL,
+                        msg: "Q source head offset overflows usize".to_owned(),
+                    }
+                    .build()
+                })?;
+            let source_end = source_start.checked_add(plan.key_width).ok_or_else(|| {
                 UnsupportedShapeSnafu {
                     kernel: RECURRENT_QK_L2_KERNEL,
-                    msg: "K source head offset overflows usize".to_owned(),
+                    msg: "source head end overflows usize".to_owned(),
                 }
                 .build()
             })?;
-        let key_end = key_start.checked_add(plan.key_width).ok_or_else(|| {
-            UnsupportedShapeSnafu {
-                kernel: RECURRENT_QK_L2_KERNEL,
-                msg: "K source head end overflows usize".to_owned(),
+            let key_start = source_start
+                .checked_add(plan.source_elements)
+                .ok_or_else(|| {
+                    UnsupportedShapeSnafu {
+                        kernel: RECURRENT_QK_L2_KERNEL,
+                        msg: "K source head offset overflows usize".to_owned(),
+                    }
+                    .build()
+                })?;
+            let key_end = key_start.checked_add(plan.key_width).ok_or_else(|| {
+                UnsupportedShapeSnafu {
+                    kernel: RECURRENT_QK_L2_KERNEL,
+                    msg: "K source head end overflows usize".to_owned(),
+                }
+                .build()
+            })?;
+            let query_source = convolved.get(source_start..source_end).ok_or_else(|| {
+                UnsupportedShapeSnafu {
+                    kernel: RECURRENT_QK_L2_KERNEL,
+                    msg: "checked Q source slice access failed".to_owned(),
+                }
+                .build()
+            })?;
+            let key_source = convolved.get(key_start..key_end).ok_or_else(|| {
+                UnsupportedShapeSnafu {
+                    kernel: RECURRENT_QK_L2_KERNEL,
+                    msg: "checked K source slice access failed".to_owned(),
+                }
+                .build()
+            })?;
+            let (query_denominator, key_denominator) =
+                native_denominators(query_source, key_source, plan.epsilon);
+            for value in query_source {
+                query.push(*value / query_denominator);
             }
-            .build()
-        })?;
-        let query_source = convolved.get(source_start..source_end).ok_or_else(|| {
-            UnsupportedShapeSnafu {
-                kernel: RECURRENT_QK_L2_KERNEL,
-                msg: "checked Q source slice access failed".to_owned(),
+            for value in key_source {
+                key.push(*value / key_denominator);
             }
-            .build()
-        })?;
-        let key_source = convolved.get(key_start..key_end).ok_or_else(|| {
-            UnsupportedShapeSnafu {
-                kernel: RECURRENT_QK_L2_KERNEL,
-                msg: "checked K source slice access failed".to_owned(),
-            }
-            .build()
-        })?;
-        let (query_denominator, key_denominator) =
-            native_denominators(query_source, key_source, plan.epsilon);
-        for value in query_source {
-            query.push(*value / query_denominator);
-        }
-        for value in key_source {
-            key.push(*value / key_denominator);
         }
     }
     Ok((query, key))
@@ -521,6 +912,71 @@ fn serial_sum_squares(values: &[f32]) -> f32 {
         sum += value * value;
     }
     sum
+}
+
+#[cfg(test)]
+fn missing_test_slice(context: &'static str) -> crate::Error {
+    UnsupportedShapeSnafu {
+        kernel: RECURRENT_QK_L2_KERNEL,
+        msg: format!("test fixture missing {context}"),
+    }
+    .build()
+}
+
+#[cfg(test)]
+fn gather_values_reference(
+    plan: RecurrentValueLayoutF32Plan,
+    convolved: &[f32],
+) -> Result<Vec<f32>> {
+    validate_length("convolved rows", convolved.len(), plan.convolved_elements)?;
+    let mut values = reserve_reference(plan.elements)?;
+    for head in 0..plan.value_heads {
+        for token in 0..plan.token_count {
+            let start = token
+                .checked_mul(plan.convolved_row_elements)
+                .and_then(|row| row.checked_add(plan.value_offset))
+                .and_then(|offset| offset.checked_add(head * plan.value_width))
+                .ok_or_else(|| missing_test_slice("value gather offset"))?;
+            let end = start
+                .checked_add(plan.value_width)
+                .ok_or_else(|| missing_test_slice("value gather end"))?;
+            values.extend_from_slice(
+                convolved
+                    .get(start..end)
+                    .ok_or_else(|| missing_test_slice("value gather source"))?,
+            );
+        }
+    }
+    Ok(values)
+}
+
+#[cfg(test)]
+fn token_major_values_reference(
+    plan: RecurrentValueLayoutF32Plan,
+    head_major: &[f32],
+) -> Result<Vec<f32>> {
+    validate_length(
+        "head-major recurrent output",
+        head_major.len(),
+        plan.elements,
+    )?;
+    let mut token_major = reserve_reference(plan.elements)?;
+    for token in 0..plan.token_count {
+        for head in 0..plan.value_heads {
+            let start = (head * plan.token_count + token)
+                .checked_mul(plan.value_width)
+                .ok_or_else(|| missing_test_slice("value scatter offset"))?;
+            let end = start
+                .checked_add(plan.value_width)
+                .ok_or_else(|| missing_test_slice("value scatter end"))?;
+            token_major.extend_from_slice(
+                head_major
+                    .get(start..end)
+                    .ok_or_else(|| missing_test_slice("value scatter source"))?,
+            );
+        }
+    }
+    Ok(token_major)
 }
 
 #[cfg(test)]
@@ -566,6 +1022,127 @@ mod tests {
         assert!(
             separation > F32_TOLERANCE,
             "source heads must distinguish modulo [0, 1, 0, 1] from floor [0, 0, 1, 1]"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn token_rows_preserve_row_prefixes_and_emit_head_major_qk() -> Result<()> {
+        let plan = RecurrentQkL2F32Plan::try_from_token_rows(3, 7, 1, 2, 2, 1e-5)?;
+        let convolved = [
+            3.0_f32, 4.0, 5.0, 12.0, 101.0, 102.0, 103.0, 8.0, 6.0, 12.0, 5.0, 201.0, 202.0, 203.0,
+            7.0, 24.0, 9.0, 40.0, 301.0, 302.0, 303.0,
+        ];
+        let (native_q, native_k) = native_order_reference(plan, &convolved)?;
+        let (oracle_q, oracle_k) = f64_logical_oracle(plan, &convolved)?;
+        assert_close_f64(&native_q, &oracle_q, "T=3 Q row prefix");
+        assert_close_f64(&native_k, &oracle_k, "T=3 K row prefix");
+        assert_eq!(plan.output_elements(), 12);
+        assert_eq!(plan.qk_prefix_elements(), 4);
+        assert!(RecurrentQkL2F32Plan::try_from_token_rows(0, 4, 1, 1, 2, 1e-5).is_err());
+        assert!(RecurrentQkL2F32Plan::try_from_token_rows(usize::MAX, 4, 1, 1, 2, 1e-5).is_err());
+        let value_qk = RecurrentQkL2F32Plan::try_from_token_rows(3, 8, 2, 2, 1, 1e-5)?;
+        let layout = RecurrentValueLayoutF32Plan::try_from_qk_plan(value_qk, 2)?;
+        let layout_source = [
+            0.0_f32, 0.0, 0.0, 0.0, 11.0, 12.0, 21.0, 22.0, 0.0, 0.0, 0.0, 0.0, 13.0, 14.0, 23.0,
+            24.0, 0.0, 0.0, 0.0, 0.0, 15.0, 16.0, 25.0, 26.0,
+        ];
+        assert_eq!(layout.convolved_elements(), 24);
+        assert_eq!(layout.elements(), 12);
+        let gathered = gather_values_reference(layout, &layout_source)?;
+        assert_eq!(
+            gathered,
+            vec![
+                11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0
+            ]
+        );
+        let token_major = token_major_values_reference(layout, &gathered)?;
+        assert_eq!(
+            token_major,
+            vec![
+                11.0, 12.0, 21.0, 22.0, 13.0, 14.0, 23.0, 24.0, 15.0, 16.0, 25.0, 26.0
+            ]
+        );
+        assert!(RecurrentValueLayoutF32Plan::try_from_convolved_rows(3, 6, 1, 3, 4).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn value_layout_validators_admit_t3_exact_spans_and_refuse_aliases()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let qk = RecurrentQkL2F32Plan::try_from_token_rows(3, 8, 2, 2, 1, 1e-5)?;
+        let plan = RecurrentValueLayoutF32Plan::try_from_qk_plan(qk, 2)?;
+        let mut convolved = [0.0_f32; 24];
+        let mut head_major = [0.0_f32; 12];
+        let mut token_major = [0.0_f32; 12];
+        validate_value_gather_launch(
+            plan,
+            convolved.as_ptr(),
+            convolved.len(),
+            head_major.as_mut_ptr(),
+            head_major.len(),
+        )?;
+        validate_compact_layout_launch(
+            plan,
+            head_major.as_ptr(),
+            head_major.len(),
+            token_major.as_mut_ptr(),
+            token_major.len(),
+        )?;
+        assert!(
+            validate_value_gather_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len() - 1,
+                head_major.as_mut_ptr(),
+                head_major.len(),
+            )
+            .is_err(),
+            "gather must refuse a convolution span shorter than checked T=3 rows"
+        );
+        assert!(
+            validate_value_gather_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len(),
+                head_major.as_mut_ptr(),
+                head_major.len() - 1,
+            )
+            .is_err(),
+            "gather must refuse a head-major destination shorter than its exact layout"
+        );
+        assert!(
+            validate_value_gather_launch(
+                plan,
+                convolved.as_ptr(),
+                convolved.len(),
+                convolved.as_mut_ptr(),
+                head_major.len(),
+            )
+            .is_err(),
+            "gather must refuse a writable head-major span overlapping convolution input"
+        );
+        assert!(
+            validate_compact_layout_launch(
+                plan,
+                head_major.as_ptr(),
+                head_major.len(),
+                head_major.as_mut_ptr(),
+                token_major.len(),
+            )
+            .is_err(),
+            "reverse layout must refuse token-major output overlapping head-major input"
+        );
+        assert!(
+            validate_compact_layout_launch(
+                plan,
+                head_major.as_ptr(),
+                head_major.len(),
+                token_major.as_mut_ptr(),
+                token_major.len() - 1,
+            )
+            .is_err(),
+            "reverse layout must refuse a token-major destination shorter than its exact layout"
         );
         Ok(())
     }
@@ -902,45 +1479,53 @@ mod tests {
         let mut key = Vec::with_capacity(plan.output_elements());
         for value_head in 0..plan.value_heads() {
             let source_head = value_head % plan.source_key_heads();
-            let source_start = source_head
-                .checked_mul(plan.key_width())
-                .ok_or_else(|| missing_test_slice("f64 source offset"))?;
-            let source_end = source_start
-                .checked_add(plan.key_width())
-                .ok_or_else(|| missing_test_slice("f64 source end"))?;
-            let key_start = plan
-                .source_elements()
-                .checked_add(source_start)
-                .ok_or_else(|| missing_test_slice("f64 key offset"))?;
-            let key_end = key_start
-                .checked_add(plan.key_width())
-                .ok_or_else(|| missing_test_slice("f64 key end"))?;
-            let query_source = convolved
-                .get(source_start..source_end)
-                .ok_or_else(|| missing_test_slice("f64 Q source"))?;
-            let key_source = convolved
-                .get(key_start..key_end)
-                .ok_or_else(|| missing_test_slice("f64 K source"))?;
-            let query_sum = query_source
-                .iter()
-                .map(|value| f64::from(*value) * f64::from(*value))
-                .sum::<f64>();
-            let key_sum = key_source
-                .iter()
-                .map(|value| f64::from(*value) * f64::from(*value))
-                .sum::<f64>();
-            let query_denominator = query_sum.sqrt().max(f64::from(plan.epsilon()));
-            let key_denominator = key_sum.sqrt().max(f64::from(plan.epsilon()));
-            query.extend(
-                query_source
+            for token in 0..plan.token_count() {
+                let row_start = token
+                    .checked_mul(plan.convolved_row_elements())
+                    .ok_or_else(|| missing_test_slice("f64 row offset"))?;
+                let source_start = row_start
+                    .checked_add(
+                        source_head
+                            .checked_mul(plan.key_width())
+                            .ok_or_else(|| missing_test_slice("f64 source offset"))?,
+                    )
+                    .ok_or_else(|| missing_test_slice("f64 source start"))?;
+                let source_end = source_start
+                    .checked_add(plan.key_width())
+                    .ok_or_else(|| missing_test_slice("f64 source end"))?;
+                let key_start = source_start
+                    .checked_add(plan.source_elements())
+                    .ok_or_else(|| missing_test_slice("f64 key offset"))?;
+                let key_end = key_start
+                    .checked_add(plan.key_width())
+                    .ok_or_else(|| missing_test_slice("f64 key end"))?;
+                let query_source = convolved
+                    .get(source_start..source_end)
+                    .ok_or_else(|| missing_test_slice("f64 Q source"))?;
+                let key_source = convolved
+                    .get(key_start..key_end)
+                    .ok_or_else(|| missing_test_slice("f64 K source"))?;
+                let query_sum = query_source
                     .iter()
-                    .map(|value| f64::from(*value) / query_denominator),
-            );
-            key.extend(
-                key_source
+                    .map(|value| f64::from(*value) * f64::from(*value))
+                    .sum::<f64>();
+                let key_sum = key_source
                     .iter()
-                    .map(|value| f64::from(*value) / key_denominator),
-            );
+                    .map(|value| f64::from(*value) * f64::from(*value))
+                    .sum::<f64>();
+                let query_denominator = query_sum.sqrt().max(f64::from(plan.epsilon()));
+                let key_denominator = key_sum.sqrt().max(f64::from(plan.epsilon()));
+                query.extend(
+                    query_source
+                        .iter()
+                        .map(|value| f64::from(*value) / query_denominator),
+                );
+                key.extend(
+                    key_source
+                        .iter()
+                        .map(|value| f64::from(*value) / key_denominator),
+                );
+            }
         }
         Ok((query, key))
     }
@@ -971,14 +1556,6 @@ mod tests {
                 "{operation} index {index}: got {actual}, expected {expected}"
             );
         }
-    }
-
-    fn missing_test_slice(context: &'static str) -> crate::Error {
-        UnsupportedShapeSnafu {
-            kernel: RECURRENT_QK_L2_KERNEL,
-            msg: format!("test fixture missing {context}"),
-        }
-        .build()
     }
 
     fn read_device(buffer: &hipcore::DeviceBuffer<f32>) -> core::result::Result<Vec<f32>, String> {
