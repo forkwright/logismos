@@ -11,7 +11,7 @@ use crate::qwen35::tests::{
 const STATE_ABSOLUTE_TOLERANCE: f64 = 1.0e-3;
 const STATE_RELATIVE_TOLERANCE: f64 = 1.0e-4;
 
-type ExecutionStateSnapshot = (
+pub(super) type ExecutionStateSnapshot = (
     usize,
     Vec<(Vec<f32>, Vec<f32>)>,
     Vec<(usize, Vec<f32>, Vec<f32>)>,
@@ -168,7 +168,7 @@ fn mixed_quantized_private_state_matches_f64_oracle_and_rolls_back()
     Ok(())
 }
 
-fn private_state_snapshot(
+pub(super) fn private_state_snapshot(
     execution: &Qwen35Execution,
 ) -> std::result::Result<ExecutionStateSnapshot, String> {
     let recurrent = execution
@@ -195,7 +195,7 @@ fn private_state_snapshot(
     Ok((execution.position, recurrent, full))
 }
 
-fn assert_private_state_matches_oracle(
+pub(super) fn assert_private_state_matches_oracle(
     execution: &Qwen35Execution,
     expected: &OracleStateSnapshot,
 ) -> std::result::Result<(), String> {
@@ -267,7 +267,7 @@ fn paged_layer_snapshot(
     Ok((kv.tokens(), keys, values))
 }
 
-fn assert_f32_slice_matches_f64(
+pub(super) fn assert_f32_slice_matches_f64(
     actual: &[f32],
     expected: &[f64],
     state: &str,
