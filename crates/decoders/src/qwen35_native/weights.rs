@@ -1,6 +1,6 @@
 //! Owned device copies of verified full-attention weights.
 
-use hipcore::{Device, DeviceBuffer};
+use hipcore::{Device, DeviceBuffer, Stream};
 use snafu::ResultExt;
 
 use super::custody::{NativeBufferSink, NativeBuildResult, NativeBuildScope, NativeBuildSource};
@@ -122,6 +122,45 @@ impl NativeMatrix {
 
     pub(super) fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
         sink.push_u8(self.bytes);
+    }
+
+    /// Launch a checked projection for `token_count` dense input rows.
+    ///
+    /// # Safety
+    ///
+    /// `input` and `output` must be exact distinct spans on `stream`'s device,
+    /// with the sticky status allocation retained through completion.
+    pub(super) unsafe fn launch_rows(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &DeviceBuffer<f32>,
+        token_count: usize,
+        stream: &Stream,
+        numerical_status: &kernels::numerical_status::NativeNumericalStatus,
+    ) -> Result<()> {
+        let batch = kernels::row_gemv::RowGemvBatchPlan::try_from_shape(
+            self.shape,
+            token_count,
+            input.len(),
+            output.len(),
+        )
+        .context(NativeKernelSnafu)?;
+        // SAFETY: the caller retains the exact checked device spans and status
+        // allocation through completion for the matrix shape bound above.
+        unsafe {
+            kernels::row_gemv::launch_row_gemv_f32_rows_checked(
+                batch,
+                self.bytes.as_device_ptr(),
+                self.bytes.len(),
+                input.as_device_ptr().cast_const(),
+                input.len(),
+                output.as_device_ptr(),
+                output.len(),
+                stream,
+                numerical_status,
+            )
+        }
+        .context(NativeKernelSnafu)
     }
 }
 
