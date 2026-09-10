@@ -177,7 +177,7 @@ impl Qwen35BatchCpuRequirements {
         let mut receipts = receipts.into_iter();
         let first = receipts.next().ok_or_else(|| {
             ExecutionBatchSnafu {
-                sequence: 0,
+                sequence: 0_usize,
                 rule: "batch requirements require at least one execution receipt",
             }
             .build()

@@ -42,7 +42,7 @@ impl Qwen35Execution {
     ) -> Result<Qwen35BatchExecutionPlan<'execution, 'tokens>> {
         if executions.is_empty() {
             return ExecutionBatchSnafu {
-                sequence: 0,
+                sequence: 0_usize,
                 rule: "batch must contain at least one independently owned execution",
             }
             .fail();
@@ -56,7 +56,7 @@ impl Qwen35Execution {
         }
         let reference = executions.first().ok_or_else(|| {
             ExecutionBatchSnafu {
-                sequence: 0,
+                sequence: 0_usize,
                 rule: "batch must retain its first execution receipt",
             }
             .build()
