@@ -176,6 +176,12 @@ impl MultiHeadRecurrentAllocationPlan {
         self.value_head_count
     }
 
+    /// Return the number of value heads assigned to each key/query head.
+    #[must_use]
+    const fn value_heads_per_key(self) -> usize {
+        self.value_head_count / self.key_head_count
+    }
+
     /// Return the admitted per-head key/query width.
     #[must_use]
     pub const fn key_dim(self) -> usize {
@@ -573,8 +579,7 @@ impl<'a> MultiHeadRecurrentInput<'a> {
     }
 
     fn head_input(&self, value_head_index: usize) -> GdnResult<RecurrentInput<'a>> {
-        let heads_per_key = self.value_head_count / self.key_head_count;
-        let key_head_index = value_head_index / heads_per_key;
+        let key_head_index = value_head_index / self.allocations.value_heads_per_key();
         let head = self.allocations.head_allocations();
         RecurrentInput::new_with_allocations(
             head_slice(self.q, key_head_index, head.query_and_key, "q")?,
@@ -614,10 +619,7 @@ pub struct PackedMultiHeadRecurrentInput<'a> {
     scale: f32,
     state: &'a [f32],
     packed: &'a PackedPrefillPlan,
-    key_head_count: usize,
-    value_head_count: usize,
-    key_dim: usize,
-    value_dim: usize,
+    allocations: MultiHeadRecurrentAllocationPlan,
 }
 
 impl<'a> PackedMultiHeadRecurrentInput<'a> {
@@ -679,10 +681,7 @@ impl<'a> PackedMultiHeadRecurrentInput<'a> {
             scale,
             state,
             packed,
-            key_head_count,
-            value_head_count,
-            key_dim,
-            value_dim,
+            allocations,
         })
     }
 }
@@ -858,110 +857,100 @@ pub fn packed_multi_head_recurrent_fwd(
     input: &PackedMultiHeadRecurrentInput<'_>,
 ) -> GdnResult<PackedMultiHeadRecurrentOutput> {
     let total = input.packed.total_tokens();
-    let state_per_sequence = checked_product(
-        input.value_head_count,
-        checked_product(input.key_dim, input.value_dim, "packed GDN state head")?,
-        "packed GDN state sequence",
-    )?;
-    let output_elements = checked_product(
-        input.value_head_count,
-        checked_product(total, input.value_dim, "packed GDN output head")?,
-        "packed GDN output",
+    let value_head_count = input.allocations.value_head_count();
+    let key_dim = input.allocations.key_dim();
+    let value_dim = input.allocations.value_dim();
+    let state_per_sequence = input.allocations.state_elements();
+    let output_elements = input.allocations.output_elements();
+    let final_state_elements = checked_product(
+        input.packed.sequence_count(),
+        state_per_sequence,
+        "packed final GDN state",
     )?;
     let mut output = reserve_f32("packed multi-head output", output_elements)?;
     output.resize(output_elements, 0.0);
-    let mut state = reserve_f32(
-        "packed multi-head final state",
-        checked_product(
-            input.packed.sequence_count(),
-            state_per_sequence,
-            "packed final GDN state",
-        )?,
-    )?;
+    let mut state = reserve_f32("packed multi-head final state", final_state_elements)?;
+    state.resize(final_state_elements, 0.0);
 
     for sequence in 0..input.packed.sequence_count() {
         let rows = packed_range(input.packed, sequence)?;
-        let q = packed_head_window(
-            input.q,
-            input.key_head_count,
-            total,
-            input.key_dim,
-            rows.clone(),
-        )?;
-        let k = packed_head_window(
-            input.k,
-            input.key_head_count,
-            total,
-            input.key_dim,
-            rows.clone(),
-        )?;
-        let v = packed_head_window(
-            input.v,
-            input.value_head_count,
-            total,
-            input.value_dim,
-            rows.clone(),
-        )?;
-        let beta = packed_head_window(input.beta, input.value_head_count, total, 1, rows.clone())?;
-        let g = packed_head_window(input.g, input.value_head_count, total, 1, rows.clone())?;
+        let head_allocations =
+            RecurrentAllocationPlan::try_from_dimensions(rows.len(), key_dim, value_dim)?;
         let state_start = checked_product(sequence, state_per_sequence, "packed GDN state start")?;
-        let state_end = checked_add(state_start, state_per_sequence, "packed GDN state end")?;
-        let prior_state = input.state.get(state_start..state_end).ok_or_else(|| {
-            LengthMismatchSnafu {
-                input: "packed state",
-                expected: state_end,
-                actual: input.state.len(),
-            }
-            .build()
-        })?;
-        let sequence_input = MultiHeadRecurrentInput::new(
-            &q,
-            &k,
-            &v,
-            &beta,
-            &g,
-            input.scale,
-            prior_state,
-            rows.len(),
-            input.key_head_count,
-            input.value_head_count,
-            input.key_dim,
-            input.value_dim,
-        )?;
-        let sequence_output = multi_head_recurrent_fwd(&sequence_input)?;
-        state.extend_from_slice(sequence_output.state());
-        let per_head = checked_product(rows.len(), input.value_dim, "packed output head window")?;
-        for head in 0..input.value_head_count {
-            let start = checked_product(head, per_head, "packed local output head start")?;
-            let end = checked_add(start, per_head, "packed local output head end")?;
-            let values = sequence_output.output().get(start..end).ok_or_else(|| {
-                LengthMismatchSnafu {
-                    input: "packed local output",
-                    expected: end,
-                    actual: sequence_output.output().len(),
-                }
-                .build()
-            })?;
+
+        for value_head in 0..value_head_count {
+            let key_head = value_head / input.allocations.value_heads_per_key();
+            let q = packed_head_slice(input.q, key_head, total, key_dim, rows.clone(), "q")?;
+            let k = packed_head_slice(input.k, key_head, total, key_dim, rows.clone(), "k")?;
+            let v = packed_head_slice(input.v, value_head, total, value_dim, rows.clone(), "v")?;
+            let beta = packed_head_slice(input.beta, value_head, total, 1, rows.clone(), "beta")?;
+            let g = packed_head_slice(input.g, value_head, total, 1, rows.clone(), "g")?;
+            let head_state_start = checked_add(
+                state_start,
+                checked_product(
+                    value_head,
+                    head_allocations.state,
+                    "packed GDN value-head state start",
+                )?,
+                "packed GDN state window start",
+            )?;
+            let head_state_end = checked_add(
+                head_state_start,
+                head_allocations.state,
+                "packed GDN state window end",
+            )?;
+            let prior_state = input
+                .state
+                .get(head_state_start..head_state_end)
+                .ok_or_else(|| {
+                    LengthMismatchSnafu {
+                        input: "packed state",
+                        expected: head_state_end,
+                        actual: input.state.len(),
+                    }
+                    .build()
+                })?;
+            let head_input = RecurrentInput::new_with_allocations(
+                q,
+                k,
+                v,
+                beta,
+                g,
+                input.scale,
+                prior_state,
+                key_dim,
+                value_dim,
+                head_allocations,
+            )?;
+            let head_output = recurrent_fwd(&head_input)?;
             let output_start = checked_add(
                 checked_product(
-                    head,
-                    checked_product(total, input.value_dim, "packed output head stride")?,
-                    "packed output head start",
+                    value_head,
+                    input.allocations.head_output_elements(),
+                    "packed GDN output head start",
                 )?,
-                checked_product(rows.start, input.value_dim, "packed output token start")?,
-                "packed output window start",
+                checked_product(rows.start, value_dim, "packed GDN output token start")?,
+                "packed GDN output window start",
             )?;
-            let output_end = checked_add(output_start, per_head, "packed output window end")?;
-            let output_len = output.len();
-            let destination = output.get_mut(output_start..output_end).ok_or_else(|| {
-                LengthMismatchSnafu {
-                    input: "packed output",
-                    expected: output_end,
-                    actual: output_len,
-                }
-                .build()
-            })?;
-            destination.copy_from_slice(values);
+            let output_end = checked_add(
+                output_start,
+                head_allocations.output,
+                "packed GDN output window end",
+            )?;
+            copy_packed_window(
+                &mut output,
+                output_start,
+                output_end,
+                head_output.output(),
+                "packed output",
+            )?;
+            copy_packed_window(
+                &mut state,
+                head_state_start,
+                head_state_end,
+                head_output.state(),
+                "packed final state",
+            )?;
         }
     }
     Ok(PackedMultiHeadRecurrentOutput { output, state })
@@ -978,36 +967,53 @@ fn packed_range(packed: &PackedPrefillPlan, sequence: usize) -> GdnResult<core::
     })
 }
 
-fn packed_head_window(
-    values: &[f32],
-    head_count: usize,
+/// Borrow one head's descriptor-defined token window from `[H, N, D]` storage.
+fn packed_head_slice<'a>(
+    values: &'a [f32],
+    head: usize,
     total_tokens: usize,
     width: usize,
     rows: core::ops::Range<usize>,
-) -> GdnResult<Vec<f32>> {
+    input: &'static str,
+) -> GdnResult<&'a [f32]> {
     let window = checked_product(rows.len(), width, "packed head window")?;
-    let capacity = checked_product(head_count, window, "packed head windows")?;
     let head_stride = checked_product(total_tokens, width, "packed head stride")?;
-    let mut output = reserve_f32("packed head window", capacity)?;
-    for head in 0..head_count {
-        let head_start = checked_product(head, head_stride, "packed head start")?;
-        let start = checked_add(
-            head_start,
-            checked_product(rows.start, width, "packed head row start")?,
-            "packed head window start",
-        )?;
-        let end = checked_add(start, window, "packed head window end")?;
-        let source = values.get(start..end).ok_or_else(|| {
-            LengthMismatchSnafu {
-                input: "packed head values",
-                expected: end,
-                actual: values.len(),
-            }
-            .build()
-        })?;
-        output.extend_from_slice(source);
-    }
-    Ok(output)
+    let head_start = checked_product(head, head_stride, "packed head start")?;
+    let start = checked_add(
+        head_start,
+        checked_product(rows.start, width, "packed head row start")?,
+        "packed head window start",
+    )?;
+    let end = checked_add(start, window, "packed head window end")?;
+    values.get(start..end).ok_or_else(|| {
+        LengthMismatchSnafu {
+            input,
+            expected: end,
+            actual: values.len(),
+        }
+        .build()
+    })
+}
+
+fn copy_packed_window(
+    destination: &mut [f32],
+    start: usize,
+    end: usize,
+    source: &[f32],
+    output: &'static str,
+) -> GdnResult<()> {
+    let destination_len = destination.len();
+    let destination = destination.get_mut(start..end).ok_or_else(|| {
+        LengthMismatchSnafu {
+            input: output,
+            expected: end,
+            actual: destination_len,
+        }
+        .build()
+    })?;
+    validate_length(output, source.len(), destination.len())?;
+    destination.copy_from_slice(source);
+    Ok(())
 }
 
 #[cfg(feature = "gpu")]
@@ -1824,10 +1830,10 @@ mod tests {
     }
 
     #[test]
-    fn packed_mixed_lengths_match_independent_f64_oracle_and_isolate_state() -> GdnResult<()> {
+    fn packed_mixed_lengths_match_independent_f64_oracle_and_isolate_state()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let fixture = multi_head_fixture(KEY_HEAD_COUNT, VALUE_HEAD_COUNT);
-        let packed = PackedPrefillPlan::new(&[1, 2], &[2, 5], 8)
-            .map_err(|_| DimensionProductOverflowSnafu.build())?;
+        let packed = PackedPrefillPlan::new(&[1, 2], &[2, 5], 8)?;
         let mut state = fixture.state.clone();
         state.extend(fixture.state.iter().map(|value| -*value));
         let input = PackedMultiHeadRecurrentInput::new(
@@ -1917,6 +1923,169 @@ mod tests {
 
         assert_close(actual.output(), &expected_output, "packed mixed output");
         assert_close(actual.state(), &expected_state, "packed mixed state");
+        Ok(())
+    }
+
+    #[test]
+    fn packed_partition_continuation_matches_independent_f64_oracle()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let fixture = multi_head_fixture(KEY_HEAD_COUNT, VALUE_HEAD_COUNT);
+        let full = PackedPrefillPlan::new(&[TOKEN_COUNT], &[3], 8)?;
+        let full_input = PackedMultiHeadRecurrentInput::new(
+            &fixture.q,
+            &fixture.k,
+            &fixture.v,
+            &fixture.beta,
+            &fixture.g,
+            SCALE,
+            &fixture.state,
+            &full,
+            KEY_HEAD_COUNT,
+            VALUE_HEAD_COUNT,
+            KEY_DIM,
+            MULTI_HEAD_VALUE_DIM,
+        )?;
+        let full_actual = packed_multi_head_recurrent_fwd(&full_input)?;
+
+        let first = PackedPrefillPlan::new(&[1], &[4], 8)?;
+        let first_q =
+            head_major_token_window(&fixture.q, KEY_HEAD_COUNT, TOKEN_COUNT, KEY_DIM, 0, 1);
+        let first_k =
+            head_major_token_window(&fixture.k, KEY_HEAD_COUNT, TOKEN_COUNT, KEY_DIM, 0, 1);
+        let first_v = head_major_token_window(
+            &fixture.v,
+            VALUE_HEAD_COUNT,
+            TOKEN_COUNT,
+            MULTI_HEAD_VALUE_DIM,
+            0,
+            1,
+        );
+        let first_beta =
+            head_major_token_window(&fixture.beta, VALUE_HEAD_COUNT, TOKEN_COUNT, 1, 0, 1);
+        let first_g = head_major_token_window(&fixture.g, VALUE_HEAD_COUNT, TOKEN_COUNT, 1, 0, 1);
+        let first_input = PackedMultiHeadRecurrentInput::new(
+            &first_q,
+            &first_k,
+            &first_v,
+            &first_beta,
+            &first_g,
+            SCALE,
+            &fixture.state,
+            &first,
+            KEY_HEAD_COUNT,
+            VALUE_HEAD_COUNT,
+            KEY_DIM,
+            MULTI_HEAD_VALUE_DIM,
+        )?;
+        let first_actual = packed_multi_head_recurrent_fwd(&first_input)?;
+
+        let rest = PackedPrefillPlan::new(&[2], &[5], 8)?;
+        let rest_q =
+            head_major_token_window(&fixture.q, KEY_HEAD_COUNT, TOKEN_COUNT, KEY_DIM, 1, 3);
+        let rest_k =
+            head_major_token_window(&fixture.k, KEY_HEAD_COUNT, TOKEN_COUNT, KEY_DIM, 1, 3);
+        let rest_v = head_major_token_window(
+            &fixture.v,
+            VALUE_HEAD_COUNT,
+            TOKEN_COUNT,
+            MULTI_HEAD_VALUE_DIM,
+            1,
+            3,
+        );
+        let rest_beta =
+            head_major_token_window(&fixture.beta, VALUE_HEAD_COUNT, TOKEN_COUNT, 1, 1, 3);
+        let rest_g = head_major_token_window(&fixture.g, VALUE_HEAD_COUNT, TOKEN_COUNT, 1, 1, 3);
+        let rest_input = PackedMultiHeadRecurrentInput::new(
+            &rest_q,
+            &rest_k,
+            &rest_v,
+            &rest_beta,
+            &rest_g,
+            SCALE,
+            first_actual.state(),
+            &rest,
+            KEY_HEAD_COUNT,
+            VALUE_HEAD_COUNT,
+            KEY_DIM,
+            MULTI_HEAD_VALUE_DIM,
+        )?;
+        let rest_actual = packed_multi_head_recurrent_fwd(&rest_input)?;
+
+        let (expected_output, expected_state) = oracle_multi_head_recurrence(
+            &fixture.q,
+            &fixture.k,
+            &fixture.v,
+            &fixture.beta,
+            &fixture.g,
+            SCALE,
+            &fixture.state,
+            TOKEN_COUNT,
+            KEY_HEAD_COUNT,
+            VALUE_HEAD_COUNT,
+            KEY_DIM,
+            MULTI_HEAD_VALUE_DIM,
+        );
+        let actual_output = join_head_major_outputs(
+            first_actual.output(),
+            rest_actual.output(),
+            VALUE_HEAD_COUNT,
+            1,
+            2,
+            MULTI_HEAD_VALUE_DIM,
+        );
+
+        assert_close(
+            &actual_output,
+            &expected_output,
+            "packed continuation output",
+        );
+        assert_close(
+            rest_actual.state(),
+            &expected_state,
+            "packed continuation state",
+        );
+        assert_close(full_actual.output(), &expected_output, "packed full output");
+        assert_close(full_actual.state(), &expected_state, "packed full state");
+        Ok(())
+    }
+
+    #[test]
+    fn packed_late_arithmetic_failure_returns_no_partial_state()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let packed = PackedPrefillPlan::new(&[1, 1], &[2, 6], 8)?;
+        let state = [0.0_f32, f32::MAX];
+        let before = state;
+        let input = PackedMultiHeadRecurrentInput::new(
+            &[1.0, 1.0],
+            &[1.0, 1.0],
+            &[1.0, 1.0],
+            &[1.0, 1.0],
+            &[0.0, 1.0],
+            1.0,
+            &state,
+            &packed,
+            1,
+            1,
+            1,
+            1,
+        )?;
+
+        let result = packed_multi_head_recurrent_fwd(&input);
+
+        assert!(
+            matches!(
+                result,
+                Err(GdnError::NonFiniteArithmetic {
+                    stage: "state decay",
+                    ..
+                })
+            ),
+            "a late sequence arithmetic failure must not escape a partial packed result"
+        );
+        assert_eq!(
+            state, before,
+            "the caller-owned packed state must remain immutable"
+        );
         Ok(())
     }
 

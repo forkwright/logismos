@@ -408,7 +408,26 @@ impl CausalConvOutput {
 pub fn causal_conv_fwd(input: &CausalConvInput<'_>) -> CausalConvResult<CausalConvOutput> {
     let history_width = input.history_width()?;
     let mut output = reserve_f32("output", input.allocations.output_elements())?;
+    let mut final_history = reserve_f32("final history", input.allocations.history_elements())?;
+    append_causal_conv(input, history_width, &mut output, &mut final_history)?;
 
+    Ok(CausalConvOutput {
+        output,
+        history: final_history,
+    })
+}
+
+/// Append one admitted sequence using the causal-convolution reference arithmetic.
+///
+/// Callers own the pre-reserved destinations. Keeping this tap evaluation and
+/// history construction shared lets packed execution stage directly into its
+/// aggregate outputs without creating a per-sequence output or history.
+fn append_causal_conv(
+    input: &CausalConvInput<'_>,
+    history_width: usize,
+    output: &mut Vec<f32>,
+    final_history: &mut Vec<f32>,
+) -> CausalConvResult<()> {
     for token_index in 0..input.allocations.token_count() {
         for channel_index in 0..input.allocations.channel_count() {
             let output_index = checked_add(
@@ -434,7 +453,6 @@ pub fn causal_conv_fwd(input: &CausalConvInput<'_>) -> CausalConvResult<CausalCo
         }
     }
 
-    let mut final_history = reserve_f32("final history", input.allocations.history_elements())?;
     for channel_index in 0..input.allocations.channel_count() {
         for history_index in 0..history_width {
             let window_position = checked_add(
@@ -446,15 +464,12 @@ pub fn causal_conv_fwd(input: &CausalConvInput<'_>) -> CausalConvResult<CausalCo
         }
     }
 
-    Ok(CausalConvOutput {
-        output,
-        history: final_history,
-    })
+    Ok(())
 }
 
 /// Evaluate packed sequence-major causal convolution with separately staged histories.
 ///
-/// Every sequence delegates its tap order and finite arithmetic to
+/// Every sequence uses the same tap order and finite arithmetic as
 /// [`causal_conv_fwd`]. No sequence can observe another sequence's history or
 /// rows, and no caller-owned history is mutated on error.
 pub fn packed_causal_conv_fwd(
@@ -509,9 +524,8 @@ pub fn packed_causal_conv_fwd(
             input.channel_count,
             input.width,
         )?;
-        let sequence_output = causal_conv_fwd(&sequence_input)?;
-        output.extend_from_slice(sequence_output.output());
-        histories.extend_from_slice(sequence_output.history());
+        let history_width = sequence_input.history_width()?;
+        append_causal_conv(&sequence_input, history_width, &mut output, &mut histories)?;
     }
     Ok(PackedCausalConvOutput { output, histories })
 }
@@ -1098,13 +1112,9 @@ mod tests {
     }
 
     #[test]
-    fn packed_sequences_preserve_independent_f64_histories_and_order() -> CausalConvResult<()> {
-        let packed = PackedPrefillPlan::new(&[2, 1], &[3, 6], 8).map_err(|_| {
-            CausalConvError::DimensionOverflow {
-                dimensions: "packed test descriptor",
-                location: snafu::Location::new(file!(), line!(), column!()),
-            }
-        })?;
+    fn packed_sequences_preserve_independent_f64_histories_and_order()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let packed = PackedPrefillPlan::new(&[2, 1], &[3, 6], 8)?;
         let input = [0.25, -1.0, 1.5];
         let weights = [0.5, -1.0, 0.25];
         let histories = [-2.0, 0.5, 1.25, -0.75];

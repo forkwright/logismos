@@ -405,7 +405,7 @@ impl Qwen35RecurrentExecution {
             z: projected.z,
             convolution_history: clone_f32(
                 "next convolution history",
-                convolution.history(),
+                convolution.histories(),
                 allocations.next_convolution_history,
             )?,
             state: clone_f32(
@@ -807,7 +807,6 @@ struct RecurrentStepAllocations {
     log_decay: usize,
     gate_heads: usize,
     causal_convolution: kernels::CausalConvAllocationPlan,
-    packed_causal_staging: usize,
     convolution_silu: usize,
     grouped_query: usize,
     normalized_query: usize,
@@ -869,13 +868,6 @@ impl RecurrentStepAllocations {
         .context(RecurrentConvolutionSnafu)?;
         let convolution_silu =
             kernels::cpu_f32::unary_output_elements(causal_convolution.output_elements());
-        let packed_causal_staging = sum_elements(
-            &[
-                causal_convolution.output_elements(),
-                causal_convolution.history_elements(),
-            ],
-            "packed causal-convolution sequence staging",
-        )?;
         let grouped_key_elements = checked_product(
             token_count,
             layout.key_width,
@@ -927,7 +919,6 @@ impl RecurrentStepAllocations {
             log_decay: scalar_elements,
             gate_heads: scalar_elements,
             causal_convolution,
-            packed_causal_staging,
             convolution_silu,
             grouped_query: grouped_key_elements,
             normalized_query: grouped_key_elements,
@@ -1001,7 +992,6 @@ impl RecurrentStepAllocations {
                 retained_scalars,
                 self.causal_convolution.output_elements(),
                 self.causal_convolution.history_elements(),
-                self.packed_causal_staging,
             ],
             "recurrent causal-convolution phase",
         )?;
