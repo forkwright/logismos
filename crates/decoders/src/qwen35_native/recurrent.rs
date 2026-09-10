@@ -222,7 +222,7 @@ impl NativeRecurrentWorkspace {
     /// Returns an error when any active scratch extent exceeds this capacity owner.
     pub(super) fn active(
         &self,
-        plan: RecurrentWorkspacePlan,
+        plan: &RecurrentWorkspacePlan,
     ) -> Result<NativeRecurrentWorkspaceViews<'_>> {
         Ok(NativeRecurrentWorkspaceViews {
             normalized_hidden: NativeBufferView::prefix(
@@ -817,7 +817,7 @@ mod tests {
             weights: &resources.native_weights,
             workspace: resources
                 .recurrent_workspace
-                .active(active_plan.workspace)
+                .active(&active_plan.workspace)
                 .map_err(|error| error.to_string())?,
             state: &resources.state,
             input: NativeBufferView::prefix(&resources.input, hidden.len())

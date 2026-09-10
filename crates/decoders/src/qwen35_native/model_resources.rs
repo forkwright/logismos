@@ -1104,7 +1104,7 @@ impl ModelSessionResources {
                         .build()
                     })?;
                     let active = recurrent.plan.active(token_count)?;
-                    let workspace = workspace.active(active.workspace)?;
+                    let workspace = workspace.active(&active.workspace)?;
                     let finish = recurrent.finish.active(self.plan.layout, token_count)?;
                     let input =
                         NativeBufferView::prefix(input, active.workspace.input_norm.elements())?;
