@@ -5,10 +5,10 @@ use super::qwen35_execution_oracle_tests::{
     private_state_snapshot,
 };
 use super::*;
-use crate::{Qwen35BatchCpuRequirements, Qwen35CpuRequirements, Qwen35Weights};
 use crate::qwen35::tests::{
     CanonicalHybridOracle, canonical_hybrid_fixture_with_context, set_f32_value, verify_fixture,
 };
+use crate::{Qwen35BatchCpuRequirements, Qwen35CpuRequirements, Qwen35Weights};
 
 const BATCH_CONTEXT: usize = 16;
 const BATCH_SEQUENCE_COUNT: usize = 2;
@@ -23,11 +23,7 @@ type ExecutionStateBits = (
     Vec<(usize, Vec<u32>, Vec<u32>)>,
 );
 type TwoExecutions = [Qwen35Execution; BATCH_SEQUENCE_COUNT];
-type IdenticalArtifactExecutions = (
-    TwoExecutions,
-    Qwen35CpuRequirements,
-    Qwen35CpuRequirements,
-);
+type IdenticalArtifactExecutions = (TwoExecutions, Qwen35CpuRequirements, Qwen35CpuRequirements);
 type FaultyBatchExecutions = (TwoExecutions, usize);
 
 #[test]
@@ -468,21 +464,16 @@ fn assert_pristine_retry_matches(
     first_chunk: &[u32],
 ) -> std::result::Result<(), String> {
     let retry_second = [0, 1];
-    let retry = Qwen35Execution::plan_batch(
-        executions,
-        &[first_chunk.as_slice(), retry_second.as_slice()],
-    )
-    .map_err(|error| error.to_string())?
-    .execute()
-    .map_err(|error| error.to_string())?;
+    let retry = Qwen35Execution::plan_batch(executions, &[first_chunk, retry_second.as_slice()])
+        .map_err(|error| error.to_string())?
+        .execute()
+        .map_err(|error| error.to_string())?;
     let mut control = pristine_prefixed_executions()?;
-    let expected = Qwen35Execution::plan_batch(
-        &mut control,
-        &[first_chunk.as_slice(), retry_second.as_slice()],
-    )
-    .map_err(|error| error.to_string())?
-    .execute()
-    .map_err(|error| error.to_string())?;
+    let expected =
+        Qwen35Execution::plan_batch(&mut control, &[first_chunk, retry_second.as_slice()])
+            .map_err(|error| error.to_string())?
+            .execute()
+            .map_err(|error| error.to_string())?;
     assert_eq!(
         logits_bits(retry),
         logits_bits(expected),
@@ -507,7 +498,9 @@ fn pristine_prefixed_executions() -> std::result::Result<TwoExecutions, String> 
     executions[0]
         .step(&[0, 1, 2])
         .map_err(|error| error.to_string())?;
-    executions[1].step(&[3]).map_err(|error| error.to_string())?;
+    executions[1]
+        .step(&[3])
+        .map_err(|error| error.to_string())?;
     Ok(executions)
 }
 

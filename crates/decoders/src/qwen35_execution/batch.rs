@@ -1,6 +1,6 @@
 //! Atomic aggregate ownership for independent bounded CPU Qwen3.5 sessions.
 
-use cache::{PagedAppend, PagedKvPool, PagedPreparedCommit};
+use cache::{PagedAppend, PagedPreparedCommit};
 use kernels::PackedPrefillPlan;
 use snafu::ResultExt;
 
