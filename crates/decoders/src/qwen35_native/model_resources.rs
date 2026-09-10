@@ -1184,14 +1184,18 @@ impl ModelSessionResources {
             }
             .build()
         })?;
-        let next_position = step.chunk.next_position;
-        if let Some(kv) = self.kv.as_mut() {
-            // SAFETY: the resource owner synchronized this exact stream; every fallible local check and output extraction precedes host-ledger publication.
-            unsafe {
-                kv.commit_prepared_after_completion()
-                    .context(NativePagedKvSnafu)?;
+        let kv = &mut self.kv;
+        let step = commit_prepared_or_restore(&mut self.step, step, || {
+            if let Some(kv) = kv {
+                // SAFETY: the resource owner synchronized this exact stream; every fallible local check and output extraction precedes host-ledger publication.
+                unsafe {
+                    kv.commit_prepared_after_completion()
+                        .context(NativePagedKvSnafu)?;
+                }
             }
-        }
+            Ok(())
+        })?;
+        let next_position = step.chunk.next_position;
         for layer in &mut self.layers {
             if let NativeSessionLayer::Recurrent(state) = layer {
                 state.publish_completed();
@@ -1221,6 +1225,20 @@ impl ModelSessionResources {
             workspace.query_rotary.coefficient_elements(),
         )?;
         Ok(Some((cosine, sine)))
+    }
+}
+
+fn commit_prepared_or_restore<T>(
+    pending_slot: &mut Option<T>,
+    pending: T,
+    commit: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    match commit() {
+        Ok(()) => Ok(pending),
+        Err(error) => {
+            *pending_slot = Some(pending);
+            Err(error)
+        }
     }
 }
 
@@ -1459,11 +1477,12 @@ fn retain_session_layers(layers: Vec<NativeSessionLayer>, sink: &mut NativeBuffe
 
 #[cfg(test)]
 mod tests {
-    use super::derive_session_plan;
+    use super::{commit_prepared_or_restore, derive_session_plan};
     use crate::Qwen35Weights;
     use crate::qwen35::tests::{canonical_hybrid_fixture_with_context, verify_fixture};
     use crate::qwen35_native::model_plan::DeviceModelPlan;
     use crate::qwen35_native::model_step::ModelChunkPlan;
+    use snafu::IntoError;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1531,5 +1550,38 @@ mod tests {
         assert_eq!(Arc::strong_count(&recovered), 1);
         drop(recovered);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_prepublication_commit_restores_pending_step_custody() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let pending = DropProbe(Arc::clone(&drops));
+        let mut pending_slot = None;
+        let result = commit_prepared_or_restore(&mut pending_slot, pending, || {
+            Err(crate::error::NativeSessionStateSnafu {
+                rule: "test prepublication commit failure",
+            }
+            .build())
+        });
+
+        assert!(
+            result.is_err(),
+            "the simulated prepared-KV failure must remain observable"
+        );
+        assert!(
+            pending_slot.is_some(),
+            "a fallible publication boundary must restore the complete pending-step owner"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "restored pending-step custody must not run its ordinary drop path"
+        );
+        drop(pending_slot);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the retained pending-step owner drops exactly once when explicit ownership ends"
+        );
     }
 }
