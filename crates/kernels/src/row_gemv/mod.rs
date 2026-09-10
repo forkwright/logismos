@@ -1317,8 +1317,9 @@ mod tests {
         let activations = [0.0_f32; 2];
         let mut output = [0.0_f32; 2];
         let shape = RowGemvShape::new(quant::RowFormat::F32, 2, 2, 16, 2, 2)?;
+        let batch = RowGemvBatchPlan::try_from_shape(shape, 1, activations.len(), output.len())?;
         super::validate_device_buffers(
-            shape,
+            batch,
             matrix.as_ptr(),
             matrix.len(),
             activations.as_ptr(),
@@ -1328,7 +1329,7 @@ mod tests {
         )?;
         let misaligned_matrix = [0.0_f32; 5];
         super::validate_device_buffers(
-            shape,
+            batch,
             misaligned_matrix.as_ptr().cast::<u8>().wrapping_byte_add(1),
             matrix.len(),
             activations.as_ptr(),
@@ -1336,9 +1337,52 @@ mod tests {
             output.as_mut_ptr(),
             output.len(),
         )?;
+        let batched_activations = [0.0_f32; 4];
+        let mut batched_output = [0.0_f32; 4];
+        let batch_two = RowGemvBatchPlan::try_from_shape(
+            shape,
+            2,
+            batched_activations.len(),
+            batched_output.len(),
+        )?;
+        super::validate_device_buffers(
+            batch_two,
+            matrix.as_ptr(),
+            matrix.len(),
+            batched_activations.as_ptr(),
+            batched_activations.len(),
+            batched_output.as_mut_ptr(),
+            batched_output.len(),
+        )?;
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch_two,
+                matrix.as_ptr(),
+                matrix.len(),
+                batched_activations.as_ptr(),
+                batched_activations.len() - 1,
+                batched_output.as_mut_ptr(),
+                batched_output.len(),
+            )
+            .is_err(),
+            "T=2 activation span must equal the batch-derived extent"
+        );
+        assert!(
+            super::validate_device_buffers(
+                batch_two,
+                matrix.as_ptr(),
+                matrix.len(),
+                batched_activations.as_ptr(),
+                batched_activations.len(),
+                batched_output.as_mut_ptr(),
+                batched_output.len() - 1,
+            )
+            .is_err(),
+            "T=2 output span must equal the batch-derived extent"
+        );
+        assert!(
+            super::validate_device_buffers(
+                batch,
                 matrix.as_ptr(),
                 matrix.len() - 1,
                 activations.as_ptr(),
@@ -1350,7 +1394,7 @@ mod tests {
         );
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch,
                 matrix.as_ptr(),
                 matrix.len(),
                 activations.as_ptr(),
@@ -1362,7 +1406,7 @@ mod tests {
         );
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch,
                 matrix.as_ptr(),
                 matrix.len(),
                 activations.as_ptr(),
@@ -1374,7 +1418,7 @@ mod tests {
         );
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch,
                 core::ptr::null(),
                 matrix.len(),
                 activations.as_ptr(),
@@ -1386,7 +1430,7 @@ mod tests {
         );
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch,
                 matrix.as_ptr(),
                 matrix.len(),
                 activations.as_ptr(),
@@ -1398,7 +1442,7 @@ mod tests {
         );
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch,
                 matrix.as_ptr(),
                 matrix.len(),
                 activations.as_ptr(),
@@ -1411,7 +1455,7 @@ mod tests {
         let mut aligned_matrix = [0.0_f32; 4];
         assert!(
             super::validate_device_buffers(
-                shape,
+                batch,
                 aligned_matrix.as_ptr().cast::<u8>(),
                 matrix.len(),
                 activations.as_ptr(),
