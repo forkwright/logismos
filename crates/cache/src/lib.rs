@@ -56,7 +56,7 @@ pub use crate::flat::{CacheLayout, FlatKvCache};
 #[cfg(feature = "gpu")]
 pub use crate::paged::{
     NativePagedAppend, NativePagedKvBuffers, NativePagedKvPlan, NativePagedKvPool,
-    NativePagedKvPoolBindingError, NativePagedLayerKv,
+    NativePagedKvPoolBindingError, NativePagedLayerKv, NativePagedPreparedCompletion,
 };
 pub use crate::paged::{
     PagedAppend, PagedKvGeometry, PagedKvPlan, PagedKvPool, PagedLayerKv, PagedPreparedCommit,
