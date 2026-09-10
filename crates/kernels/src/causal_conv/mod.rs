@@ -1067,10 +1067,11 @@ mod tests {
     const WIDTH: usize = 3;
     const ORACLE_TOLERANCE: f64 = 1e-6;
 
+    #[cfg(feature = "gpu")]
     #[test]
-    fn dense_native_admission_accepts_t3_but_legacy_step_stays_t1() -> Result<()> {
-        let plan = CausalConvAllocationPlan::try_from_dimensions(3, 2, 2)
-            .map_err(|error| unsupported_causal_conv_step_shape(error.to_string()))?;
+    fn dense_native_admission_accepts_t3_but_legacy_step_stays_t1()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let plan = CausalConvAllocationPlan::try_from_dimensions(3, 2, 2)?;
         let input = [0.0_f32; 6];
         let weights = [0.0_f32; 4];
         let history_in = [0.0_f32; 2];

@@ -911,6 +911,15 @@ fn serial_sum_squares(values: &[f32]) -> f32 {
 }
 
 #[cfg(test)]
+fn missing_test_slice(context: &'static str) -> crate::Error {
+    UnsupportedShapeSnafu {
+        kernel: RECURRENT_QK_L2_KERNEL,
+        msg: format!("test fixture missing {context}"),
+    }
+    .build()
+}
+
+#[cfg(test)]
 fn gather_values_reference(
     plan: RecurrentValueLayoutF32Plan,
     convolved: &[f32],
@@ -1463,14 +1472,6 @@ mod tests {
                 "{operation} index {index}: got {actual}, expected {expected}"
             );
         }
-    }
-
-    fn missing_test_slice(context: &'static str) -> crate::Error {
-        UnsupportedShapeSnafu {
-            kernel: RECURRENT_QK_L2_KERNEL,
-            msg: format!("test fixture missing {context}"),
-        }
-        .build()
     }
 
     fn read_device(buffer: &hipcore::DeviceBuffer<f32>) -> core::result::Result<Vec<f32>, String> {

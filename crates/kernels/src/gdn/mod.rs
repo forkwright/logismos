@@ -1700,10 +1700,11 @@ mod tests {
     const SCALE: f32 = 0.5;
     const ORACLE_TOLERANCE: f32 = 1e-5;
 
+    #[cfg(feature = "gpu")]
     #[test]
-    fn dense_native_admission_accepts_t3_but_legacy_step_stays_t1() -> Result<()> {
-        let plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(3, 1, 1, 2, 2)
-            .map_err(|error| unsupported_gdn_step_shape(error.to_string()))?;
+    fn dense_native_admission_accepts_t3_but_legacy_step_stays_t1()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let plan = MultiHeadRecurrentAllocationPlan::try_from_dimensions(3, 1, 1, 2, 2)?;
         let q = [0.0_f32; 6];
         let k = [0.0_f32; 6];
         let v = [0.0_f32; 6];
