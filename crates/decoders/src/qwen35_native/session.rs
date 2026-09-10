@@ -172,9 +172,9 @@ pub(super) fn session_state<Resource: CompletionResource>(
     owner: &ResourceOwner<Resource>,
 ) -> Qwen35NativeSessionState {
     match owner.state() {
-        Some(ResourceState::Ready(_)) => Qwen35NativeSessionState::Ready,
-        Some(ResourceState::PoisonedIdle(_)) => Qwen35NativeSessionState::PoisonedKnownIdle,
-        Some(ResourceState::InFlight(_) | ResourceState::PoisonedUncertain(_)) | None => {
+        ResourceState::Ready => Qwen35NativeSessionState::Ready,
+        ResourceState::PoisonedIdle => Qwen35NativeSessionState::PoisonedKnownIdle,
+        ResourceState::InFlight | ResourceState::PoisonedUncertain => {
             Qwen35NativeSessionState::PoisonedCompletionUncertain
         }
     }

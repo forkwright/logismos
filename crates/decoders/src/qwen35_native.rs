@@ -32,6 +32,7 @@ mod weights;
 #[cfg(feature = "gpu")]
 pub use model_session::{
     NativeBuildFailure, NativeBuildRelease, NativeBuildReleaseState, NativeBuildSource,
+    Qwen35NativeExecutionBatchDeviceDemand, Qwen35NativeExecutionBatchPlan,
     Qwen35NativeExecutionDeviceDemand, Qwen35NativeExecutionModel, Qwen35NativeExecutionModelClose,
     Qwen35NativeExecutionModelTeardown, Qwen35NativeExecutionPlan, Qwen35NativeExecutionSession,
     Qwen35NativeExecutionSessionPlan, Qwen35NativeExecutionSessionTeardown,
@@ -59,11 +60,12 @@ trait CompletionResource {
     fn validate_after_synchronization(&mut self) -> core::result::Result<(), Self::Error>;
 }
 
-enum ResourceState<Resource> {
-    Ready(Resource),
-    InFlight(Resource),
-    PoisonedIdle(Resource),
-    PoisonedUncertain(Resource),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResourceState {
+    Ready,
+    InFlight,
+    PoisonedIdle,
+    PoisonedUncertain,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,23 +84,26 @@ enum CompletionError<Error> {
 }
 
 struct ResourceOwner<Resource: CompletionResource> {
-    state: Option<ResourceState<Resource>>,
+    state: ResourceState,
+    resource: Option<Resource>,
 }
 
 impl<Resource: CompletionResource> ResourceOwner<Resource> {
     fn new(resource: Resource) -> Self {
         Self {
-            state: Some(ResourceState::Ready(resource)),
+            state: ResourceState::Ready,
+            resource: Some(resource),
         }
     }
 
     fn begin(&mut self) -> core::result::Result<InFlight<'_, Resource>, BeginError> {
-        let state = self.state.take().ok_or(BeginError::MissingResource)?;
-        let ResourceState::Ready(resource) = state else {
-            self.state = Some(state);
+        if self.resource.is_none() {
+            return Err(BeginError::MissingResource);
+        }
+        if self.state != ResourceState::Ready {
             return Err(BeginError::NotReady);
-        };
-        self.state = Some(ResourceState::InFlight(resource));
+        }
+        self.state = ResourceState::InFlight;
         Ok(InFlight {
             owner: self,
             submitted: false,
@@ -106,34 +111,44 @@ impl<Resource: CompletionResource> ResourceOwner<Resource> {
         })
     }
 
-    fn state(&self) -> Option<&ResourceState<Resource>> {
-        self.state.as_ref()
+    fn state(&self) -> ResourceState {
+        self.state
+    }
+
+    fn ready_resource(&self) -> core::result::Result<&Resource, BeginError> {
+        if self.state != ResourceState::Ready {
+            return Err(BeginError::NotReady);
+        }
+        self.resource.as_ref().ok_or(BeginError::MissingResource)
+    }
+
+    fn ready_resource_mut(&mut self) -> core::result::Result<&mut Resource, BeginError> {
+        if self.state != ResourceState::Ready {
+            return Err(BeginError::NotReady);
+        }
+        self.resource.as_mut().ok_or(BeginError::MissingResource)
     }
 
     /// Consume the complete bundle without invoking its ordinary drop path.
     ///
     /// Explicit native teardown consumes this only to transfer the original
     /// stream and buffers into inert custody. `None` is possible only if an
-    /// internal in-flight guard already removed the state; safe session APIs do
+    /// internal guard has already detached its resource; safe session APIs do
     /// not expose such a guard across a consuming close.
     fn into_resource(mut self) -> Option<Resource> {
-        self.state.take().map(|state| match state {
-            ResourceState::Ready(resource)
-            | ResourceState::InFlight(resource)
-            | ResourceState::PoisonedIdle(resource)
-            | ResourceState::PoisonedUncertain(resource) => resource,
-        })
+        self.resource.take()
     }
 }
 
 impl<Resource: CompletionResource> Drop for ResourceOwner<Resource> {
     fn drop(&mut self) {
-        let Some(state) = self.state.take() else {
+        if !matches!(
+            self.state,
+            ResourceState::InFlight | ResourceState::PoisonedUncertain
+        ) {
             return;
-        };
-        let (ResourceState::InFlight(mut resource)
-        | ResourceState::PoisonedUncertain(mut resource)) = state
-        else {
+        }
+        let Some(mut resource) = self.resource.take() else {
             return;
         };
         if resource.synchronize().is_err() {
@@ -155,14 +170,9 @@ impl<Resource: CompletionResource> InFlight<'_, Resource> {
     fn resource(
         &mut self,
     ) -> core::result::Result<&mut Resource, CompletionError<Resource::Error>> {
-        match self.owner.state.as_mut() {
-            Some(ResourceState::InFlight(resource)) => Ok(resource),
-            Some(
-                ResourceState::Ready(_)
-                | ResourceState::PoisonedIdle(_)
-                | ResourceState::PoisonedUncertain(_),
-            )
-            | None => Err(CompletionError::MissingResource),
+        match (self.owner.state, self.owner.resource.as_mut()) {
+            (ResourceState::InFlight, Some(resource)) => Ok(resource),
+            _ => Err(CompletionError::MissingResource),
         }
     }
 
@@ -203,44 +213,112 @@ impl<Resource: CompletionResource> InFlight<'_, Resource> {
         Ok(value)
     }
 
+    /// Prove completion before a transaction's fallible shared preparation.
+    ///
+    /// Dropping the returned phase never synchronizes a second time. It keeps
+    /// the complete resource as known-idle poisoned custody until its caller
+    /// performs the one infallible publication tail.
+    fn complete_prepublication(
+        mut self,
+    ) -> core::result::Result<PostCompletion<'_, Resource>, CompletionError<Resource::Error>> {
+        if !self.submitted {
+            return Err(CompletionError::NotSubmitted);
+        }
+        let synchronization = self.resource()?.synchronize();
+        if let Err(source) = synchronization {
+            self.poison_uncertain();
+            return Err(CompletionError::Synchronization { source });
+        }
+        let validation = self.resource()?.validate_after_synchronization();
+        if let Err(source) = validation {
+            self.poison_known_idle();
+            return Err(CompletionError::PostSynchronizationValidation { source });
+        }
+        let owner = self.owner;
+        let (state, resource) = (&mut owner.state, &mut owner.resource);
+        let resource = resource
+            .as_mut()
+            .ok_or(CompletionError::MissingResource)?;
+        self.finished = true;
+        Ok(PostCompletion {
+            state,
+            resource,
+            finished: false,
+        })
+    }
+
     fn restore_ready(&mut self) -> core::result::Result<(), CompletionError<Resource::Error>> {
-        let Some(ResourceState::InFlight(resource)) = self.owner.state.take() else {
+        if self.owner.state != ResourceState::InFlight || self.owner.resource.is_none() {
             self.finished = true;
             return Err(CompletionError::MissingResource);
-        };
-        self.owner.state = Some(ResourceState::Ready(resource));
+        }
+        self.owner.state = ResourceState::Ready;
         self.finished = true;
         Ok(())
     }
 
     fn poison_uncertain(&mut self) {
-        let Some(ResourceState::InFlight(resource)) = self.owner.state.take() else {
+        if self.owner.state != ResourceState::InFlight || self.owner.resource.is_none() {
             self.finished = true;
             return;
-        };
-        self.owner.state = Some(ResourceState::PoisonedUncertain(resource));
+        }
+        self.owner.state = ResourceState::PoisonedUncertain;
         self.finished = true;
     }
 
     fn poison_known_idle(&mut self) {
-        let Some(ResourceState::InFlight(resource)) = self.owner.state.take() else {
+        if self.owner.state != ResourceState::InFlight || self.owner.resource.is_none() {
             self.finished = true;
             return;
-        };
-        self.owner.state = Some(ResourceState::PoisonedIdle(resource));
+        }
+        self.owner.state = ResourceState::PoisonedIdle;
         self.finished = true;
     }
 
     fn finish_after_submission(&mut self) {
-        let Some(ResourceState::InFlight(mut resource)) = self.owner.state.take() else {
+        if self.owner.state != ResourceState::InFlight {
+            self.finished = true;
+            return;
+        }
+        let Some(resource) = self.owner.resource.as_mut() else {
             self.finished = true;
             return;
         };
-        self.owner.state = Some(match resource.synchronize() {
-            Ok(()) => ResourceState::PoisonedIdle(resource),
-            Err(_) => ResourceState::PoisonedUncertain(resource),
-        });
+        self.owner.state = match resource.synchronize() {
+            Ok(()) => ResourceState::PoisonedIdle,
+            Err(_) => ResourceState::PoisonedUncertain,
+        };
         self.finished = true;
+    }
+}
+
+struct PostCompletion<'owner, Resource: CompletionResource> {
+    state: &'owner mut ResourceState,
+    resource: &'owner mut Resource,
+    finished: bool,
+}
+
+impl<Resource: CompletionResource> PostCompletion<'_, Resource> {
+    fn resource(&mut self) -> &mut Resource {
+        self.resource
+    }
+
+    /// Publish an already prepared resource without allocation, validation, or
+    /// callbacks after the caller's final infallible commit.
+    fn publish<Value>(mut self, publish: impl FnOnce(&mut Resource) -> Value) -> Value {
+        let value = publish(self.resource);
+        *self.state = ResourceState::Ready;
+        self.finished = true;
+        value
+    }
+}
+
+impl<Resource: CompletionResource> Drop for PostCompletion<'_, Resource> {
+    fn drop(&mut self) {
+        if !self.finished {
+            *self.state = ResourceState::PoisonedIdle;
+            self.finished = true;
+        }
     }
 }
 
@@ -253,10 +331,10 @@ impl<Resource: CompletionResource> Drop for InFlight<'_, Resource> {
             self.finish_after_submission();
             return;
         }
-        let Some(ResourceState::InFlight(resource)) = self.owner.state.take() else {
+        if self.owner.state != ResourceState::InFlight || self.owner.resource.is_none() {
             return;
-        };
-        self.owner.state = Some(ResourceState::Ready(resource));
+        }
+        self.owner.state = ResourceState::Ready;
     }
 }
 
@@ -380,7 +458,7 @@ mod tests {
         } = owner([], []);
         let guard = owner.begin()?;
         drop(guard);
-        assert!(matches!(owner.state(), Some(ResourceState::Ready(_))));
+        assert_eq!(owner.state(), ResourceState::Ready);
         assert_eq!(synchronizations.get(), 0);
         drop(owner);
         assert_eq!(drops.get(), 1);
@@ -405,7 +483,57 @@ mod tests {
                 Ok(())
             })
             .map_err(|_| BeginError::MissingResource)?;
-        assert!(matches!(owner.state(), Some(ResourceState::Ready(_))));
+        assert_eq!(owner.state(), ResourceState::Ready);
+        assert_eq!(synchronizations.get(), 1);
+        assert_eq!(validations.get(), 1);
+        assert_eq!(publications.get(), 1);
+        drop(owner);
+        assert_eq!(drops.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn post_completion_drop_retains_known_idle_without_a_second_sync()
+    -> core::result::Result<(), BeginError> {
+        let OwnerFixture {
+            mut owner,
+            synchronizations,
+            validations,
+            drops,
+            publications,
+        } = owner([Ok(())], [Ok(())]);
+        let mut guard = owner.begin()?;
+        guard.mark_submitted();
+        let completion = guard
+            .complete_prepublication()
+            .map_err(|_| BeginError::MissingResource)?;
+        drop(completion);
+        assert_eq!(owner.state(), ResourceState::PoisonedIdle);
+        assert_eq!(synchronizations.get(), 1);
+        assert_eq!(validations.get(), 1);
+        assert_eq!(publications.get(), 0);
+        drop(owner);
+        assert_eq!(drops.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn post_completion_publish_is_infallible_and_restores_ready()
+    -> core::result::Result<(), BeginError> {
+        let OwnerFixture {
+            mut owner,
+            synchronizations,
+            validations,
+            drops,
+            publications,
+        } = owner([Ok(())], [Ok(())]);
+        let mut guard = owner.begin()?;
+        guard.mark_submitted();
+        let completion = guard
+            .complete_prepublication()
+            .map_err(|_| BeginError::MissingResource)?;
+        completion.publish(|resource| resource.publish());
+        assert_eq!(owner.state(), ResourceState::Ready);
         assert_eq!(synchronizations.get(), 1);
         assert_eq!(validations.get(), 1);
         assert_eq!(publications.get(), 1);
@@ -432,7 +560,7 @@ mod tests {
             .err()
             .ok_or(BeginError::MissingResource)?;
         assert!(matches!(error, CompletionError::NotSubmitted));
-        assert!(matches!(owner.state(), Some(ResourceState::Ready(_))));
+        assert_eq!(owner.state(), ResourceState::Ready);
         assert_eq!(synchronizations.get(), 0);
         assert_eq!(publications.get(), 0);
         drop(owner);
@@ -464,7 +592,7 @@ mod tests {
         ));
         assert!(matches!(
             owner.state(),
-            Some(ResourceState::PoisonedIdle(_))
+            ResourceState::PoisonedIdle
         ));
         assert!(matches!(owner.begin(), Err(BeginError::NotReady)));
         assert_eq!(publications.get(), 0);
@@ -489,7 +617,7 @@ mod tests {
         drop(guard);
         assert!(matches!(
             owner.state(),
-            Some(ResourceState::PoisonedIdle(_))
+            ResourceState::PoisonedIdle
         ));
         assert!(matches!(owner.begin(), Err(BeginError::NotReady)));
         assert_eq!(synchronizations.get(), 1);
@@ -526,7 +654,7 @@ mod tests {
         ));
         assert!(matches!(
             owner.state(),
-            Some(ResourceState::PoisonedUncertain(_))
+            ResourceState::PoisonedUncertain
         ));
         assert_eq!(publications.get(), 0);
         assert_eq!(synchronizations.get(), 1);
@@ -554,7 +682,7 @@ mod tests {
         drop(guard);
         assert!(matches!(
             owner.state(),
-            Some(ResourceState::PoisonedUncertain(_))
+            ResourceState::PoisonedUncertain
         ));
         assert_eq!(publications.get(), 0);
         drop(owner);
@@ -590,7 +718,7 @@ mod tests {
         ));
         assert!(matches!(
             owner.state(),
-            Some(ResourceState::PoisonedIdle(_))
+            ResourceState::PoisonedIdle
         ));
         assert!(matches!(owner.begin(), Err(BeginError::NotReady)));
         assert_eq!(synchronizations.get(), 1);
@@ -630,7 +758,7 @@ mod tests {
         assert!(unwind.is_err());
         assert!(matches!(
             owner.state(),
-            Some(ResourceState::PoisonedIdle(_))
+            ResourceState::PoisonedIdle
         ));
         assert_eq!(publications.get(), 0);
         assert_eq!(synchronizations.get(), 2);

@@ -1,6 +1,6 @@
 //! Owned native resources for one whole Qwen3.5 main-model step.
 
-use cache::{NativePagedKvBuffers, NativePagedKvPlan, NativePagedKvPool};
+use cache::{NativePagedKvBuffers, NativePagedKvPlan, NativePagedKvPool, NativePagedPreparedCompletion};
 use core::mem::ManuallyDrop;
 use hipcore::{
     BufferAllocationError, Device, DeviceBuffer, InventoryRelease, Stream, StreamCreationError,
@@ -34,9 +34,7 @@ use crate::{Qwen35Weights, Result};
 
 struct ModelStep {
     chunk: ModelChunkPlan,
-    logits: DeviceBuffer<f32>,
-    cosine: Option<DeviceBuffer<f32>>,
-    sine: Option<DeviceBuffer<f32>>,
+    logits: Option<DeviceBuffer<f32>>,
 }
 
 enum NativeModelLayer {
@@ -73,6 +71,8 @@ pub(super) struct ModelSessionResources {
     stream: Stream,
     numerical_status: kernels::numerical_status::NativeNumericalStatus,
     full_workspace: Option<NativeWorkspace>,
+    mrope_cosine: Option<DeviceBuffer<f32>>,
+    mrope_sine: Option<DeviceBuffer<f32>>,
     recurrent_workspace: Option<NativeRecurrentWorkspace>,
     finish_workspace: LayerFinishWorkspace,
     hidden_a: DeviceBuffer<f32>,
@@ -82,6 +82,7 @@ pub(super) struct ModelSessionResources {
     step: Option<ModelStep>,
     failed_step: Option<NativeBufferParts>,
     failed_step_creation: Option<BufferAllocationError>,
+    preparation_touched: bool,
     position: usize,
 }
 
@@ -96,6 +97,8 @@ struct SessionBuildFields {
     numerical_status: kernels::numerical_status::NativeNumericalStatus,
     kv: Option<NativePagedKvPool>,
     full_workspace: Option<NativeWorkspace>,
+    mrope_cosine: Option<DeviceBuffer<f32>>,
+    mrope_sine: Option<DeviceBuffer<f32>>,
     recurrent_workspace: Option<NativeRecurrentWorkspace>,
     finish_workspace: LayerFinishWorkspace,
     hidden_a: DeviceBuffer<f32>,
@@ -108,6 +111,8 @@ struct SessionBuildPrefix {
     numerical_status: NativeBuildGuard<kernels::numerical_status::NativeNumericalStatus>,
     kv: Option<NativeBuildGuard<NativePagedKvPool>>,
     full_workspace: Option<NativeBuildGuard<NativeWorkspace>>,
+    mrope_cosine: Option<NativeBuildGuard<DeviceBuffer<f32>>>,
+    mrope_sine: Option<NativeBuildGuard<DeviceBuffer<f32>>>,
     recurrent_workspace: Option<NativeBuildGuard<NativeRecurrentWorkspace>>,
 }
 
@@ -546,6 +551,27 @@ fn build_session_fields(
         .map(|workspace| NativeWorkspace::new(workspace, &model.device, scope))
         .transpose()?
         .map(|workspace| scope.guard(workspace, NativeWorkspace::into_buffer_sink));
+    let control_elements = match plan.full_workspace.as_ref() {
+        Some(workspace) => workspace
+            .query_rotary
+            .coefficient_elements()
+            .checked_mul(workspace.hidden_norm.rows())
+            .ok_or_else(|| ArithmeticOverflowSnafu {
+                context: "native persistent MRoPE control elements",
+            }.build())
+            .map_err(NativeBuildSource::decoder)?,
+        None => 0,
+    };
+    let mrope_cosine = if control_elements == 0 {
+        None
+    } else {
+        Some(scope.allocate_f32(&model.device, control_elements)?)
+    };
+    let mrope_sine = if control_elements == 0 {
+        None
+    } else {
+        Some(scope.allocate_f32(&model.device, control_elements)?)
+    };
     let recurrent_workspace = plan
         .recurrent_workspace
         .as_ref()
@@ -556,6 +582,8 @@ fn build_session_fields(
         numerical_status,
         kv,
         full_workspace,
+        mrope_cosine,
+        mrope_sine,
         recurrent_workspace,
     };
     build_remaining_session_fields(model, plan, scope, prefix)
@@ -582,6 +610,8 @@ fn build_remaining_session_fields(
         numerical_status: prefix.numerical_status.commit(),
         kv: prefix.kv.map(NativeBuildGuard::commit),
         full_workspace: prefix.full_workspace.map(NativeBuildGuard::commit),
+        mrope_cosine: prefix.mrope_cosine.map(NativeBuildGuard::commit),
+        mrope_sine: prefix.mrope_sine.map(NativeBuildGuard::commit),
         recurrent_workspace: prefix.recurrent_workspace.map(NativeBuildGuard::commit),
         finish_workspace: finish_workspace.commit(),
         hidden_a: hidden_a.commit(),
@@ -753,6 +783,52 @@ impl NativeResidentModelResources {
 }
 
 impl ModelSessionResources {
+    pub(super) fn resident(&self) -> &Arc<NativeResidentModelResources> {
+        &self.model
+    }
+
+    pub(super) const fn position(&self) -> usize {
+        self.position
+    }
+
+    pub(super) const fn max_context(&self) -> usize {
+        self.plan.layout.max_context()
+    }
+
+    pub(super) const fn device_bytes(&self) -> super::model_plan::ModelDeviceByteDemand {
+        self.plan.bytes
+    }
+
+    pub(super) const fn plan_for_batch(&self) -> &DeviceModelPlan {
+        &self.plan
+    }
+
+    pub(super) fn validate_prefill_tokens(&self, tokens: &[u32]) -> Result<()> {
+        if tokens.is_empty() || tokens.len() > self.plan.max_chunk_tokens {
+            return NativeSessionStateSnafu {
+                rule: "native model batch tokens must be nonempty and within exact chunk capacity",
+            }
+            .fail();
+        }
+        let end = self.position.checked_add(tokens.len()).ok_or_else(|| {
+            ArithmeticOverflowSnafu { context: "native model batch position plus tokens" }.build()
+        })?;
+        if end > self.plan.layout.max_context() {
+            return NativeSessionStateSnafu {
+                rule: "native model batch tokens must fit exact session context",
+            }
+            .fail();
+        }
+        for &token in tokens {
+            let row = usize::try_from(token).map_err(|_| {
+                ArithmeticOverflowSnafu { context: "native model batch embedding token row" }.build()
+            })?;
+            kernels::row_gemv::RowDecodePlan::try_from_shape(self.plan.embedding.shape, row)
+                .context(NativeKernelSnafu)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn new(
         model: Arc<NativeResidentModelResources>,
         plan: DeviceModelPlan,
@@ -786,6 +862,8 @@ impl ModelSessionResources {
             numerical_status,
             kv,
             full_workspace,
+            mrope_cosine,
+            mrope_sine,
             recurrent_workspace,
             finish_workspace,
             hidden_a,
@@ -800,6 +878,8 @@ impl ModelSessionResources {
             stream: stream.recover(),
             numerical_status,
             full_workspace,
+            mrope_cosine,
+            mrope_sine,
             recurrent_workspace,
             finish_workspace,
             hidden_a,
@@ -809,6 +889,7 @@ impl ModelSessionResources {
             step: None,
             failed_step: None,
             failed_step_creation: None,
+            preparation_touched: false,
             position: 0,
         })
     }
@@ -827,6 +908,8 @@ impl ModelSessionResources {
             stream,
             numerical_status,
             full_workspace,
+            mrope_cosine,
+            mrope_sine,
             recurrent_workspace,
             finish_workspace,
             hidden_a,
@@ -836,6 +919,7 @@ impl ModelSessionResources {
             step,
             failed_step,
             failed_step_creation,
+            preparation_touched: _,
             position: _,
         } = self;
         drop(plan);
@@ -863,6 +947,8 @@ impl ModelSessionResources {
         if let Some(step) = step {
             step.into_buffer_sink(&mut buffers);
         }
+        if let Some(cosine) = mrope_cosine { buffers.push_f32(cosine); }
+        if let Some(sine) = mrope_sine { buffers.push_f32(sine); }
         if let Some(failed_step) = failed_step {
             failed_step.append_to(&mut buffers);
         }
@@ -877,61 +963,24 @@ impl ModelSessionResources {
     pub(super) fn prepare_prefill(&mut self, tokens: &[u32]) -> Result<()> {
         self.ensure_step_available()?;
         let chunk = ModelChunkPlan::from_model(&self.plan, self.position, tokens)?;
-        let controls = self.attention_control_values(&chunk)?;
-        let mut failed_step = NativeBufferParts::new();
+        self.prepare_chunk(chunk)
+    }
+
+    pub(super) fn prepare_chunk(&mut self, chunk: ModelChunkPlan) -> Result<()> {
+        self.ensure_step_available()?;
+        self.copy_attention_controls(&chunk)?;
         let device = self.stream.device().clone();
-        let (cosine, sine) = match controls {
-            Some((cosine, sine)) => {
-                let cosine = match copy_f32_to_device(
-                    &device,
-                    &cosine,
-                    &mut failed_step,
-                    &mut self.failed_step_creation,
-                ) {
-                    Ok(cosine) => cosine,
-                    Err(error) => {
-                        if !failed_step.is_empty() {
-                            self.failed_step = Some(failed_step);
-                        }
-                        return Err(error);
-                    }
-                };
-                let sine = match copy_f32_to_device(
-                    &device,
-                    &sine,
-                    &mut failed_step,
-                    &mut self.failed_step_creation,
-                ) {
-                    Ok(sine) => sine,
-                    Err(error) => {
-                        failed_step.push_f32(cosine);
-                        self.failed_step = Some(failed_step);
-                        return Err(error);
-                    }
-                };
-                (Some(cosine), Some(sine))
-            }
-            None => (None, None),
-        };
         let logits = match tracked_step_buffer(
             &device,
             self.model.output.shape.rows(),
             &mut self.failed_step_creation,
         ) {
             Ok(logits) => logits,
-            Err(error) => {
-                retain_optional_controls(cosine, sine, &mut failed_step);
-                if !failed_step.is_empty() {
-                    self.failed_step = Some(failed_step);
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         self.step = Some(ModelStep {
             chunk,
-            logits,
-            cosine,
-            sine,
+            logits: Some(logits),
         });
         Ok(())
     }
@@ -961,7 +1010,7 @@ impl ModelSessionResources {
     /// True when a failed step allocation has already moved buffers into
     /// explicit inert custody and the session must not dispatch again.
     pub(super) const fn requires_teardown(&self) -> bool {
-        self.failed_step.is_some() || self.failed_step_creation.is_some()
+        self.failed_step.is_some() || self.failed_step_creation.is_some() || self.preparation_touched
     }
 
     /// Submit one bounded B=1 chunk through the complete artifact-ordered model.
@@ -1045,13 +1094,13 @@ impl ModelSessionResources {
                         }
                         .build()
                     })?;
-                    let cosine = step.cosine.as_ref().ok_or_else(|| {
+                    let cosine = self.mrope_cosine.as_ref().ok_or_else(|| {
                         NativeSessionStateSnafu {
                             rule: "native full-attention block requires prepared MRoPE cosine controls",
                         }
                         .build()
                     })?;
-                    let sine = step.sine.as_ref().ok_or_else(|| {
+                    let sine = self.mrope_sine.as_ref().ok_or_else(|| {
                         NativeSessionStateSnafu {
                             rule: "native full-attention block requires prepared MRoPE sine controls",
                         }
@@ -1160,7 +1209,13 @@ impl ModelSessionResources {
                 &self.numerical_status,
             )
         }?;
-        let logits = NativeBufferView::prefix(&step.logits, step.logits.len())?;
+        let logits = step.logits.as_ref().ok_or_else(|| {
+            NativeSessionStateSnafu {
+                rule: "native model submission requires a pending logits owner",
+            }
+            .build()
+        })?;
+        let logits = NativeBufferView::prefix(logits, logits.len())?;
         // SAFETY: the verified output matrix and exact final/logit spans remain owned through completion.
         unsafe {
             self.model.output.launch_rows_view(
@@ -1177,24 +1232,46 @@ impl ModelSessionResources {
         Ok(())
     }
 
-    pub(super) fn publish_completed(&mut self) -> Result<DeviceBuffer<f32>> {
-        let step = self.step.take().ok_or_else(|| {
+    /// Extract terminal output before any logical publication.
+    pub(super) fn take_completed_logits(&mut self) -> Result<DeviceBuffer<f32>> {
+        let step = self.step.as_mut().ok_or_else(|| {
             NativeSessionStateSnafu {
-                rule: "native model publication requires one prepared step",
+                rule: "native completed model step requires pending output",
             }
             .build()
         })?;
-        let kv = &mut self.kv;
-        let step = commit_prepared_or_restore(&mut self.step, step, || {
-            if let Some(kv) = kv {
-                // SAFETY: the resource owner synchronized this exact stream; every fallible local check and output extraction precedes host-ledger publication.
-                unsafe {
-                    kv.commit_prepared_after_completion()
-                        .context(NativePagedKvSnafu)?;
-                }
+        let logits = step.logits.take().ok_or_else(|| {
+            NativeSessionStateSnafu {
+                rule: "native completed model step requires its output owner",
             }
-            Ok(())
+            .build()
         })?;
+        Ok(logits)
+    }
+
+    pub(super) fn restore_completed_logits(&mut self, logits: DeviceBuffer<f32>) {
+        if let Some(step) = self.step.as_mut() {
+            step.logits = Some(logits);
+        }
+    }
+
+    pub(super) unsafe fn prepare_cache_completion(
+        &mut self,
+    ) -> Result<Option<NativePagedPreparedCompletion<'_>>> {
+        self.kv
+            .as_mut()
+            .map(|kv| {
+                // SAFETY: caller proved this resource's ordered stream complete and status clear.
+                unsafe { kv.prepare_commit_after_completion() }.context(NativePagedKvSnafu)
+            })
+            .transpose()
+    }
+
+    pub(super) fn publish_after_cache(&mut self) {
+        let step = self.step.take();
+        let Some(step) = step else {
+            return;
+        };
         let next_position = step.chunk.next_position;
         for layer in &mut self.layers {
             if let NativeSessionLayer::Recurrent(state) = layer {
@@ -1202,7 +1279,7 @@ impl ModelSessionResources {
             }
         }
         self.position = next_position;
-        Ok(step.logits)
+        self.preparation_touched = false;
     }
 
     fn attention_control_values(
@@ -1220,14 +1297,52 @@ impl ModelSessionResources {
         };
         let (cosine, sine) = native_mrope_controls(
             self.plan.layout.text_mrope(),
-            self.position,
+            chunk.position,
             chunk.token_count(),
             workspace.query_rotary.coefficient_elements(),
         )?;
         Ok(Some((cosine, sine)))
     }
+
+    fn copy_attention_controls(&mut self, chunk: &ModelChunkPlan) -> Result<usize> {
+        let Some((cosine, sine)) = self.attention_control_values(chunk)? else {
+            return Ok(0);
+        };
+        let cosine_buffer = self.mrope_cosine.as_mut().ok_or_else(|| NativeSessionStateSnafu {
+            rule: "native full-attention session requires persistent MRoPE cosine controls",
+        }.build())?;
+        let sine_buffer = self.mrope_sine.as_mut().ok_or_else(|| NativeSessionStateSnafu {
+            rule: "native full-attention session requires persistent MRoPE sine controls",
+        }.build())?;
+        let capacity = cosine_buffer.len();
+        if sine_buffer.len() != capacity || cosine.len() > capacity || sine.len() != cosine.len() {
+            return NativeSessionStateSnafu {
+                rule: "native persistent MRoPE controls must cover one active chunk exactly",
+            }
+            .fail();
+        }
+        let mut padded_cosine = Vec::new();
+        padded_cosine.try_reserve_exact(capacity).context(ExecutionAllocationSnafu {
+            target: "native persistent MRoPE cosine staging",
+            length: capacity,
+        })?;
+        let mut padded_sine = Vec::new();
+        padded_sine.try_reserve_exact(capacity).context(ExecutionAllocationSnafu {
+            target: "native persistent MRoPE sine staging",
+            length: capacity,
+        })?;
+        padded_cosine.resize(capacity, 0.0_f32);
+        padded_sine.resize(capacity, 0.0_f32);
+        padded_cosine[..cosine.len()].copy_from_slice(&cosine);
+        padded_sine[..sine.len()].copy_from_slice(&sine);
+        self.preparation_touched = true;
+        cosine_buffer.copy_from_host(&padded_cosine).context(NativeDeviceSnafu)?;
+        sine_buffer.copy_from_host(&padded_sine).context(NativeDeviceSnafu)?;
+        Ok(cosine.len())
+    }
 }
 
+#[cfg(test)]
 fn commit_prepared_or_restore<T>(
     pending_slot: &mut Option<T>,
     pending: T,
@@ -1244,35 +1359,6 @@ fn commit_prepared_or_restore<T>(
 
 /// Allocate then synchronously copy one host control vector without losing a
 /// successful allocation when HIP reports a copy failure.
-fn copy_f32_to_device(
-    device: &Device,
-    values: &[f32],
-    failed_step: &mut NativeBufferParts,
-    creation_failure: &mut Option<BufferAllocationError>,
-) -> Result<DeviceBuffer<f32>> {
-    let mut buffer = tracked_step_buffer(device, values.len(), creation_failure)?;
-    match buffer.copy_from_host(values) {
-        Ok(()) => Ok(buffer),
-        Err(source) => {
-            failed_step.push_f32(buffer);
-            Err(source).context(NativeDeviceSnafu)
-        }
-    }
-}
-
-fn retain_optional_controls(
-    cosine: Option<DeviceBuffer<f32>>,
-    sine: Option<DeviceBuffer<f32>>,
-    failed_step: &mut NativeBufferParts,
-) {
-    if let Some(cosine) = cosine {
-        failed_step.push_f32(cosine);
-    }
-    if let Some(sine) = sine {
-        failed_step.push_f32(sine);
-    }
-}
-
 fn tracked_step_buffer<T: hipcore::BytePod>(
     device: &Device,
     elements: usize,
@@ -1293,12 +1379,8 @@ fn tracked_step_buffer<T: hipcore::BytePod>(
 
 impl ModelStep {
     fn into_buffer_sink(self, sink: &mut impl NativeBufferSink) {
-        sink.push_f32(self.logits);
-        if let Some(cosine) = self.cosine {
-            sink.push_f32(cosine);
-        }
-        if let Some(sine) = self.sine {
-            sink.push_f32(sine);
+        if let Some(logits) = self.logits {
+            sink.push_f32(logits);
         }
     }
 }

@@ -18,6 +18,8 @@ pub(super) struct ModelChunkPlan {
     pub(super) packed: PackedPrefillPlan,
     /// Exact selected serialized embedding rows in chronological chunk order.
     pub(super) embeddings: Vec<kernels::row_gemv::RowDecodePlan>,
+    /// Committed absolute position supplied by the packed sequence descriptor.
+    pub(super) position: usize,
     /// Position published only with every other transaction result.
     pub(super) next_position: usize,
     /// Full-attention chunk geometry when this model owns native paged K/V.
@@ -35,27 +37,53 @@ impl ModelChunkPlan {
         position: usize,
         tokens: &[u32],
     ) -> Result<Self> {
-        if tokens.len() > plan.max_chunk_tokens {
+        let packed = PackedPrefillPlan::new(&[tokens.len()], &[position], plan.layout.max_context())
+            .context(NativeKernelSnafu)?;
+        Self::from_packed_sequence(plan, tokens, &packed, 0)
+    }
+
+    pub(super) fn from_packed_sequence(
+        plan: &DeviceModelPlan,
+        tokens: &[u32],
+        packed: &PackedPrefillPlan,
+        sequence: usize,
+    ) -> Result<Self> {
+        let token_count = packed.sequence_length(sequence).ok_or_else(|| {
+            NativeSessionStateSnafu { rule: "native packed model sequence must exist" }.build()
+        })?;
+        let position = packed.committed_offset(sequence).ok_or_else(|| {
+            NativeSessionStateSnafu { rule: "native packed model sequence must retain its committed position" }.build()
+        })?;
+        if token_count != tokens.len() {
+            return NativeSessionStateSnafu {
+                rule: "native packed model sequence length must match token ids",
+            }
+            .fail();
+        }
+        if token_count > plan.max_chunk_tokens {
             return NativeSessionStateSnafu {
                 rule: "native model chunk must remain within its admitted capacity",
             }
             .fail();
         }
-        let packed =
-            PackedPrefillPlan::new(&[tokens.len()], &[position], plan.layout.max_context())
-                .context(NativeKernelSnafu)?;
-        let next_position = position.checked_add(packed.total_tokens()).ok_or_else(|| {
+        let next_position = position.checked_add(token_count).ok_or_else(|| {
             ArithmeticOverflowSnafu {
                 context: "native model chunk next position",
             }
             .build()
         })?;
+        if next_position > plan.layout.max_context() {
+            return NativeSessionStateSnafu {
+                rule: "native packed model sequence must fit its exact session context",
+            }
+            .fail();
+        }
         let mut embeddings = Vec::new();
         embeddings
-            .try_reserve_exact(packed.total_tokens())
+            .try_reserve_exact(token_count)
             .context(ExecutionAllocationSnafu {
                 target: "native model chunk embedding rows",
-                length: packed.total_tokens(),
+                length: token_count,
             })?;
         for &token in tokens {
             let row = usize::try_from(token).map_err(|_| {
@@ -69,11 +97,13 @@ impl ModelChunkPlan {
                     .context(NativeKernelSnafu)?,
             );
         }
+        let native_packed = PackedPrefillPlan::new(&[token_count], &[position], plan.layout.max_context())
+            .context(NativeKernelSnafu)?;
         let attention = plan
             .kv
             .map(|kv| {
                 let logical = kernels::attention::PagedPrefillPlan::try_from_packed_prefill(
-                    &packed,
+                    &native_packed,
                     plan.layout.heads,
                     plan.layout.kv_heads,
                     plan.layout.key,
@@ -89,8 +119,9 @@ impl ModelChunkPlan {
             .transpose()?;
 
         Ok(Self {
-            packed,
+            packed: native_packed,
             embeddings,
+            position,
             next_position,
             attention,
         })
