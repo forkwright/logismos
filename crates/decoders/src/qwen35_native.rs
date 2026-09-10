@@ -185,7 +185,7 @@ impl<'owner, Resource: CompletionResource> InFlight<'owner, Resource> {
 
     /// Synchronizes submitted work, then runs the checked prepublication step.
     fn complete<Value>(
-        mut self,
+        self,
         commit: impl FnOnce(&mut Resource) -> core::result::Result<Value, Resource::Error>,
     ) -> core::result::Result<Value, CompletionError<Resource::Error>> {
         let mut completion = self.complete_prepublication()?;
@@ -284,7 +284,7 @@ struct PostCompletion<'owner, Resource: CompletionResource> {
     finished: bool,
 }
 
-impl<'owner, Resource: CompletionResource> PostCompletion<'owner, Resource> {
+impl<Resource: CompletionResource> PostCompletion<'_, Resource> {
     fn resource(&mut self) -> &mut Resource {
         self.resource
     }
@@ -299,7 +299,7 @@ impl<'owner, Resource: CompletionResource> PostCompletion<'owner, Resource> {
     }
 }
 
-impl<'owner, Resource: CompletionResource> Drop for PostCompletion<'owner, Resource> {
+impl<Resource: CompletionResource> Drop for PostCompletion<'_, Resource> {
     fn drop(&mut self) {
         if !self.finished {
             *self.state = ResourceState::PoisonedIdle;
@@ -719,11 +719,11 @@ mod tests {
             drops,
             publications,
             ..
-        } = owner([Ok(()), Ok(())], [Ok(())]);
+        } = owner([Ok(())], [Ok(())]);
         let mut guard = owner.begin()?;
         guard.mark_submitted();
-        // This controlled unwind proves the real guard's destructor synchronizes
-        // and poisons the bundle if logical publication cannot finish.
+        // NOTE: completion already proved idle; unwind poisons the retained
+        // bundle without issuing a second synchronization.
         let unwind = catch_unwind(AssertUnwindSafe(|| {
             drop(guard.complete(|_| -> core::result::Result<(), TestError> {
                 panic_any(ControlledUnwind)
@@ -732,7 +732,7 @@ mod tests {
         assert!(unwind.is_err());
         assert!(matches!(owner.state(), ResourceState::PoisonedIdle));
         assert_eq!(publications.get(), 0);
-        assert_eq!(synchronizations.get(), 2);
+        assert_eq!(synchronizations.get(), 1);
         drop(owner);
         assert_eq!(drops.get(), 1);
         Ok(())
