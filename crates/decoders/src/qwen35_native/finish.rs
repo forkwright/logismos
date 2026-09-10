@@ -17,7 +17,6 @@ use crate::{Qwen35Weights, Result};
 
 #[derive(Debug)]
 pub(super) struct LayerFinishPlan {
-    pub(super) token_count: usize,
     pub(super) post_attention_norm: kernels::decoder_ops::RmsNormF32Plan,
     pub(super) ffn: kernels::decoder_ops::ElementwiseF32Plan,
     pub(super) residual: kernels::decoder_ops::ElementwiseF32Plan,
@@ -141,7 +140,6 @@ impl LayerFinishPlan {
             scratch: workspace.bytes()?,
         };
         Ok(Self {
-            token_count,
             post_attention_norm,
             ffn,
             residual,
@@ -309,7 +307,7 @@ impl DeferredLayerFinish<'_> {
             self.weights.ffn_gate.launch_rows(
                 &self.workspace.post_norm,
                 &self.workspace.ffn_gate,
-                self.plan.token_count,
+                self.plan.post_attention_norm.rows(),
                 self.stream,
                 self.numerical_status,
             )
@@ -320,7 +318,7 @@ impl DeferredLayerFinish<'_> {
             self.weights.ffn_up.launch_rows(
                 &self.workspace.post_norm,
                 &self.workspace.ffn_up,
-                self.plan.token_count,
+                self.plan.post_attention_norm.rows(),
                 self.stream,
                 self.numerical_status,
             )
@@ -342,7 +340,7 @@ impl DeferredLayerFinish<'_> {
             self.weights.ffn_down.launch_rows(
                 &self.workspace.ffn_product,
                 &self.workspace.ffn_down,
-                self.plan.token_count,
+                self.plan.post_attention_norm.rows(),
                 self.stream,
                 self.numerical_status,
             )
@@ -385,27 +383,54 @@ mod tests {
         for token_count in 1..=3 {
             let plan = LayerFinishPlan::from_weights_rows(&weights, layout, 3, token_count)
                 .map_err(|error| error.to_string())?;
-            assert_eq!(plan.token_count, token_count);
-            assert_eq!(plan.post_attention_norm.rows(), token_count);
-            assert_eq!(plan.residual.elements(), token_count * layout.hidden);
-            assert_eq!(plan.ffn.elements(), token_count * layout.feed_forward);
-            assert_eq!(plan.workspace.attention_residual, plan.residual.elements());
+            assert_eq!(
+                plan.post_attention_norm.rows(),
+                token_count,
+                "RMSNorm rows are the sole token-count owner"
+            );
+            assert_eq!(
+                plan.residual.elements(),
+                token_count * layout.hidden,
+                "residual extent must derive from RMSNorm rows and hidden width"
+            );
+            assert_eq!(
+                plan.ffn.elements(),
+                token_count * layout.feed_forward,
+                "FFN extent must derive from the requested token count"
+            );
+            assert_eq!(
+                plan.workspace.attention_residual,
+                plan.residual.elements(),
+                "attention residual scratch must match residual geometry"
+            );
             assert_eq!(
                 plan.workspace.post_norm,
-                plan.post_attention_norm.elements()
+                plan.post_attention_norm.elements(),
+                "post-norm scratch must use its checked RMSNorm extent"
             );
-            assert_eq!(plan.workspace.ffn_down, plan.residual.elements());
+            assert_eq!(
+                plan.workspace.ffn_down,
+                plan.residual.elements(),
+                "down projection scratch must match residual geometry"
+            );
             assert_eq!(
                 plan.workspace.bytes().map_err(|error| error.to_string())?,
-                plan.demand.scratch
+                plan.demand.scratch,
+                "scratch demand must be derived from the named workspace owner"
             );
             if token_count == 1 {
                 assert_eq!(
-                    plan.workspace.attention_residual,
-                    t1.workspace.attention_residual
+                    plan.workspace.attention_residual, t1.workspace.attention_residual,
+                    "T1 row constructor must preserve residual scratch"
                 );
-                assert_eq!(plan.workspace.ffn_gate, t1.workspace.ffn_gate);
-                assert_eq!(plan.demand.scratch, t1.demand.scratch);
+                assert_eq!(
+                    plan.workspace.ffn_gate, t1.workspace.ffn_gate,
+                    "T1 row constructor must preserve FFN scratch"
+                );
+                assert_eq!(
+                    plan.demand.scratch, t1.demand.scratch,
+                    "T1 row constructor must preserve scratch demand"
+                );
             }
         }
         Ok(())
