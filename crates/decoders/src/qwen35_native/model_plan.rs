@@ -361,7 +361,7 @@ impl ModelDeviceByteDemand {
                 "native final normalized bytes",
             )?,
             logits: elements_bytes(vocabulary, size_of::<f32>(), "native logits bytes")?,
-            mrope_controls: controls_bytes(blocks.full_workspace.as_ref(), max_chunk_tokens)?,
+            mrope_controls: controls_bytes(blocks.full_workspace.as_ref())?,
             key_values: kv_bytes(kv)?,
             page_table: page_table_bytes(kv, layout)?,
             recurrent_history_active: recurrent_bytes(
@@ -464,17 +464,8 @@ fn recurrent_workspace_bytes(plan: Option<&RecurrentWorkspacePlan>) -> Result<us
         .map(|bytes| bytes.unwrap_or(0))
 }
 
-fn controls_bytes(plan: Option<&WorkspacePlan>, max_chunk_tokens: usize) -> Result<usize> {
+fn controls_bytes(plan: Option<&WorkspacePlan>) -> Result<usize> {
     plan.map(|plan| plan.coefficient_elements())
-        .transpose()?
-        .map(|elements| {
-            elements.checked_mul(max_chunk_tokens).ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "native prefill mRoPE controls",
-                }
-                .build()
-            })
-        })
         .transpose()?
         .map(|elements| elements_bytes(elements, size_of::<f32>(), "native mRoPE control bytes"))
         .transpose()
@@ -702,9 +693,35 @@ mod tests {
             token.bytes.finish_workspace * CAPACITY
         );
         assert_eq!(chunk.bytes.hidden_rows, token.bytes.hidden_rows * CAPACITY);
+        let token_control_elements = token
+            .full_workspace
+            .ok_or("canonical model must retain full-attention workspace")?
+            .coefficient_elements()
+            .map_err(|error| error.to_string())?;
+        let chunk_control_elements = chunk
+            .full_workspace
+            .ok_or("canonical model must retain full-attention workspace")?
+            .coefficient_elements()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            chunk_control_elements,
+            token_control_elements * CAPACITY,
+            "the capacity workspace owner must account for one token-major cosine/sine row per admitted token"
+        );
         assert_eq!(
             chunk.bytes.mrope_controls,
-            token.bytes.mrope_controls * CAPACITY
+            elements_bytes(
+                chunk_control_elements,
+                size_of::<f32>(),
+                "test native mRoPE controls",
+            )
+            .map_err(|error| error.to_string())?,
+            "mRoPE byte demand must derive directly from its capacity workspace owner"
+        );
+        assert_eq!(
+            chunk.bytes.mrope_controls,
+            token.bytes.mrope_controls * CAPACITY,
+            "capacity-three controls must be exactly three capacity-one control spans, never squared"
         );
         Ok(())
     }
