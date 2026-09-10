@@ -1519,6 +1519,22 @@ pub(crate) fn canonical_hybrid_fixture_with_invalid_output_head_operand()
     Ok(fixture)
 }
 
+/// Preserve canonical structure while introducing a late full-attention operand fault.
+pub(crate) fn canonical_hybrid_fixture_with_invalid_full_attention_operand()
+-> std::result::Result<Fixture, String> {
+    let mut fixture = canonical_hybrid_fixture()?;
+    set_invalid_f32_tensor(&mut fixture, "blk.3.attn_output.weight")?;
+    Ok(fixture)
+}
+
+/// Preserve canonical structure while introducing a late recurrent operand fault.
+pub(crate) fn canonical_hybrid_fixture_with_invalid_recurrent_operand()
+-> std::result::Result<Fixture, String> {
+    let mut fixture = canonical_hybrid_fixture()?;
+    set_invalid_f32_tensor(&mut fixture, "blk.2.ssm_out.weight")?;
+    Ok(fixture)
+}
+
 /// Preserve the canonical main model while varying only its optional auxiliary block.
 pub(crate) fn canonical_hybrid_fixture_with_nextn(
     context: usize,

@@ -6,7 +6,9 @@ use crate::qwen35::tests::{
     CanonicalHybridOracle, Fixture, assert_f32_matches_f64,
     canonical_hybrid_fixture_with_context_and_rotary,
     canonical_hybrid_fixture_with_invalid_embedding_operand,
-    canonical_hybrid_fixture_with_invalid_output_head_operand, canonical_hybrid_fixture_with_nextn,
+    canonical_hybrid_fixture_with_invalid_full_attention_operand,
+    canonical_hybrid_fixture_with_invalid_output_head_operand,
+    canonical_hybrid_fixture_with_invalid_recurrent_operand, canonical_hybrid_fixture_with_nextn,
     verify_fixture,
 };
 use crate::{
@@ -322,7 +324,36 @@ fn reserved_device_native_main_model_status_refuses_invalid_output_head_operand(
 #[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
 fn reserved_device_native_prefill_late_output_fault_returns_no_terminal_logits()
 -> core::result::Result<(), String> {
-    let fixture = canonical_hybrid_fixture_with_invalid_output_head_operand()?;
+    native_prefill_late_numeric_fault_witness(
+        &canonical_hybrid_fixture_with_invalid_output_head_operand()?,
+        "late output-head operand",
+    )
+}
+
+#[test]
+#[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
+fn reserved_device_native_prefill_late_full_attention_fault_returns_no_terminal_logits()
+-> core::result::Result<(), String> {
+    native_prefill_late_numeric_fault_witness(
+        &canonical_hybrid_fixture_with_invalid_full_attention_operand()?,
+        "late full-attention output-projection operand",
+    )
+}
+
+#[test]
+#[ignore = "requires an operator-reserved visible gfx1100 device 0; source tests do not qualify hardware"]
+fn reserved_device_native_prefill_late_recurrent_fault_returns_no_terminal_logits()
+-> core::result::Result<(), String> {
+    native_prefill_late_numeric_fault_witness(
+        &canonical_hybrid_fixture_with_invalid_recurrent_operand()?,
+        "late recurrent output-projection operand",
+    )
+}
+
+fn native_prefill_late_numeric_fault_witness(
+    fixture: &Fixture,
+    fault_stage: &str,
+) -> core::result::Result<(), String> {
     let payload = verify_fixture(&fixture)?;
     let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
     let plan = Qwen35NativeExecutionPlan::try_from_weights_prefill(
@@ -333,20 +364,25 @@ fn reserved_device_native_prefill_late_output_fault_returns_no_terminal_logits()
     )
     .map_err(|error| error.to_string())?;
     let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
-    // SAFETY: the checked fixture has one deliberate late output-head numerical
-    // fault. This ignored witness retains the complete bundle until the status
-    // read proves the failed stream is idle.
+    // SAFETY: the checked fixture has one deliberate late numerical fault. This
+    // ignored witness retains the complete bundle until the status read proves
+    // the failed stream is idle.
     let mut session = unsafe { plan.into_session(&device) }.map_err(|error| error.to_string())?;
-    // SAFETY: the fault is after the chunk has staged all prior model work. No
-    // terminal logits may escape and no retryable publication state may remain.
+    // SAFETY: the fault occurs after chunk work has been submitted. No terminal
+    // logits may escape and no retryable publication state may remain.
     if unsafe { session.prefill(&MODEL_PREFILL_FIRST) }.is_ok() {
-        return Err("late output-head prefill fault unexpectedly returned logits".to_string());
+        return Err(format!(
+            "native {fault_stage} prefill fault unexpectedly returned logits"
+        ));
     }
     assert_eq!(
         session.state(),
         Qwen35NativeSessionState::PoisonedKnownIdle,
-        "a synchronized late chunk fault must retain poisoned ownership rather than publish K/V, recurrent state, position, or logits"
+        "a synchronized {fault_stage} must retain known-idle poisoned ownership after refusing terminal logits"
     );
+    // The opaque session intentionally does not expose raw K/V, recurrent, or
+    // position snapshots. This witness therefore proves no logits escape and
+    // the observable poisoned-custody state, not their bytewise contents.
     Ok(())
 }
 
