@@ -224,6 +224,14 @@ struct PagedKvLedger {
     free: Vec<usize>,
     staged_rows: Vec<usize>,
     committed_tokens: usize,
+    append_state: PagedAppendState,
+}
+
+#[derive(Debug, Default)]
+enum PagedAppendState {
+    #[default]
+    Idle,
+    Reserved,
 }
 
 impl PagedKvLedger {
@@ -243,10 +251,12 @@ impl PagedKvLedger {
             free,
             staged_rows,
             committed_tokens: 0,
+            append_state: PagedAppendState::Idle,
         })
     }
 
     fn begin_append(&mut self, append_tokens: usize) -> Result<AppendReservation> {
+        self.ensure_append_idle()?;
         if append_tokens == 0 {
             return PagedEmptyAppendSnafu.fail();
         }
@@ -298,6 +308,7 @@ impl PagedKvLedger {
             self.table.push(bundle);
             self.fills.push(0);
         }
+        self.append_state = PagedAppendState::Reserved;
         Ok(AppendReservation {
             append_tokens,
             original_tokens,
@@ -350,6 +361,16 @@ impl PagedKvLedger {
         })
     }
 
+    fn ensure_append_idle(&self) -> Result<()> {
+        match self.append_state {
+            PagedAppendState::Idle => Ok(()),
+            PagedAppendState::Reserved => PagedLayoutSnafu {
+                operation: "active paged-KV append",
+            }
+            .fail(),
+        }
+    }
+
     fn validate_commit(&self, reservation: &AppendReservation) -> Result<()> {
         for (layer, written_tokens) in self.staged_rows.iter().copied().enumerate() {
             if written_tokens != reservation.append_tokens {
@@ -370,6 +391,7 @@ impl PagedKvLedger {
             self.free.push(replacement.original_bundle);
         }
         self.staged_rows.fill(0);
+        self.append_state = PagedAppendState::Idle;
     }
 
     fn rollback(&mut self, reservation: &AppendReservation) {
@@ -389,6 +411,7 @@ impl PagedKvLedger {
             self.free.push(replacement.replacement_bundle);
         }
         self.staged_rows.fill(0);
+        self.append_state = PagedAppendState::Idle;
     }
 
     fn write_location(
@@ -2514,6 +2537,43 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn all_page_sizes_refuse_forgotten_cpu_append_custody() -> Result<()> {
+        const APPEND_TOKENS: usize = 2;
+
+        for (page_tokens, page) in [
+            (8, PageTokens::B8),
+            (16, PageTokens::B16),
+            (32, PageTokens::B32),
+        ] {
+            let start = page_tokens - 1;
+            let plan = PagedKvPlan::new(geometry(page_tokens * 2 + 1), page)?;
+
+            let mut append_pool = PagedKvPool::new(plan)?;
+            let mut append_model = empty_model();
+            seed_partial_tail(&mut append_pool, &mut append_model, start)?;
+            let append = append_pool.begin_append(APPEND_TOKENS)?;
+            core::mem::forget(append);
+            assert_eq!(append_pool.ledger.committed_tokens, start);
+            assert!(matches!(
+                append_pool.begin_append(1),
+                Err(Error::PagedLayout { .. })
+            ));
+
+            let mut prepared_pool = PagedKvPool::new(plan)?;
+            let mut prepared_model = empty_model();
+            seed_partial_tail(&mut prepared_pool, &mut prepared_model, start)?;
+            let prepared = prepare_all(&mut prepared_pool, start, APPEND_TOKENS)?;
+            core::mem::forget(prepared);
+            assert_eq!(prepared_pool.ledger.committed_tokens, start);
+            assert!(matches!(
+                prepared_pool.begin_append(1),
+                Err(Error::PagedLayout { .. })
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "gpu")]
     #[test]
     fn native_plan_uses_explicit_page_choice_and_one_spare_bundle() -> Result<()> {
@@ -2644,6 +2704,24 @@ mod tests {
         ));
         let reservation = pool.prepared.take()?;
         pool.ledger.rollback(&reservation);
+        Ok(())
+    }
+
+    #[test]
+    fn forgotten_native_completion_guard_keeps_pool_refused_and_unpublished() -> Result<()> {
+        let mut pool = prepared_native_completion_pool()?;
+        let prepared = prepare_native_completion(&mut pool);
+        core::mem::forget(prepared);
+        assert_eq!(pool.ledger.committed_tokens, 0);
+        assert!(matches!(pool.prepared.ensure_empty(), Ok(())));
+        assert!(matches!(
+            pool.ledger.begin_append(1),
+            Err(Error::PagedLayout { .. })
+        ));
+        assert!(matches!(
+            NativeCompletionPrepared::prepare(&mut pool),
+            Err(NativeCompletionRefusal::MissingPrepared)
+        ));
         Ok(())
     }
 
