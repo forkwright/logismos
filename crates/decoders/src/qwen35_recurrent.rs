@@ -1567,4 +1567,67 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn allocation_owner_arithmetic_witness_preserves_corrected_gdn_phase() -> Result<()> {
+        let profile = Qwen35RecurrentLayout {
+            hidden: 2,
+            conv_kernel: 1,
+            inner: 2,
+            state: 2,
+            time_step_rank: 1,
+            group_count: 1,
+            main_block_count: 1,
+            full_attention_interval: 2,
+        };
+        let layout = ExecutionLayout::try_from_profile(profile, 1.0e-5)?;
+        assert_eq!(layout.conv_width, 6, "Q/K channels plus values must be [6]");
+        assert_eq!(layout.value_dim, 2);
+        let allocations = RecurrentStepAllocations::try_from_layout(layout, 1)?;
+
+        let causal_phase = sum_elements(
+            &[
+                allocations.qkv_projection.aggregate_output,
+                allocations.gate_projection.aggregate_output,
+                allocations.alpha_projection.aggregate_output,
+                allocations.beta_projection.aggregate_output,
+                allocations.beta_heads,
+                allocations.gate_heads,
+                allocations.causal_convolution.output_elements(),
+                allocations.causal_convolution.history_elements(),
+            ],
+            "allocation-owner arithmetic witness causal phase",
+        )?;
+        let recurrence_base = sum_elements(
+            &[
+                causal_phase,
+                allocations.value_heads,
+                allocations.tiled_query,
+                allocations.tiled_key,
+            ],
+            "allocation-owner arithmetic witness recurrence base",
+        )?;
+        assert_eq!(causal_phase, 18);
+        assert_eq!(recurrence_base, 24);
+        assert_eq!(
+            [
+                allocations.gdn.output_elements(),
+                allocations.gdn.state_elements(),
+                allocations.gdn.head_output_elements(),
+                allocations.gdn.head_state_elements(),
+                allocations.gdn.state_times_key_elements(),
+                allocations.gdn.delta_elements(),
+            ],
+            [2, 4, 2, 4, 2, 2],
+            "the corrected GDN phase must count aggregate and canonical one-head owners"
+        );
+        assert_eq!(allocations.gdn.workspace_elements(), 16);
+        assert_eq!(
+            allocations.workspace_elements(),
+            recurrence_base + allocations.gdn.workspace_elements(),
+            "this is allocation-owner arithmetic, not an allocator or heap measurement"
+        );
+        assert_eq!(allocations.workspace_elements(), 40);
+        Ok(())
+    }
 }

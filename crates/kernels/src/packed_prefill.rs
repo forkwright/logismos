@@ -176,9 +176,11 @@ mod tests {
     #[test]
     fn invalid_prefixes_and_context_ends_refuse() {
         assert!(PackedPrefillPlan::new(&[], &[], 1).is_err());
+        assert!(PackedPrefillPlan::new(&[1], &[0], 0).is_err());
         assert!(PackedPrefillPlan::new(&[1], &[], 1).is_err());
         assert!(PackedPrefillPlan::new(&[0], &[0], 1).is_err());
         assert!(PackedPrefillPlan::new(&[2], &[0], 1).is_err());
         assert!(PackedPrefillPlan::new(&[1], &[usize::MAX], usize::MAX).is_err());
+        assert!(PackedPrefillPlan::new(&[usize::MAX, 1], &[0, 0], usize::MAX).is_err());
     }
 }

@@ -504,7 +504,6 @@ pub struct MultiHeadRecurrentInput<'a> {
     scale: f32,
     state: &'a [f32],
     token_count: usize,
-    key_head_count: usize,
     value_head_count: usize,
     key_dim: usize,
     value_dim: usize,
@@ -561,7 +560,6 @@ impl<'a> MultiHeadRecurrentInput<'a> {
             scale,
             state,
             token_count,
-            key_head_count,
             value_head_count,
             key_dim,
             value_dim,
@@ -1931,6 +1929,8 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let fixture = multi_head_fixture(KEY_HEAD_COUNT, VALUE_HEAD_COUNT);
         let full = PackedPrefillPlan::new(&[TOKEN_COUNT], &[3], 8)?;
+        assert_eq!(full.committed_offset(0), Some(3));
+        assert_eq!(full.sequence_length(0), Some(TOKEN_COUNT));
         let full_input = PackedMultiHeadRecurrentInput::new(
             &fixture.q,
             &fixture.k,
@@ -1947,7 +1947,9 @@ mod tests {
         )?;
         let full_actual = packed_multi_head_recurrent_fwd(&full_input)?;
 
-        let first = PackedPrefillPlan::new(&[1], &[4], 8)?;
+        let first = PackedPrefillPlan::new(&[1], &[3], 8)?;
+        assert_eq!(first.committed_offset(0), Some(3));
+        assert_eq!(first.sequence_length(0), Some(1));
         let first_q =
             head_major_token_window(&fixture.q, KEY_HEAD_COUNT, TOKEN_COUNT, KEY_DIM, 0, 1);
         let first_k =
@@ -1979,7 +1981,24 @@ mod tests {
         )?;
         let first_actual = packed_multi_head_recurrent_fwd(&first_input)?;
 
-        let rest = PackedPrefillPlan::new(&[2], &[5], 8)?;
+        let rest = PackedPrefillPlan::new(&[2], &[4], 8)?;
+        assert_eq!(
+            first
+                .committed_offset(0)
+                .zip(first.sequence_length(0))
+                .and_then(|(offset, length)| offset.checked_add(length)),
+            rest.committed_offset(0),
+            "the continuation must start at the preceding chunk's checked context end"
+        );
+        assert_eq!(
+            rest.committed_offset(0)
+                .zip(rest.sequence_length(0))
+                .and_then(|(offset, length)| offset.checked_add(length)),
+            full.committed_offset(0)
+                .zip(full.sequence_length(0))
+                .and_then(|(offset, length)| offset.checked_add(length)),
+            "partitioned chunks must share the full descriptor's checked context end"
+        );
         let rest_q =
             head_major_token_window(&fixture.q, KEY_HEAD_COUNT, TOKEN_COUNT, KEY_DIM, 1, 3);
         let rest_k =
