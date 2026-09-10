@@ -664,7 +664,7 @@ pub enum PagedPrefillError {
     },
 
     /// Native dense-page construction rejected a reused Q=1 physical constraint.
-    #[snafu(transparent)]
+    #[snafu(display("{source}"), context(name(PrefillNativeSnafu)))]
     Native {
         /// Source native descriptor error.
         source: PagedDecodeError,
