@@ -209,12 +209,30 @@ impl NativeTextResident {
         &self,
         prepared: PreparedGeneration,
     ) -> Result<NativeTextUsePlan, NativeTextUsePlanFailure> {
+        self.plan_generation_prefill(prepared, 1)
+    }
+
+    /// Plan one exact prepared request with an explicit native prefill capacity.
+    ///
+    /// The requested capacity is forwarded unchanged to the decoder's checked
+    /// per-use plan. It therefore controls both this use's device demand and
+    /// every bounded native prefill submission without changing resident state.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a foreign preparation or a zero, context-exceeding, or otherwise
+    /// unrepresentable native session plan before session allocation.
+    pub fn plan_generation_prefill(
+        &self,
+        prepared: PreparedGeneration,
+        max_chunk_tokens: usize,
+    ) -> Result<NativeTextUsePlan, NativeTextUsePlanFailure> {
         let prepared = bind_preparation(&self.inner.pipeline, prepared)?;
         let session = self
             .inner
             .model
             .get()
-            .plan_session(prepared.context_tokens())
+            .plan_prefill_session(prepared.context_tokens(), max_chunk_tokens)
             .map_err(|source| NativeTextUsePlanFailure::NativePlan {
                 source,
                 location: snafu::location!(),
@@ -315,14 +333,21 @@ impl NativeTextUsePlan {
         self.session.device_demand()
     }
 
+    /// Return this use's exact checked B=1 prefill capacity.
+    #[must_use]
+    pub const fn max_chunk_tokens(&self) -> usize {
+        self.session.max_chunk_tokens()
+    }
+
     /// Execute this exact planned use with caller-acquired recycled host storage.
     ///
     /// Storage is validated and cancellation is observed before native session
     /// construction can allocate any per-use resource.
     ///
-    /// Every native token output is explicitly released before another token is
-    /// started. Generation is published only after both final output and session
-    /// teardown are acknowledged; all other outcomes retain typed custody.
+    /// Every non-final native chunk output is explicitly released before another
+    /// chunk is started. Generation is published only after both final output
+    /// and session teardown are acknowledged; all other outcomes retain typed
+    /// custody.
     ///
     /// # Errors
     ///
@@ -332,7 +357,7 @@ impl NativeTextUsePlan {
     /// # Safety
     ///
     /// The caller must maintain the qualified native device, compiler, and
-    /// numerical contract for each submitted token and separately hold current
+    /// numerical contract for each submitted native chunk and separately hold current
     /// host authorization. This is not a service or admission entrypoint.
     pub unsafe fn generate(
         self,
@@ -352,6 +377,7 @@ impl NativeTextUsePlan {
             session,
             prepared,
         } = self;
+        let max_chunk_tokens = session.max_chunk_tokens();
         let construction = construct_unless_cancelled(
             session,
             cancellation,
@@ -380,9 +406,16 @@ impl NativeTextUsePlan {
                 })
             }
             ConstructionAttempt::Attempted(Ok(session)) => {
-                // SAFETY: this method's contract supplies the per-token native qualification.
+                // SAFETY: this method's contract supplies the bounded native qualification.
                 unsafe {
-                    generate_with_native_session(resident, prepared, session, storage, cancellation)
+                    generate_with_native_session(
+                        resident,
+                        prepared,
+                        session,
+                        max_chunk_tokens,
+                        storage,
+                        cancellation,
+                    )
                 }
             }
         }
@@ -418,7 +451,7 @@ pub struct NativeTextUseConstructionCustody {
 #[must_use = "driver failures can retain unreleased native output custody"]
 #[non_exhaustive]
 pub enum NativeTextDriverError {
-    /// One native decoder token step failed.
+    /// One native decoder prefill submission failed.
     Native {
         /// Original decoder failure.
         source: decoders::Error,
@@ -435,7 +468,7 @@ pub enum NativeTextDriverError {
         /// Explicit release outcome retaining unresolved output custody.
         release: Box<BufferRelease>,
     },
-    /// Cancellation was observed between complete native prompt-token operations.
+    /// Cancellation was observed at a native chunk boundary.
     Cancelled,
     /// The shared text port violated its nonempty token-batch contract.
     EmptyTokenBatch,
@@ -464,7 +497,7 @@ impl fmt::Debug for NativeTextDriverError {
 impl fmt::Display for NativeTextDriverError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Native { source } => write!(formatter, "native text token step failed: {source}"),
+            Self::Native { source } => write!(formatter, "native text prefill failed: {source}"),
             Self::Copy { source, .. } => {
                 write!(formatter, "native text logits copy failed: {source}")
             }
@@ -851,12 +884,15 @@ impl std::error::Error for NativeTextGenerationFailure {
 
 struct NativeTextDriver {
     session: Qwen35NativeExecutionSession,
+    // INVARIANT: the checked native session plan is the sole authority for this
+    // positive capacity; this driver neither clamps nor supplies a default.
+    max_chunk_tokens: usize,
 }
 
 trait NativeTokenDriver {
     type Output;
 
-    fn step_token(&mut self, token: u32) -> Result<Self::Output, NativeTextDriverError>;
+    fn prefill_tokens(&mut self, tokens: &[u32]) -> Result<Self::Output, NativeTextDriverError>;
 
     fn release_intermediate(&mut self, output: Self::Output) -> Result<(), NativeTextDriverError>;
 
@@ -870,9 +906,9 @@ trait NativeTokenDriver {
 impl NativeTokenDriver for NativeTextDriver {
     type Output = DeviceBuffer<f32>;
 
-    fn step_token(&mut self, token: u32) -> Result<Self::Output, NativeTextDriverError> {
+    fn prefill_tokens(&mut self, tokens: &[u32]) -> Result<Self::Output, NativeTextDriverError> {
         // SAFETY: `NativeTextUsePlan::generate` establishes this native execution contract.
-        unsafe { self.session.step(token) }
+        unsafe { self.session.prefill(tokens) }
             .map_err(|source| NativeTextDriverError::Native { source })
     }
 
@@ -898,12 +934,14 @@ impl RecycledGenerationDriver for NativeTextDriver {
         logits: &mut [f32],
         cancellation: &dyn Cancellation,
     ) -> Result<(), Self::Error> {
-        drive_token_batch(self, token_ids, logits, cancellation)
+        let max_chunk_tokens = self.max_chunk_tokens;
+        drive_token_batch(self, max_chunk_tokens, token_ids, logits, cancellation)
     }
 }
 
 fn drive_token_batch<Driver>(
     driver: &mut Driver,
+    max_chunk_tokens: usize,
     token_ids: &[u32],
     logits: &mut [f32],
     cancellation: &dyn Cancellation,
@@ -911,31 +949,36 @@ fn drive_token_batch<Driver>(
 where
     Driver: NativeTokenDriver,
 {
-    let Some((last, prefix)) = token_ids.split_last() else {
+    if token_ids.is_empty() {
         return Err(NativeTextDriverError::EmptyTokenBatch);
-    };
-    for token in prefix {
+    }
+    let mut chunks = token_ids.chunks(max_chunk_tokens).peekable();
+    while let Some(tokens) = chunks.next() {
         if cancellation.is_cancelled() {
             return Err(NativeTextDriverError::Cancelled);
         }
-        let output = driver.step_token(*token)?;
-        driver.release_intermediate(output)?;
+        let output = driver.prefill_tokens(tokens)?;
+        if chunks.peek().is_some() {
+            driver.release_intermediate(output)?;
+        } else {
+            return driver.copy_and_release_final(output, logits);
+        }
     }
-    if cancellation.is_cancelled() {
-        return Err(NativeTextDriverError::Cancelled);
-    }
-    let output = driver.step_token(*last)?;
-    driver.copy_and_release_final(output, logits)
+    Err(NativeTextDriverError::EmptyTokenBatch)
 }
 
 unsafe fn generate_with_native_session(
     resident: Arc<NativeTextResidentInner>,
     prepared: PreparedGeneration,
     session: Qwen35NativeExecutionSession,
+    max_chunk_tokens: usize,
     storage: RecycledLogitsStorage,
     cancellation: &dyn Cancellation,
 ) -> Result<Generation, NativeTextGenerationFailure> {
-    let mut driver = NativeTextDriver { session };
+    let mut driver = NativeTextDriver {
+        session,
+        max_chunk_tokens,
+    };
     let generation = prepared.generate_with_recycled_driver(&mut driver, storage, cancellation);
     let close = NativeTextUseClose::from_session(resident, driver.session);
     finish_generation(generation, close)
@@ -1074,27 +1117,39 @@ mod tests {
 
     #[derive(Default)]
     struct SyntheticDriver {
-        stepped: Vec<u32>,
+        prefills: Vec<Vec<u32>>,
         released: Vec<u32>,
+        unresolved_output: Option<u32>,
         final_output: Option<u32>,
         fails_on: Option<u32>,
+        release_fails_on: Option<u32>,
     }
 
     impl NativeTokenDriver for SyntheticDriver {
         type Output = u32;
 
-        fn step_token(&mut self, token: u32) -> Result<Self::Output, NativeTextDriverError> {
-            self.stepped.push(token);
-            if self.fails_on == Some(token) {
+        fn prefill_tokens(
+            &mut self,
+            tokens: &[u32],
+        ) -> Result<Self::Output, NativeTextDriverError> {
+            self.prefills.push(tokens.to_vec());
+            if self.fails_on.is_some_and(|token| tokens.contains(&token)) {
                 return Err(NativeTextDriverError::EmptyTokenBatch);
             }
-            Ok(token)
+            tokens
+                .last()
+                .copied()
+                .ok_or(NativeTextDriverError::EmptyTokenBatch)
         }
 
         fn release_intermediate(
             &mut self,
             output: Self::Output,
         ) -> Result<(), NativeTextDriverError> {
+            if self.release_fails_on == Some(output) {
+                self.unresolved_output = Some(output);
+                return Err(NativeTextDriverError::EmptyTokenBatch);
+            }
             self.released.push(output);
             Ok(())
         }
@@ -1181,6 +1236,33 @@ mod tests {
             bind_preparation(&first, prepared(&second)?),
             Err(NativeTextUsePlanFailure::ForeignPreparation { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_capacity_refuses_zero_and_context_excess_before_native_allocation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, pipeline) = synthetic_pipeline(8)?;
+        let profile = pipeline.execution_profile();
+
+        assert!(
+            Qwen35NativeExecutionPlan::try_from_weights_prefill(
+                profile.weights(),
+                8,
+                0,
+                NativePageTokens::B8,
+            )
+            .is_err()
+        );
+        assert!(
+            Qwen35NativeExecutionPlan::try_from_weights_prefill(
+                profile.weights(),
+                8,
+                9,
+                NativePageTokens::B8,
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -1306,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_releases_every_nonfinal_native_output() {
+    fn capacity_one_prefill_preserves_token_serial_execution() {
         let mut driver = SyntheticDriver::default();
         let mut logits = [0.0];
         let cancellation = CancelAt {
@@ -1314,17 +1396,17 @@ mod tests {
             cancelled_call: usize::MAX,
         };
 
-        let result = drive_token_batch(&mut driver, &[11, 12, 13], &mut logits, &cancellation);
+        let result = drive_token_batch(&mut driver, 1, &[11, 12, 13], &mut logits, &cancellation);
 
         assert!(result.is_ok());
-        assert_eq!(driver.stepped, [11, 12, 13]);
+        assert_eq!(driver.prefills, [vec![11], vec![12], vec![13]]);
         assert_eq!(driver.released, [11, 12]);
         assert_eq!(driver.final_output, Some(13));
         assert_eq!(logits.map(f32::to_bits), [13.0_f32.to_bits()]);
     }
 
     #[test]
-    fn continuation_uses_only_one_final_native_output() {
+    fn uneven_prefill_chunks_release_every_nonfinal_output() {
         let mut driver = SyntheticDriver::default();
         let mut logits = [0.0];
         let cancellation = CancelAt {
@@ -1332,16 +1414,57 @@ mod tests {
             cancelled_call: usize::MAX,
         };
 
-        let result = drive_token_batch(&mut driver, &[29], &mut logits, &cancellation);
+        let result = drive_token_batch(
+            &mut driver,
+            2,
+            &[29, 30, 31, 32, 33],
+            &mut logits,
+            &cancellation,
+        );
 
         assert!(result.is_ok());
-        assert_eq!(driver.stepped, [29]);
+        assert_eq!(driver.prefills, [vec![29, 30], vec![31, 32], vec![33]]);
+        assert_eq!(driver.released, [30, 32]);
+        assert_eq!(driver.final_output, Some(33));
+        assert_eq!(logits.map(f32::to_bits), [33.0_f32.to_bits()]);
+    }
+
+    #[test]
+    fn continuation_uses_one_final_prefill_output() {
+        let mut driver = SyntheticDriver::default();
+        let mut logits = [0.0];
+        let cancellation = CancelAt {
+            call: Cell::new(0),
+            cancelled_call: usize::MAX,
+        };
+
+        let result = drive_token_batch(&mut driver, 3, &[29], &mut logits, &cancellation);
+
+        assert!(result.is_ok());
+        assert_eq!(driver.prefills, [vec![29]]);
         assert!(driver.released.is_empty());
         assert_eq!(driver.final_output, Some(29));
     }
 
     #[test]
-    fn cancellation_prevents_the_next_native_prompt_token() {
+    fn cancellation_before_prefill_submits_no_chunk() {
+        let mut driver = SyntheticDriver::default();
+        let mut logits = [0.0];
+        let cancellation = CancelAt {
+            call: Cell::new(0),
+            cancelled_call: 0,
+        };
+
+        let result = drive_token_batch(&mut driver, 2, &[41, 42, 43], &mut logits, &cancellation);
+
+        assert!(matches!(result, Err(NativeTextDriverError::Cancelled)));
+        assert!(driver.prefills.is_empty());
+        assert!(driver.released.is_empty());
+        assert_eq!(driver.final_output, None);
+    }
+
+    #[test]
+    fn cancellation_between_prefill_chunks_preserves_prior_release() {
         let mut driver = SyntheticDriver::default();
         let mut logits = [0.0];
         let cancellation = CancelAt {
@@ -1349,18 +1472,24 @@ mod tests {
             cancelled_call: 1,
         };
 
-        let result = drive_token_batch(&mut driver, &[41, 42, 43], &mut logits, &cancellation);
+        let result = drive_token_batch(
+            &mut driver,
+            2,
+            &[41, 42, 43, 44, 45],
+            &mut logits,
+            &cancellation,
+        );
 
         assert!(matches!(result, Err(NativeTextDriverError::Cancelled)));
-        assert_eq!(driver.stepped, [41]);
-        assert_eq!(driver.released, [41]);
+        assert_eq!(driver.prefills, [vec![41, 42]]);
+        assert_eq!(driver.released, [42]);
         assert_eq!(driver.final_output, None);
     }
 
     #[test]
     fn native_failure_keeps_later_outputs_unvisited() {
         let mut driver = SyntheticDriver {
-            fails_on: Some(52),
+            fails_on: Some(53),
             ..SyntheticDriver::default()
         };
         let mut logits = [0.0];
@@ -1369,14 +1498,51 @@ mod tests {
             cancelled_call: usize::MAX,
         };
 
-        let result = drive_token_batch(&mut driver, &[51, 52, 53], &mut logits, &cancellation);
+        let result = drive_token_batch(
+            &mut driver,
+            2,
+            &[51, 52, 53, 54, 55],
+            &mut logits,
+            &cancellation,
+        );
 
         assert!(matches!(
             result,
             Err(NativeTextDriverError::EmptyTokenBatch)
         ));
-        assert_eq!(driver.stepped, [51, 52]);
-        assert_eq!(driver.released, [51]);
+        assert_eq!(driver.prefills, [vec![51, 52], vec![53, 54]]);
+        assert_eq!(driver.released, [52]);
         assert_eq!(driver.final_output, None);
+    }
+
+    #[test]
+    fn intermediate_release_failure_returns_original_error_without_later_driver_actions() {
+        let mut driver = SyntheticDriver {
+            release_fails_on: Some(62),
+            ..SyntheticDriver::default()
+        };
+        let mut logits = [0.0];
+        let cancellation = CancelAt {
+            call: Cell::new(0),
+            cancelled_call: usize::MAX,
+        };
+
+        let result = drive_token_batch(
+            &mut driver,
+            2,
+            &[61, 62, 63, 64, 65],
+            &mut logits,
+            &cancellation,
+        );
+
+        assert!(matches!(
+            result,
+            Err(NativeTextDriverError::EmptyTokenBatch)
+        ));
+        assert_eq!(driver.prefills, [vec![61, 62]]);
+        assert!(driver.released.is_empty());
+        assert_eq!(driver.unresolved_output, Some(62));
+        assert_eq!(driver.final_output, None);
+        assert_eq!(logits.map(f32::to_bits), [0.0_f32.to_bits()]);
     }
 }
