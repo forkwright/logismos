@@ -15,6 +15,10 @@ use super::model_resources::{
 use super::session::{Qwen35NativeSessionState, begin_error, completion_error, session_state};
 use crate::{Qwen35Weights, Result};
 
+#[path = "model_batch.rs"]
+mod batch;
+pub use batch::{Qwen35NativeExecutionBatchDeviceDemand, Qwen35NativeExecutionBatchPlan};
+
 enum NativeBuildCustody {
     Resident {
         scope: NativeBuildScope,
@@ -516,6 +520,121 @@ pub struct Qwen35NativeExecutionDeviceDemand {
     total: usize,
 }
 
+/// Checked requested device-byte receipt for one atomic native mixed-session transaction.
+///
+/// Resident uploads are counted once because admission proves one shared resident
+/// allocation identity. Every mutable session, maximum chunk-control, and
+/// returned-logit bound remains independently summed. This is a request
+/// receipt, not measured capacity, residency, or an admission grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen35NativeExecutionBatchDeviceDemand {
+    resident_bytes: usize,
+    session_bytes: usize,
+    step_bytes: usize,
+    output_bytes: usize,
+    total_bytes: usize,
+    sequence_count: usize,
+    total_tokens: usize,
+}
+
+impl Qwen35NativeExecutionBatchDeviceDemand {
+    pub(super) fn try_from_demands(
+        demands: impl IntoIterator<Item = Qwen35NativeExecutionDeviceDemand>,
+        packed: &kernels::PackedPrefillPlan,
+    ) -> Result<Self> {
+        let mut demands = demands.into_iter();
+        let first = demands.next().ok_or_else(|| {
+            crate::error::NativeSessionStateSnafu {
+                rule: "native batch demand requires one session receipt",
+            }
+            .build()
+        })?;
+        let resident_bytes = first.resident_bytes();
+        let mut session_bytes = first.session_bytes();
+        let mut step_bytes = first.step_bytes();
+        let mut output_bytes = first.output_bytes();
+        for demand in demands {
+            session_bytes = session_bytes
+                .checked_add(demand.session_bytes())
+                .ok_or_else(|| {
+                    crate::error::ArithmeticOverflowSnafu {
+                        context: "native batch session bytes",
+                    }
+                    .build()
+                })?;
+            step_bytes = step_bytes.checked_add(demand.step_bytes()).ok_or_else(|| {
+                crate::error::ArithmeticOverflowSnafu {
+                    context: "native batch step bytes",
+                }
+                .build()
+            })?;
+            output_bytes = output_bytes
+                .checked_add(demand.output_bytes())
+                .ok_or_else(|| {
+                    crate::error::ArithmeticOverflowSnafu {
+                        context: "native batch output bytes",
+                    }
+                    .build()
+                })?;
+        }
+        let total_bytes = resident_bytes
+            .checked_add(session_bytes)
+            .and_then(|bytes| bytes.checked_add(step_bytes))
+            .and_then(|bytes| bytes.checked_add(output_bytes))
+            .ok_or_else(|| {
+                crate::error::ArithmeticOverflowSnafu {
+                    context: "native batch total device bytes",
+                }
+                .build()
+            })?;
+        Ok(Self {
+            resident_bytes,
+            session_bytes,
+            step_bytes,
+            output_bytes,
+            total_bytes,
+            sequence_count: packed.sequence_count(),
+            total_tokens: packed.total_tokens(),
+        })
+    }
+
+    /// Return resident uploads counted once by the shared-identity admission check.
+    #[must_use]
+    pub const fn resident_bytes(self) -> usize {
+        self.resident_bytes
+    }
+    /// Return independently summed mutable session backing.
+    #[must_use]
+    pub const fn session_bytes(self) -> usize {
+        self.session_bytes
+    }
+    /// Return independently summed admitted chunk-control backing.
+    #[must_use]
+    pub const fn step_bytes(self) -> usize {
+        self.step_bytes
+    }
+    /// Return independently summed terminal output backing.
+    #[must_use]
+    pub const fn output_bytes(self) -> usize {
+        self.output_bytes
+    }
+    /// Return the checked requested aggregate bytes.
+    #[must_use]
+    pub const fn total_bytes(self) -> usize {
+        self.total_bytes
+    }
+    /// Return the independently owned sequence count.
+    #[must_use]
+    pub const fn sequence_count(self) -> usize {
+        self.sequence_count
+    }
+    /// Return the packed sequence-major token count.
+    #[must_use]
+    pub const fn total_tokens(self) -> usize {
+        self.total_tokens
+    }
+}
+
 impl Qwen35NativeExecutionDeviceDemand {
     fn from_bytes(bytes: ModelDeviceByteDemand) -> Result<Self> {
         Ok(Self {
@@ -633,17 +752,21 @@ impl Qwen35NativeExecutionDeviceDemand {
     /// Requested mutable device bytes retained by each native session.
     ///
     /// Construction checked the complete sum before this demand escaped, so
-    /// this is the checked total less resident, one-token control, and returned
-    /// output extents rather than a second mutable-category ledger.
+    /// this is the checked total less resident and returned output extents. It
+    /// includes reusable maximum-chunk MRoPE controls rather than treating them
+    /// as per-call allocation.
     #[must_use]
     pub const fn session_bytes(self) -> usize {
-        self.total - self.resident_bytes() - self.step_bytes() - self.output_bytes()
+        self.total - self.resident_bytes() - self.output_bytes()
     }
 
-    /// Requested maximum-chunk control-buffer bytes.
+    /// Requested per-call control-buffer bytes.
+    ///
+    /// Native model MRoPE controls are session-owned reusable buffers, so this
+    /// receipt intentionally reports no per-call device allocation.
     #[must_use]
     pub const fn step_bytes(self) -> usize {
-        self.bytes.mrope_controls
+        0
     }
 
     /// Requested returned-logit bytes for one completed token.
@@ -1166,14 +1289,23 @@ impl Qwen35NativeExecutionSession {
             // launchers retain and classify their explicit numerical inputs.
             unsafe { resources.submit_step()? };
         }
-        in_flight
-            .complete(publish_completed_step)
-            .map_err(completion_error)
+        let mut completion = in_flight
+            .complete_prepublication()
+            .map_err(completion_error)?;
+        let logits = completion.resource().take_completed_logits()?;
+        let prepared_cache = match unsafe { completion.resource().prepare_cache_completion() } {
+            Ok(prepared_cache) => prepared_cache,
+            Err(error) => {
+                completion.resource().restore_completed_logits(logits);
+                return Err(error);
+            }
+        };
+        if let Some(prepared_cache) = prepared_cache {
+            prepared_cache.commit();
+        }
+        completion.publish(ModelSessionResources::publish_after_cache);
+        Ok(logits)
     }
-}
-
-fn publish_completed_step(resources: &mut ModelSessionResources) -> Result<DeviceBuffer<f32>> {
-    resources.publish_completed()
 }
 
 #[cfg(test)]
@@ -1208,10 +1340,10 @@ mod tests {
         assert_eq!(demand.resident_bytes(), 11);
         assert_eq!(
             demand.session_bytes(),
-            472,
+            509,
             "per-session demand must include only mutable state and workspaces"
         );
-        assert_eq!(demand.step_bytes(), 37);
+        assert_eq!(demand.step_bytes(), 0);
         assert_eq!(demand.output_bytes(), 31);
         assert_eq!(
             demand.total_bytes(),

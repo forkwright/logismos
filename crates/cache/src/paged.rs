@@ -224,6 +224,14 @@ struct PagedKvLedger {
     free: Vec<usize>,
     staged_rows: Vec<usize>,
     committed_tokens: usize,
+    append_state: PagedAppendState,
+}
+
+#[derive(Debug, Default)]
+enum PagedAppendState {
+    #[default]
+    Idle,
+    Reserved,
 }
 
 impl PagedKvLedger {
@@ -243,10 +251,12 @@ impl PagedKvLedger {
             free,
             staged_rows,
             committed_tokens: 0,
+            append_state: PagedAppendState::Idle,
         })
     }
 
     fn begin_append(&mut self, append_tokens: usize) -> Result<AppendReservation> {
+        self.ensure_append_idle()?;
         if append_tokens == 0 {
             return PagedEmptyAppendSnafu.fail();
         }
@@ -298,6 +308,7 @@ impl PagedKvLedger {
             self.table.push(bundle);
             self.fills.push(0);
         }
+        self.append_state = PagedAppendState::Reserved;
         Ok(AppendReservation {
             append_tokens,
             original_tokens,
@@ -350,6 +361,16 @@ impl PagedKvLedger {
         })
     }
 
+    fn ensure_append_idle(&self) -> Result<()> {
+        match self.append_state {
+            PagedAppendState::Idle => Ok(()),
+            PagedAppendState::Reserved => PagedLayoutSnafu {
+                operation: "active paged-KV append",
+            }
+            .fail(),
+        }
+    }
+
     fn validate_commit(&self, reservation: &AppendReservation) -> Result<()> {
         for (layer, written_tokens) in self.staged_rows.iter().copied().enumerate() {
             if written_tokens != reservation.append_tokens {
@@ -370,6 +391,7 @@ impl PagedKvLedger {
             self.free.push(replacement.original_bundle);
         }
         self.staged_rows.fill(0);
+        self.append_state = PagedAppendState::Idle;
     }
 
     fn rollback(&mut self, reservation: &AppendReservation) {
@@ -389,6 +411,7 @@ impl PagedKvLedger {
             self.free.push(replacement.replacement_bundle);
         }
         self.staged_rows.fill(0);
+        self.append_state = PagedAppendState::Idle;
     }
 
     fn write_location(
@@ -715,6 +738,90 @@ impl NativePreparedCommit {
     }
 }
 
+#[cfg(any(feature = "gpu", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeCompletionRefusal {
+    Poisoned,
+    MissingPrepared,
+}
+
+#[cfg(any(feature = "gpu", test))]
+#[derive(Debug)]
+enum NativeCompletionCustody {
+    Unpublished(AppendReservation),
+    Published,
+}
+
+#[cfg(any(feature = "gpu", test))]
+impl NativeCompletionCustody {
+    fn take(
+        prepared: &mut NativePreparedCommit,
+    ) -> core::result::Result<Self, NativeCompletionRefusal> {
+        prepared
+            .take()
+            .map(Self::Unpublished)
+            .map_err(|_| NativeCompletionRefusal::MissingPrepared)
+    }
+
+    fn publish(&mut self, ledger: &mut PagedKvLedger) {
+        if let Self::Unpublished(reservation) = self {
+            ledger.publish_commit(reservation);
+            *self = Self::Published;
+        }
+    }
+
+    fn restore(&mut self, prepared: &mut NativePreparedCommit) {
+        let custody = core::mem::replace(self, Self::Published);
+        if let Self::Unpublished(reservation) = custody {
+            prepared.park_verified(reservation);
+        }
+    }
+}
+
+#[cfg(any(feature = "gpu", test))]
+trait NativeCompletionTarget {
+    fn native_completion_poisoned(&self) -> bool;
+
+    fn native_completion_prepared(&mut self) -> &mut NativePreparedCommit;
+
+    fn native_completion_ledger(&mut self) -> &mut PagedKvLedger;
+}
+
+#[cfg(any(feature = "gpu", test))]
+struct NativeCompletionPrepared<'a, T: NativeCompletionTarget> {
+    target: &'a mut T,
+    custody: NativeCompletionCustody,
+}
+
+#[cfg(any(feature = "gpu", test))]
+impl<'a, T> NativeCompletionPrepared<'a, T>
+where
+    T: NativeCompletionTarget,
+{
+    fn prepare(target: &'a mut T) -> core::result::Result<Self, NativeCompletionRefusal> {
+        if target.native_completion_poisoned() {
+            return Err(NativeCompletionRefusal::Poisoned);
+        }
+        let custody = NativeCompletionCustody::take(target.native_completion_prepared())?;
+        Ok(Self { target, custody })
+    }
+
+    fn commit(mut self) {
+        self.custody.publish(self.target.native_completion_ledger());
+    }
+}
+
+#[cfg(any(feature = "gpu", test))]
+impl<T> Drop for NativeCompletionPrepared<'_, T>
+where
+    T: NativeCompletionTarget,
+{
+    fn drop(&mut self) {
+        self.custody
+            .restore(self.target.native_completion_prepared());
+    }
+}
+
 impl<'a> PagedAppend<'a> {
     /// Write one contiguous transaction-relative K/V row for one layer.
     pub fn write_layer_row(
@@ -1024,6 +1131,17 @@ pub struct NativePagedKvPool {
     poisoned: bool,
 }
 
+/// Completion-proven native append publication with exclusive pool custody.
+///
+/// The reservation remains unpublished until [`Self::commit`] consumes this
+/// guard. Dropping it restores the same reservation to the pool's existing
+/// parked native-commit custody without issuing device work.
+#[cfg(feature = "gpu")]
+#[must_use = "commit publishes the completion-proven append; dropping preserves its custody"]
+pub struct NativePagedPreparedCompletion<'a> {
+    prepared: NativeCompletionPrepared<'a, NativePagedKvPool>,
+}
+
 /// Caller-owned native K/V buffers awaiting one checked pool binding.
 ///
 /// This is an ownership carrier only. It performs no allocation, upload, or
@@ -1078,6 +1196,29 @@ impl NativePagedKvPoolBindingError {
     #[must_use]
     pub fn into_parts(self) -> (crate::Error, NativePagedKvBuffers) {
         (*self.error, self.buffers)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl NativeCompletionTarget for NativePagedKvPool {
+    fn native_completion_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    fn native_completion_prepared(&mut self) -> &mut NativePreparedCommit {
+        &mut self.prepared
+    }
+
+    fn native_completion_ledger(&mut self) -> &mut PagedKvLedger {
+        &mut self.ledger
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl NativePagedPreparedCompletion<'_> {
+    /// Publish this externally completion-proven native append.
+    pub fn commit(self) {
+        self.prepared.commit();
     }
 }
 
@@ -1212,6 +1353,37 @@ impl NativePagedKvPool {
         })
     }
 
+    /// Prepare one externally completion-proven native append for publication.
+    ///
+    /// This preserves the checked reservation in an opaque guard so aggregate
+    /// owners can prepare every native sequence before publishing any host
+    /// ledger. It performs no device operation or host-ledger publication.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have successfully synchronized the ordered stream used
+    /// for that append's prepare, row, and attention submissions. No read or
+    /// write of its K/V, table, query, or output buffers may remain pending.
+    /// On any submission or completion failure, retain and never reuse this
+    /// complete native session instead of calling this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed poisoned or missing-prepared-append error before any
+    /// host-ledger publication.
+    pub unsafe fn prepare_commit_after_completion(
+        &mut self,
+    ) -> Result<NativePagedPreparedCompletion<'_>> {
+        let prepared = match NativeCompletionPrepared::prepare(self) {
+            Ok(prepared) => prepared,
+            Err(NativeCompletionRefusal::Poisoned) => return PagedNativePoisonedSnafu.fail(),
+            Err(NativeCompletionRefusal::MissingPrepared) => {
+                return PagedNativeCommitNotPreparedSnafu.fail();
+            }
+        };
+        Ok(NativePagedPreparedCompletion { prepared })
+    }
+
     /// Publish the one prepared native append after external completion proof.
     ///
     /// # Safety
@@ -1227,9 +1399,9 @@ impl NativePagedKvPool {
     /// Returns a typed poisoned or missing-prepared-append error before any
     /// host-ledger publication.
     pub unsafe fn commit_prepared_after_completion(&mut self) -> Result<()> {
-        self.ensure_not_poisoned()?;
-        let mut reservation = self.prepared.take()?;
-        self.ledger.publish_commit(&mut reservation);
+        // SAFETY: this compatibility seam inherits this method's completion proof.
+        let prepared = unsafe { self.prepare_commit_after_completion() }?;
+        prepared.commit();
         Ok(())
     }
 
@@ -1924,6 +2096,50 @@ mod tests {
         Ok(())
     }
 
+    struct NativeCompletionTestPool {
+        ledger: PagedKvLedger,
+        prepared: NativePreparedCommit,
+        poisoned: bool,
+    }
+
+    impl NativeCompletionTarget for NativeCompletionTestPool {
+        fn native_completion_poisoned(&self) -> bool {
+            self.poisoned
+        }
+
+        fn native_completion_prepared(&mut self) -> &mut NativePreparedCommit {
+            &mut self.prepared
+        }
+
+        fn native_completion_ledger(&mut self) -> &mut PagedKvLedger {
+            &mut self.ledger
+        }
+    }
+
+    fn prepared_native_completion_pool() -> Result<NativeCompletionTestPool> {
+        let plan = PagedKvPlan::new(geometry(8), PageTokens::B8)?;
+        let mut ledger = PagedKvLedger::new(plan)?;
+        let reservation = ledger.begin_append(1)?;
+        record_all_ledger_rows(&mut ledger, &reservation)?;
+        ledger.validate_commit(&reservation)?;
+        let mut prepared = NativePreparedCommit::default();
+        prepared.park_verified(reservation);
+        Ok(NativeCompletionTestPool {
+            ledger,
+            prepared,
+            poisoned: false,
+        })
+    }
+
+    fn prepare_native_completion(
+        pool: &mut NativeCompletionTestPool,
+    ) -> NativeCompletionPrepared<'_, NativeCompletionTestPool> {
+        match NativeCompletionPrepared::prepare(pool) {
+            Ok(prepared) => prepared,
+            Err(error) => panic!("prepared native completion setup refused: {error:?}"),
+        }
+    }
+
     fn assert_inventory(pool: &PagedKvPool, held_old_tail: Option<usize>) {
         assert_eq!(pool.ledger.table.len(), pool.ledger.fills.len());
         let mut seen = BTreeSet::new();
@@ -2321,6 +2537,49 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn all_page_sizes_refuse_forgotten_cpu_append_custody() -> Result<()> {
+        const APPEND_TOKENS: usize = 2;
+
+        for (page_tokens, page) in [
+            (8, PageTokens::B8),
+            (16, PageTokens::B16),
+            (32, PageTokens::B32),
+        ] {
+            let start = page_tokens - 1;
+            let plan = PagedKvPlan::new(geometry(page_tokens * 2 + 1), page)?;
+
+            let mut append_pool = PagedKvPool::new(plan)?;
+            let mut append_model = empty_model();
+            seed_partial_tail(&mut append_pool, &mut append_model, start)?;
+            let append = append_pool.begin_append(APPEND_TOKENS)?;
+            core::mem::forget(append);
+            assert_eq!(append_pool.ledger.committed_tokens, start);
+            assert!(matches!(
+                append_pool.begin_append(1),
+                Err(Error::PagedLayout {
+                    operation: "active paged-KV append",
+                    ..
+                })
+            ));
+
+            let mut prepared_pool = PagedKvPool::new(plan)?;
+            let mut prepared_model = empty_model();
+            seed_partial_tail(&mut prepared_pool, &mut prepared_model, start)?;
+            let prepared = prepare_all(&mut prepared_pool, start, APPEND_TOKENS)?;
+            core::mem::forget(prepared);
+            assert_eq!(prepared_pool.ledger.committed_tokens, start);
+            assert!(matches!(
+                prepared_pool.begin_append(1),
+                Err(Error::PagedLayout {
+                    operation: "active paged-KV append",
+                    ..
+                })
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "gpu")]
     #[test]
     fn native_plan_uses_explicit_page_choice_and_one_spare_bundle() -> Result<()> {
@@ -2434,6 +2693,114 @@ mod tests {
             prepared.take(),
             Err(Error::PagedNativeCommitNotPrepared { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_native_completion_guard_preserves_unpublished_reservation() -> Result<()> {
+        let mut pool = prepared_native_completion_pool()?;
+        {
+            let prepared = prepare_native_completion(&mut pool);
+            drop(prepared);
+        }
+        assert_eq!(pool.ledger.committed_tokens, 0);
+        assert!(matches!(
+            pool.prepared.ensure_empty(),
+            Err(Error::PagedNativeCommitPrepared { .. })
+        ));
+        let reservation = pool.prepared.take()?;
+        pool.ledger.rollback(&reservation);
+        Ok(())
+    }
+
+    #[test]
+    fn forgotten_native_completion_guard_keeps_pool_refused_and_unpublished() -> Result<()> {
+        let mut pool = prepared_native_completion_pool()?;
+        let prepared = prepare_native_completion(&mut pool);
+        core::mem::forget(prepared);
+        assert_eq!(pool.ledger.committed_tokens, 0);
+        assert!(matches!(pool.prepared.ensure_empty(), Ok(())));
+        assert!(matches!(
+            pool.ledger.begin_append(1),
+            Err(Error::PagedLayout {
+                operation: "active paged-KV append",
+                ..
+            })
+        ));
+        assert!(matches!(
+            NativeCompletionPrepared::prepare(&mut pool),
+            Err(NativeCompletionRefusal::MissingPrepared)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn late_native_completion_peer_refusal_publishes_neither_ledger() -> Result<()> {
+        let mut first = prepared_native_completion_pool()?;
+        let mut second = prepared_native_completion_pool()?;
+        let first_prepared = prepare_native_completion(&mut first);
+        second.poisoned = true;
+        assert!(matches!(
+            NativeCompletionPrepared::prepare(&mut second),
+            Err(NativeCompletionRefusal::Poisoned)
+        ));
+        assert_eq!(second.ledger.committed_tokens, 0);
+        drop(first_prepared);
+        assert_eq!(first.ledger.committed_tokens, 0);
+        assert!(matches!(
+            first.prepared.ensure_empty(),
+            Err(Error::PagedNativeCommitPrepared { .. })
+        ));
+        assert!(matches!(
+            second.prepared.ensure_empty(),
+            Err(Error::PagedNativeCommitPrepared { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn all_native_completion_guards_publish_verified_ledgers() -> Result<()> {
+        let mut first = prepared_native_completion_pool()?;
+        let mut second = prepared_native_completion_pool()?;
+        let first_prepared = prepare_native_completion(&mut first);
+        let second_prepared = prepare_native_completion(&mut second);
+        first_prepared.commit();
+        second_prepared.commit();
+        assert_eq!(first.ledger.committed_tokens, 1);
+        assert_eq!(second.ledger.committed_tokens, 1);
+        assert!(matches!(
+            first.prepared.take(),
+            Err(Error::PagedNativeCommitNotPrepared { .. })
+        ));
+        assert!(matches!(
+            second.prepared.take(),
+            Err(Error::PagedNativeCommitNotPrepared { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn native_completion_preparation_refuses_poisoned_or_missing_custody() -> Result<()> {
+        let mut poisoned = prepared_native_completion_pool()?;
+        poisoned.poisoned = true;
+        assert!(matches!(
+            NativeCompletionPrepared::prepare(&mut poisoned),
+            Err(NativeCompletionRefusal::Poisoned)
+        ));
+        assert_eq!(poisoned.ledger.committed_tokens, 0);
+        assert!(matches!(
+            poisoned.prepared.ensure_empty(),
+            Err(Error::PagedNativeCommitPrepared { .. })
+        ));
+
+        let mut missing = prepared_native_completion_pool()?;
+        let reservation = missing.prepared.take()?;
+        missing.ledger.rollback(&reservation);
+        assert!(matches!(
+            NativeCompletionPrepared::prepare(&mut missing),
+            Err(NativeCompletionRefusal::MissingPrepared)
+        ));
+        assert_eq!(missing.ledger.committed_tokens, 0);
         Ok(())
     }
     #[test]

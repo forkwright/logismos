@@ -17,10 +17,10 @@ use crate::{
 };
 
 const FULL_ATTENTION_BLOCK: usize = 3;
-const FIXTURE_CONTEXT: usize = 16;
+pub(crate) const FIXTURE_CONTEXT: usize = 16;
 const WITNESS_STEPS: usize = 9;
 const MODEL_WITNESS_TOKENS: [u32; 9] = [2, 0, 4, 1, 3, 2, 4, 0, 1];
-const MODEL_PREFILL_CAPACITY: usize = 3;
+pub(crate) const MODEL_PREFILL_CAPACITY: usize = 3;
 const MODEL_PREFILL_FIRST: [u32; 3] = [2, 0, 4];
 const MODEL_PREFILL_SHORT: [u32; 2] = [1, 3];
 const MODEL_PREFILL_PAGE_EDGE: [u32; 3] = [2, 4, 0];
@@ -467,7 +467,7 @@ fn native_main_model_witness(
     Ok(())
 }
 
-fn assert_native_prefill_terminal(
+pub(crate) fn assert_native_prefill_terminal(
     session: &mut Qwen35NativeExecutionSession,
     oracle: &mut CanonicalHybridOracle,
     tokens: &[u32],
@@ -483,7 +483,7 @@ fn assert_native_prefill_terminal(
     assert_native_terminal_logits(&output, &expected, tokens.len(), label)
 }
 
-fn assert_native_terminal_logits(
+pub(crate) fn assert_native_terminal_logits(
     output: &DeviceBuffer<f32>,
     expected: &[f64],
     token_count: usize,

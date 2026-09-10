@@ -47,6 +47,7 @@ pub use crate::qwen35_execution::{
 #[cfg(feature = "gpu")]
 pub use crate::qwen35_native::{
     NativeBuildFailure, NativeBuildRelease, NativeBuildReleaseState, NativeBuildSource,
+    Qwen35NativeExecutionBatchDeviceDemand, Qwen35NativeExecutionBatchPlan,
     Qwen35NativeExecutionDeviceDemand, Qwen35NativeExecutionModel, Qwen35NativeExecutionModelClose,
     Qwen35NativeExecutionModelTeardown, Qwen35NativeExecutionPlan, Qwen35NativeExecutionSession,
     Qwen35NativeExecutionSessionPlan, Qwen35NativeExecutionSessionTeardown,
@@ -60,6 +61,9 @@ pub use crate::qwen35_weights::Qwen35Weights;
 
 #[cfg(test)]
 const CRATE_NAME: &str = "decoders";
+
+#[cfg(all(test, feature = "gpu"))]
+mod qwen35_native_batch_tests;
 
 #[cfg(all(test, feature = "gpu"))]
 mod qwen35_native_tests;
