@@ -279,8 +279,36 @@ are token-major at the corresponding absolute positions. Existing embedding,
 rotary and KV row launches are bounded submission plumbing, not a loop around
 independently committing model steps. Final normalization and the output head
 consume only the terminal hidden row, so output is one vocabulary-sized logits
-buffer rather than one per prompt token. Multi-sequence model ownership and
-mixed-length batching remain separate work.
+buffer rather than one per prompt token.
+
+`Qwen35NativeExecutionSession::plan_batch` exclusively borrows independently
+positioned sessions and their token slices. Every session must be ready and
+retain the same actual resident `Arc`; equal artifact bytes do not establish
+shared uploaded allocations. Complete preflight preserves each session's exact
+context, chunk capacity and vocabulary bounds, then derives one
+`PackedPrefillPlan`. The opaque `Qwen35NativeExecutionBatchPlan` retains those
+inputs and returns terminal logits in sequence order. Its device demand counts
+resident uploads once and checked-sums the independent session, step-control
+and returned-output bounds. These are requested extents, not a host grant or
+measured physical capacity.
+
+Batch execution reuses private B=1 row-block submission under the existing
+resource lifecycle. Every submitted stream must complete and pass sticky-status
+validation, and every cache/output preparation must succeed before any member
+publishes. Prepared guards retain each original pending owner; ordered result
+storage exists before the infallible group publication of KV, recurrent state
+and positions. A late failure returns no partial logits and retains unfinished
+resources with the appropriate idle or uncertain poison state. Untouched owners
+remain ready. The native cache's completion-prepared guard preserves its parked
+reservation on drop and exposes only consuming, infallible publication.
+The shared cache ledger retains outstanding-append state independently of guard
+destruction, so forgetting a CPU or native append/publication guard cannot
+authorize reuse of unpublished page-table mutations. Model rotary controls are
+bounded reusable session scratch, included in session demand and explicit
+session teardown; they are not implicitly freed during publication.
+This is aggregate native model ownership using B=1 arithmetic, not packed or
+vectorized B>1 recurrent/attention kernels, scheduler admission, safe serving,
+or hardware qualification. Those remain separate acceptance boundaries.
 
 The existing resource guard covers the first embedding submission through
 final logits. One append spans every full layer, interleaved with recurrent

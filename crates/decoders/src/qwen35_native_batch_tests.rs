@@ -10,9 +10,7 @@ use crate::qwen35_native_tests::{
     FIXTURE_CONTEXT, MODEL_PREFILL_CAPACITY, assert_native_prefill_terminal,
     assert_native_terminal_logits,
 };
-use crate::{
-    Qwen35NativeExecutionPlan, Qwen35NativeExecutionSession, Qwen35Weights,
-};
+use crate::{Qwen35NativeExecutionPlan, Qwen35NativeExecutionSession, Qwen35Weights};
 
 const SECOND_SESSION_CONTEXT: usize = 8;
 const FIRST_HISTORY: [u32; 3] = [2, 0, 4];
@@ -142,11 +140,11 @@ fn assert_native_mixed_batch_continuations(
     let second_expected = second_oracle.step(&[SECOND_CONTINUATION])?;
     // SAFETY: the completed aggregate transaction has published each sequence
     // exactly once, so these T1 calls observe its committed private state.
-    let first_output = unsafe { sessions[0].step(FIRST_CONTINUATION) }
-        .map_err(|error| error.to_string())?;
+    let first_output =
+        unsafe { sessions[0].step(FIRST_CONTINUATION) }.map_err(|error| error.to_string())?;
     // SAFETY: this is the second independently owned session's T1 continuation.
-    let second_output = unsafe { sessions[1].step(SECOND_CONTINUATION) }
-        .map_err(|error| error.to_string())?;
+    let second_output =
+        unsafe { sessions[1].step(SECOND_CONTINUATION) }.map_err(|error| error.to_string())?;
     assert_native_terminal_logits(
         &first_output,
         &first_expected,

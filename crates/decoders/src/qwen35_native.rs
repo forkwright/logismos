@@ -236,9 +236,7 @@ impl<Resource: CompletionResource> InFlight<'_, Resource> {
         }
         let owner = self.owner;
         let (state, resource) = (&mut owner.state, &mut owner.resource);
-        let resource = resource
-            .as_mut()
-            .ok_or(CompletionError::MissingResource)?;
+        let resource = resource.as_mut().ok_or(CompletionError::MissingResource)?;
         self.finished = true;
         Ok(PostCompletion {
             state,
@@ -590,10 +588,7 @@ mod tests {
                 source: TestError::ScriptFailure,
             }
         ));
-        assert!(matches!(
-            owner.state(),
-            ResourceState::PoisonedIdle
-        ));
+        assert!(matches!(owner.state(), ResourceState::PoisonedIdle));
         assert!(matches!(owner.begin(), Err(BeginError::NotReady)));
         assert_eq!(publications.get(), 0);
         assert_eq!(synchronizations.get(), 1);
@@ -615,10 +610,7 @@ mod tests {
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         drop(guard);
-        assert!(matches!(
-            owner.state(),
-            ResourceState::PoisonedIdle
-        ));
+        assert!(matches!(owner.state(), ResourceState::PoisonedIdle));
         assert!(matches!(owner.begin(), Err(BeginError::NotReady)));
         assert_eq!(synchronizations.get(), 1);
         assert_eq!(publications.get(), 0);
@@ -652,10 +644,7 @@ mod tests {
                 source: TestError::ScriptFailure,
             }
         ));
-        assert!(matches!(
-            owner.state(),
-            ResourceState::PoisonedUncertain
-        ));
+        assert!(matches!(owner.state(), ResourceState::PoisonedUncertain));
         assert_eq!(publications.get(), 0);
         assert_eq!(synchronizations.get(), 1);
         drop(owner);
@@ -680,10 +669,7 @@ mod tests {
         let mut guard = owner.begin()?;
         guard.mark_submitted();
         drop(guard);
-        assert!(matches!(
-            owner.state(),
-            ResourceState::PoisonedUncertain
-        ));
+        assert!(matches!(owner.state(), ResourceState::PoisonedUncertain));
         assert_eq!(publications.get(), 0);
         drop(owner);
         assert_eq!(synchronizations.get(), 2);
@@ -716,10 +702,7 @@ mod tests {
                 source: TestError::ScriptFailure,
             }
         ));
-        assert!(matches!(
-            owner.state(),
-            ResourceState::PoisonedIdle
-        ));
+        assert!(matches!(owner.state(), ResourceState::PoisonedIdle));
         assert!(matches!(owner.begin(), Err(BeginError::NotReady)));
         assert_eq!(synchronizations.get(), 1);
         assert_eq!(validations.get(), 1);
@@ -756,10 +739,7 @@ mod tests {
             }));
         }));
         assert!(unwind.is_err());
-        assert!(matches!(
-            owner.state(),
-            ResourceState::PoisonedIdle
-        ));
+        assert!(matches!(owner.state(), ResourceState::PoisonedIdle));
         assert_eq!(publications.get(), 0);
         assert_eq!(synchronizations.get(), 2);
         drop(owner);

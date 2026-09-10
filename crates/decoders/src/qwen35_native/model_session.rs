@@ -543,47 +543,96 @@ impl Qwen35NativeExecutionBatchDeviceDemand {
         packed: &kernels::PackedPrefillPlan,
     ) -> Result<Self> {
         let mut demands = demands.into_iter();
-        let first = demands.next().ok_or_else(|| crate::error::NativeSessionStateSnafu {
-            rule: "native batch demand requires one session receipt",
-        }.build())?;
+        let first = demands.next().ok_or_else(|| {
+            crate::error::NativeSessionStateSnafu {
+                rule: "native batch demand requires one session receipt",
+            }
+            .build()
+        })?;
         let resident_bytes = first.resident_bytes();
         let mut session_bytes = first.session_bytes();
         let mut step_bytes = first.step_bytes();
         let mut output_bytes = first.output_bytes();
         for demand in demands {
-            session_bytes = session_bytes.checked_add(demand.session_bytes()).ok_or_else(|| crate::error::ArithmeticOverflowSnafu { context: "native batch session bytes" }.build())?;
-            step_bytes = step_bytes.checked_add(demand.step_bytes()).ok_or_else(|| crate::error::ArithmeticOverflowSnafu { context: "native batch step bytes" }.build())?;
-            output_bytes = output_bytes.checked_add(demand.output_bytes()).ok_or_else(|| crate::error::ArithmeticOverflowSnafu { context: "native batch output bytes" }.build())?;
+            session_bytes = session_bytes
+                .checked_add(demand.session_bytes())
+                .ok_or_else(|| {
+                    crate::error::ArithmeticOverflowSnafu {
+                        context: "native batch session bytes",
+                    }
+                    .build()
+                })?;
+            step_bytes = step_bytes.checked_add(demand.step_bytes()).ok_or_else(|| {
+                crate::error::ArithmeticOverflowSnafu {
+                    context: "native batch step bytes",
+                }
+                .build()
+            })?;
+            output_bytes = output_bytes
+                .checked_add(demand.output_bytes())
+                .ok_or_else(|| {
+                    crate::error::ArithmeticOverflowSnafu {
+                        context: "native batch output bytes",
+                    }
+                    .build()
+                })?;
         }
         let total_bytes = resident_bytes
             .checked_add(session_bytes)
             .and_then(|bytes| bytes.checked_add(step_bytes))
             .and_then(|bytes| bytes.checked_add(output_bytes))
-            .ok_or_else(|| crate::error::ArithmeticOverflowSnafu { context: "native batch total device bytes" }.build())?;
-        Ok(Self { resident_bytes, session_bytes, step_bytes, output_bytes, total_bytes, sequence_count: packed.sequence_count(), total_tokens: packed.total_tokens() })
+            .ok_or_else(|| {
+                crate::error::ArithmeticOverflowSnafu {
+                    context: "native batch total device bytes",
+                }
+                .build()
+            })?;
+        Ok(Self {
+            resident_bytes,
+            session_bytes,
+            step_bytes,
+            output_bytes,
+            total_bytes,
+            sequence_count: packed.sequence_count(),
+            total_tokens: packed.total_tokens(),
+        })
     }
 
     /// Return resident uploads counted once by the shared-identity admission check.
     #[must_use]
-    pub const fn resident_bytes(self) -> usize { self.resident_bytes }
+    pub const fn resident_bytes(self) -> usize {
+        self.resident_bytes
+    }
     /// Return independently summed mutable session backing.
     #[must_use]
-    pub const fn session_bytes(self) -> usize { self.session_bytes }
+    pub const fn session_bytes(self) -> usize {
+        self.session_bytes
+    }
     /// Return independently summed admitted chunk-control backing.
     #[must_use]
-    pub const fn step_bytes(self) -> usize { self.step_bytes }
+    pub const fn step_bytes(self) -> usize {
+        self.step_bytes
+    }
     /// Return independently summed terminal output backing.
     #[must_use]
-    pub const fn output_bytes(self) -> usize { self.output_bytes }
+    pub const fn output_bytes(self) -> usize {
+        self.output_bytes
+    }
     /// Return the checked requested aggregate bytes.
     #[must_use]
-    pub const fn total_bytes(self) -> usize { self.total_bytes }
+    pub const fn total_bytes(self) -> usize {
+        self.total_bytes
+    }
     /// Return the independently owned sequence count.
     #[must_use]
-    pub const fn sequence_count(self) -> usize { self.sequence_count }
+    pub const fn sequence_count(self) -> usize {
+        self.sequence_count
+    }
     /// Return the packed sequence-major token count.
     #[must_use]
-    pub const fn total_tokens(self) -> usize { self.total_tokens }
+    pub const fn total_tokens(self) -> usize {
+        self.total_tokens
+    }
 }
 
 impl Qwen35NativeExecutionDeviceDemand {
@@ -1240,7 +1289,9 @@ impl Qwen35NativeExecutionSession {
             // launchers retain and classify their explicit numerical inputs.
             unsafe { resources.submit_step()? };
         }
-        let mut completion = in_flight.complete_prepublication().map_err(completion_error)?;
+        let mut completion = in_flight
+            .complete_prepublication()
+            .map_err(completion_error)?;
         let logits = completion.resource().take_completed_logits()?;
         let prepared_cache = match unsafe { completion.resource().prepare_cache_completion() } {
             Ok(prepared_cache) => prepared_cache,

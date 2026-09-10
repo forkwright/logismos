@@ -2557,7 +2557,10 @@ mod tests {
             assert_eq!(append_pool.ledger.committed_tokens, start);
             assert!(matches!(
                 append_pool.begin_append(1),
-                Err(Error::PagedLayout { .. })
+                Err(Error::PagedLayout {
+                    operation: "active paged-KV append",
+                    ..
+                })
             ));
 
             let mut prepared_pool = PagedKvPool::new(plan)?;
@@ -2568,7 +2571,10 @@ mod tests {
             assert_eq!(prepared_pool.ledger.committed_tokens, start);
             assert!(matches!(
                 prepared_pool.begin_append(1),
-                Err(Error::PagedLayout { .. })
+                Err(Error::PagedLayout {
+                    operation: "active paged-KV append",
+                    ..
+                })
             ));
         }
         Ok(())
@@ -2716,7 +2722,10 @@ mod tests {
         assert!(matches!(pool.prepared.ensure_empty(), Ok(())));
         assert!(matches!(
             pool.ledger.begin_append(1),
-            Err(Error::PagedLayout { .. })
+            Err(Error::PagedLayout {
+                operation: "active paged-KV append",
+                ..
+            })
         ));
         assert!(matches!(
             NativeCompletionPrepared::prepare(&mut pool),

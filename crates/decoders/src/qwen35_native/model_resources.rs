@@ -1,6 +1,8 @@
 //! Owned native resources for one whole Qwen3.5 main-model step.
 
-use cache::{NativePagedKvBuffers, NativePagedKvPlan, NativePagedKvPool, NativePagedPreparedCompletion};
+use cache::{
+    NativePagedKvBuffers, NativePagedKvPlan, NativePagedKvPool, NativePagedPreparedCompletion,
+};
 use core::mem::ManuallyDrop;
 use hipcore::{
     BufferAllocationError, Device, DeviceBuffer, InventoryRelease, Stream, StreamCreationError,
@@ -556,9 +558,12 @@ fn build_session_fields(
             .query_rotary
             .coefficient_elements()
             .checked_mul(workspace.hidden_norm.rows())
-            .ok_or_else(|| ArithmeticOverflowSnafu {
-                context: "native persistent MRoPE control elements",
-            }.build())
+            .ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "native persistent MRoPE control elements",
+                }
+                .build()
+            })
             .map_err(NativeBuildSource::decoder)?,
         None => 0,
     };
@@ -811,7 +816,10 @@ impl ModelSessionResources {
             .fail();
         }
         let end = self.position.checked_add(tokens.len()).ok_or_else(|| {
-            ArithmeticOverflowSnafu { context: "native model batch position plus tokens" }.build()
+            ArithmeticOverflowSnafu {
+                context: "native model batch position plus tokens",
+            }
+            .build()
         })?;
         if end > self.plan.layout.max_context() {
             return NativeSessionStateSnafu {
@@ -821,7 +829,10 @@ impl ModelSessionResources {
         }
         for &token in tokens {
             let row = usize::try_from(token).map_err(|_| {
-                ArithmeticOverflowSnafu { context: "native model batch embedding token row" }.build()
+                ArithmeticOverflowSnafu {
+                    context: "native model batch embedding token row",
+                }
+                .build()
             })?;
             kernels::row_gemv::RowDecodePlan::try_from_shape(self.plan.embedding.shape, row)
                 .context(NativeKernelSnafu)?;
@@ -947,8 +958,12 @@ impl ModelSessionResources {
         if let Some(step) = step {
             step.into_buffer_sink(&mut buffers);
         }
-        if let Some(cosine) = mrope_cosine { buffers.push_f32(cosine); }
-        if let Some(sine) = mrope_sine { buffers.push_f32(sine); }
+        if let Some(cosine) = mrope_cosine {
+            buffers.push_f32(cosine);
+        }
+        if let Some(sine) = mrope_sine {
+            buffers.push_f32(sine);
+        }
         if let Some(failed_step) = failed_step {
             failed_step.append_to(&mut buffers);
         }
@@ -1010,7 +1025,9 @@ impl ModelSessionResources {
     /// True when a failed step allocation has already moved buffers into
     /// explicit inert custody and the session must not dispatch again.
     pub(super) const fn requires_teardown(&self) -> bool {
-        self.failed_step.is_some() || self.failed_step_creation.is_some() || self.preparation_touched
+        self.failed_step.is_some()
+            || self.failed_step_creation.is_some()
+            || self.preparation_touched
     }
 
     /// Submit one bounded B=1 chunk through the complete artifact-ordered model.
@@ -1308,12 +1325,18 @@ impl ModelSessionResources {
         let Some((cosine, sine)) = self.attention_control_values(chunk)? else {
             return Ok(0);
         };
-        let cosine_buffer = self.mrope_cosine.as_mut().ok_or_else(|| NativeSessionStateSnafu {
-            rule: "native full-attention session requires persistent MRoPE cosine controls",
-        }.build())?;
-        let sine_buffer = self.mrope_sine.as_mut().ok_or_else(|| NativeSessionStateSnafu {
-            rule: "native full-attention session requires persistent MRoPE sine controls",
-        }.build())?;
+        let cosine_buffer = self.mrope_cosine.as_mut().ok_or_else(|| {
+            NativeSessionStateSnafu {
+                rule: "native full-attention session requires persistent MRoPE cosine controls",
+            }
+            .build()
+        })?;
+        let sine_buffer = self.mrope_sine.as_mut().ok_or_else(|| {
+            NativeSessionStateSnafu {
+                rule: "native full-attention session requires persistent MRoPE sine controls",
+            }
+            .build()
+        })?;
         let capacity = cosine_buffer.len();
         if sine_buffer.len() != capacity || cosine.len() > capacity || sine.len() != cosine.len() {
             return NativeSessionStateSnafu {
@@ -1322,22 +1345,30 @@ impl ModelSessionResources {
             .fail();
         }
         let mut padded_cosine = Vec::new();
-        padded_cosine.try_reserve_exact(capacity).context(ExecutionAllocationSnafu {
-            target: "native persistent MRoPE cosine staging",
-            length: capacity,
-        })?;
+        padded_cosine
+            .try_reserve_exact(capacity)
+            .context(ExecutionAllocationSnafu {
+                target: "native persistent MRoPE cosine staging",
+                length: capacity,
+            })?;
         let mut padded_sine = Vec::new();
-        padded_sine.try_reserve_exact(capacity).context(ExecutionAllocationSnafu {
-            target: "native persistent MRoPE sine staging",
-            length: capacity,
-        })?;
+        padded_sine
+            .try_reserve_exact(capacity)
+            .context(ExecutionAllocationSnafu {
+                target: "native persistent MRoPE sine staging",
+                length: capacity,
+            })?;
         padded_cosine.resize(capacity, 0.0_f32);
         padded_sine.resize(capacity, 0.0_f32);
         padded_cosine[..cosine.len()].copy_from_slice(&cosine);
         padded_sine[..sine.len()].copy_from_slice(&sine);
         self.preparation_touched = true;
-        cosine_buffer.copy_from_host(&padded_cosine).context(NativeDeviceSnafu)?;
-        sine_buffer.copy_from_host(&padded_sine).context(NativeDeviceSnafu)?;
+        cosine_buffer
+            .copy_from_host(&padded_cosine)
+            .context(NativeDeviceSnafu)?;
+        sine_buffer
+            .copy_from_host(&padded_sine)
+            .context(NativeDeviceSnafu)?;
         Ok(cosine.len())
     }
 }

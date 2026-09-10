@@ -37,8 +37,9 @@ impl ModelChunkPlan {
         position: usize,
         tokens: &[u32],
     ) -> Result<Self> {
-        let packed = PackedPrefillPlan::new(&[tokens.len()], &[position], plan.layout.max_context())
-            .context(NativeKernelSnafu)?;
+        let packed =
+            PackedPrefillPlan::new(&[tokens.len()], &[position], plan.layout.max_context())
+                .context(NativeKernelSnafu)?;
         Self::from_packed_sequence(plan, tokens, &packed, 0)
     }
 
@@ -49,10 +50,16 @@ impl ModelChunkPlan {
         sequence: usize,
     ) -> Result<Self> {
         let token_count = packed.sequence_length(sequence).ok_or_else(|| {
-            NativeSessionStateSnafu { rule: "native packed model sequence must exist" }.build()
+            NativeSessionStateSnafu {
+                rule: "native packed model sequence must exist",
+            }
+            .build()
         })?;
         let position = packed.committed_offset(sequence).ok_or_else(|| {
-            NativeSessionStateSnafu { rule: "native packed model sequence must retain its committed position" }.build()
+            NativeSessionStateSnafu {
+                rule: "native packed model sequence must retain its committed position",
+            }
+            .build()
         })?;
         if token_count != tokens.len() {
             return NativeSessionStateSnafu {
@@ -97,8 +104,9 @@ impl ModelChunkPlan {
                     .context(NativeKernelSnafu)?,
             );
         }
-        let native_packed = PackedPrefillPlan::new(&[token_count], &[position], plan.layout.max_context())
-            .context(NativeKernelSnafu)?;
+        let native_packed =
+            PackedPrefillPlan::new(&[token_count], &[position], plan.layout.max_context())
+                .context(NativeKernelSnafu)?;
         let attention = plan
             .kv
             .map(|kv| {
