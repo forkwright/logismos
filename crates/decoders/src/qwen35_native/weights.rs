@@ -4,11 +4,11 @@ use hipcore::{Device, DeviceBuffer, Stream};
 use snafu::ResultExt;
 
 use super::custody::{NativeBufferSink, NativeBuildResult, NativeBuildScope, NativeBuildSource};
-use crate::Qwen35Weights;
 use crate::error::{NativeDeviceSnafu, NativeKernelSnafu, NativeSessionStateSnafu};
 use crate::qwen35_execution::read_f32;
 use crate::qwen35_native::finish::LayerFinishWeights;
 use crate::qwen35_native::plan::{DeviceFullAttentionPlan, F32Parameter, ProjectionWeight};
+use crate::{Qwen35Weights, Result};
 
 pub(super) struct NativeWeights {
     pub(super) q_gate: NativeMatrix,
