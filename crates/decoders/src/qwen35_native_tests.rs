@@ -181,7 +181,7 @@ fn reserved_device_native_main_model_prefill_matches_terminal_f64_oracle_and_con
     // continuation therefore observes their committed K/V and recurrent state.
     let output = unsafe { session.step(MODEL_PREFILL_CONTINUATION) }
         .map_err(|error| format!("native prefill T1 continuation: {error}"))?;
-    assert_native_terminal_logits(output, &expected, 1, "prefill T1 continuation")?;
+    assert_native_terminal_logits(&output, &expected, 1, "prefill T1 continuation")?;
     assert_eq!(
         session.state(),
         Qwen35NativeSessionState::Ready,
@@ -354,7 +354,7 @@ fn native_prefill_late_numeric_fault_witness(
     fixture: &Fixture,
     fault_stage: &str,
 ) -> core::result::Result<(), String> {
-    let payload = verify_fixture(&fixture)?;
+    let payload = verify_fixture(fixture)?;
     let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
     let plan = Qwen35NativeExecutionPlan::try_from_weights_prefill(
         &weights,
@@ -478,11 +478,13 @@ fn assert_native_prefill_terminal(
     // the bounded fixture's declared device numerical-domain preconditions.
     let output = unsafe { session.prefill(tokens) }
         .map_err(|error| format!("native prefill {label}: {error}"))?;
-    assert_native_terminal_logits(output, &expected, tokens.len(), label)
+    // Borrowing retains explicit output custody in this helper through the
+    // observational read; normal scope exit performs its established release.
+    assert_native_terminal_logits(&output, &expected, tokens.len(), label)
 }
 
 fn assert_native_terminal_logits(
-    output: DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
     expected: &[f64],
     token_count: usize,
     label: &str,

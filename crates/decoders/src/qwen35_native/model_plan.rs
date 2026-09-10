@@ -649,14 +649,7 @@ mod tests {
     fn prefill_capacity_scales_only_transient_rows_controls_and_workspaces()
     -> std::result::Result<(), String> {
         const CAPACITY: usize = 3;
-        let fixture = canonical_hybrid_fixture()?;
-        let artifact = verify_fixture(&fixture)?;
-        let weights =
-            Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
-        let token = DeviceModelPlan::from_weights_prefill(&weights, CONTEXT, 1, PAGE_TOKENS)
-            .map_err(|error| error.to_string())?;
-        let chunk = DeviceModelPlan::from_weights_prefill(&weights, CONTEXT, CAPACITY, PAGE_TOKENS)
-            .map_err(|error| error.to_string())?;
+        let (token, chunk) = prefill_capacity_plans(CAPACITY)?;
 
         assert_eq!(token.max_chunk_tokens, 1);
         assert_eq!(chunk.max_chunk_tokens, CAPACITY);
@@ -666,6 +659,30 @@ mod tests {
                 .map_err(|error| error.to_string())?,
             9
         );
+        assert_prefill_persistent_storage_is_unscaled(&token, &chunk);
+        assert_prefill_transient_storage_scales(&token, &chunk, CAPACITY);
+        assert_prefill_controls_scale(&token, &chunk, CAPACITY)?;
+        Ok(())
+    }
+
+    fn prefill_capacity_plans(
+        capacity: usize,
+    ) -> std::result::Result<(DeviceModelPlan, DeviceModelPlan), String> {
+        let fixture = canonical_hybrid_fixture()?;
+        let artifact = verify_fixture(&fixture)?;
+        let weights =
+            Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let token = DeviceModelPlan::from_weights_prefill(&weights, CONTEXT, 1, PAGE_TOKENS)
+            .map_err(|error| error.to_string())?;
+        let chunk = DeviceModelPlan::from_weights_prefill(&weights, CONTEXT, capacity, PAGE_TOKENS)
+            .map_err(|error| error.to_string())?;
+        Ok((token, chunk))
+    }
+
+    fn assert_prefill_persistent_storage_is_unscaled(
+        token: &DeviceModelPlan,
+        chunk: &DeviceModelPlan,
+    ) {
         assert_eq!(chunk.bytes.weights, token.bytes.weights);
         assert_eq!(chunk.bytes.key_values, token.bytes.key_values);
         assert_eq!(chunk.bytes.page_table, token.bytes.page_table);
@@ -687,32 +704,38 @@ mod tests {
         );
         assert_eq!(chunk.bytes.final_normalized, token.bytes.final_normalized);
         assert_eq!(chunk.bytes.logits, token.bytes.logits);
+    }
+
+    fn assert_prefill_transient_storage_scales(
+        token: &DeviceModelPlan,
+        chunk: &DeviceModelPlan,
+        capacity: usize,
+    ) {
         assert_eq!(
             chunk.bytes.full_workspace,
-            token.bytes.full_workspace * CAPACITY
+            token.bytes.full_workspace * capacity
         );
         assert_eq!(
             chunk.bytes.recurrent_workspace,
-            token.bytes.recurrent_workspace * CAPACITY
+            token.bytes.recurrent_workspace * capacity
         );
         assert_eq!(
             chunk.bytes.finish_workspace,
-            token.bytes.finish_workspace * CAPACITY
+            token.bytes.finish_workspace * capacity
         );
-        assert_eq!(chunk.bytes.hidden_rows, token.bytes.hidden_rows * CAPACITY);
-        let token_control_elements = token
-            .full_workspace
-            .ok_or("canonical model must retain full-attention workspace")?
-            .coefficient_elements()
-            .map_err(|error| error.to_string())?;
-        let chunk_control_elements = chunk
-            .full_workspace
-            .ok_or("canonical model must retain full-attention workspace")?
-            .coefficient_elements()
-            .map_err(|error| error.to_string())?;
+        assert_eq!(chunk.bytes.hidden_rows, token.bytes.hidden_rows * capacity);
+    }
+
+    fn assert_prefill_controls_scale(
+        token: &DeviceModelPlan,
+        chunk: &DeviceModelPlan,
+        capacity: usize,
+    ) -> std::result::Result<(), String> {
+        let token_control_elements = prefill_control_elements(token)?;
+        let chunk_control_elements = prefill_control_elements(chunk)?;
         assert_eq!(
             chunk_control_elements,
-            token_control_elements * CAPACITY,
+            token_control_elements * capacity,
             "the capacity workspace owner must account for one token-major cosine/sine row per admitted token"
         );
         assert_eq!(
@@ -727,10 +750,17 @@ mod tests {
         );
         assert_eq!(
             chunk.bytes.mrope_controls,
-            token.bytes.mrope_controls * CAPACITY,
+            token.bytes.mrope_controls * capacity,
             "capacity-three controls must be exactly three capacity-one control spans, never squared"
         );
         Ok(())
+    }
+
+    fn prefill_control_elements(plan: &DeviceModelPlan) -> std::result::Result<usize, String> {
+        plan.full_workspace
+            .ok_or("canonical model must retain full-attention workspace")?
+            .coefficient_elements()
+            .map_err(|error| error.to_string())
     }
 
     #[test]
