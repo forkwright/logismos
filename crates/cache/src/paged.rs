@@ -1114,6 +1114,7 @@ pub struct NativePagedKvPool {
 /// guard. Dropping it restores the same reservation to the pool's existing
 /// parked native-commit custody without issuing device work.
 #[cfg(feature = "gpu")]
+#[must_use = "commit publishes the completion-proven append; dropping preserves its custody"]
 pub struct NativePagedPreparedCompletion<'a> {
     prepared: NativeCompletionPrepared<'a, NativePagedKvPool>,
 }
@@ -2587,6 +2588,46 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn prepared_native_commit_parks_one_verified_reservation_without_device_state() -> Result<()> {
+        let plan = PagedKvPlan::new(geometry(8), PageTokens::B8)?;
+        let mut ledger = PagedKvLedger::new(plan)?;
+        let mut prepared = NativePreparedCommit::default();
+
+        assert!(matches!(
+            prepared.take(),
+            Err(Error::PagedNativeCommitNotPrepared { .. })
+        ));
+
+        let incomplete = ledger.begin_append(1)?;
+        let first = ledger.write_location(&incomplete, 0, 0)?;
+        ledger.record_write(0, first.page, first.within)?;
+        assert!(matches!(
+            ledger.validate_commit(&incomplete),
+            Err(Error::PagedIncompleteAppend { layer: 1, .. })
+        ));
+        ledger.rollback(&incomplete);
+
+        let reservation = ledger.begin_append(1)?;
+        record_all_ledger_rows(&mut ledger, &reservation)?;
+        ledger.validate_commit(&reservation)?;
+        prepared.park_verified(reservation);
+        assert!(matches!(
+            prepared.ensure_empty(),
+            Err(Error::PagedNativeCommitPrepared { .. })
+        ));
+        assert_eq!(ledger.committed_tokens, 0);
+
+        let mut reservation = prepared.take()?;
+        ledger.publish_commit(&mut reservation);
+        assert_eq!(ledger.committed_tokens, 1);
+        assert!(matches!(
+            prepared.take(),
+            Err(Error::PagedNativeCommitNotPrepared { .. })
+        ));
+        Ok(())
     }
 
     #[test]
