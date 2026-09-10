@@ -22,6 +22,7 @@ use crate::error::NoGpuBuildSnafu;
 use crate::error::Result;
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
 use crate::error::UnsupportedShapeSnafu;
+use crate::packed_prefill::PackedPrefillPlan;
 
 const CAUSAL_CONVOLUTION: &str = "causal_conv_fwd";
 #[cfg(feature = "gpu")]
@@ -299,6 +300,85 @@ pub struct CausalConvOutput {
     history: Vec<f32>,
 }
 
+/// Validated packed sequence-major causal-convolution input.
+///
+/// `input` and output rows follow [`PackedPrefillPlan`]'s sequence-major
+/// order. Each sequence has immutable raw history `[C, W - 1]`; the returned
+/// histories use the same sequence-major order and are separately staged.
+#[derive(Debug, Clone, Copy)]
+pub struct PackedCausalConvInput<'a> {
+    input: &'a [f32],
+    weights: &'a [f32],
+    histories: &'a [f32],
+    packed: &'a PackedPrefillPlan,
+    channel_count: usize,
+    width: usize,
+}
+
+impl<'a> PackedCausalConvInput<'a> {
+    /// Admit packed causal-convolution buffers against one checked descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CausalConvError`] when a buffer does not match the descriptor
+    /// and convolution dimensions, or when any supplied scalar is non-finite.
+    pub fn new(
+        input: &'a [f32],
+        weights: &'a [f32],
+        histories: &'a [f32],
+        packed: &'a PackedPrefillPlan,
+        channel_count: usize,
+        width: usize,
+    ) -> CausalConvResult<Self> {
+        let total = checked_product(
+            packed.total_tokens(),
+            channel_count,
+            "packed token count * channel count",
+        )?;
+        let one = CausalConvAllocationPlan::try_from_dimensions(0, channel_count, width)?;
+        let history = checked_product(
+            packed.sequence_count(),
+            one.history_elements(),
+            "packed sequence count * history elements",
+        )?;
+        validate_length("packed input", input.len(), total)?;
+        validate_length("weights", weights.len(), one.weight_elements())?;
+        validate_length("packed histories", histories.len(), history)?;
+        validate_scalars("packed input", input)?;
+        validate_scalars("weights", weights)?;
+        validate_scalars("packed histories", histories)?;
+        Ok(Self {
+            input,
+            weights,
+            histories,
+            packed,
+            channel_count,
+            width,
+        })
+    }
+}
+
+/// Packed causal-convolution outputs and separately staged final histories.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedCausalConvOutput {
+    output: Vec<f32>,
+    histories: Vec<f32>,
+}
+
+impl PackedCausalConvOutput {
+    /// Return sequence-major `[N, C]` convolution rows.
+    #[must_use]
+    pub fn output(&self) -> &[f32] {
+        &self.output
+    }
+
+    /// Return sequence-major `[B, C, W - 1]` final raw histories.
+    #[must_use]
+    pub fn histories(&self) -> &[f32] {
+        &self.histories
+    }
+}
+
 impl CausalConvOutput {
     /// Return the dense `[T, C]` output in row-major order.
     #[must_use]
@@ -328,7 +408,26 @@ impl CausalConvOutput {
 pub fn causal_conv_fwd(input: &CausalConvInput<'_>) -> CausalConvResult<CausalConvOutput> {
     let history_width = input.history_width()?;
     let mut output = reserve_f32("output", input.allocations.output_elements())?;
+    let mut final_history = reserve_f32("final history", input.allocations.history_elements())?;
+    append_causal_conv(input, history_width, &mut output, &mut final_history)?;
 
+    Ok(CausalConvOutput {
+        output,
+        history: final_history,
+    })
+}
+
+/// Append one admitted sequence using the causal-convolution reference arithmetic.
+///
+/// Callers own the pre-reserved destinations. Keeping this tap evaluation and
+/// history construction shared lets packed execution stage directly into its
+/// aggregate outputs without creating a per-sequence output or history.
+fn append_causal_conv(
+    input: &CausalConvInput<'_>,
+    history_width: usize,
+    output: &mut Vec<f32>,
+    final_history: &mut Vec<f32>,
+) -> CausalConvResult<()> {
     for token_index in 0..input.allocations.token_count() {
         for channel_index in 0..input.allocations.channel_count() {
             let output_index = checked_add(
@@ -354,7 +453,6 @@ pub fn causal_conv_fwd(input: &CausalConvInput<'_>) -> CausalConvResult<CausalCo
         }
     }
 
-    let mut final_history = reserve_f32("final history", input.allocations.history_elements())?;
     for channel_index in 0..input.allocations.channel_count() {
         for history_index in 0..history_width {
             let window_position = checked_add(
@@ -366,9 +464,83 @@ pub fn causal_conv_fwd(input: &CausalConvInput<'_>) -> CausalConvResult<CausalCo
         }
     }
 
-    Ok(CausalConvOutput {
-        output,
-        history: final_history,
+    Ok(())
+}
+
+/// Evaluate packed sequence-major causal convolution with separately staged histories.
+///
+/// Every sequence uses the same tap order and finite arithmetic as
+/// [`causal_conv_fwd`]. No sequence can observe another sequence's history or
+/// rows, and no caller-owned history is mutated on error.
+pub fn packed_causal_conv_fwd(
+    input: &PackedCausalConvInput<'_>,
+) -> CausalConvResult<PackedCausalConvOutput> {
+    let one = CausalConvAllocationPlan::try_from_dimensions(0, input.channel_count, input.width)?;
+    let history_elements = one.history_elements();
+    let output_elements = checked_product(
+        input.packed.total_tokens(),
+        input.channel_count,
+        "packed output elements",
+    )?;
+    let histories_elements = checked_product(
+        input.packed.sequence_count(),
+        history_elements,
+        "packed final histories",
+    )?;
+    let mut output = reserve_f32("packed output", output_elements)?;
+    let mut histories = reserve_f32("packed final histories", histories_elements)?;
+
+    for sequence in 0..input.packed.sequence_count() {
+        let rows = packed_range(input.packed, sequence)?;
+        let input_start = checked_product(rows.start, input.channel_count, "packed input start")?;
+        let input_end = checked_product(rows.end, input.channel_count, "packed input end")?;
+        let history_start = checked_product(sequence, history_elements, "packed history start")?;
+        let history_end = checked_add(history_start, history_elements, "packed history end")?;
+        let sequence_input = input.input.get(input_start..input_end).ok_or_else(|| {
+            LengthMismatchSnafu {
+                input: "packed input",
+                expected: input_end,
+                actual: input.input.len(),
+            }
+            .build()
+        })?;
+        let sequence_history =
+            input
+                .histories
+                .get(history_start..history_end)
+                .ok_or_else(|| {
+                    LengthMismatchSnafu {
+                        input: "packed histories",
+                        expected: history_end,
+                        actual: input.histories.len(),
+                    }
+                    .build()
+                })?;
+        let sequence_input = CausalConvInput::new(
+            sequence_input,
+            input.weights,
+            sequence_history,
+            rows.len(),
+            input.channel_count,
+            input.width,
+        )?;
+        let history_width = sequence_input.history_width()?;
+        append_causal_conv(&sequence_input, history_width, &mut output, &mut histories)?;
+    }
+    Ok(PackedCausalConvOutput { output, histories })
+}
+
+fn packed_range(
+    packed: &PackedPrefillPlan,
+    sequence: usize,
+) -> CausalConvResult<core::ops::Range<usize>> {
+    packed.packed_range(sequence).ok_or_else(|| {
+        LengthMismatchSnafu {
+            input: "packed sequence",
+            expected: sequence + 1,
+            actual: packed.sequence_count(),
+        }
+        .build()
     })
 }
 
@@ -936,6 +1108,33 @@ mod tests {
 
         assert_close_f64(actual.output(), &expected_output, "oracle output");
         assert_close_f64(actual.history(), &expected_history, "oracle history");
+        Ok(())
+    }
+
+    #[test]
+    fn packed_sequences_preserve_independent_f64_histories_and_order()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let packed = PackedPrefillPlan::new(&[2, 1], &[3, 6], 8)?;
+        let input = [0.25, -1.0, 1.5];
+        let weights = [0.5, -1.0, 0.25];
+        let histories = [-2.0, 0.5, 1.25, -0.75];
+        let admitted = PackedCausalConvInput::new(&input, &weights, &histories, &packed, 1, WIDTH)?;
+        let actual = packed_causal_conv_fwd(&admitted)?;
+        let (first_output, first_history) =
+            oracle_causal_conv(&input[..2], &weights, &histories[..2], 2, 1, WIDTH)?;
+        let (second_output, second_history) =
+            oracle_causal_conv(&input[2..], &weights, &histories[2..], 1, 1, WIDTH)?;
+        let mut expected_output = first_output;
+        expected_output.extend(second_output);
+        let mut expected_histories = first_history;
+        expected_histories.extend(second_history);
+
+        assert_close_f64(actual.output(), &expected_output, "packed f64 output");
+        assert_close_f64(
+            actual.histories(),
+            &expected_histories,
+            "packed f64 histories",
+        );
         Ok(())
     }
 

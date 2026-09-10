@@ -5,7 +5,8 @@
 //! finite payload parameters and persistent state to the verified artifact.
 
 use kernels::{
-    CausalConvInput, MultiHeadRecurrentInput, causal_conv_fwd, multi_head_recurrent_fwd,
+    PackedCausalConvInput, PackedMultiHeadRecurrentInput, PackedPrefillPlan,
+    packed_causal_conv_fwd, packed_multi_head_recurrent_fwd,
 };
 use loader::gguf::GgmlType;
 use quant::f32_row::F32Row;
@@ -203,11 +204,45 @@ impl Qwen35RecurrentExecution {
     /// one of the bounded CPU reference operators rejects the step.
     pub fn step(&mut self, hidden_tokens: &[f32]) -> Result<Vec<f32>> {
         let token_count = self.token_count(hidden_tokens)?;
+        // NOTE: standalone recurrent arithmetic owns no model-context grant.
+        // Its descriptor is deliberately operation-relative rather than a
+        // claim about a caller's persisted decoder position.
+        let packed =
+            PackedPrefillPlan::new(&[token_count], &[0], token_count).context(RecurrentCpuSnafu)?;
+        self.step_with_packed(hidden_tokens, token_count, &packed)
+    }
+
+    /// Execute one checked B=1 packed chunk at the model owner's position.
+    ///
+    /// The caller owns model context and supplies the descriptor; this layer
+    /// only checks that its one recurrent state can consume that one sequence.
+    pub(crate) fn step_packed_at(
+        &mut self,
+        hidden_tokens: &[f32],
+        packed: &PackedPrefillPlan,
+    ) -> Result<Vec<f32>> {
+        let token_count = self.token_count(hidden_tokens)?;
+        if packed.sequence_count() != 1 || packed.sequence_length(0) != Some(token_count) {
+            return RecurrentInputSnafu {
+                hidden: self.layout.hidden,
+                actual: hidden_tokens.len(),
+            }
+            .fail();
+        }
+        self.step_with_packed(hidden_tokens, token_count, packed)
+    }
+
+    fn step_with_packed(
+        &mut self,
+        hidden_tokens: &[f32],
+        token_count: usize,
+        packed: &PackedPrefillPlan,
+    ) -> Result<Vec<f32>> {
         let allocations = RecurrentStepAllocations::try_from_layout(self.layout, token_count)?;
         let normalized = self.normalize_input(hidden_tokens, token_count)?;
         let projected = self.project_inputs(token_count, &normalized, &allocations)?;
         drop(normalized);
-        let recurrent = self.run_recurrence(token_count, projected, &allocations)?;
+        let recurrent = self.run_recurrence(token_count, projected, &allocations, packed)?;
         let output =
             self.project_output(token_count, &recurrent.output, &recurrent.z, &allocations)?;
 
@@ -338,11 +373,12 @@ impl Qwen35RecurrentExecution {
         token_count: usize,
         projected: ProjectedInputs,
         allocations: &RecurrentStepAllocations,
+        packed: &PackedPrefillPlan,
     ) -> Result<RecurrentOutput> {
         let scalars = self.recurrence_scalars(token_count, &projected, allocations)?;
-        let convolution = self.convolve(token_count, &projected.qkv)?;
+        let convolution = self.convolve(token_count, &projected.qkv, packed)?;
         let inputs = self.arrange_recurrence(token_count, convolution.output(), allocations)?;
-        let recurrence = MultiHeadRecurrentInput::new(
+        let recurrence = PackedMultiHeadRecurrentInput::new(
             &inputs.q,
             &inputs.k,
             &inputs.v,
@@ -350,14 +386,14 @@ impl Qwen35RecurrentExecution {
             &scalars.gate,
             self.layout.gdn_scale,
             &self.recurrent_state,
-            token_count,
+            packed,
             self.layout.value_head_count,
             self.layout.value_head_count,
             self.layout.key_dim,
             self.layout.value_dim,
         )
         .context(RecurrentGdnSnafu)?;
-        let recurrence = multi_head_recurrent_fwd(&recurrence).context(RecurrentGdnSnafu)?;
+        let recurrence = packed_multi_head_recurrent_fwd(&recurrence).context(RecurrentGdnSnafu)?;
         Ok(RecurrentOutput {
             output: heads_to_tokens(
                 recurrence.output(),
@@ -369,7 +405,7 @@ impl Qwen35RecurrentExecution {
             z: projected.z,
             convolution_history: clone_f32(
                 "next convolution history",
-                convolution.history(),
+                convolution.histories(),
                 allocations.next_convolution_history,
             )?,
             state: clone_f32(
@@ -416,17 +452,29 @@ impl Qwen35RecurrentExecution {
         Ok(RecurrenceScalars { beta, gate })
     }
 
-    fn convolve(&self, token_count: usize, qkv: &[f32]) -> Result<kernels::CausalConvOutput> {
-        let convolution = CausalConvInput::new(
+    fn convolve(
+        &self,
+        token_count: usize,
+        qkv: &[f32],
+        packed: &PackedPrefillPlan,
+    ) -> Result<kernels::PackedCausalConvOutput> {
+        let convolution = PackedCausalConvInput::new(
             qkv,
             &self.ssm_conv,
             &self.convolution_history,
-            token_count,
+            packed,
             self.layout.conv_width,
             self.layout.conv_kernel,
         )
         .context(RecurrentConvolutionSnafu)?;
-        causal_conv_fwd(&convolution).context(RecurrentConvolutionSnafu)
+        if packed.sequence_length(0) != Some(token_count) {
+            return RecurrentInputSnafu {
+                hidden: self.layout.hidden,
+                actual: qkv.len(),
+            }
+            .fail();
+        }
+        packed_causal_conv_fwd(&convolution).context(RecurrentConvolutionSnafu)
     }
 
     fn arrange_recurrence(
@@ -1517,6 +1565,69 @@ mod tests {
             vec![0.0],
             "softplus(-infinity) is zero, so finite negative alpha and dt overflow must not reject the exact decay"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_owner_arithmetic_witness_preserves_corrected_gdn_phase() -> Result<()> {
+        let profile = Qwen35RecurrentLayout {
+            hidden: 2,
+            conv_kernel: 1,
+            inner: 2,
+            state: 2,
+            time_step_rank: 1,
+            group_count: 1,
+            main_block_count: 1,
+            full_attention_interval: 2,
+        };
+        let layout = ExecutionLayout::try_from_profile(profile, 1.0e-5)?;
+        assert_eq!(layout.conv_width, 6, "Q/K channels plus values must be [6]");
+        assert_eq!(layout.value_dim, 2);
+        let allocations = RecurrentStepAllocations::try_from_layout(layout, 1)?;
+
+        let causal_phase = sum_elements(
+            &[
+                allocations.qkv_projection.aggregate_output,
+                allocations.gate_projection.aggregate_output,
+                allocations.alpha_projection.aggregate_output,
+                allocations.beta_projection.aggregate_output,
+                allocations.beta_heads,
+                allocations.gate_heads,
+                allocations.causal_convolution.output_elements(),
+                allocations.causal_convolution.history_elements(),
+            ],
+            "allocation-owner arithmetic witness causal phase",
+        )?;
+        let recurrence_base = sum_elements(
+            &[
+                causal_phase,
+                allocations.value_heads,
+                allocations.tiled_query,
+                allocations.tiled_key,
+            ],
+            "allocation-owner arithmetic witness recurrence base",
+        )?;
+        assert_eq!(causal_phase, 18);
+        assert_eq!(recurrence_base, 24);
+        assert_eq!(
+            [
+                allocations.gdn.output_elements(),
+                allocations.gdn.state_elements(),
+                allocations.gdn.head_output_elements(),
+                allocations.gdn.head_state_elements(),
+                allocations.gdn.state_times_key_elements(),
+                allocations.gdn.delta_elements(),
+            ],
+            [2, 4, 2, 4, 2, 2],
+            "the corrected GDN phase must count aggregate and canonical one-head owners"
+        );
+        assert_eq!(allocations.gdn.workspace_elements(), 16);
+        assert_eq!(
+            allocations.workspace_elements(),
+            recurrence_base + allocations.gdn.workspace_elements(),
+            "this is allocation-owner arithmetic, not an allocator or heap measurement"
+        );
+        assert_eq!(allocations.workspace_elements(), 40);
         Ok(())
     }
 }
