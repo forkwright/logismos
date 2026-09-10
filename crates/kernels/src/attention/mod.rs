@@ -691,18 +691,24 @@ pub enum PagedPrefillError {
 
 /// A typed failure from B=1 prefill or one caller-owned row borrow.
 #[derive(Debug, Snafu)]
-#[snafu(module, visibility(pub))]
+#[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum PagedPrefillRowsError<E: std::error::Error + 'static> {
     /// The prefill operation rejected its geometry, input, or arithmetic.
-    #[snafu(display("{PAGED_DECODE}: prefill operation failure: {source}"))]
+    #[snafu(
+        display("{PAGED_DECODE}: prefill operation failure: {source}"),
+        context(name(PrefillRowsKernelSnafu))
+    )]
     Kernel {
         /// Source operation failure.
         source: PagedPrefillError,
     },
 
     /// The caller could not borrow a key row at one absolute cache token.
-    #[snafu(display("{PAGED_DECODE}: prefill key row {token} unavailable: {source}"))]
+    #[snafu(
+        display("{PAGED_DECODE}: prefill key row {token} unavailable: {source}"),
+        context(name(PrefillRowsKeyRowSnafu))
+    )]
     KeyRow {
         /// Absolute cache token.
         token: usize,
@@ -711,7 +717,10 @@ pub enum PagedPrefillRowsError<E: std::error::Error + 'static> {
     },
 
     /// The caller could not borrow a value row at one absolute cache token.
-    #[snafu(display("{PAGED_DECODE}: prefill value row {token} unavailable: {source}"))]
+    #[snafu(
+        display("{PAGED_DECODE}: prefill value row {token} unavailable: {source}"),
+        context(name(PrefillRowsValueRowSnafu))
+    )]
     ValueRow {
         /// Absolute cache token.
         token: usize,
@@ -1520,6 +1529,15 @@ mod tests {
     use super::*;
     use crate::numerical_status::{NativeNumericalStatusCategory, NativeNumericalStatusMask};
 
+    #[derive(Clone, Copy)]
+    struct PrefillOracleGeometry {
+        tokens: usize,
+        offset: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        head_width: usize,
+    }
+
     #[test]
     fn checked_native_first_token_maximum_sentinel_is_not_an_operand_failure()
     -> core::result::Result<(), Box<dyn std::error::Error>> {
@@ -1641,6 +1659,14 @@ mod tests {
         const KV_HEADS: usize = 2;
         const HEAD_WIDTH: usize = 3;
 
+        let oracle_geometry = PrefillOracleGeometry {
+            tokens: TOKENS,
+            offset: OFFSET,
+            query_heads: QUERY_HEADS,
+            kv_heads: KV_HEADS,
+            head_width: HEAD_WIDTH,
+        };
+
         let packed = PackedPrefillPlan::new(&[TOKENS], &[OFFSET], OFFSET + TOKENS)?;
         let plan =
             PagedPrefillPlan::try_from_packed_prefill(&packed, QUERY_HEADS, KV_HEADS, HEAD_WIDTH)?;
@@ -1676,16 +1702,7 @@ mod tests {
                 )
             },
         )?;
-        let oracle = prefill_oracle_f64(
-            TOKENS,
-            OFFSET,
-            &queries,
-            &keys,
-            &values,
-            QUERY_HEADS,
-            KV_HEADS,
-            HEAD_WIDTH,
-        );
+        let oracle = prefill_oracle_f64(oracle_geometry, &queries, &keys, &values);
         assert_eq!(
             actual.len(),
             oracle.len(),
@@ -1739,6 +1756,14 @@ mod tests {
         const KV_HEADS: usize = 1;
         const HEAD_WIDTH: usize = 2;
 
+        let oracle_geometry = PrefillOracleGeometry {
+            tokens: 1,
+            offset: 3,
+            query_heads: QUERY_HEADS,
+            kv_heads: KV_HEADS,
+            head_width: HEAD_WIDTH,
+        };
+
         let keys = prefill_rows(4, KV_HEADS, HEAD_WIDTH, 0.5);
         let values = prefill_rows(4, KV_HEADS, HEAD_WIDTH, 2.0);
         let packed = PackedPrefillPlan::new(&[1], &[3], 4)?;
@@ -1769,16 +1794,7 @@ mod tests {
                 )
             },
         )?;
-        let oracle = prefill_oracle_f64(
-            1,
-            3,
-            &queries,
-            &keys,
-            &values,
-            QUERY_HEADS,
-            KV_HEADS,
-            HEAD_WIDTH,
-        );
+        let oracle = prefill_oracle_f64(oracle_geometry, &queries, &keys, &values);
         for (actual, oracle) in actual.iter().zip(oracle) {
             assert!(
                 (*actual as f64 - oracle).abs() <= 1.0e-5_f64,
@@ -1863,30 +1879,27 @@ mod tests {
     }
 
     fn prefill_oracle_f64(
-        tokens: usize,
-        offset: usize,
+        geometry: PrefillOracleGeometry,
         queries: &[f32],
         keys: &[f32],
         values: &[f32],
-        query_heads: usize,
-        kv_heads: usize,
-        head_width: usize,
     ) -> Vec<f64> {
-        let gqa_group = query_heads / kv_heads;
-        let scale = 1.0_f64 / (head_width as f64).sqrt();
+        let gqa_group = geometry.query_heads / geometry.kv_heads;
+        let scale = 1.0_f64 / (geometry.head_width as f64).sqrt();
         let mut output = Vec::new();
-        for token in 0..tokens {
-            let visible_tokens = offset + token + 1;
-            for query_head in 0..query_heads {
-                let query_start = (token * query_heads + query_head) * head_width;
-                let query = &queries[query_start..query_start + head_width];
+        for token in 0..geometry.tokens {
+            let visible_tokens = geometry.offset + token + 1;
+            for query_head in 0..geometry.query_heads {
+                let query_start = (token * geometry.query_heads + query_head) * geometry.head_width;
+                let query = &queries[query_start..query_start + geometry.head_width];
                 let kv_head = query_head / gqa_group;
                 let scores = (0..visible_tokens)
                     .map(|key_token| {
-                        let key_start = (key_token * kv_heads + kv_head) * head_width;
+                        let key_start =
+                            (key_token * geometry.kv_heads + kv_head) * geometry.head_width;
                         query
                             .iter()
-                            .zip(&keys[key_start..key_start + head_width])
+                            .zip(&keys[key_start..key_start + geometry.head_width])
                             .map(|(query, key)| *query as f64 * *key as f64)
                             .sum::<f64>()
                             * scale
@@ -1897,13 +1910,14 @@ mod tests {
                     .iter()
                     .map(|score| (score - maximum).exp())
                     .sum::<f64>();
-                for column in 0..head_width {
+                for column in 0..geometry.head_width {
                     let weighted = scores
                         .iter()
                         .enumerate()
                         .map(|(key_token, score)| {
-                            let value_index =
-                                (key_token * kv_heads + kv_head) * head_width + column;
+                            let value_index = (key_token * geometry.kv_heads + kv_head)
+                                * geometry.head_width
+                                + column;
                             (score - maximum).exp() / normalizer * values[value_index] as f64
                         })
                         .sum::<f64>();
