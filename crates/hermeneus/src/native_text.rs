@@ -468,7 +468,7 @@ pub enum NativeTextDriverError {
         /// Explicit release outcome retaining unresolved output custody.
         release: Box<BufferRelease>,
     },
-    /// Cancellation was observed between complete native prompt-token operations.
+    /// Cancellation was observed at a native chunk boundary.
     Cancelled,
     /// The shared text port violated its nonempty token-batch contract.
     EmptyTokenBatch,
@@ -884,6 +884,8 @@ impl std::error::Error for NativeTextGenerationFailure {
 
 struct NativeTextDriver {
     session: Qwen35NativeExecutionSession,
+    // INVARIANT: the checked native session plan is the sole authority for this
+    // positive capacity; this driver neither clamps nor supplies a default.
     max_chunk_tokens: usize,
 }
 
@@ -932,7 +934,8 @@ impl RecycledGenerationDriver for NativeTextDriver {
         logits: &mut [f32],
         cancellation: &dyn Cancellation,
     ) -> Result<(), Self::Error> {
-        drive_token_batch(self, self.max_chunk_tokens, token_ids, logits, cancellation)
+        let max_chunk_tokens = self.max_chunk_tokens;
+        drive_token_batch(self, max_chunk_tokens, token_ids, logits, cancellation)
     }
 }
 
@@ -1116,8 +1119,10 @@ mod tests {
     struct SyntheticDriver {
         prefills: Vec<Vec<u32>>,
         released: Vec<u32>,
+        unresolved_output: Option<u32>,
         final_output: Option<u32>,
         fails_on: Option<u32>,
+        release_fails_on: Option<u32>,
     }
 
     impl NativeTokenDriver for SyntheticDriver {
@@ -1141,6 +1146,10 @@ mod tests {
             &mut self,
             output: Self::Output,
         ) -> Result<(), NativeTextDriverError> {
+            if self.release_fails_on == Some(output) {
+                self.unresolved_output = Some(output);
+                return Err(NativeTextDriverError::EmptyTokenBatch);
+            }
             self.released.push(output);
             Ok(())
         }
@@ -1504,5 +1513,33 @@ mod tests {
         assert_eq!(driver.prefills, [vec![51, 52], vec![53, 54]]);
         assert_eq!(driver.released, [52]);
         assert_eq!(driver.final_output, None);
+    }
+
+    #[test]
+    fn intermediate_release_failure_returns_original_error_without_later_driver_actions() {
+        let mut driver = SyntheticDriver {
+            release_fails_on: Some(62),
+            ..SyntheticDriver::default()
+        };
+        let mut logits = [0.0];
+        let cancellation = CancelAt {
+            call: Cell::new(0),
+            cancelled_call: usize::MAX,
+        };
+
+        let result = drive_token_batch(
+            &mut driver,
+            2,
+            &[61, 62, 63, 64, 65],
+            &mut logits,
+            &cancellation,
+        );
+
+        assert!(matches!(result, Err(NativeTextDriverError::EmptyTokenBatch)));
+        assert_eq!(driver.prefills, [vec![61, 62]]);
+        assert!(driver.released.is_empty());
+        assert_eq!(driver.unresolved_output, Some(62));
+        assert_eq!(driver.final_output, None);
+        assert_eq!(logits, [0.0]);
     }
 }
