@@ -111,14 +111,6 @@ pub(super) struct ActiveRecurrentPlan {
 }
 
 impl DeviceRecurrentPlan {
-    /// Bind one admitted recurrent main block to native operation descriptors.
-    ///
-    /// No device allocation, upload, submission, state mutation, or cache
-    /// publication occurs here.
-    pub(super) fn from_weights(weights: &Qwen35Weights, block: usize) -> Result<Self> {
-        Self::from_token_count(weights, block, 1)
-    }
-
     /// Bind one single-sequence packed recurrent chunk to native descriptors.
     ///
     /// The packed descriptor remains borrowed at this boundary: its existing
@@ -512,8 +504,9 @@ mod tests {
         let artifact = verify_fixture(&canonical_hybrid_fixture()?)?;
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
-        let plan =
-            DeviceRecurrentPlan::from_weights(&weights, 0).map_err(|error| error.to_string())?;
+        let packed = PackedPrefillPlan::new(&[1], &[0], 1).map_err(|error| error.to_string())?;
+        let plan = DeviceRecurrentPlan::from_packed_prefill(&weights, 0, &packed)
+            .map_err(|error| error.to_string())?;
 
         assert_eq!(plan.workspace.qkv, plan.convolution.output_elements());
         assert_eq!(
@@ -540,12 +533,13 @@ mod tests {
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
 
+        let packed = PackedPrefillPlan::new(&[1], &[0], 1).map_err(|error| error.to_string())?;
         assert!(
-            DeviceRecurrentPlan::from_weights(&weights, 3).is_err(),
+            DeviceRecurrentPlan::from_packed_prefill(&weights, 3, &packed).is_err(),
             "a cadence full-attention block cannot use recurrent native geometry"
         );
         assert!(
-            DeviceRecurrentPlan::from_weights(&weights, 4).is_err(),
+            DeviceRecurrentPlan::from_packed_prefill(&weights, 4, &packed).is_err(),
             "a block outside the main-block domain cannot use recurrent native geometry"
         );
         Ok(())

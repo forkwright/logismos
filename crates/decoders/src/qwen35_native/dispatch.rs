@@ -1,7 +1,7 @@
 //! One-token native full-attention launch ordering.
 
 use cache::NativePagedAppend;
-use hipcore::{DeviceBuffer, Stream};
+use hipcore::Stream;
 use snafu::ResultExt;
 
 use super::CompletionResource;
@@ -12,7 +12,7 @@ use super::plan::WorkspacePlan;
 use super::resources::{
     DeviceResources, FullAttentionStep, NativeBufferView, NativeWorkspace, checked_buffer_window,
 };
-use super::weights::{NativeMatrix, NativeWeights};
+use super::weights::NativeWeights;
 use crate::Result;
 use crate::error::{
     NativeDeviceSnafu, NativeKernelSnafu, NativePagedKvSnafu, NativeSessionStateSnafu,
@@ -363,70 +363,6 @@ fn row_offset(row: usize, row_elements: usize, context: &'static str) -> Result<
         .ok_or_else(|| crate::error::ArithmeticOverflowSnafu { context }.build())
 }
 
-impl NativeMatrix {
-    /// Launch one verified row-major projection into an owned exact output span.
-    ///
-    /// # Safety
-    ///
-    /// `input` and `output` must be non-overlapping device spans on `stream`'s
-    /// device with its sticky status allocation through completion. The checked
-    /// kernel classifies explicit operands and results before publication.
-    pub(super) unsafe fn launch(
-        &self,
-        input: &DeviceBuffer<f32>,
-        output: &DeviceBuffer<f32>,
-        stream: &Stream,
-        numerical_status: &kernels::numerical_status::NativeNumericalStatus,
-    ) -> Result<()> {
-        // SAFETY: the caller upholds the native row-GEMV device-span and
-        // status-lifetime contract for this verified descriptor.
-        unsafe {
-            kernels::row_gemv::launch_row_gemv_f32_checked(
-                self.shape,
-                self.bytes.as_device_ptr(),
-                self.bytes.len(),
-                input.as_device_ptr().cast_const(),
-                input.len(),
-                output.as_device_ptr(),
-                output.len(),
-                stream,
-                numerical_status,
-            )
-        }
-        .context(NativeKernelSnafu)
-    }
-}
-
-/// # Safety
-///
-/// The three spans must be distinct exact buffers on `stream`'s device and
-/// retain the status allocation through completion. The checked kernel records
-/// explicit operand and arithmetic faults for the post-sync owner to classify.
-pub(super) unsafe fn launch_rms_norm(
-    plan: kernels::decoder_ops::RmsNormF32Plan,
-    input: &DeviceBuffer<f32>,
-    weight: &DeviceBuffer<f32>,
-    output: &DeviceBuffer<f32>,
-    stream: &Stream,
-    numerical_status: &kernels::numerical_status::NativeNumericalStatus,
-) -> Result<()> {
-    // SAFETY: caller establishes exact spans and retains the status allocation.
-    unsafe {
-        kernels::decoder_ops::launch_rms_norm_f32_checked(
-            plan,
-            input.as_device_ptr().cast_const(),
-            input.len(),
-            weight.as_device_ptr().cast_const(),
-            weight.len(),
-            output.as_device_ptr(),
-            output.len(),
-            stream,
-            numerical_status,
-        )
-    }
-    .context(NativeKernelSnafu)
-}
-
 /// # Safety
 ///
 /// The three views must be distinct exact spans on `stream`'s device and
@@ -449,36 +385,6 @@ pub(super) unsafe fn launch_rms_norm_view(
             weight.len(),
             output.as_mut_ptr(),
             output.len(),
-            stream,
-            numerical_status,
-        )
-    }
-    .context(NativeKernelSnafu)
-}
-
-/// # Safety
-///
-/// `values` must be exclusive, while coefficient spans remain immutable and
-/// all buffers, including `numerical_status`, stay live on `stream`'s device
-/// through completion.
-unsafe fn launch_rotary(
-    plan: kernels::decoder_ops::RotaryHalfSplitF32Plan,
-    values: &DeviceBuffer<f32>,
-    cosine: &DeviceBuffer<f32>,
-    sine: &DeviceBuffer<f32>,
-    stream: &Stream,
-    numerical_status: &kernels::numerical_status::NativeNumericalStatus,
-) -> Result<()> {
-    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
-    unsafe {
-        kernels::decoder_ops::launch_rotary_half_split_f32_in_place_checked(
-            plan,
-            values.as_device_ptr(),
-            values.len(),
-            cosine.as_device_ptr().cast_const(),
-            cosine.len(),
-            sine.as_device_ptr().cast_const(),
-            sine.len(),
             stream,
             numerical_status,
         )
@@ -517,35 +423,6 @@ unsafe fn launch_rotary_view(
 
 /// # Safety
 ///
-/// The input and two output spans must be distinct exact buffers on
-/// `stream`'s device and retain `numerical_status` through completion.
-unsafe fn launch_split(
-    plan: kernels::decoder_ops::SplitQGateF32Plan,
-    input: &DeviceBuffer<f32>,
-    query: &DeviceBuffer<f32>,
-    gate: &DeviceBuffer<f32>,
-    stream: &Stream,
-    numerical_status: &kernels::numerical_status::NativeNumericalStatus,
-) -> Result<()> {
-    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
-    unsafe {
-        kernels::decoder_ops::launch_split_q_gate_f32_checked(
-            plan,
-            input.as_device_ptr().cast_const(),
-            input.len(),
-            query.as_device_ptr(),
-            query.len(),
-            gate.as_device_ptr(),
-            gate.len(),
-            stream,
-            numerical_status,
-        )
-    }
-    .context(NativeKernelSnafu)
-}
-
-/// # Safety
-///
 /// The input and two output views must be distinct exact spans on `stream`'s
 /// device and retain `numerical_status` through completion.
 unsafe fn launch_split_view(
@@ -566,35 +443,6 @@ unsafe fn launch_split_view(
             query.len(),
             gate.as_mut_ptr(),
             gate.len(),
-            stream,
-            numerical_status,
-        )
-    }
-    .context(NativeKernelSnafu)
-}
-
-/// # Safety
-///
-/// The two inputs and output must be distinct exact spans on `stream`'s device
-/// with the shared status allocation through completion.
-pub(super) unsafe fn launch_sigmoid_mul(
-    plan: kernels::decoder_ops::ElementwiseF32Plan,
-    value: &DeviceBuffer<f32>,
-    gate: &DeviceBuffer<f32>,
-    output: &DeviceBuffer<f32>,
-    stream: &Stream,
-    numerical_status: &kernels::numerical_status::NativeNumericalStatus,
-) -> Result<()> {
-    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
-    unsafe {
-        kernels::decoder_ops::sigmoid_mul_checked(
-            plan,
-            value.as_device_ptr().cast_const(),
-            value.len(),
-            gate.as_device_ptr().cast_const(),
-            gate.len(),
-            output.as_device_ptr(),
-            output.len(),
             stream,
             numerical_status,
         )
@@ -633,35 +481,6 @@ pub(super) unsafe fn launch_sigmoid_mul_view(
 
 /// # Safety
 ///
-/// The two inputs and output must be distinct exact spans on `stream`'s device
-/// with the shared status allocation through completion.
-pub(super) unsafe fn launch_silu_mul(
-    plan: kernels::decoder_ops::ElementwiseF32Plan,
-    gate: &DeviceBuffer<f32>,
-    up: &DeviceBuffer<f32>,
-    output: &DeviceBuffer<f32>,
-    stream: &Stream,
-    numerical_status: &kernels::numerical_status::NativeNumericalStatus,
-) -> Result<()> {
-    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
-    unsafe {
-        kernels::decoder_ops::silu_mul_checked(
-            plan,
-            gate.as_device_ptr().cast_const(),
-            gate.len(),
-            up.as_device_ptr().cast_const(),
-            up.len(),
-            output.as_device_ptr(),
-            output.len(),
-            stream,
-            numerical_status,
-        )
-    }
-    .context(NativeKernelSnafu)
-}
-
-/// # Safety
-///
 /// The two input and output views must be distinct exact spans on `stream`'s
 /// device with the shared status allocation through completion.
 pub(super) unsafe fn launch_silu_mul_view(
@@ -681,35 +500,6 @@ pub(super) unsafe fn launch_silu_mul_view(
             up.as_const_ptr(),
             up.len(),
             output.as_mut_ptr(),
-            output.len(),
-            stream,
-            numerical_status,
-        )
-    }
-    .context(NativeKernelSnafu)
-}
-
-/// # Safety
-///
-/// The two inputs and output must be distinct exact spans on `stream`'s device
-/// with the shared status allocation through completion.
-pub(super) unsafe fn launch_residual(
-    plan: kernels::decoder_ops::ElementwiseF32Plan,
-    left: &DeviceBuffer<f32>,
-    right: &DeviceBuffer<f32>,
-    output: &DeviceBuffer<f32>,
-    stream: &Stream,
-    numerical_status: &kernels::numerical_status::NativeNumericalStatus,
-) -> Result<()> {
-    // SAFETY: caller establishes exact non-aliasing spans and status lifetime.
-    unsafe {
-        kernels::decoder_ops::residual_add_checked(
-            plan,
-            left.as_device_ptr().cast_const(),
-            left.len(),
-            right.as_device_ptr().cast_const(),
-            right.len(),
-            output.as_device_ptr(),
             output.len(),
             stream,
             numerical_status,

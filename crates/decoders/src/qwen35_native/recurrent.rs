@@ -662,6 +662,7 @@ mod tests {
     use crate::qwen35_native::finish::{LayerFinishPlan, LayerFinishWeights, LayerFinishWorkspace};
     use crate::qwen35_native::model_resources::build_numerical_status;
     use crate::qwen35_native::recurrent_plan::DeviceRecurrentPlan;
+    use crate::qwen35_native::resources::NativeBufferView;
     use kernels::PackedPrefillPlan;
 
     const RECURRENT_BLOCK: usize = 0;

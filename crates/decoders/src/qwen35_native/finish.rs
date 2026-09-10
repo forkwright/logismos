@@ -18,9 +18,6 @@ use crate::{Qwen35Weights, Result};
 
 #[derive(Debug)]
 pub(super) struct LayerFinishPlan {
-    pub(super) post_attention_norm: kernels::decoder_ops::RmsNormF32Plan,
-    pub(super) ffn: kernels::decoder_ops::ElementwiseF32Plan,
-    pub(super) residual: kernels::decoder_ops::ElementwiseF32Plan,
     pub(super) weights: LayerFinishWeightPlan,
     pub(super) workspace: LayerFinishWorkspacePlan,
     pub(super) demand: LayerFinishDeviceDemand,
@@ -153,9 +150,6 @@ impl LayerFinishPlan {
             scratch: active.workspace.bytes()?,
         };
         Ok(Self {
-            post_attention_norm: active.post_attention_norm,
-            ffn: active.ffn,
-            residual: active.residual,
             weights,
             workspace: active.workspace,
             demand,
@@ -459,34 +453,37 @@ mod tests {
         for token_count in 1..=3 {
             let plan = LayerFinishPlan::from_weights_rows(&weights, layout, 3, token_count)
                 .map_err(|error| error.to_string())?;
+            let active = plan
+                .active(layout, token_count)
+                .map_err(|error| error.to_string())?;
             assert_eq!(
-                plan.post_attention_norm.rows(),
+                active.post_attention_norm.rows(),
                 token_count,
                 "RMSNorm rows are the sole token-count owner"
             );
             assert_eq!(
-                plan.residual.elements(),
+                active.residual.elements(),
                 token_count * layout.hidden,
                 "residual extent must derive from RMSNorm rows and hidden width"
             );
             assert_eq!(
-                plan.ffn.elements(),
+                active.ffn.elements(),
                 token_count * layout.feed_forward,
                 "FFN extent must derive from the requested token count"
             );
             assert_eq!(
                 plan.workspace.attention_residual,
-                plan.residual.elements(),
+                active.residual.elements(),
                 "attention residual scratch must match residual geometry"
             );
             assert_eq!(
                 plan.workspace.post_norm,
-                plan.post_attention_norm.elements(),
+                active.post_attention_norm.elements(),
                 "post-norm scratch must use its checked RMSNorm extent"
             );
             assert_eq!(
                 plan.workspace.ffn_down,
-                plan.residual.elements(),
+                active.residual.elements(),
                 "down projection scratch must match residual geometry"
             );
             assert_eq!(

@@ -340,10 +340,6 @@ pub(super) fn f32_parameter(
 }
 
 impl WorkspacePlan {
-    fn from_layout(layout: Layout) -> Result<Self> {
-        Self::from_layout_rows(layout, 1)
-    }
-
     /// # Errors
     ///
     /// Returns an error when a nonempty token-major workspace cannot be
