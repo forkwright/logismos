@@ -378,8 +378,8 @@ fn dropped_batch_plan_does_not_publish_private_state() -> std::result::Result<()
 fn late_second_sequence_refusal_rolls_back_the_whole_batch_and_retries()
 -> std::result::Result<(), String> {
     let mut faulty_fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
-    let faulty_index = usize::try_from(LATE_FAILURE_TOKEN)
-        .map_err(|error| error.to_string())?
+    let faulty_row = usize::try_from(LATE_FAILURE_TOKEN).map_err(|error| error.to_string())?;
+    let faulty_index = faulty_row
         .checked_mul(CANONICAL_HIDDEN)
         .ok_or("late-failure embedding offset overflowed")?;
     set_f32_value(
@@ -415,10 +415,12 @@ fn late_second_sequence_refusal_rolls_back_the_whole_batch_and_retries()
     assert!(
         matches!(
             &error,
-            crate::Error::ExecutionArithmetic {
-                stage: "token embedding",
+            crate::Error::ProjectionRow {
+                name,
+                row,
+                source: quant::Error::NonFiniteF32Weight { index: 0, .. },
                 ..
-            }
+            } if name == TOKEN_EMBEDDING && *row == faulty_row
         ),
         "the valid token id must fail only when its unique embedding row executes: {error}"
     );

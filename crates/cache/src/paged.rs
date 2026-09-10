@@ -2147,11 +2147,11 @@ mod tests {
         Ok(())
     }
 
-    fn prepare_all<'a>(
-        pool: &'a mut PagedKvPool,
+    fn prepare_all(
+        pool: &mut PagedKvPool,
         start: usize,
         tokens: usize,
-    ) -> Result<PagedPreparedCommit<'a>> {
+    ) -> Result<PagedPreparedCommit<'_>> {
         let mut append = pool.begin_append(tokens)?;
         write_all(&mut append, start, tokens)?;
         append.prepare_commit()
