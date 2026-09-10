@@ -369,6 +369,32 @@ template/tokenizer allocations, process RSS, physical residency and GPU memory
 are outside this report. It is neither an allocation guarantee nor device
 admission input.
 
+`Qwen35Execution::plan_batch` exclusively borrows existing CPU executions and
+their per-sequence token slices. The opaque `Qwen35BatchExecutionPlan` validates
+common verified content identity and each owner's own step/context/token bounds
+before state staging. Its checked packed descriptor supplies independent
+sequence lengths, offsets and execution cursors; its representation context
+does not enlarge an individual session's bound. Logit selection remains
+per-sequence and results retain input order.
+
+The CPU batch is an atomic ownership/reference decomposition, not vectorized
+model arithmetic. It executes private scalar operations while retaining every
+sequence's staged recurrent state, paged append and logits. A consuming
+`PagedPreparedCommit` validates cache completeness, prevents further writes and
+retains rollback on drop. All cache appends are prepared and the outer result
+collection is complete before any infallible publication. Single-session calls
+share this pending/publication primitive. No loop over independently committing
+public sessions can substitute for the aggregate transaction.
+
+The batch's logical CPU envelope composes the admitted construction receipts:
+retained state, simultaneous transaction copies and returned outputs are checked
+sums; transient workspace is the maximum because arithmetic is serial. The
+separate serialized-backing upper bound conservatively sums every owner. Equal
+digests prove content equivalence, not allocation aliasing, so shared clones may
+intentionally overcount. Existing metadata/allocator/RSS and host-authority
+exclusions still apply. This adds no scheduler, shared resident policy, native
+multi-sequence execution, physical admission or automatic CPU fallback.
+
 Private paging provides no cross-session sharing, prefix index, eviction,
 device allocation or admission lease. Those require their actual consumers
 and additional identity, lifecycle and qualification contracts.

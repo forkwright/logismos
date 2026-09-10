@@ -1,13 +1,13 @@
 //! Aggregate transaction witnesses for bounded Qwen3.5 CPU executions.
 
+use super::qwen35_execution_oracle_tests::{
+    ExecutionStateSnapshot, assert_f32_slice_matches_f64, assert_private_state_matches_oracle,
+    private_state_snapshot,
+};
 use super::*;
 use crate::Qwen35Weights;
 use crate::qwen35::tests::{
     CanonicalHybridOracle, canonical_hybrid_fixture_with_context, set_f32_value, verify_fixture,
-};
-use super::qwen35_execution_oracle_tests::{
-    ExecutionStateSnapshot, assert_f32_slice_matches_f64, assert_private_state_matches_oracle,
-    private_state_snapshot,
 };
 
 const BATCH_CONTEXT: usize = 16;
@@ -24,8 +24,8 @@ type ExecutionStateBits = (
 );
 
 #[test]
-fn batch_execution_deinterleaves_unequal_histories_and_continues()
--> std::result::Result<(), String> {
+fn batch_execution_deinterleaves_unequal_histories_and_continues() -> std::result::Result<(), String>
+{
     let fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
     let payload = verify_fixture(&fixture)?;
     let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
@@ -34,7 +34,11 @@ fn batch_execution_deinterleaves_unequal_histories_and_continues()
     let mut first = execution(&weights, Qwen35LogitSelection::AllTokens)?;
     let mut second = execution(&weights, Qwen35LogitSelection::AllTokens)?;
 
-    advance(&mut first, &mut first_oracle, &[&[0, 1, 2], &[3, 4, 0], &[1]])?;
+    advance(
+        &mut first,
+        &mut first_oracle,
+        &[&[0, 1, 2], &[3, 4, 0], &[1]],
+    )?;
     advance(&mut second, &mut second_oracle, &[&[2, 3, 4]])?;
 
     let first_chunk = [2, 3];
@@ -74,8 +78,7 @@ fn batch_execution_deinterleaves_unequal_histories_and_continues()
 }
 
 #[test]
-fn batch_execution_preserves_per_sequence_logit_selection()
--> std::result::Result<(), String> {
+fn batch_execution_preserves_per_sequence_logit_selection() -> std::result::Result<(), String> {
     let fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
     let payload = verify_fixture(&fixture)?;
     let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
@@ -119,8 +122,8 @@ fn batch_execution_preserves_per_sequence_logit_selection()
 }
 
 #[test]
-fn batch_execution_admits_distinct_owner_context_and_step_bounds()
--> std::result::Result<(), String> {
+fn batch_execution_admits_distinct_owner_context_and_step_bounds() -> std::result::Result<(), String>
+{
     let fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
     let payload = verify_fixture(&fixture)?;
     let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
@@ -147,12 +150,7 @@ fn batch_execution_admits_distinct_owner_context_and_step_bounds()
     .map_err(|error| error.to_string())?;
 
     assert_f32_slice_matches_f64(&outputs[0], &wider_expected, "wider owner logits", 0)?;
-    assert_f32_slice_matches_f64(
-        &outputs[1],
-        &narrower_expected,
-        "narrower owner logits",
-        0,
-    )?;
+    assert_f32_slice_matches_f64(&outputs[1], &narrower_expected, "narrower owner logits", 0)?;
     assert_private_state_matches_oracle(&executions[0], &wider_oracle.state_for_test())?;
     assert_private_state_matches_oracle(&executions[1], &narrower_oracle.state_for_test())?;
     Ok(())
@@ -188,8 +186,8 @@ fn batch_plan_refuses_smaller_owner_context_despite_larger_aggregate_bound()
 }
 
 #[test]
-fn batch_plan_preflight_refusals_leave_every_execution_unchanged()
--> std::result::Result<(), String> {
+fn batch_plan_preflight_refusals_leave_every_execution_unchanged() -> std::result::Result<(), String>
+{
     let fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
     let payload = verify_fixture(&fixture)?;
     let weights = Qwen35Weights::try_from_verified(&payload).map_err(|error| error.to_string())?;
@@ -206,13 +204,11 @@ fn batch_plan_preflight_refusals_leave_every_execution_unchanged()
     let mut token = [execution(&weights, Qwen35LogitSelection::AllTokens)?];
     assert_batch_refusal_preserves(&mut token, &[&[u32::MAX]])?;
 
-    let mut step_bound = [
-        weights
-            .execution_plan(BATCH_CONTEXT, 2, Qwen35LogitSelection::AllTokens)
-            .map_err(|error| error.to_string())?
-            .execution()
-            .map_err(|error| error.to_string())?,
-    ];
+    let mut step_bound = [weights
+        .execution_plan(BATCH_CONTEXT, 2, Qwen35LogitSelection::AllTokens)
+        .map_err(|error| error.to_string())?
+        .execution()
+        .map_err(|error| error.to_string())?];
     assert_batch_refusal_preserves(&mut step_bound, &[&[0, 1, 2]])?;
 
     let mut context_bound = [execution(&weights, Qwen35LogitSelection::AllTokens)?];
@@ -243,21 +239,29 @@ fn batch_plan_preflight_refusals_leave_every_execution_unchanged()
 }
 
 #[test]
-fn batch_plan_aggregates_identical_artifacts_conservatively()
--> std::result::Result<(), String> {
+fn batch_plan_aggregates_identical_artifacts_conservatively() -> std::result::Result<(), String> {
     let fixture = canonical_hybrid_fixture_with_context(BATCH_CONTEXT)?;
     let shared_payload = verify_fixture(&fixture)?;
     let shared_weights =
         Qwen35Weights::try_from_verified(&shared_payload).map_err(|error| error.to_string())?;
     let cloned_shared_weights = shared_weights.clone();
     let separately_verified_payload = verify_fixture(&fixture)?;
-    let separately_verified_weights = Qwen35Weights::try_from_verified(&separately_verified_payload)
-        .map_err(|error| error.to_string())?;
+    let separately_verified_weights =
+        Qwen35Weights::try_from_verified(&separately_verified_payload)
+            .map_err(|error| error.to_string())?;
     let first_plan = cloned_shared_weights
-        .execution_plan(BATCH_CONTEXT, BATCH_STEP_TOKENS, Qwen35LogitSelection::AllTokens)
+        .execution_plan(
+            BATCH_CONTEXT,
+            BATCH_STEP_TOKENS,
+            Qwen35LogitSelection::AllTokens,
+        )
         .map_err(|error| error.to_string())?;
     let second_plan = separately_verified_weights
-        .execution_plan(BATCH_CONTEXT, BATCH_STEP_TOKENS, Qwen35LogitSelection::LastToken)
+        .execution_plan(
+            BATCH_CONTEXT,
+            BATCH_STEP_TOKENS,
+            Qwen35LogitSelection::LastToken,
+        )
         .map_err(|error| error.to_string())?;
     let first_requirements = first_plan.cpu_requirements();
     let second_requirements = second_plan.cpu_requirements();
@@ -274,7 +278,10 @@ fn batch_plan_aggregates_identical_artifacts_conservatively()
         .map_err(|error| error.to_string())?;
     let requirements = plan.cpu_requirements();
 
-    assert_eq!(requirements.artifact_digest(), first_requirements.artifact_digest());
+    assert_eq!(
+        requirements.artifact_digest(),
+        first_requirements.artifact_digest()
+    );
     assert_eq!(requirements.sequence_count(), BATCH_SEQUENCE_COUNT);
     assert_eq!(requirements.total_tokens(), 3);
     assert_eq!(requirements.max_context(), BATCH_CONTEXT);
@@ -349,8 +356,12 @@ fn dropped_batch_plan_does_not_publish_private_state() -> std::result::Result<()
         execution(&weights, Qwen35LogitSelection::AllTokens)?,
         execution(&weights, Qwen35LogitSelection::AllTokens)?,
     ];
-    executions[0].step(&[0, 1]).map_err(|error| error.to_string())?;
-    executions[1].step(&[2]).map_err(|error| error.to_string())?;
+    executions[0]
+        .step(&[0, 1])
+        .map_err(|error| error.to_string())?;
+    executions[1]
+        .step(&[2])
+        .map_err(|error| error.to_string())?;
     let before = execution_state_bits(&executions)?;
     let plan = Qwen35Execution::plan_batch(&mut executions, &[&[2, 3], &[4]])
         .map_err(|error| error.to_string())?;
@@ -387,7 +398,9 @@ fn late_second_sequence_refusal_rolls_back_the_whole_batch_and_retries()
     executions[0]
         .step(&[0, 1, 2])
         .map_err(|error| error.to_string())?;
-    executions[1].step(&[3]).map_err(|error| error.to_string())?;
+    executions[1]
+        .step(&[3])
+        .map_err(|error| error.to_string())?;
     let before = execution_state_bits(&executions)?;
     let first_chunk = [2, 3];
     let second_chunk = [0, LATE_FAILURE_TOKEN];
@@ -431,7 +444,9 @@ fn late_second_sequence_refusal_rolls_back_the_whole_batch_and_retries()
         execution(&good_weights, Qwen35LogitSelection::AllTokens)?,
         execution(&good_weights, Qwen35LogitSelection::AllTokens)?,
     ];
-    control[0].step(&[0, 1, 2]).map_err(|error| error.to_string())?;
+    control[0]
+        .step(&[0, 1, 2])
+        .map_err(|error| error.to_string())?;
     control[1].step(&[3]).map_err(|error| error.to_string())?;
     let expected = Qwen35Execution::plan_batch(
         &mut control,

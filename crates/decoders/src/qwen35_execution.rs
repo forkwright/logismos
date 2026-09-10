@@ -1627,6 +1627,9 @@ fn add_in_place(destination: &mut [f32], source: &[f32], stage: &'static str) ->
 }
 
 #[cfg(test)]
+mod qwen35_batch_execution_tests;
+
+#[cfg(test)]
 mod qwen35_execution_oracle_tests;
 
 #[cfg(test)]
