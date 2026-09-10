@@ -4,7 +4,10 @@ use kernels::PackedPrefillPlan;
 use snafu::ResultExt;
 
 use super::model_plan::DeviceModelPlan;
-use crate::error::{ArithmeticOverflowSnafu, ExecutionAllocationSnafu, NativeKernelSnafu, NativeSessionStateSnafu};
+use crate::error::{
+    ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionPagedPrefillPlanSnafu,
+    NativeKernelSnafu, NativeSessionStateSnafu,
+};
 use crate::Result;
 
 /// Complete action-free geometry admitted before a native model allocates,
@@ -74,23 +77,13 @@ impl ModelChunkPlan {
                     plan.layout.kv_heads,
                     plan.layout.key,
                 )
-                .map_err(|_| {
-                    NativeSessionStateSnafu {
-                        rule: "native model chunk must lower to one checked causal attention sequence",
-                    }
-                    .build()
-                })?;
+                .context(ExecutionPagedPrefillPlanSnafu)?;
                 kernels::attention::NativePagedPrefillPlan::try_from_paged_prefill(
                     logical,
                     kv.layout().page_tokens(),
                     kv.layout().physical_pages(),
                 )
-                .map_err(|_| {
-                    NativeSessionStateSnafu {
-                        rule: "native model chunk must fit its checked paged KV binding",
-                    }
-                    .build()
-                })
+                .context(ExecutionPagedPrefillPlanSnafu)
             })
             .transpose()?;
 

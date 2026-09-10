@@ -412,6 +412,16 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// Checked B=1 paged-prefill planning rejected the execution geometry.
+    #[snafu(display("qwen35 execution paged prefill plan failed: {source}"))]
+    ExecutionPagedPrefillPlan {
+        /// Checked causal prefill geometry, allocation, or native lowering failure.
+        source: kernels::attention::PagedPrefillError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     /// The checked paged-decode operation or paged-KV row borrow failed.
     #[snafu(display("qwen35 execution paged decode operation failed: {source}"))]
     ExecutionPagedDecode {
