@@ -837,7 +837,7 @@ struct CausalConvStepAbi {
     width: u32,
 }
 
-#[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
+#[cfg(all(feature = "gpu", test))]
 #[expect(
     clippy::too_many_arguments,
     reason = "validation receives the fixed raw staged causal-convolution ABI without constructing a second shape owner"

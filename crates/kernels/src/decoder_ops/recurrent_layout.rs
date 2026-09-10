@@ -338,18 +338,22 @@ impl RecurrentValueLayoutF32Plan {
         })
     }
 
+    /// Return the admitted number of token rows.
     #[must_use]
     pub const fn token_count(self) -> usize {
         self.token_count
     }
+    /// Return the exact activated convolution source extent across all rows.
     #[must_use]
     pub const fn convolved_elements(self) -> usize {
         self.convolved_elements
     }
+    /// Return the exact compact `[Hv, T, V]` or `[T, Hv, V]` extent.
     #[must_use]
     pub const fn elements(self) -> usize {
         self.elements
     }
+    /// Return the checked per-row start of the exact value tail.
     #[must_use]
     pub const fn value_offset(self) -> usize {
         self.value_offset
