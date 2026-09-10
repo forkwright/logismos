@@ -66,7 +66,8 @@ pub mod softmax;
 
 pub use crate::attention::{
     PagedDecodeError, PagedDecodePlan, PagedDecodeResult, PagedDecodeRowsError,
-    PagedDecodeRowsResult, paged_decode_cpu,
+    PagedDecodeRowsResult, PagedPrefillError, PagedPrefillPlan, PagedPrefillResult,
+    PagedPrefillRowsError, PagedPrefillRowsResult, paged_decode_cpu, paged_prefill_cpu,
 };
 pub use crate::causal_conv::{
     CausalConvAllocationPlan, CausalConvError, CausalConvInput, CausalConvOutput, CausalConvResult,
