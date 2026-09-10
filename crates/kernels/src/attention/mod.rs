@@ -671,6 +671,22 @@ pub enum PagedPrefillError {
         #[snafu(implicit)]
         location: snafu::Location,
     },
+
+    /// A checked active query row was absent from the supplied backing.
+    #[snafu(display(
+        "{PAGED_DECODE}: prefill query span {start}..{end} exceeds supplied length {available}"
+    ))]
+    QuerySpan {
+        /// Requested active query-row start.
+        start: usize,
+        /// Requested active query-row end.
+        end: usize,
+        /// Supplied query backing length.
+        available: usize,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }
 
 /// A typed failure from B=1 prefill or one caller-owned row borrow.
@@ -902,24 +918,29 @@ where
                     .build(),
                 }
             })?;
-            let head_output = paged_decode_cpu(
-                query_plan,
-                query_head,
-                &queries[query_start..query_end],
-                &mut key_row,
-                &mut value_row,
-            )
-            .map_err(|error| match error {
-                PagedDecodeRowsError::Kernel { source } => PagedPrefillRowsError::Kernel {
-                    source: PagedPrefillError::Decode { source },
-                },
-                PagedDecodeRowsError::KeyRow { token, source } => {
-                    PagedPrefillRowsError::KeyRow { token, source }
-                }
-                PagedDecodeRowsError::ValueRow { token, source } => {
-                    PagedPrefillRowsError::ValueRow { token, source }
+            let query = queries.get(query_start..query_end).ok_or_else(|| {
+                PagedPrefillRowsError::Kernel {
+                    source: QuerySpanSnafu {
+                        start: query_start,
+                        end: query_end,
+                        available: queries.len(),
+                    }
+                    .build(),
                 }
             })?;
+            let head_output =
+                paged_decode_cpu(query_plan, query_head, query, &mut key_row, &mut value_row)
+                    .map_err(|error| match error {
+                        PagedDecodeRowsError::Kernel { source } => PagedPrefillRowsError::Kernel {
+                            source: PagedPrefillError::Decode { source },
+                        },
+                        PagedDecodeRowsError::KeyRow { token, source } => {
+                            PagedPrefillRowsError::KeyRow { token, source }
+                        }
+                        PagedDecodeRowsError::ValueRow { token, source } => {
+                            PagedPrefillRowsError::ValueRow { token, source }
+                        }
+                    })?;
             output.extend_from_slice(&head_output);
         }
     }
@@ -1623,6 +1644,21 @@ mod tests {
         let packed = PackedPrefillPlan::new(&[TOKENS], &[OFFSET], OFFSET + TOKENS)?;
         let plan =
             PagedPrefillPlan::try_from_packed_prefill(&packed, QUERY_HEADS, KV_HEADS, HEAD_WIDTH)?;
+        assert_eq!(
+            plan.offset(),
+            OFFSET,
+            "lowered offset must preserve the packed committed prefix"
+        );
+        assert_eq!(
+            plan.visible_tokens_for(0)?,
+            OFFSET + 1,
+            "first chunk query must include its own row after the committed prefix"
+        );
+        assert_eq!(
+            plan.visible_tokens_for(TOKENS - 1)?,
+            OFFSET + TOKENS,
+            "last chunk query must reach the checked final visible prefix"
+        );
         let queries = prefill_queries(TOKENS, QUERY_HEADS, HEAD_WIDTH);
         let keys = prefill_rows(OFFSET + TOKENS, KV_HEADS, HEAD_WIDTH, 0.25);
         let values = prefill_rows(OFFSET + TOKENS, KV_HEADS, HEAD_WIDTH, 1.75);
@@ -1641,17 +1677,25 @@ mod tests {
             },
         )?;
         let oracle = prefill_oracle_f64(
-            plan,
+            TOKENS,
+            OFFSET,
             &queries,
             &keys,
             &values,
             QUERY_HEADS,
             KV_HEADS,
             HEAD_WIDTH,
-        )?;
-        assert_eq!(actual.len(), oracle.len());
+        );
+        assert_eq!(
+            actual.len(),
+            oracle.len(),
+            "CPU output must cover every fixture token/query-head/coordinate"
+        );
         for (actual, oracle) in actual.iter().zip(oracle) {
-            assert_relative_eq!(*actual as f64, oracle, epsilon = 1.0e-5_f64);
+            assert!(
+                (*actual as f64 - oracle).abs() <= 1.0e-5_f64,
+                "canonical Q=1 f32 decomposition must agree with the independent f64 oracle: actual={actual}, oracle={oracle}"
+            );
         }
 
         let mut future_mutated = values.clone();
@@ -1700,8 +1744,16 @@ mod tests {
         let packed = PackedPrefillPlan::new(&[1], &[3], 4)?;
         let plan =
             PagedPrefillPlan::try_from_packed_prefill(&packed, QUERY_HEADS, KV_HEADS, HEAD_WIDTH)?;
-        assert_eq!(plan.offset(), 3);
-        assert_eq!(plan.visible_tokens_for(0)?, 4);
+        assert_eq!(
+            plan.offset(),
+            3,
+            "continuation must derive its committed offset"
+        );
+        assert_eq!(
+            plan.visible_tokens_for(0)?,
+            4,
+            "continuation query must include exactly one staged row"
+        );
         let queries = prefill_queries(1, QUERY_HEADS, HEAD_WIDTH);
         let actual = paged_prefill_cpu(
             plan,
@@ -1718,16 +1770,20 @@ mod tests {
             },
         )?;
         let oracle = prefill_oracle_f64(
-            plan,
+            1,
+            3,
             &queries,
             &keys,
             &values,
             QUERY_HEADS,
             KV_HEADS,
             HEAD_WIDTH,
-        )?;
+        );
         for (actual, oracle) in actual.iter().zip(oracle) {
-            assert_relative_eq!(*actual as f64, oracle, epsilon = 1.0e-5_f64);
+            assert!(
+                (*actual as f64 - oracle).abs() <= 1.0e-5_f64,
+                "short continuation must retain the full committed causal prefix: actual={actual}, oracle={oracle}"
+            );
         }
         Ok(())
     }
@@ -1736,18 +1792,61 @@ mod tests {
     fn prefill_plan_refuses_batch_and_overflowing_attention_geometry()
     -> core::result::Result<(), Box<dyn std::error::Error>> {
         let batched = PackedPrefillPlan::new(&[1, 1], &[0, 0], 1)?;
-        assert!(matches!(
-            PagedPrefillPlan::try_from_packed_prefill(&batched, 1, 1, 1),
-            Err(PagedPrefillError::BatchSize { sequences: 2, .. })
-        ));
+        assert!(
+            matches!(
+                PagedPrefillPlan::try_from_packed_prefill(&batched, 1, 1, 1),
+                Err(PagedPrefillError::BatchSize { sequences: 2, .. })
+            ),
+            "B=1 prefill must refuse packed batch geometry"
+        );
 
         let packed = PackedPrefillPlan::new(&[1], &[0], 1)?;
-        assert!(matches!(
-            PagedPrefillPlan::try_from_packed_prefill(&packed, usize::MAX, 1, 2),
-            Err(PagedPrefillError::Decode {
-                source: PagedDecodeError::DimensionOverflow { .. }
-            })
-        ));
+        assert!(
+            matches!(
+                PagedPrefillPlan::try_from_packed_prefill(&packed, usize::MAX, 1, 2),
+                Err(PagedPrefillError::Decode {
+                    source: PagedDecodeError::DimensionOverflow { .. }
+                })
+            ),
+            "prefill must preserve Q1 checked geometry overflow refusal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_cpu_preserves_query_and_provider_refusals()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        let packed = PackedPrefillPlan::new(&[1], &[0], 1)?;
+        let plan = PagedPrefillPlan::try_from_packed_prefill(&packed, 1, 1, 1)?;
+        let short_query = paged_prefill_cpu(
+            plan,
+            &[],
+            |_| Ok::<_, std::io::Error>(&[0.0_f32]),
+            |_| Ok::<_, std::io::Error>(&[0.0_f32]),
+        );
+        assert!(
+            matches!(
+                short_query,
+                Err(PagedPrefillRowsError::Kernel {
+                    source: PagedPrefillError::QueryLengthMismatch { .. }
+                })
+            ),
+            "short active query backing must fail at the prefill result boundary"
+        );
+
+        let provider_failure = paged_prefill_cpu(
+            plan,
+            &[0.0_f32],
+            |_| Err::<&[f32], _>(std::io::Error::other("synthetic key-provider failure")),
+            |_| Ok::<_, std::io::Error>(&[0.0_f32]),
+        );
+        assert!(
+            matches!(
+                provider_failure,
+                Err(PagedPrefillRowsError::KeyRow { token: 0, .. })
+            ),
+            "key-provider failure must retain its absolute cache token and typed result variant"
+        );
         Ok(())
     }
 
@@ -1764,19 +1863,20 @@ mod tests {
     }
 
     fn prefill_oracle_f64(
-        plan: PagedPrefillPlan,
+        tokens: usize,
+        offset: usize,
         queries: &[f32],
         keys: &[f32],
         values: &[f32],
         query_heads: usize,
         kv_heads: usize,
         head_width: usize,
-    ) -> PagedPrefillResult<Vec<f64>> {
+    ) -> Vec<f64> {
         let gqa_group = query_heads / kv_heads;
         let scale = 1.0_f64 / (head_width as f64).sqrt();
         let mut output = Vec::new();
-        for token in 0..plan.tokens() {
-            let visible_tokens = plan.visible_tokens_for(token)?;
+        for token in 0..tokens {
+            let visible_tokens = offset + token + 1;
             for query_head in 0..query_heads {
                 let query_start = (token * query_heads + query_head) * head_width;
                 let query = &queries[query_start..query_start + head_width];
@@ -1811,7 +1911,7 @@ mod tests {
                 }
             }
         }
-        Ok(output)
+        output
     }
 
     #[test]
