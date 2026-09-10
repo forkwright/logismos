@@ -2101,9 +2101,12 @@ mod tests {
             ),
             "a late sequence arithmetic failure must not escape a partial packed result"
         );
-        assert_eq!(
-            state, before,
-            "the caller-owned packed state must remain immutable"
+        assert!(
+            state
+                .iter()
+                .zip(before)
+                .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
+            "the caller-owned packed state must remain bitwise immutable"
         );
         Ok(())
     }
