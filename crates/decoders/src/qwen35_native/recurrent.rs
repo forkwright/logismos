@@ -42,9 +42,11 @@ pub(super) struct NativeRecurrentWorkspace {
     pub(super) activated_convolution: DeviceBuffer<f32>,
     pub(super) tiled_query: DeviceBuffer<f32>,
     pub(super) tiled_key: DeviceBuffer<f32>,
+    pub(super) value_head_major: DeviceBuffer<f32>,
     pub(super) beta: DeviceBuffer<f32>,
     pub(super) log_decay: DeviceBuffer<f32>,
     pub(super) recurrence_output: DeviceBuffer<f32>,
+    pub(super) token_major_recurrence_output: DeviceBuffer<f32>,
     pub(super) normalized_output: DeviceBuffer<f32>,
     pub(super) gated_output: DeviceBuffer<f32>,
     pub(super) projected_attention: DeviceBuffer<f32>,
@@ -144,9 +146,11 @@ impl NativeRecurrentWorkspace {
         let activated_convolution = buffer!(activated_convolution);
         let tiled_query = buffer!(tiled_query);
         let tiled_key = buffer!(tiled_key);
+        let value_head_major = buffer!(value_head_major);
         let beta = buffer!(beta);
         let log_decay = buffer!(log_decay);
         let recurrence_output = buffer!(recurrence_output);
+        let token_major_recurrence_output = buffer!(token_major_recurrence_output);
         let normalized_output = buffer!(normalized_output);
         let gated_output = buffer!(gated_output);
         let projected_attention = buffer!(projected_attention);
@@ -160,9 +164,11 @@ impl NativeRecurrentWorkspace {
             activated_convolution: activated_convolution.commit(),
             tiled_query: tiled_query.commit(),
             tiled_key: tiled_key.commit(),
+            value_head_major: value_head_major.commit(),
             beta: beta.commit(),
             log_decay: log_decay.commit(),
             recurrence_output: recurrence_output.commit(),
+            token_major_recurrence_output: token_major_recurrence_output.commit(),
             normalized_output: normalized_output.commit(),
             gated_output: gated_output.commit(),
             projected_attention: projected_attention.commit(),
@@ -179,9 +185,11 @@ impl NativeRecurrentWorkspace {
         sink.push_f32(self.activated_convolution);
         sink.push_f32(self.tiled_query);
         sink.push_f32(self.tiled_key);
+        sink.push_f32(self.value_head_major);
         sink.push_f32(self.beta);
         sink.push_f32(self.log_decay);
         sink.push_f32(self.recurrence_output);
+        sink.push_f32(self.token_major_recurrence_output);
         sink.push_f32(self.normalized_output);
         sink.push_f32(self.gated_output);
         sink.push_f32(self.projected_attention);
@@ -282,36 +290,40 @@ impl DeferredRecurrent<'_> {
         // SAFETY: each verified matrix binds its exact distinct input/output
         // span; all buffers remain owned by the deferred model resource.
         unsafe {
-            self.weights.qkv.launch(
+            self.weights.qkv.launch_rows(
                 &self.workspace.normalized_hidden,
                 &self.workspace.qkv,
+                self.plan.recurrence.token_count(),
                 self.stream,
                 self.numerical_status,
             )
         }?;
         // SAFETY: each remaining projection has its own exact output span.
         unsafe {
-            self.weights.gate.launch(
+            self.weights.gate.launch_rows(
                 &self.workspace.normalized_hidden,
                 &self.workspace.z,
+                self.plan.recurrence.token_count(),
                 self.stream,
                 self.numerical_status,
             )
         }?;
         // SAFETY: alpha and beta outputs are distinct exact workspace spans.
         unsafe {
-            self.weights.alpha.launch(
+            self.weights.alpha.launch_rows(
                 &self.workspace.normalized_hidden,
                 &self.workspace.alpha,
+                self.plan.recurrence.token_count(),
                 self.stream,
                 self.numerical_status,
             )
         }?;
         // SAFETY: beta projection output remains distinct through completion.
         unsafe {
-            self.weights.beta.launch(
+            self.weights.beta.launch_rows(
                 &self.workspace.normalized_hidden,
                 &self.workspace.beta_projection,
+                self.plan.recurrence.token_count(),
                 self.stream,
                 self.numerical_status,
             )
@@ -352,6 +364,23 @@ impl DeferredRecurrent<'_> {
                 self.numerical_status,
             )
         }
+        .context(NativeKernelSnafu)?;
+        // SAFETY: the value layout gathers every token's checked convolution
+        // tail into distinct head-major storage retained through completion.
+        unsafe {
+            kernels::decoder_ops::launch_recurrent_values_to_head_major_f32_checked(
+                self.plan.workspace.value_layout,
+                self.workspace
+                    .activated_convolution
+                    .as_device_ptr()
+                    .cast_const(),
+                self.workspace.activated_convolution.len(),
+                self.workspace.value_head_major.as_device_ptr(),
+                self.workspace.value_head_major.len(),
+                self.stream,
+                self.numerical_status,
+            )
+        }
         .context(NativeKernelSnafu)
     }
 
@@ -384,11 +413,28 @@ impl DeferredRecurrent<'_> {
     }
 
     unsafe fn submit_output_and_finish(&self) -> Result<()> {
+        // SAFETY: the compact GDN output and token-major destination are exact
+        // disjoint workspace spans retained by this deferred submission.
+        unsafe {
+            kernels::decoder_ops::launch_recurrent_values_to_token_major_f32_checked(
+                self.plan.workspace.value_layout,
+                self.workspace
+                    .recurrence_output
+                    .as_device_ptr()
+                    .cast_const(),
+                self.workspace.recurrence_output.len(),
+                self.workspace.token_major_recurrence_output.as_device_ptr(),
+                self.workspace.token_major_recurrence_output.len(),
+                self.stream,
+                self.numerical_status,
+            )
+        }
+        .context(NativeKernelSnafu)?;
         // SAFETY: each output head is an exact separate RMSNorm row.
         unsafe {
             launch_rms_norm(
                 self.plan.workspace.output_norm,
-                &self.workspace.recurrence_output,
+                &self.workspace.token_major_recurrence_output,
                 &self.weights.output_norm,
                 &self.workspace.normalized_output,
                 self.stream,
@@ -409,9 +455,10 @@ impl DeferredRecurrent<'_> {
         }?;
         // SAFETY: the checked output projection and its spans remain live.
         unsafe {
-            self.weights.output.launch(
+            self.weights.output.launch_rows(
                 &self.workspace.gated_output,
                 &self.workspace.projected_attention,
+                self.plan.recurrence.token_count(),
                 self.stream,
                 self.numerical_status,
             )
@@ -445,7 +492,7 @@ impl DeferredRecurrent<'_> {
         // SAFETY: the checked plan gives zero-length absent history for W=1,
         // otherwise the two state buffers are exact distinct device spans.
         unsafe {
-            kernels::causal_conv::launch_causal_conv_step_f32_checked(
+            kernels::causal_conv::launch_causal_conv_fwd_f32_checked(
                 self.plan.convolution,
                 self.workspace.qkv.as_device_ptr().cast_const(),
                 self.workspace.qkv.len(),
@@ -465,23 +512,17 @@ impl DeferredRecurrent<'_> {
     }
 
     unsafe fn submit_recurrence(&self) -> Result<()> {
-        let value = self
-            .workspace
-            .activated_convolution
-            .as_device_ptr()
-            .wrapping_add(self.plan.workspace.value_tail_offset)
-            .cast_const();
-        // SAFETY: the plan derives the V tail from the activated-convolution
-        // extent, and committed/staged GDN state plus output are distinct.
+        // SAFETY: the plan derives compact V from each activated-convolution
+        // row, and committed/staged GDN state plus output are distinct.
         unsafe {
-            kernels::gdn::launch_multi_head_recurrent_step_f32_checked(
+            kernels::gdn::launch_multi_head_recurrent_fwd_f32_checked(
                 self.plan.recurrence,
                 self.workspace.tiled_query.as_device_ptr().cast_const(),
                 self.workspace.tiled_query.len(),
                 self.workspace.tiled_key.as_device_ptr().cast_const(),
                 self.workspace.tiled_key.len(),
-                value,
-                self.plan.workspace.value_tail_elements,
+                self.workspace.value_head_major.as_device_ptr().cast_const(),
+                self.workspace.value_head_major.len(),
                 self.workspace.beta.as_device_ptr().cast_const(),
                 self.workspace.beta.len(),
                 self.workspace.log_decay.as_device_ptr().cast_const(),
