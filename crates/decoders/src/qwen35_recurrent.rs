@@ -5,7 +5,8 @@
 //! finite payload parameters and persistent state to the verified artifact.
 
 use kernels::{
-    CausalConvInput, MultiHeadRecurrentInput, causal_conv_fwd, multi_head_recurrent_fwd,
+    PackedCausalConvInput, PackedMultiHeadRecurrentInput, PackedPrefillPlan,
+    packed_causal_conv_fwd, packed_multi_head_recurrent_fwd,
 };
 use loader::gguf::GgmlType;
 use quant::f32_row::F32Row;
@@ -203,11 +204,45 @@ impl Qwen35RecurrentExecution {
     /// one of the bounded CPU reference operators rejects the step.
     pub fn step(&mut self, hidden_tokens: &[f32]) -> Result<Vec<f32>> {
         let token_count = self.token_count(hidden_tokens)?;
+        // NOTE: standalone recurrent arithmetic owns no model-context grant.
+        // Its descriptor is deliberately operation-relative rather than a
+        // claim about a caller's persisted decoder position.
+        let packed =
+            PackedPrefillPlan::new(&[token_count], &[0], token_count).context(RecurrentCpuSnafu)?;
+        self.step_with_packed(hidden_tokens, token_count, &packed)
+    }
+
+    /// Execute one checked B=1 packed chunk at the model owner's position.
+    ///
+    /// The caller owns model context and supplies the descriptor; this layer
+    /// only checks that its one recurrent state can consume that one sequence.
+    pub(crate) fn step_packed_at(
+        &mut self,
+        hidden_tokens: &[f32],
+        packed: &PackedPrefillPlan,
+    ) -> Result<Vec<f32>> {
+        let token_count = self.token_count(hidden_tokens)?;
+        if packed.sequence_count() != 1 || packed.sequence_length(0) != Some(token_count) {
+            return RecurrentInputSnafu {
+                hidden: self.layout.hidden,
+                actual: hidden_tokens.len(),
+            }
+            .fail();
+        }
+        self.step_with_packed(hidden_tokens, token_count, packed)
+    }
+
+    fn step_with_packed(
+        &mut self,
+        hidden_tokens: &[f32],
+        token_count: usize,
+        packed: &PackedPrefillPlan,
+    ) -> Result<Vec<f32>> {
         let allocations = RecurrentStepAllocations::try_from_layout(self.layout, token_count)?;
         let normalized = self.normalize_input(hidden_tokens, token_count)?;
         let projected = self.project_inputs(token_count, &normalized, &allocations)?;
         drop(normalized);
-        let recurrent = self.run_recurrence(token_count, projected, &allocations)?;
+        let recurrent = self.run_recurrence(token_count, projected, &allocations, packed)?;
         let output =
             self.project_output(token_count, &recurrent.output, &recurrent.z, &allocations)?;
 
@@ -338,11 +373,12 @@ impl Qwen35RecurrentExecution {
         token_count: usize,
         projected: ProjectedInputs,
         allocations: &RecurrentStepAllocations,
+        packed: &PackedPrefillPlan,
     ) -> Result<RecurrentOutput> {
         let scalars = self.recurrence_scalars(token_count, &projected, allocations)?;
-        let convolution = self.convolve(token_count, &projected.qkv)?;
+        let convolution = self.convolve(token_count, &projected.qkv, packed)?;
         let inputs = self.arrange_recurrence(token_count, convolution.output(), allocations)?;
-        let recurrence = MultiHeadRecurrentInput::new(
+        let recurrence = PackedMultiHeadRecurrentInput::new(
             &inputs.q,
             &inputs.k,
             &inputs.v,
@@ -350,14 +386,14 @@ impl Qwen35RecurrentExecution {
             &scalars.gate,
             self.layout.gdn_scale,
             &self.recurrent_state,
-            token_count,
+            packed,
             self.layout.value_head_count,
             self.layout.value_head_count,
             self.layout.key_dim,
             self.layout.value_dim,
         )
         .context(RecurrentGdnSnafu)?;
-        let recurrence = multi_head_recurrent_fwd(&recurrence).context(RecurrentGdnSnafu)?;
+        let recurrence = packed_multi_head_recurrent_fwd(&recurrence).context(RecurrentGdnSnafu)?;
         Ok(RecurrentOutput {
             output: heads_to_tokens(
                 recurrence.output(),
@@ -416,17 +452,29 @@ impl Qwen35RecurrentExecution {
         Ok(RecurrenceScalars { beta, gate })
     }
 
-    fn convolve(&self, token_count: usize, qkv: &[f32]) -> Result<kernels::CausalConvOutput> {
-        let convolution = CausalConvInput::new(
+    fn convolve(
+        &self,
+        token_count: usize,
+        qkv: &[f32],
+        packed: &PackedPrefillPlan,
+    ) -> Result<kernels::PackedCausalConvOutput> {
+        let convolution = PackedCausalConvInput::new(
             qkv,
             &self.ssm_conv,
             &self.convolution_history,
-            token_count,
+            packed,
             self.layout.conv_width,
             self.layout.conv_kernel,
         )
         .context(RecurrentConvolutionSnafu)?;
-        causal_conv_fwd(&convolution).context(RecurrentConvolutionSnafu)
+        if packed.sequence_length(0) != Some(token_count) {
+            return RecurrentInputSnafu {
+                hidden: self.layout.hidden,
+                actual: qkv.len(),
+            }
+            .fail();
+        }
+        packed_causal_conv_fwd(&convolution).context(RecurrentConvolutionSnafu)
     }
 
     fn arrange_recurrence(
@@ -759,6 +807,7 @@ struct RecurrentStepAllocations {
     log_decay: usize,
     gate_heads: usize,
     causal_convolution: kernels::CausalConvAllocationPlan,
+    packed_causal_staging: usize,
     convolution_silu: usize,
     grouped_query: usize,
     normalized_query: usize,
@@ -820,6 +869,13 @@ impl RecurrentStepAllocations {
         .context(RecurrentConvolutionSnafu)?;
         let convolution_silu =
             kernels::cpu_f32::unary_output_elements(causal_convolution.output_elements());
+        let packed_causal_staging = sum_elements(
+            &[
+                causal_convolution.output_elements(),
+                causal_convolution.history_elements(),
+            ],
+            "packed causal-convolution sequence staging",
+        )?;
         let grouped_key_elements = checked_product(
             token_count,
             layout.key_width,
@@ -871,6 +927,7 @@ impl RecurrentStepAllocations {
             log_decay: scalar_elements,
             gate_heads: scalar_elements,
             causal_convolution,
+            packed_causal_staging,
             convolution_silu,
             grouped_query: grouped_key_elements,
             normalized_query: grouped_key_elements,
@@ -944,6 +1001,7 @@ impl RecurrentStepAllocations {
                 retained_scalars,
                 self.causal_convolution.output_elements(),
                 self.causal_convolution.history_elements(),
+                self.packed_causal_staging,
             ],
             "recurrent causal-convolution phase",
         )?;

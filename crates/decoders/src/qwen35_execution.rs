@@ -1,6 +1,7 @@
 //! Bounded CPU token-to-logits execution for a verified Qwen3.5 payload.
 
 use cache::{PagedAppend, PagedKvGeometry, PagedKvPlan, PagedKvPool};
+use kernels::PackedPrefillPlan;
 use loader::gguf::{GgmlType, MetaValue, MetaValueType};
 use quant::f32_row::F32Row;
 use snafu::ResultExt;
@@ -277,6 +278,8 @@ impl StagedExecution {
         let mut logits = reserve("token logits", total)?;
         for (token_index, token_id) in token_ids.iter().enumerate() {
             let mut hidden = self.embed(*token_id)?;
+            let packed = PackedPrefillPlan::new(&[1], &[self.position], self.layout.max_context)
+                .context(ExecutionCpuSnafu)?;
             for block in 0..self.layout.main_blocks {
                 let weights = &self.weights;
                 let layout = self.layout;
@@ -289,7 +292,9 @@ impl StagedExecution {
                     .build()
                 })?;
                 let attention = match layer {
-                    LayerState::Recurrent(execution) => execution.step(&hidden)?,
+                    LayerState::Recurrent(execution) => {
+                        execution.step_packed_at(&hidden, &packed)?
+                    }
                     LayerState::Full(full_layer) => full_attention(
                         weights,
                         layout,

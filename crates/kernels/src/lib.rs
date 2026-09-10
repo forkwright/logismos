@@ -53,6 +53,7 @@ pub mod gdn;
 #[cfg(feature = "gpu")]
 pub mod matmul;
 pub mod numerical_status;
+pub mod packed_prefill;
 #[cfg(feature = "gpu")]
 pub mod paged_kv;
 #[cfg(feature = "gpu")]
@@ -69,11 +70,13 @@ pub use crate::attention::{
 };
 pub use crate::causal_conv::{
     CausalConvAllocationPlan, CausalConvError, CausalConvInput, CausalConvOutput, CausalConvResult,
-    causal_conv_fwd,
+    PackedCausalConvInput, PackedCausalConvOutput, causal_conv_fwd, packed_causal_conv_fwd,
 };
 pub use crate::error::{Error, Result};
 pub use crate::gdn::{
     GdnError, GdnResult, MultiHeadRecurrentAllocationPlan, MultiHeadRecurrentInput,
-    MultiHeadRecurrentOutput, RecurrentInput, RecurrentOutput, multi_head_recurrent_fwd,
+    MultiHeadRecurrentOutput, PackedMultiHeadRecurrentInput, PackedMultiHeadRecurrentOutput,
+    RecurrentInput, RecurrentOutput, multi_head_recurrent_fwd, packed_multi_head_recurrent_fwd,
     recurrent_fwd,
 };
+pub use crate::packed_prefill::PackedPrefillPlan;

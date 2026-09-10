@@ -399,6 +399,20 @@ pub enum Error {
         location: snafu::Location,
     },
 
+    /// Packed-prefill descriptor could not reserve its checked sequence records.
+    #[snafu(display("packed prefill {allocation} allocation for {entries} records failed"))]
+    PackedPrefillAllocation {
+        /// Named descriptor allocation.
+        allocation: &'static str,
+        /// Exact checked record count.
+        entries: usize,
+        /// Allocation failure.
+        source: std::collections::TryReserveError,
+        /// Source code location where the error was reported.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     #[cfg(feature = "gpu")]
     /// Build was produced without the HIP kernel archive (e.g. `hipcc`
     /// was absent). CPU references still work; GPU paths return this.
