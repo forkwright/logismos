@@ -300,11 +300,6 @@ impl DeferredFullAttention<'_> {
 
     unsafe fn append_and_attend(&self, append: &mut NativePagedAppend<'_>) -> Result<()> {
         let workspace = self.workspace;
-        let attention = NativeBufferView::prefix(&workspace.attention, self.plan.attention)?;
-        let gate = NativeBufferView::prefix(&workspace.gate, self.plan.gate_values)?;
-        let gated = NativeBufferView::prefix(&workspace.gated, self.plan.gated)?;
-        let output_projection =
-            NativeBufferView::prefix(&workspace.output_projection, self.plan.output_projection)?;
         // SAFETY: the opaque append owner validates its reservation-sized
         // active prefixes inside these retained capacity allocations.
         unsafe {
@@ -341,6 +336,11 @@ impl DeferredFullAttention<'_> {
 
     unsafe fn project_attention(&self) -> Result<()> {
         let workspace = self.workspace;
+        let attention = NativeBufferView::prefix(&workspace.attention, self.plan.attention)?;
+        let gate = NativeBufferView::prefix(&workspace.gate, self.plan.gate_values)?;
+        let gated = NativeBufferView::prefix(&workspace.gated, self.plan.gated)?;
+        let output_projection =
+            NativeBufferView::prefix(&workspace.output_projection, self.plan.output_projection)?;
         // SAFETY: this method's caller retains the checked exact elementwise
         // spans and sticky status allocation through completion.
         unsafe {
