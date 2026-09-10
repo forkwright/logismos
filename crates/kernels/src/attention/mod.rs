@@ -553,7 +553,7 @@ impl PagedPrefillPlan {
     /// active row in this chunk.
     pub fn visible_tokens_for(self, token: usize) -> PagedPrefillResult<usize> {
         if token >= self.tokens {
-            return PrefillTokenOutOfRangeSnafu {
+            return TokenOutOfRangeSnafu {
                 token,
                 tokens: self.tokens,
             }
