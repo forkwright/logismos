@@ -678,6 +678,7 @@ fn compile_sources(
                 || name == "recurrent_layout_f32.hip"
                 || name == "recurrent_scalars_f32.hip"
                 || name == "paged_decode_q1.hip"
+                || name == "paged_prefill_b1.hip"
         }) {
             // WHY: these correctness baselines retain separately rounded f32
             // operations. Scope no-fast-math and no contraction to their
