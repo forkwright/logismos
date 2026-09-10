@@ -10,8 +10,8 @@ use crate::qwen35::tests::{
     verify_fixture,
 };
 use crate::{
-    Qwen35NativeExecutionPlan, Qwen35NativeLayerPlan, Qwen35NativeLayerSessionState,
-    Qwen35NativeExecutionSession, Qwen35NativeSessionState, Qwen35Weights,
+    Qwen35NativeExecutionPlan, Qwen35NativeExecutionSession, Qwen35NativeLayerPlan,
+    Qwen35NativeLayerSessionState, Qwen35NativeSessionState, Qwen35Weights,
 };
 
 const FULL_ATTENTION_BLOCK: usize = 3;
@@ -156,8 +156,18 @@ fn reserved_device_native_main_model_prefill_matches_terminal_f64_oracle_and_con
     let mut session = unsafe { plan.into_session(&device) }.map_err(|error| error.to_string())?;
     let mut oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
 
-    assert_native_prefill_terminal(&mut session, &mut oracle, &MODEL_PREFILL_FIRST, "first chunk")?;
-    assert_native_prefill_terminal(&mut session, &mut oracle, &MODEL_PREFILL_SHORT, "short chunk")?;
+    assert_native_prefill_terminal(
+        &mut session,
+        &mut oracle,
+        &MODEL_PREFILL_FIRST,
+        "first chunk",
+    )?;
+    assert_native_prefill_terminal(
+        &mut session,
+        &mut oracle,
+        &MODEL_PREFILL_SHORT,
+        "short chunk",
+    )?;
     assert_native_prefill_terminal(
         &mut session,
         &mut oracle,
@@ -196,8 +206,8 @@ fn reserved_device_native_prefill_constructor_preserves_capacity_and_legacy_sess
     .map_err(|error| error.to_string())?;
     // SAFETY: an admitted three-token transaction is the device witness that
     // `try_from_weights_prefill(...).into_session` retained its exact capacity.
-    let mut explicit = unsafe { explicit.into_session(&device) }
-        .map_err(|error| error.to_string())?;
+    let mut explicit =
+        unsafe { explicit.into_session(&device) }.map_err(|error| error.to_string())?;
     let mut oracle = CanonicalHybridOracle::from_fixture(&fixture)?;
     assert_native_prefill_terminal(
         &mut explicit,

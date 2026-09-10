@@ -280,12 +280,8 @@ impl ModelBlockPlans {
         capacity: &PackedPrefillPlan,
     ) -> Result<()> {
         let plan = DeviceRecurrentPlan::from_packed_prefill(weights, block, capacity)?;
-        let finish = LayerFinishPlan::from_weights_rows(
-            weights,
-            layout,
-            block,
-            capacity.total_tokens(),
-        )?;
+        let finish =
+            LayerFinishPlan::from_weights_rows(weights, layout, block, capacity.total_tokens())?;
         self.recurrent_workspace.get_or_insert(plan.workspace);
         self.finish_workspace.get_or_insert(finish.workspace);
         self.finish_workspace_bytes
@@ -421,15 +417,12 @@ fn checked_sum(left: usize, right: usize, context: &'static str) -> Result<usize
 }
 
 fn hidden_row_elements(layout: Layout, max_chunk_tokens: usize) -> Result<usize> {
-    layout
-        .hidden
-        .checked_mul(max_chunk_tokens)
-        .ok_or_else(|| {
-            ArithmeticOverflowSnafu {
-                context: "native prefill hidden row elements",
-            }
-            .build()
-        })
+    layout.hidden.checked_mul(max_chunk_tokens).ok_or_else(|| {
+        ArithmeticOverflowSnafu {
+            context: "native prefill hidden row elements",
+        }
+        .build()
+    })
 }
 
 fn verify_vocabulary_matrix(
@@ -667,7 +660,12 @@ mod tests {
 
         assert_eq!(token.max_chunk_tokens, 1);
         assert_eq!(chunk.max_chunk_tokens, CAPACITY);
-        assert_eq!(chunk.hidden_row_elements().map_err(|error| error.to_string())?, 9);
+        assert_eq!(
+            chunk
+                .hidden_row_elements()
+                .map_err(|error| error.to_string())?,
+            9
+        );
         assert_eq!(chunk.bytes.weights, token.bytes.weights);
         assert_eq!(chunk.bytes.key_values, token.bytes.key_values);
         assert_eq!(chunk.bytes.page_table, token.bytes.page_table);
@@ -679,11 +677,20 @@ mod tests {
             chunk.bytes.recurrent_history_staged,
             token.bytes.recurrent_history_staged
         );
-        assert_eq!(chunk.bytes.recurrent_state_active, token.bytes.recurrent_state_active);
-        assert_eq!(chunk.bytes.recurrent_state_staged, token.bytes.recurrent_state_staged);
+        assert_eq!(
+            chunk.bytes.recurrent_state_active,
+            token.bytes.recurrent_state_active
+        );
+        assert_eq!(
+            chunk.bytes.recurrent_state_staged,
+            token.bytes.recurrent_state_staged
+        );
         assert_eq!(chunk.bytes.final_normalized, token.bytes.final_normalized);
         assert_eq!(chunk.bytes.logits, token.bytes.logits);
-        assert_eq!(chunk.bytes.full_workspace, token.bytes.full_workspace * CAPACITY);
+        assert_eq!(
+            chunk.bytes.full_workspace,
+            token.bytes.full_workspace * CAPACITY
+        );
         assert_eq!(
             chunk.bytes.recurrent_workspace,
             token.bytes.recurrent_workspace * CAPACITY

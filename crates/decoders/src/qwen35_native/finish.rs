@@ -6,13 +6,11 @@ use hipcore::{DeviceBuffer, Stream};
 use snafu::ResultExt;
 
 use super::custody::{NativeBufferSink, NativeBuildResult, NativeBuildScope};
-use super::dispatch::{
-    launch_residual_view, launch_rms_norm_view, launch_silu_mul_view,
-};
-use super::resources::NativeBufferView;
+use super::dispatch::{launch_residual_view, launch_rms_norm_view, launch_silu_mul_view};
 use super::plan::{
     F32Parameter, ProjectionWeight, dimension, elements_bytes, f32_parameter, projection, sum,
 };
+use super::resources::NativeBufferView;
 use super::weights::{NativeMatrix, f32_parameter_buffer};
 use crate::error::{NativeKernelSnafu, NativeSessionStateSnafu};
 use crate::qwen35_execution::{Layout, block_name};

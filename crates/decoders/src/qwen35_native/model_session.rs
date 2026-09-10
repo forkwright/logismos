@@ -1225,8 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_prefill_plan_retains_capacity_in_its_checked_demand()
-    -> Result<(), String> {
+    fn explicit_prefill_plan_retains_capacity_in_its_checked_demand() -> Result<(), String> {
         const CONTEXT: usize = 16;
         const CAPACITY: usize = 3;
         let artifact = verify_fixture(&canonical_hybrid_fixture_with_context(CONTEXT)?)?;
@@ -1247,8 +1246,14 @@ mod tests {
         .map_err(|error| error.to_string())?;
 
         assert_eq!(chunk.demand.weight_bytes(), token.demand.weight_bytes());
-        assert_eq!(chunk.demand.key_value_bytes(), token.demand.key_value_bytes());
-        assert_eq!(chunk.demand.page_table_bytes(), token.demand.page_table_bytes());
+        assert_eq!(
+            chunk.demand.key_value_bytes(),
+            token.demand.key_value_bytes()
+        );
+        assert_eq!(
+            chunk.demand.page_table_bytes(),
+            token.demand.page_table_bytes()
+        );
         assert_eq!(
             chunk.demand.recurrent_history_active_bytes(),
             token.demand.recurrent_history_active_bytes()

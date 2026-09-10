@@ -225,23 +225,44 @@ impl NativeRecurrentWorkspace {
         plan: RecurrentWorkspacePlan,
     ) -> Result<NativeRecurrentWorkspaceViews<'_>> {
         Ok(NativeRecurrentWorkspaceViews {
-            normalized_hidden: NativeBufferView::prefix(&self.normalized_hidden, plan.normalized_hidden)?,
+            normalized_hidden: NativeBufferView::prefix(
+                &self.normalized_hidden,
+                plan.normalized_hidden,
+            )?,
             qkv: NativeBufferView::prefix(&self.qkv, plan.qkv)?,
             z: NativeBufferView::prefix(&self.z, plan.z)?,
             alpha: NativeBufferView::prefix(&self.alpha, plan.alpha)?,
             beta_projection: NativeBufferView::prefix(&self.beta_projection, plan.beta_projection)?,
             raw_convolution: NativeBufferView::prefix(&self.raw_convolution, plan.raw_convolution)?,
-            activated_convolution: NativeBufferView::prefix(&self.activated_convolution, plan.activated_convolution)?,
+            activated_convolution: NativeBufferView::prefix(
+                &self.activated_convolution,
+                plan.activated_convolution,
+            )?,
             tiled_query: NativeBufferView::prefix(&self.tiled_query, plan.tiled_query)?,
             tiled_key: NativeBufferView::prefix(&self.tiled_key, plan.tiled_key)?,
-            value_head_major: NativeBufferView::prefix(&self.value_head_major, plan.value_head_major)?,
+            value_head_major: NativeBufferView::prefix(
+                &self.value_head_major,
+                plan.value_head_major,
+            )?,
             beta: NativeBufferView::prefix(&self.beta, plan.beta)?,
             log_decay: NativeBufferView::prefix(&self.log_decay, plan.log_decay)?,
-            recurrence_output: NativeBufferView::prefix(&self.recurrence_output, plan.recurrence_output)?,
-            token_major_recurrence_output: NativeBufferView::prefix(&self.token_major_recurrence_output, plan.token_major_recurrence_output)?,
-            normalized_output: NativeBufferView::prefix(&self.normalized_output, plan.normalized_output)?,
+            recurrence_output: NativeBufferView::prefix(
+                &self.recurrence_output,
+                plan.recurrence_output,
+            )?,
+            token_major_recurrence_output: NativeBufferView::prefix(
+                &self.token_major_recurrence_output,
+                plan.token_major_recurrence_output,
+            )?,
+            normalized_output: NativeBufferView::prefix(
+                &self.normalized_output,
+                plan.normalized_output,
+            )?,
             gated_output: NativeBufferView::prefix(&self.gated_output, plan.gated_output)?,
-            projected_attention: NativeBufferView::prefix(&self.projected_attention, plan.projected_attention)?,
+            projected_attention: NativeBufferView::prefix(
+                &self.projected_attention,
+                plan.projected_attention,
+            )?,
         })
     }
 }
@@ -404,9 +425,7 @@ impl DeferredRecurrent<'_> {
         unsafe {
             kernels::decoder_ops::launch_recurrent_qk_l2_f32_checked(
                 self.plan.workspace.qk_l2,
-                self.workspace
-                    .activated_convolution
-                    .as_const_ptr(),
+                self.workspace.activated_convolution.as_const_ptr(),
                 self.workspace.activated_convolution.len(),
                 self.workspace.tiled_query.as_mut_ptr(),
                 self.workspace.tiled_query.len(),
@@ -422,9 +441,7 @@ impl DeferredRecurrent<'_> {
         unsafe {
             kernels::decoder_ops::launch_recurrent_values_to_head_major_f32_checked(
                 self.plan.workspace.value_layout,
-                self.workspace
-                    .activated_convolution
-                    .as_const_ptr(),
+                self.workspace.activated_convolution.as_const_ptr(),
                 self.workspace.activated_convolution.len(),
                 self.workspace.value_head_major.as_mut_ptr(),
                 self.workspace.value_head_major.len(),
@@ -469,9 +486,7 @@ impl DeferredRecurrent<'_> {
         unsafe {
             kernels::decoder_ops::launch_recurrent_values_to_token_major_f32_checked(
                 self.plan.workspace.value_layout,
-                self.workspace
-                    .recurrence_output
-                    .as_const_ptr(),
+                self.workspace.recurrence_output.as_const_ptr(),
                 self.workspace.recurrence_output.len(),
                 self.workspace.token_major_recurrence_output.as_mut_ptr(),
                 self.workspace.token_major_recurrence_output.len(),
@@ -485,7 +500,10 @@ impl DeferredRecurrent<'_> {
             launch_rms_norm_view(
                 self.plan.workspace.output_norm,
                 self.workspace.token_major_recurrence_output,
-                NativeBufferView::prefix(&self.weights.output_norm, self.weights.output_norm.len())?,
+                NativeBufferView::prefix(
+                    &self.weights.output_norm,
+                    self.weights.output_norm.len(),
+                )?,
                 self.workspace.normalized_output,
                 self.stream,
                 self.numerical_status,
@@ -781,7 +799,9 @@ mod tests {
         let finish =
             LayerFinishPlan::from_weights_rows(&weights, layout, RECURRENT_BLOCK, TOKEN_COUNT)
                 .map_err(|error| error.to_string())?;
-        let active_plan = plan.active(TOKEN_COUNT).map_err(|error| error.to_string())?;
+        let active_plan = plan
+            .active(TOKEN_COUNT)
+            .map_err(|error| error.to_string())?;
         let active_finish = finish
             .active(layout, TOKEN_COUNT)
             .map_err(|error| error.to_string())?;

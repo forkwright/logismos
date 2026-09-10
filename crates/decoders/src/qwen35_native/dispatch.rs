@@ -226,9 +226,7 @@ impl DeferredFullAttention<'_> {
             )
         }?;
         // SAFETY: the controls and rotated Q span are distinct exact buffers.
-        unsafe {
-            self.rotate_rows(normalized_query, normalized_key, stream)
-        }
+        unsafe { self.rotate_rows(normalized_query, normalized_key, stream) }
     }
 
     unsafe fn rotate_rows(
@@ -244,11 +242,8 @@ impl DeferredFullAttention<'_> {
         for token in 0..token_count {
             let query_offset = row_offset(token, query_row_elements, "native query rotary row")?;
             let key_offset = row_offset(token, key_row_elements, "native key rotary row")?;
-            let coefficient_offset = row_offset(
-                token,
-                coefficient_elements,
-                "native MRoPE coefficient row",
-            )?;
+            let coefficient_offset =
+                row_offset(token, coefficient_elements, "native MRoPE coefficient row")?;
             checked_buffer_window(normalized_query.len(), query_offset, query_row_elements)?;
             checked_buffer_window(normalized_key.len(), key_offset, key_row_elements)?;
             let query = NativeBufferView::window(
@@ -266,11 +261,8 @@ impl DeferredFullAttention<'_> {
                 coefficient_offset,
                 coefficient_elements,
             )?;
-            let sine = NativeBufferView::window(
-                self.step.sine,
-                coefficient_offset,
-                coefficient_elements,
-            )?;
+            let sine =
+                NativeBufferView::window(self.step.sine, coefficient_offset, coefficient_elements)?;
             // SAFETY: each row view is a checked disjoint window and controls
             // are immutable token-major coefficients retained through completion.
             unsafe {

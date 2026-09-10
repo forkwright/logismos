@@ -4,11 +4,11 @@ use kernels::PackedPrefillPlan;
 use snafu::ResultExt;
 
 use super::model_plan::DeviceModelPlan;
+use crate::Result;
 use crate::error::{
     ArithmeticOverflowSnafu, ExecutionAllocationSnafu, ExecutionPagedPrefillPlanSnafu,
     NativeKernelSnafu, NativeSessionStateSnafu,
 };
-use crate::Result;
 
 /// Complete action-free geometry admitted before a native model allocates,
 /// reserves K/V, or submits a chunk.
@@ -41,8 +41,9 @@ impl ModelChunkPlan {
             }
             .fail();
         }
-        let packed = PackedPrefillPlan::new(&[tokens.len()], &[position], plan.layout.max_context())
-            .context(NativeKernelSnafu)?;
+        let packed =
+            PackedPrefillPlan::new(&[tokens.len()], &[position], plan.layout.max_context())
+                .context(NativeKernelSnafu)?;
         let next_position = position.checked_add(packed.total_tokens()).ok_or_else(|| {
             ArithmeticOverflowSnafu {
                 context: "native model chunk next position",
@@ -128,8 +129,8 @@ mod tests {
         let invalid = u32::try_from(plan.layout.vocabulary()).map_err(|error| error.to_string())?;
 
         assert!(ModelChunkPlan::from_model(&plan, 0, &[0, 1, invalid]).is_err());
-        let retry = ModelChunkPlan::from_model(&plan, 0, &[0, 1])
-            .map_err(|error| error.to_string())?;
+        let retry =
+            ModelChunkPlan::from_model(&plan, 0, &[0, 1]).map_err(|error| error.to_string())?;
         assert_eq!(
             retry.packed.committed_offset(0),
             Some(0),
@@ -153,9 +154,11 @@ mod tests {
     fn model_chunk_plan_keeps_one_position_and_derives_page_crossing_geometry()
     -> core::result::Result<(), String> {
         let plan = model_plan()?;
-        let chunk = ModelChunkPlan::from_model(&plan, 7, &[0, 1, 2])
-            .map_err(|error| error.to_string())?;
-        let attention = chunk.attention.ok_or("canonical model needs paged attention")?;
+        let chunk =
+            ModelChunkPlan::from_model(&plan, 7, &[0, 1, 2]).map_err(|error| error.to_string())?;
+        let attention = chunk
+            .attention
+            .ok_or("canonical model needs paged attention")?;
 
         assert_eq!(chunk.packed.sequence_count(), 1);
         assert_eq!(chunk.packed.committed_offset(0), Some(7));

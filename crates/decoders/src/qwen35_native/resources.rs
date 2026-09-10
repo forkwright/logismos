@@ -156,12 +156,9 @@ impl DeviceResources {
             1,
             self.plan.workspace.query_rotary.coefficient_elements(),
         )?;
-        let packed = kernels::PackedPrefillPlan::new(
-            &[1],
-            &[self.position],
-            self.plan.layout.max_context(),
-        )
-        .context(NativeKernelSnafu)?;
+        let packed =
+            kernels::PackedPrefillPlan::new(&[1], &[self.position], self.plan.layout.max_context())
+                .context(NativeKernelSnafu)?;
         let logical = kernels::PagedPrefillPlan::try_from_packed_prefill(
             &packed,
             self.plan.layout.heads,

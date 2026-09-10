@@ -1106,14 +1106,10 @@ impl ModelSessionResources {
                     let active = recurrent.plan.active(token_count)?;
                     let workspace = workspace.active(active.workspace)?;
                     let finish = recurrent.finish.active(self.plan.layout, token_count)?;
-                    let input = NativeBufferView::prefix(
-                        input,
-                        active.workspace.input_norm.elements(),
-                    )?;
-                    let output = NativeBufferView::prefix(
-                        output,
-                        active.workspace.input_norm.elements(),
-                    )?;
+                    let input =
+                        NativeBufferView::prefix(input, active.workspace.input_norm.elements())?;
+                    let output =
+                        NativeBufferView::prefix(output, active.workspace.input_norm.elements())?;
                     let deferred = DeferredRecurrent {
                         plan: &active,
                         weights: &resources.weights,
@@ -1142,14 +1138,17 @@ impl ModelSessionResources {
         let final_offset = token_count
             .checked_sub(1)
             .and_then(|token| token.checked_mul(self.plan.layout.hidden))
-            .ok_or_else(|| NativeSessionStateSnafu {
-                rule: "native model submission requires one active chunk token",
-            }
-            .build())?;
-        let final_hidden =
-            NativeBufferView::window(input, final_offset, self.plan.layout.hidden)?;
-        let output_norm = NativeBufferView::prefix(&self.model.output_norm, self.model.output_norm.len())?;
-        let normalized = NativeBufferView::prefix(&self.final_normalized, self.final_normalized.len())?;
+            .ok_or_else(|| {
+                NativeSessionStateSnafu {
+                    rule: "native model submission requires one active chunk token",
+                }
+                .build()
+            })?;
+        let final_hidden = NativeBufferView::window(input, final_offset, self.plan.layout.hidden)?;
+        let output_norm =
+            NativeBufferView::prefix(&self.model.output_norm, self.model.output_norm.len())?;
+        let normalized =
+            NativeBufferView::prefix(&self.final_normalized, self.final_normalized.len())?;
         // SAFETY: this model owns the exact terminal hidden, norm, and logits spans through completion.
         unsafe {
             launch_rms_norm_view(
@@ -1479,13 +1478,9 @@ mod tests {
         let artifact = verify_fixture(&canonical_hybrid_fixture_with_context(RESIDENT_CONTEXT)?)?;
         let weights =
             Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
-        let resident = DeviceModelPlan::from_weights_prefill(
-            &weights,
-            RESIDENT_CONTEXT,
-            1,
-            PAGE_TOKENS,
-        )
-            .map_err(|error| error.to_string())?;
+        let resident =
+            DeviceModelPlan::from_weights_prefill(&weights, RESIDENT_CONTEXT, 1, PAGE_TOKENS)
+                .map_err(|error| error.to_string())?;
         let session = derive_session_plan(&weights, &resident, SESSION_CONTEXT, 1)
             .map_err(|error| error.to_string())?;
 

@@ -356,27 +356,23 @@ impl WorkspacePlan {
         )
         .context(NativeKernelSnafu)?;
         let query_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(
-            token_count
-                .checked_mul(layout.heads)
-                .ok_or_else(|| {
-                    ArithmeticOverflowSnafu {
-                        context: "native full-attention query-normalization rows",
-                    }
-                    .build()
-                })?,
+            token_count.checked_mul(layout.heads).ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "native full-attention query-normalization rows",
+                }
+                .build()
+            })?,
             layout.key,
             layout.epsilon(),
         )
         .context(NativeKernelSnafu)?;
         let key_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(
-            token_count
-                .checked_mul(layout.kv_heads)
-                .ok_or_else(|| {
-                    ArithmeticOverflowSnafu {
-                        context: "native full-attention key-normalization rows",
-                    }
-                    .build()
-                })?,
+            token_count.checked_mul(layout.kv_heads).ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "native full-attention key-normalization rows",
+                }
+                .build()
+            })?,
             layout.key,
             layout.epsilon(),
         )
@@ -504,17 +500,20 @@ pub(super) fn sum(values: &[usize], context: &'static str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::WorkspacePlan;
+    use crate::Qwen35Weights;
     use crate::qwen35::tests::{canonical_hybrid_fixture, verify_fixture};
     use crate::qwen35_execution::Layout;
-    use crate::Qwen35Weights;
 
     #[test]
     fn full_attention_rows_own_token_major_active_geometry() -> core::result::Result<(), String> {
         let artifact = verify_fixture(&canonical_hybrid_fixture()?)?;
-        let weights = Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let weights =
+            Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
         let layout = Layout::from_metadata(&weights, 4).map_err(|error| error.to_string())?;
-        let capacity = WorkspacePlan::from_layout_rows(layout, 3).map_err(|error| error.to_string())?;
-        let active = WorkspacePlan::from_layout_rows(layout, 2).map_err(|error| error.to_string())?;
+        let capacity =
+            WorkspacePlan::from_layout_rows(layout, 3).map_err(|error| error.to_string())?;
+        let active =
+            WorkspacePlan::from_layout_rows(layout, 2).map_err(|error| error.to_string())?;
 
         assert_eq!(capacity.hidden_norm.rows(), 3);
         assert_eq!(active.hidden_norm.rows(), 2);
@@ -526,7 +525,9 @@ mod tests {
         assert_eq!(active.key, 2 * layout.kv_width);
         assert_eq!(active.value, 2 * layout.kv_width);
         assert_eq!(
-            active.coefficient_elements().map_err(|error| error.to_string())?,
+            active
+                .coefficient_elements()
+                .map_err(|error| error.to_string())?,
             2 * active.query_rotary.coefficient_elements() * 2,
             "MRoPE controls remain token-major despite one-row rotary launches"
         );
