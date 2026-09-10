@@ -1543,6 +1543,6 @@ mod tests {
         assert!(driver.released.is_empty());
         assert_eq!(driver.unresolved_output, Some(62));
         assert_eq!(driver.final_output, None);
-        assert_eq!(logits, [0.0]);
+        assert_eq!(logits.map(f32::to_bits), [0.0_f32.to_bits()]);
     }
 }
