@@ -1,9 +1,10 @@
 //! Executor-owned logical CPU allocation requirements for Qwen3.5.
 
 use cache::PagedKvPlan;
+use kernels::PackedPrefillPlan;
 use loader::gguf::ArtifactDigest;
 
-use crate::error::ArithmeticOverflowSnafu;
+use crate::error::{ArithmeticOverflowSnafu, ExecutionBatchSnafu};
 use crate::qwen35::Qwen35RecurrentLayout;
 use crate::qwen35_execution::{
     Layout, Qwen35LogitSelection, embedding_workspace_elements, full_attention_retained_elements,
@@ -32,6 +33,29 @@ pub struct Qwen35CpuRequirements {
     max_context: usize,
     max_step_tokens: usize,
     selection: Qwen35LogitSelection,
+}
+
+/// Conservative logical CPU backing envelope for one atomic multi-session execution.
+///
+/// Each session retains independent private state and serialized artifact
+/// backing even when every receipt identifies identical content. The aggregate
+/// executes private arithmetic one sequence at a time, so transient workspace
+/// is the maximum per-owner plan bound rather than a sum. As with
+/// [`Qwen35CpuRequirements`], these fields exclude allocator capacity,
+/// metadata, stack or structure storage, RSS, and separately reported artifact
+/// backing from the logical `f32` total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35BatchCpuRequirements {
+    artifact_digest: ArtifactDigest,
+    serialized_backing_upper_bound_bytes: u64,
+    retained_bytes: u64,
+    transaction_copy_bytes: u64,
+    workspace_upper_bound_bytes: u64,
+    returned_logits_bytes: u64,
+    logical_f32_upper_bound_bytes: u64,
+    sequence_count: usize,
+    total_tokens: usize,
+    max_context: usize,
 }
 
 impl Qwen35CpuRequirements {
@@ -142,6 +166,133 @@ impl Qwen35CpuRequirements {
     #[must_use]
     pub const fn selection(self) -> Qwen35LogitSelection {
         self.selection
+    }
+}
+
+impl Qwen35BatchCpuRequirements {
+    pub(crate) fn try_from_receipts(
+        receipts: impl IntoIterator<Item = Qwen35CpuRequirements>,
+        packed: &PackedPrefillPlan,
+    ) -> Result<Self> {
+        let mut receipts = receipts.into_iter();
+        let first = receipts.next().ok_or_else(|| {
+            ExecutionBatchSnafu {
+                sequence: 0,
+                rule: "batch requirements require at least one execution receipt",
+            }
+            .build()
+        })?;
+        let mut serialized_backing_upper_bound_bytes = first.serialized_backing_bytes;
+        let mut retained_bytes = first.retained_bytes;
+        let mut transaction_copy_bytes = first.transaction_copy_bytes;
+        let mut returned_logits_bytes = first.returned_logits_bytes;
+        let mut workspace_upper_bound_bytes = first.workspace_upper_bound_bytes;
+
+        for receipt in receipts {
+            serialized_backing_upper_bound_bytes = checked_bytes_add(
+                serialized_backing_upper_bound_bytes,
+                receipt.serialized_backing_bytes,
+                "batch serialized backing upper bound",
+            )?;
+            retained_bytes = checked_bytes_add(
+                retained_bytes,
+                receipt.retained_bytes,
+                "batch retained backing",
+            )?;
+            transaction_copy_bytes = checked_bytes_add(
+                transaction_copy_bytes,
+                receipt.transaction_copy_bytes,
+                "batch recurrent transaction copies",
+            )?;
+            returned_logits_bytes = checked_bytes_add(
+                returned_logits_bytes,
+                receipt.returned_logits_bytes,
+                "batch selected returned logits",
+            )?;
+            workspace_upper_bound_bytes =
+                workspace_upper_bound_bytes.max(receipt.workspace_upper_bound_bytes);
+        }
+        let logical_f32_upper_bound_bytes = checked_bytes_sum(
+            &[
+                retained_bytes,
+                transaction_copy_bytes,
+                workspace_upper_bound_bytes,
+                returned_logits_bytes,
+            ],
+            "batch logical f32 upper bound",
+        )?;
+        Ok(Self {
+            artifact_digest: first.artifact_digest,
+            serialized_backing_upper_bound_bytes,
+            retained_bytes,
+            transaction_copy_bytes,
+            workspace_upper_bound_bytes,
+            returned_logits_bytes,
+            logical_f32_upper_bound_bytes,
+            sequence_count: packed.sequence_count(),
+            total_tokens: packed.total_tokens(),
+            max_context: packed.max_context(),
+        })
+    }
+
+    /// Return the common verified digest checked during aggregate admission.
+    #[must_use]
+    pub const fn artifact_digest(self) -> ArtifactDigest {
+        self.artifact_digest
+    }
+
+    /// Return conservative serialized backing across every independently owned session.
+    #[must_use]
+    pub const fn serialized_backing_upper_bound_bytes(self) -> u64 {
+        self.serialized_backing_upper_bound_bytes
+    }
+
+    /// Return the sum of retained private executor backing across owners.
+    #[must_use]
+    pub const fn retained_bytes(self) -> u64 {
+        self.retained_bytes
+    }
+
+    /// Return the sum of separately staged recurrent transaction backing across owners.
+    #[must_use]
+    pub const fn transaction_copy_bytes(self) -> u64 {
+        self.transaction_copy_bytes
+    }
+
+    /// Return the largest private per-owner transient workspace bound.
+    #[must_use]
+    pub const fn workspace_upper_bound_bytes(self) -> u64 {
+        self.workspace_upper_bound_bytes
+    }
+
+    /// Return the sum of owner-selected returned-logit plan bounds.
+    #[must_use]
+    pub const fn returned_logits_bytes(self) -> u64 {
+        self.returned_logits_bytes
+    }
+
+    /// Return retained, transaction-copy, maximal workspace, and returned-logit backing.
+    #[must_use]
+    pub const fn logical_f32_upper_bound_bytes(self) -> u64 {
+        self.logical_f32_upper_bound_bytes
+    }
+
+    /// Return the number of independently owned sequences in the aggregate plan.
+    #[must_use]
+    pub const fn sequence_count(self) -> usize {
+        self.sequence_count
+    }
+
+    /// Return the total admitted sequence-major token count.
+    #[must_use]
+    pub const fn total_tokens(self) -> usize {
+        self.total_tokens
+    }
+
+    /// Return the maximum independently validated owner context bound.
+    #[must_use]
+    pub const fn max_context(self) -> usize {
+        self.max_context
     }
 }
 
@@ -313,6 +464,18 @@ fn checked_product(left: usize, right: usize, context: &'static str) -> Result<u
 fn checked_add(left: usize, right: usize, context: &'static str) -> Result<usize> {
     left.checked_add(right)
         .ok_or_else(|| ArithmeticOverflowSnafu { context }.build())
+}
+
+fn checked_bytes_add(left: u64, right: u64, context: &'static str) -> Result<u64> {
+    left.checked_add(right)
+        .ok_or_else(|| ArithmeticOverflowSnafu { context }.build())
+}
+
+fn checked_bytes_sum(values: &[u64], context: &'static str) -> Result<u64> {
+    values
+        .iter()
+        .copied()
+        .try_fold(0_u64, |sum, value| checked_bytes_add(sum, value, context))
 }
 
 fn sum_elements(elements: &[usize], context: &'static str) -> Result<usize> {

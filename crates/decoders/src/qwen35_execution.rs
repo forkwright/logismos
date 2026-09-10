@@ -19,6 +19,10 @@ use crate::qwen35_mrope::{TextMrope, text_mrope_coefficient};
 use crate::qwen35_requirements::Qwen35CpuRequirements;
 use crate::{Qwen35RecurrentExecution, Qwen35Weights, Result};
 
+mod batch;
+
+pub use batch::Qwen35BatchExecutionPlan;
+
 const CONTEXT_LENGTH_KEY: &str = "qwen35.context_length";
 const ROPE_SECTIONS_KEY: &str = "qwen35.rope.dimension_sections";
 const ROPE_FREQ_BASE_KEY: &str = "qwen35.rope.freq_base";
@@ -69,6 +73,7 @@ pub struct Qwen35Execution {
     layers: Vec<LayerState>,
     paged_kv_pool: Option<PagedKvPool>,
     position: usize,
+    requirements: Qwen35CpuRequirements,
 }
 
 #[derive(Debug)]
@@ -139,7 +144,7 @@ impl Qwen35ExecutionPlan {
             max_step_tokens,
             selection,
             paged_kv_plan,
-            requirements: _,
+            requirements,
         } = self;
         let block_count = layout.main_blocks;
         let mut layers = reserve("main-block execution slots", block_count)?;
@@ -176,6 +181,7 @@ impl Qwen35ExecutionPlan {
             layers,
             paged_kv_pool,
             position: 0,
+            requirements,
         })
     }
 
@@ -202,6 +208,37 @@ impl Qwen35Execution {
     /// Returns [`crate::Error`] without committing state if a token, payload
     /// projection, checked allocation, or finite CPU operation is invalid.
     pub fn step(&mut self, token_ids: &[u32]) -> Result<Vec<f32>> {
+        self.validate_step(token_ids)?;
+        let packed = PackedPrefillPlan::new(
+            &[token_ids.len()],
+            &[self.position],
+            self.layout.max_context,
+        )
+        .context(ExecutionCpuSnafu)?;
+        let staged = self.stage()?;
+        let (layers, position, paged_kv_pool) = (
+            &mut self.layers,
+            &mut self.position,
+            &mut self.paged_kv_pool,
+        );
+        let pending = batch::PendingExecution::stage(
+            staged,
+            layers,
+            position,
+            paged_kv_pool,
+            token_ids,
+            &packed,
+            0,
+        )?;
+        let (prepared_owner, prepared_commit, logits) = pending.prepare()?;
+        if let Some(prepared_commit) = prepared_commit {
+            prepared_commit.commit();
+        }
+        prepared_owner.publish();
+        Ok(logits)
+    }
+
+    fn validate_step(&self, token_ids: &[u32]) -> Result<()> {
         if token_ids.is_empty() {
             return ExecutionContextSnafu {
                 requested: 0_usize,
@@ -222,22 +259,27 @@ impl Qwen35Execution {
             }
             .fail();
         }
-        let mut staged = self.stage()?;
-        let mut append = self
-            .paged_kv_pool
-            .as_mut()
-            .map(|pool| {
-                pool.begin_append(token_ids.len())
-                    .context(ExecutionPagedKvSnafu)
-            })
-            .transpose()?;
-        let logits = staged.step_staged(token_ids, append.as_mut())?;
-        if let Some(append) = append {
-            append.commit().context(ExecutionPagedKvSnafu)?;
+        self.validate_token_ids(token_ids)
+    }
+
+    fn validate_token_ids(&self, token_ids: &[u32]) -> Result<()> {
+        for &token_id in token_ids {
+            let token = usize::try_from(token_id).map_err(|_| {
+                ExecutionTokenSnafu {
+                    token_id,
+                    vocabulary: self.layout.vocabulary,
+                }
+                .build()
+            })?;
+            if token >= self.layout.vocabulary {
+                return ExecutionTokenSnafu {
+                    token_id,
+                    vocabulary: self.layout.vocabulary,
+                }
+                .fail();
+            }
         }
-        self.layers = staged.layers;
-        self.position = staged.position;
-        Ok(logits)
+        Ok(())
     }
 
     fn stage(&self) -> Result<StagedExecution> {
@@ -272,18 +314,55 @@ impl StagedExecution {
     fn step_staged(
         &mut self,
         token_ids: &[u32],
+        packed: &PackedPrefillPlan,
+        sequence: usize,
         mut append: Option<&mut PagedAppend<'_>>,
     ) -> Result<Vec<f32>> {
+        let sequence_tokens = packed.sequence_length(sequence).ok_or_else(|| {
+            ExecutionContextSnafu {
+                requested: sequence,
+                rule: "packed execution sequence must exist",
+            }
+            .build()
+        })?;
+        if sequence_tokens != token_ids.len() {
+            return ExecutionContextSnafu {
+                requested: token_ids.len(),
+                rule: "packed execution sequence length must match supplied token ids",
+            }
+            .fail();
+        }
+        let sequence_position = packed.committed_offset(sequence).ok_or_else(|| {
+            ExecutionContextSnafu {
+                requested: sequence,
+                rule: "packed execution sequence must retain its committed offset",
+            }
+            .build()
+        })?;
+        let sequence_end = sequence_position
+            .checked_add(sequence_tokens)
+            .ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "packed execution sequence end",
+                }
+                .build()
+            })?;
         let total = returned_logits_elements(self.layout, token_ids.len(), self.selection)?;
         let mut logits = reserve("token logits", total)?;
         for (token_index, token_id) in token_ids.iter().enumerate() {
             let mut hidden = self.embed(*token_id)?;
-            let packed = PackedPrefillPlan::new(&[1], &[self.position], self.layout.max_context)
-                .context(ExecutionCpuSnafu)?;
+            let position = sequence_position.checked_add(token_index).ok_or_else(|| {
+                ArithmeticOverflowSnafu {
+                    context: "packed execution token position",
+                }
+                .build()
+            })?;
+            let recurrent_packed =
+                PackedPrefillPlan::new(&[1], &[position], self.layout.max_context)
+                    .context(ExecutionCpuSnafu)?;
             for block in 0..self.layout.main_blocks {
                 let weights = &self.weights;
                 let layout = self.layout;
-                let position = self.position;
                 let layer = self.layers.get_mut(block).ok_or_else(|| {
                     ExecutionContextSnafu {
                         requested: block,
@@ -293,7 +372,7 @@ impl StagedExecution {
                 })?;
                 let attention = match layer {
                     LayerState::Recurrent(execution) => {
-                        execution.step_packed_at(&hidden, &packed)?
+                        execution.step_packed_at(&hidden, &recurrent_packed)?
                     }
                     LayerState::Full(full_layer) => full_attention(
                         weights,
@@ -346,13 +425,8 @@ impl StagedExecution {
                     lm_head.vocabulary_projection,
                 )?);
             }
-            self.position = self.position.checked_add(1).ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "execution position increment",
-                }
-                .build()
-            })?;
         }
+        self.position = sequence_end;
         Ok(logits)
     }
 
