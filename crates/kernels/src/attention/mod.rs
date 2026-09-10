@@ -1307,35 +1307,72 @@ impl NativePagedPrefillPlan {
             physical_pages,
             logical_pages,
             key_value_elements,
-            abi_tokens: native_abi_u32("tokens", logical.tokens()).map_err(|source| PagedPrefillError::Native { source })?,
-            abi_work_items: native_abi_u32("tokens * query_heads", logical.tokens().checked_mul(logical.query_heads()).ok_or_else(|| PrefillDimensionOverflowSnafu { dimensions: "tokens * query_heads" }.build())?).map_err(|source| PagedPrefillError::Native { source })?,
-            abi_offset: native_abi_u32("offset", logical.offset()).map_err(|source| PagedPrefillError::Native { source })?,
-            abi_query_heads: native_abi_u32("query_heads", logical.query_heads()).map_err(|source| PagedPrefillError::Native { source })?,
-            abi_kv_heads: native_abi_u32("kv_heads", logical.kv_heads()).map_err(|source| PagedPrefillError::Native { source })?,
-            abi_head_width: native_abi_u32("head_width", logical.head_width()).map_err(|source| PagedPrefillError::Native { source })?,
-            abi_page_tokens: native_abi_u32("page_tokens", page_tokens.get()).map_err(|source| PagedPrefillError::Native { source })?,
-            abi_physical_pages: native_abi_u32("physical_pages", physical_pages).map_err(|source| PagedPrefillError::Native { source })?,
+            abi_tokens: native_abi_u32("tokens", logical.tokens())
+                .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_work_items: native_abi_u32(
+                "tokens * query_heads",
+                logical
+                    .tokens()
+                    .checked_mul(logical.query_heads())
+                    .ok_or_else(|| {
+                        PrefillDimensionOverflowSnafu {
+                            dimensions: "tokens * query_heads",
+                        }
+                        .build()
+                    })?,
+            )
+            .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_offset: native_abi_u32("offset", logical.offset())
+                .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_query_heads: native_abi_u32("query_heads", logical.query_heads())
+                .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_kv_heads: native_abi_u32("kv_heads", logical.kv_heads())
+                .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_head_width: native_abi_u32("head_width", logical.head_width())
+                .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_page_tokens: native_abi_u32("page_tokens", page_tokens.get())
+                .map_err(|source| PagedPrefillError::Native { source })?,
+            abi_physical_pages: native_abi_u32("physical_pages", physical_pages)
+                .map_err(|source| PagedPrefillError::Native { source })?,
         })
     }
 
     #[must_use]
-    pub const fn logical(self) -> PagedPrefillPlan { self.logical }
+    pub const fn logical(self) -> PagedPrefillPlan {
+        self.logical
+    }
     #[must_use]
-    pub const fn tokens(self) -> usize { self.logical.tokens() }
+    pub const fn tokens(self) -> usize {
+        self.logical.tokens()
+    }
     #[must_use]
-    pub const fn visible_tokens(self) -> usize { self.logical.visible_tokens() }
+    pub const fn visible_tokens(self) -> usize {
+        self.logical.visible_tokens()
+    }
     #[must_use]
-    pub const fn page_tokens(self) -> NativePageTokens { self.page_tokens }
+    pub const fn page_tokens(self) -> NativePageTokens {
+        self.page_tokens
+    }
     #[must_use]
-    pub const fn physical_pages(self) -> usize { self.physical_pages }
+    pub const fn physical_pages(self) -> usize {
+        self.physical_pages
+    }
     #[must_use]
-    pub const fn page_table_entries(self) -> usize { self.logical_pages }
+    pub const fn page_table_entries(self) -> usize {
+        self.logical_pages
+    }
     #[must_use]
-    pub const fn query_elements(self) -> usize { self.logical.query_elements() }
+    pub const fn query_elements(self) -> usize {
+        self.logical.query_elements()
+    }
     #[must_use]
-    pub const fn output_elements(self) -> usize { self.logical.output_elements() }
+    pub const fn output_elements(self) -> usize {
+        self.logical.output_elements()
+    }
     #[must_use]
-    pub const fn key_value_elements(self) -> usize { self.key_value_elements }
+    pub const fn key_value_elements(self) -> usize {
+        self.key_value_elements
+    }
 }
 
 /// Launch checked B=1 causal multiquery paged attention.
@@ -1361,34 +1398,91 @@ pub unsafe fn launch_paged_prefill_b1_f32_checked(
 ) -> KernelResult<()> {
     #[cfg(logismos_no_gpu_kernels)]
     {
-        let _ = (plan, query_f32, query_elements, keys_f32, key_elements, values_f32, value_elements, page_table_u32, page_table_entries, output_f32, output_elements, stream, status);
-        NoGpuBuildSnafu { kernel: PAGED_PREFILL_KERNEL }.fail()
+        let _ = (
+            plan,
+            query_f32,
+            query_elements,
+            keys_f32,
+            key_elements,
+            values_f32,
+            value_elements,
+            page_table_u32,
+            page_table_entries,
+            output_f32,
+            output_elements,
+            stream,
+            status,
+        );
+        NoGpuBuildSnafu {
+            kernel: PAGED_PREFILL_KERNEL,
+        }
+        .fail()
     }
     #[cfg(not(logismos_no_gpu_kernels))]
     {
-        validate_paged_prefill_launch(plan, query_f32, query_elements, keys_f32, key_elements, values_f32, value_elements, page_table_u32, page_table_entries, output_f32, output_elements)?;
+        validate_paged_prefill_launch(
+            plan,
+            query_f32,
+            query_elements,
+            keys_f32,
+            key_elements,
+            values_f32,
+            value_elements,
+            page_table_u32,
+            page_table_entries,
+            output_f32,
+            output_elements,
+        )?;
         stream.make_current()?;
         let code = unsafe {
             logismos_launch_paged_prefill_b1_f32(
-                query_f32.cast::<c_void>(), keys_f32.cast::<c_void>(), values_f32.cast::<c_void>(),
-                page_table_u32.cast::<c_void>(), output_f32.cast::<c_void>(), plan.abi_tokens, plan.abi_work_items,
-                plan.abi_offset, plan.abi_query_heads, plan.abi_kv_heads, plan.abi_head_width,
-                plan.abi_page_tokens, plan.abi_physical_pages, plan.logical.scale(),
-                status.as_device_ptr().cast::<c_void>(), stream.raw().cast::<c_void>(),
+                query_f32.cast::<c_void>(),
+                keys_f32.cast::<c_void>(),
+                values_f32.cast::<c_void>(),
+                page_table_u32.cast::<c_void>(),
+                output_f32.cast::<c_void>(),
+                plan.abi_tokens,
+                plan.abi_work_items,
+                plan.abi_offset,
+                plan.abi_query_heads,
+                plan.abi_kv_heads,
+                plan.abi_head_width,
+                plan.abi_page_tokens,
+                plan.abi_physical_pages,
+                plan.logical.scale(),
+                status.as_device_ptr().cast::<c_void>(),
+                stream.raw().cast::<c_void>(),
             )
         };
-        if code == 0 { Ok(()) } else {
-            LaunchSnafu { kernel: PAGED_PREFILL_KERNEL, kind: hipcore::ErrorKind::from_raw(code), code }.fail()
+        if code == 0 {
+            Ok(())
+        } else {
+            LaunchSnafu {
+                kernel: PAGED_PREFILL_KERNEL,
+                kind: hipcore::ErrorKind::from_raw(code),
+                code,
+            }
+            .fail()
         }
     }
 }
 
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
-#[expect(clippy::too_many_arguments, reason = "native prefill validation mirrors the fixed launch ABI")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "native prefill validation mirrors the fixed launch ABI"
+)]
 fn validate_paged_prefill_launch(
-    plan: NativePagedPrefillPlan, query_f32: *const f32, query_elements: usize,
-    keys_f32: *const f32, key_elements: usize, values_f32: *const f32, value_elements: usize,
-    page_table_u32: *const u32, page_table_entries: usize, output_f32: *mut f32,
+    plan: NativePagedPrefillPlan,
+    query_f32: *const f32,
+    query_elements: usize,
+    keys_f32: *const f32,
+    key_elements: usize,
+    values_f32: *const f32,
+    value_elements: usize,
+    page_table_u32: *const u32,
+    page_table_entries: usize,
+    output_f32: *mut f32,
     output_elements: usize,
 ) -> KernelResult<()> {
     validate_native_prefix_length("query", query_elements, plan.query_elements())?;
@@ -1396,19 +1490,49 @@ fn validate_paged_prefill_launch(
     validate_native_length("values", value_elements, plan.key_value_elements())?;
     validate_native_length("page table", page_table_entries, plan.page_table_entries())?;
     validate_native_prefix_length("output", output_elements, plan.output_elements())?;
-    let query = checked_f32_device_span(PAGED_PREFILL_KERNEL, query_f32, plan.query_elements(), "query")?;
+    let query = checked_f32_device_span(
+        PAGED_PREFILL_KERNEL,
+        query_f32,
+        plan.query_elements(),
+        "query",
+    )?;
     let keys = checked_f32_device_span(PAGED_PREFILL_KERNEL, keys_f32, key_elements, "keys")?;
-    let values = checked_f32_device_span(PAGED_PREFILL_KERNEL, values_f32, value_elements, "values")?;
-    let table = checked_device_span(PAGED_PREFILL_KERNEL, page_table_u32, page_table_entries, "page table")?;
-    let output = checked_f32_device_span(PAGED_PREFILL_KERNEL, output_f32.cast_const(), plan.output_elements(), "output")?;
-    for input in [query, keys, values, table] { reject_overlapping_device_spans(PAGED_PREFILL_KERNEL, output, input)?; }
+    let values =
+        checked_f32_device_span(PAGED_PREFILL_KERNEL, values_f32, value_elements, "values")?;
+    let table = checked_device_span(
+        PAGED_PREFILL_KERNEL,
+        page_table_u32,
+        page_table_entries,
+        "page table",
+    )?;
+    let output = checked_f32_device_span(
+        PAGED_PREFILL_KERNEL,
+        output_f32.cast_const(),
+        plan.output_elements(),
+        "output",
+    )?;
+    for input in [query, keys, values, table] {
+        reject_overlapping_device_spans(PAGED_PREFILL_KERNEL, output, input)?;
+    }
     Ok(())
 }
 
 #[cfg(all(feature = "gpu", any(test, not(logismos_no_gpu_kernels))))]
-fn validate_native_prefix_length(name: &'static str, actual: usize, required: usize) -> KernelResult<()> {
-    if actual >= required { Ok(()) } else {
-        UnsupportedShapeSnafu { kernel: PAGED_PREFILL_KERNEL, msg: format!("{name} length {actual} does not cover native prefill active extent {required}") }.fail()
+fn validate_native_prefix_length(
+    name: &'static str,
+    actual: usize,
+    required: usize,
+) -> KernelResult<()> {
+    if actual >= required {
+        Ok(())
+    } else {
+        UnsupportedShapeSnafu {
+            kernel: PAGED_PREFILL_KERNEL,
+            msg: format!(
+                "{name} length {actual} does not cover native prefill active extent {required}"
+            ),
+        }
+        .fail()
     }
 }
 
@@ -2082,15 +2206,37 @@ mod tests {
         let b8 = NativePagedPrefillPlan::try_from_paged_prefill(logical, 8, 3)?;
         let b16 = NativePagedPrefillPlan::try_from_paged_prefill(logical, 16, 3)?;
         let b32 = NativePagedPrefillPlan::try_from_paged_prefill(logical, 32, 3)?;
-        assert_eq!(b8.tokens(), 2, "native descriptor must retain active chunk length");
-        assert_eq!(b8.visible_tokens(), 9, "native descriptor must retain final causal prefix");
-        assert_eq!(b8.page_table_entries(), 2, "B8 must cross the offset-seven page boundary");
-        assert_eq!(b16.page_table_entries(), 1, "B16 must retain one page for the same prefix");
-        assert_eq!(b32.page_table_entries(), 1, "B32 must retain one page for the same prefix");
+        assert_eq!(
+            b8.tokens(),
+            2,
+            "native descriptor must retain active chunk length"
+        );
+        assert_eq!(
+            b8.visible_tokens(),
+            9,
+            "native descriptor must retain final causal prefix"
+        );
+        assert_eq!(
+            b8.page_table_entries(),
+            2,
+            "B8 must cross the offset-seven page boundary"
+        );
+        assert_eq!(
+            b16.page_table_entries(),
+            1,
+            "B16 must retain one page for the same prefix"
+        );
+        assert_eq!(
+            b32.page_table_entries(),
+            1,
+            "B32 must retain one page for the same prefix"
+        );
         assert!(
             matches!(
                 NativePagedPrefillPlan::try_from_paged_prefill(logical, 8, 0),
-                Err(PagedPrefillError::Native { source: PagedDecodeError::ZeroDimension { .. } })
+                Err(PagedPrefillError::Native {
+                    source: PagedDecodeError::ZeroDimension { .. }
+                })
             ),
             "native prefill must preserve physical-page admission refusal"
         );
