@@ -577,3 +577,229 @@ fn zeroed_buffer(
         .map_err(NativeBuildSource::decoder)?;
     Ok(buffer)
 }
+
+#[cfg(test)]
+mod tests {
+    use hipcore::{Device, Stream};
+
+    use super::{
+        DeferredRecurrent, NativeRecurrentState, NativeRecurrentWeights, NativeRecurrentWorkspace,
+    };
+    use crate::Qwen35Weights;
+    use crate::qwen35::tests::{
+        CanonicalHybridOracle, assert_f32_matches_f64, canonical_hybrid_fixture, verify_fixture,
+    };
+    use crate::qwen35_execution::Layout;
+    use crate::qwen35_native::custody::{NativeBufferSink, NativeBuildScope};
+    use crate::qwen35_native::finish::{LayerFinishPlan, LayerFinishWeights, LayerFinishWorkspace};
+    use crate::qwen35_native::model_resources::build_numerical_status;
+    use crate::qwen35_native::recurrent_plan::DeviceRecurrentPlan;
+    use kernels::PackedPrefillPlan;
+
+    const RECURRENT_BLOCK: usize = 0;
+    const RECURRENT_BLOCK_LAYER: u64 = 0;
+    const TOKEN_COUNT: usize = 3;
+
+    struct RecurrentWitnessResources {
+        stream: Stream,
+        numerical_status: kernels::numerical_status::NativeNumericalStatus,
+        native_weights: NativeRecurrentWeights,
+        recurrent_workspace: NativeRecurrentWorkspace,
+        state: NativeRecurrentState,
+        finish_weights: LayerFinishWeights,
+        finish_workspace: LayerFinishWorkspace,
+        input: hipcore::DeviceBuffer<f32>,
+        output: hipcore::DeviceBuffer<f32>,
+    }
+
+    impl RecurrentWitnessResources {
+        /// Retain every submitted owner when completion cannot be established.
+        fn retain_unconfirmed(self) {
+            core::mem::forget(self);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an operator-reserved visible gfx1100 device; source tests do not qualify hardware"]
+    fn reserved_device_native_recurrent_rows_match_cpu_block_and_staged_state()
+    -> core::result::Result<(), String> {
+        let fixture = canonical_hybrid_fixture()?;
+        let artifact = verify_fixture(&fixture)?;
+        let weights =
+            Qwen35Weights::try_from_verified(&artifact).map_err(|error| error.to_string())?;
+        let packed = PackedPrefillPlan::new(&[TOKEN_COUNT], &[0], TOKEN_COUNT)
+            .map_err(|error| error.to_string())?;
+        let plan = DeviceRecurrentPlan::from_packed_prefill(&weights, RECURRENT_BLOCK, &packed)
+            .map_err(|error| error.to_string())?;
+        let hidden = recurrent_witness_input(TOKEN_COUNT, plan.layout.hidden())?;
+        let layout =
+            Layout::from_metadata(&weights, TOKEN_COUNT).map_err(|error| error.to_string())?;
+        let finish =
+            LayerFinishPlan::from_weights_rows(&weights, layout, RECURRENT_BLOCK, TOKEN_COUNT)
+                .map_err(|error| error.to_string())?;
+        let (expected_hidden, expected_history, expected_state) =
+            cpu_recurrent_expectations(&weights, &fixture, &hidden, &packed)?;
+
+        let device = Device::new(0).map_err(|error| format!("open reserved device: {error}"))?;
+        let stream =
+            Stream::new_tracked(&device).map_err(|error| format!("create stream: {error}"))?;
+        let scope = NativeBuildScope::new();
+        let numerical_status = scope.guard(
+            build_numerical_status(&device, &scope).map_err(|error| error.to_string())?,
+            |status, sink| sink.push_u32(status.into_buffer()),
+        );
+        let native_weights = scope.guard(
+            NativeRecurrentWeights::upload(&weights, &plan, &device, &scope)
+                .map_err(|error| error.to_string())?,
+            NativeRecurrentWeights::into_buffer_sink,
+        );
+        let recurrent_workspace = scope.guard(
+            NativeRecurrentWorkspace::new(&plan.workspace, &device, &scope)
+                .map_err(|error| error.to_string())?,
+            NativeRecurrentWorkspace::into_buffer_sink,
+        );
+        let state = scope.guard(
+            NativeRecurrentState::new(&plan, &device, &scope).map_err(|error| error.to_string())?,
+            NativeRecurrentState::into_buffer_sink,
+        );
+        let finish_weights = scope.guard(
+            LayerFinishWeights::upload(&weights, &finish, &device, &scope)
+                .map_err(|error| error.to_string())?,
+            LayerFinishWeights::into_buffer_sink,
+        );
+        let finish_workspace = scope.guard(
+            LayerFinishWorkspace::new(finish.workspace, &device, &scope)
+                .map_err(|error| error.to_string())?,
+            LayerFinishWorkspace::into_buffer_sink,
+        );
+        let mut input = scope
+            .allocate_f32(&device, hidden.len())
+            .map_err(|error| error.to_string())?;
+        input
+            .copy_from_host(&hidden)
+            .map_err(|error| format!("upload recurrent rows: {error}"))?;
+        let output = scope
+            .allocate_f32(&device, hidden.len())
+            .map_err(|error| error.to_string())?;
+
+        let resources = RecurrentWitnessResources {
+            stream,
+            numerical_status: numerical_status.commit(),
+            native_weights: native_weights.commit(),
+            recurrent_workspace: recurrent_workspace.commit(),
+            state: state.commit(),
+            finish_weights: finish_weights.commit(),
+            finish_workspace: finish_workspace.commit(),
+            input: input.commit(),
+            output: output.commit(),
+        };
+        let deferred = DeferredRecurrent {
+            plan: &plan,
+            weights: &resources.native_weights,
+            workspace: &resources.recurrent_workspace,
+            state: &resources.state,
+            input: &resources.input,
+            output: &resources.output,
+            finish_plan: &finish,
+            finish_weights: &resources.finish_weights,
+            finish_workspace: &resources.finish_workspace,
+            stream: &resources.stream,
+            numerical_status: &resources.numerical_status,
+        };
+
+        // SAFETY: this ignored witness owns every exact checked input, output,
+        // state, workspace, weight, status, and stream allocation through its
+        // completion check on the operator-reserved device.
+        let submitted = unsafe { deferred.submit() };
+        drop(deferred);
+        if let Err(error) = submitted {
+            resources.retain_unconfirmed();
+            return Err(error.to_string());
+        }
+        if let Err(error) = resources.stream.synchronize() {
+            resources.retain_unconfirmed();
+            return Err(format!("synchronize recurrent rows: {error}"));
+        }
+        resources
+            .numerical_status
+            .read_after_synchronization()
+            .map_err(|error| error.to_string())?;
+
+        let actual_hidden = copy_to_host(&resources.output, "native recurrent hidden")?;
+        let actual_history = match &resources.state.staged_convolution_history {
+            Some(history) => copy_to_host(history, "native recurrent staged history")?,
+            None => Vec::new(),
+        };
+        let actual_state = copy_to_host(
+            &resources.state.staged_recurrent_state,
+            "native recurrent staged GDN state",
+        )?;
+        assert_f32_matches_f64(
+            &actual_hidden,
+            &expected_hidden,
+            "native recurrent complete rows",
+        )?;
+        assert_f32_matches_f64(
+            &actual_history,
+            &expected_history,
+            "native recurrent staged history",
+        )?;
+        assert_f32_matches_f64(
+            &actual_state,
+            &expected_state,
+            "native recurrent staged GDN state",
+        )?;
+        Ok(())
+    }
+
+    fn recurrent_witness_input(
+        token_count: usize,
+        hidden: usize,
+    ) -> core::result::Result<Vec<f32>, String> {
+        const VALUES: [f32; 3] = [0.25, -0.5, 0.75];
+        let elements = token_count
+            .checked_mul(hidden)
+            .ok_or("recurrent witness input extent overflow")?;
+        Ok((0..elements)
+            .map(|index| VALUES[index % VALUES.len()])
+            .collect())
+    }
+
+    fn cpu_recurrent_expectations(
+        weights: &Qwen35Weights,
+        fixture: &crate::qwen35::tests::Fixture,
+        hidden: &[f32],
+        packed: &PackedPrefillPlan,
+    ) -> core::result::Result<(Vec<f64>, Vec<f64>, Vec<f64>), String> {
+        let mut recurrent = weights
+            .recurrent_execution(RECURRENT_BLOCK_LAYER)
+            .map_err(|error| error.to_string())?;
+        recurrent
+            .step_packed_at(hidden, packed)
+            .map_err(|error| error.to_string())?;
+        let (history, state) = recurrent.transaction_state_for_test();
+        let mut oracle = CanonicalHybridOracle::from_fixture(fixture)?;
+        let row_width = hidden.len() / TOKEN_COUNT;
+        let mut output = Vec::new();
+        for row in hidden.chunks_exact(row_width) {
+            let row = row.iter().copied().map(f64::from).collect::<Vec<_>>();
+            output.extend(oracle.recurrent_block_step(RECURRENT_BLOCK, &row)?);
+        }
+        Ok((
+            output,
+            history.iter().copied().map(f64::from).collect(),
+            state.iter().copied().map(f64::from).collect(),
+        ))
+    }
+
+    fn copy_to_host(
+        buffer: &hipcore::DeviceBuffer<f32>,
+        label: &str,
+    ) -> core::result::Result<Vec<f32>, String> {
+        let mut values = vec![0.0_f32; buffer.len()];
+        buffer
+            .copy_to_host(&mut values)
+            .map_err(|error| format!("read {label}: {error}"))?;
+        Ok(values)
+    }
+}

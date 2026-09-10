@@ -11,6 +11,7 @@ use crate::error::{
 };
 use crate::qwen35::recurrent_layernorm_rms_epsilon;
 use crate::qwen35_recurrent::{ExecutionLayout, RecurrentTensorRole, recurrent_tensor_name};
+#[cfg(test)]
 use kernels::PackedPrefillPlan;
 
 /// One verified matrix descriptor used by a native recurrent block.
@@ -110,11 +111,16 @@ impl DeviceRecurrentPlan {
         Self::from_token_count(weights, block, 1)
     }
 
-    /// Bind one single-sequence packed recurrent chunk to native descriptors.
+    /// Bind one test-only single-sequence packed recurrent chunk to native descriptors.
     ///
     /// The packed descriptor remains borrowed at this boundary: its existing
     /// context admission is consumed as geometry, never copied into model
     /// position, grant, or publication state.
+    ///
+    /// The production native model has no chunk entrypoint yet. Keeping this
+    /// constructor test-only makes that absence explicit while letting the
+    /// reserved-device witness exercise the private block body.
+    #[cfg(test)]
     pub(super) fn from_packed_prefill(
         weights: &Qwen35Weights,
         block: usize,
@@ -323,15 +329,11 @@ impl RecurrentWorkspacePlan {
             layout.epsilon(),
         )
         .context(NativeKernelSnafu)?;
-        let value_layout =
-            kernels::decoder_ops::RecurrentValueLayoutF32Plan::try_from_convolved_rows(
-                token_count,
-                layout.convolution_width(),
-                layout.value_head_count(),
-                layout.value_dim(),
-                qk_l2.qk_prefix_elements(),
-            )
-            .context(NativeKernelSnafu)?;
+        let value_layout = kernels::decoder_ops::RecurrentValueLayoutF32Plan::try_from_qk_plan(
+            qk_l2,
+            layout.value_dim(),
+        )
+        .context(NativeKernelSnafu)?;
         let scalars = kernels::decoder_ops::RecurrentScalarsF32Plan::try_from_token_rows(
             token_count,
             layout.value_head_count(),
@@ -639,14 +641,8 @@ mod tests {
             kernels::decoder_ops::RecurrentQkL2F32Plan::try_from_dimensions(14, 1, 2, 3, 0.5)
                 .map_err(|error| error.to_string())?;
         let value_layout =
-            kernels::decoder_ops::RecurrentValueLayoutF32Plan::try_from_convolved_rows(
-                1,
-                14,
-                2,
-                4,
-                qk_l2.qk_prefix_elements(),
-            )
-            .map_err(|error| error.to_string())?;
+            kernels::decoder_ops::RecurrentValueLayoutF32Plan::try_from_qk_plan(qk_l2, 4)
+                .map_err(|error| error.to_string())?;
         let scalars = kernels::decoder_ops::RecurrentScalarsF32Plan::try_from_value_heads(2)
             .map_err(|error| error.to_string())?;
         let output_norm = kernels::decoder_ops::RmsNormF32Plan::try_from_dimensions(2, 4, 0.5)
