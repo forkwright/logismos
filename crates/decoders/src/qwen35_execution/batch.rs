@@ -13,8 +13,9 @@ use crate::qwen35_requirements::Qwen35BatchCpuRequirements;
 ///
 /// The plan borrows every execution exclusively, validates every sequence
 /// before staging, and consumes itself to publish every owner together. Equal
-/// artifact content is an admission relation only: it never aliases private
-/// recurrent state, K/V pools, or serialized backing.
+/// artifact content is an admission relation only: it neither proves nor
+/// creates allocation aliasing. Recurrent state and K/V pools remain private;
+/// immutable serialized backing may already be shared or separately allocated.
 #[derive(Debug)]
 pub struct Qwen35BatchExecutionPlan<'execution, 'tokens> {
     executions: &'execution mut [Qwen35Execution],

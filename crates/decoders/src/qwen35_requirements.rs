@@ -37,9 +37,11 @@ pub struct Qwen35CpuRequirements {
 
 /// Conservative logical CPU backing envelope for one atomic multi-session execution.
 ///
-/// Each session retains independent private state and serialized artifact
-/// backing even when every receipt identifies identical content. The aggregate
-/// executes private arithmetic one sequence at a time, so transient workspace
+/// Each session retains independent mutable state. Immutable serialized artifact
+/// backing may be shared or separately allocated even when every receipt
+/// identifies identical content, so its per-owner sum is a conservative upper
+/// bound, not a unique-residency count. The aggregate executes private arithmetic
+/// one sequence at a time, so transient workspace
 /// is the maximum per-owner plan bound rather than a sum. As with
 /// [`Qwen35CpuRequirements`], these fields exclude allocator capacity,
 /// metadata, stack or structure storage, RSS, and separately reported artifact
