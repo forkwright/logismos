@@ -711,7 +711,6 @@ mod tests {
         // state, workspace, weight, status, and stream allocation through its
         // completion check on the operator-reserved device.
         let submitted = unsafe { deferred.submit() };
-        drop(deferred);
         if let Err(error) = submitted {
             resources.retain_unconfirmed();
             return Err(error.to_string());

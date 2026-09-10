@@ -2150,6 +2150,7 @@ impl CanonicalHybridOracle {
         self.block_step(block, input, true)
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) fn recurrent_block_step(
         &mut self,
         block: usize,
