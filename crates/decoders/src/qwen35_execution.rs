@@ -215,21 +215,7 @@ impl Qwen35Execution {
             self.layout.max_context,
         )
         .context(ExecutionCpuSnafu)?;
-        let staged = self.stage()?;
-        let (layers, position, paged_kv_pool) = (
-            &mut self.layers,
-            &mut self.position,
-            &mut self.paged_kv_pool,
-        );
-        let pending = batch::PendingExecution::stage(
-            staged,
-            layers,
-            position,
-            paged_kv_pool,
-            token_ids,
-            &packed,
-            0,
-        )?;
+        let pending = batch::PendingExecution::stage(self, token_ids, &packed, 0)?;
         let (prepared_owner, logits) = pending.prepare()?;
         prepared_owner.publish();
         Ok(logits)
@@ -307,6 +293,41 @@ struct StagedExecution {
     position: usize,
 }
 
+fn packed_sequence_positions(
+    packed: &PackedPrefillPlan,
+    sequence: usize,
+    token_count: usize,
+) -> Result<core::ops::Range<usize>> {
+    let sequence_tokens = packed.sequence_length(sequence).ok_or_else(|| {
+        ExecutionContextSnafu {
+            requested: sequence,
+            rule: "packed execution sequence must exist",
+        }
+        .build()
+    })?;
+    if sequence_tokens != token_count {
+        return ExecutionContextSnafu {
+            requested: token_count,
+            rule: "packed execution sequence length must match supplied token ids",
+        }
+        .fail();
+    }
+    let position = packed.committed_offset(sequence).ok_or_else(|| {
+        ExecutionContextSnafu {
+            requested: sequence,
+            rule: "packed execution sequence must retain its committed offset",
+        }
+        .build()
+    })?;
+    let end = position.checked_add(sequence_tokens).ok_or_else(|| {
+        ArithmeticOverflowSnafu {
+            context: "packed execution sequence end",
+        }
+        .build()
+    })?;
+    Ok(position..end)
+}
+
 impl StagedExecution {
     fn step_staged(
         &mut self,
@@ -315,45 +336,20 @@ impl StagedExecution {
         sequence: usize,
         mut append: Option<&mut PagedAppend<'_>>,
     ) -> Result<Vec<f32>> {
-        let sequence_tokens = packed.sequence_length(sequence).ok_or_else(|| {
-            ExecutionContextSnafu {
-                requested: sequence,
-                rule: "packed execution sequence must exist",
-            }
-            .build()
-        })?;
-        if sequence_tokens != token_ids.len() {
-            return ExecutionContextSnafu {
-                requested: token_ids.len(),
-                rule: "packed execution sequence length must match supplied token ids",
-            }
-            .fail();
-        }
-        let sequence_position = packed.committed_offset(sequence).ok_or_else(|| {
-            ExecutionContextSnafu {
-                requested: sequence,
-                rule: "packed execution sequence must retain its committed offset",
-            }
-            .build()
-        })?;
-        let sequence_end = sequence_position
-            .checked_add(sequence_tokens)
-            .ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "packed execution sequence end",
-                }
-                .build()
-            })?;
+        let sequence_positions = packed_sequence_positions(packed, sequence, token_ids.len())?;
         let total = returned_logits_elements(self.layout, token_ids.len(), self.selection)?;
         let mut logits = reserve("token logits", total)?;
         for (token_index, token_id) in token_ids.iter().enumerate() {
             let mut hidden = self.embed(*token_id)?;
-            let position = sequence_position.checked_add(token_index).ok_or_else(|| {
-                ArithmeticOverflowSnafu {
-                    context: "packed execution token position",
-                }
-                .build()
-            })?;
+            let position = sequence_positions
+                .start
+                .checked_add(token_index)
+                .ok_or_else(|| {
+                    ArithmeticOverflowSnafu {
+                        context: "packed execution token position",
+                    }
+                    .build()
+                })?;
             let recurrent_packed =
                 PackedPrefillPlan::new(&[1], &[position], self.layout.max_context)
                     .context(ExecutionCpuSnafu)?;
@@ -423,7 +419,7 @@ impl StagedExecution {
                 )?);
             }
         }
-        self.position = sequence_end;
+        self.position = sequence_positions.end;
         Ok(logits)
     }
 

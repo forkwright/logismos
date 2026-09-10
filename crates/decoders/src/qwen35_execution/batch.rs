@@ -98,7 +98,7 @@ impl Qwen35Execution {
     }
 }
 
-impl<'execution, 'tokens> Qwen35BatchExecutionPlan<'execution, 'tokens> {
+impl Qwen35BatchExecutionPlan<'_, '_> {
     /// Return the aggregate logical CPU backing envelope derived at admission.
     #[must_use]
     pub const fn cpu_requirements(&self) -> Qwen35BatchCpuRequirements {
@@ -165,20 +165,8 @@ fn stage_batch<'execution>(
         .fail();
     }
     for (sequence, (execution, tokens)) in executions.iter_mut().zip(token_ids).enumerate() {
-        let staged = execution.stage()?;
-        let (layers, position, paged_kv_pool) = (
-            &mut execution.layers,
-            &mut execution.position,
-            &mut execution.paged_kv_pool,
-        );
         pending.push(PendingExecution::stage(
-            staged,
-            layers,
-            position,
-            paged_kv_pool,
-            tokens,
-            packed,
-            sequence,
+            execution, tokens, packed, sequence,
         )?);
     }
     Ok(())
@@ -194,14 +182,17 @@ pub(super) struct PendingExecution<'execution> {
 
 impl<'execution> PendingExecution<'execution> {
     pub(super) fn stage(
-        mut staged: StagedExecution,
-        target_layers: &'execution mut Vec<LayerState>,
-        target_position: &'execution mut usize,
-        paged_kv_pool: &'execution mut Option<PagedKvPool>,
+        execution: &'execution mut Qwen35Execution,
         token_ids: &[u32],
         packed: &PackedPrefillPlan,
         sequence: usize,
     ) -> Result<Self> {
+        let mut staged = execution.stage()?;
+        let (target_layers, target_position, paged_kv_pool) = (
+            &mut execution.layers,
+            &mut execution.position,
+            &mut execution.paged_kv_pool,
+        );
         let mut append = paged_kv_pool
             .as_mut()
             .map(|pool| {
